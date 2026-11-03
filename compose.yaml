@@ -18,13 +18,3 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports: ["127.0.0.1:8000:8000"]
-
-  api-go:
-    <<: *hardening
-    build:
-      context: ./services/api-go
-      args: { APP_VERSION: local }
-    environment:
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-20s}
-    ports: ["127.0.0.1:8080:8080"]

@@ -70,37 +70,9 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest # fails below 80% coverage (see pyproject.toml)
 
-  go:
-    name: Go (lint, tests)
-    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
-    defaults:
-      run:
-        working-directory: services/api-go
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27"
-          cache-dependency-path: services/api-go/go.sum
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.14.0
-          working-directory: services/api-go
-      - name: Test (race detector, 80% coverage gate)
-        run: |
-          go test -race -covermode=atomic -coverprofile=coverage.out ./...
-          total=$(go tool cover -func=coverage.out | awk '/^total:/ {sub("%", "", $3); print $3}')
-          echo "Total coverage: ${total}%"
-          if awk -v t="$total" 'BEGIN { exit !(t + 0 < 80) }'; then
-            echo "::error::Go coverage ${total}% is below 80%"
-            exit 1
-          fi
-
   images:
     name: Image ${{ matrix.service }} (build, scan, smoke test)
-    needs: [python, go]
+    needs: [python]
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
     strategy:
       fail-fast: false
@@ -108,8 +80,6 @@ jobs:
         include:
           - service: api-python
             port: 8000
-          - service: api-go
-            port: 8080
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
