@@ -15,9 +15,9 @@ PRD open question 8, the download mechanism. The other phase 3 documents cover t
 ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)). Where this page relies on them, it says so.
 
 Every number here is a starting value: configuration promoted dev → staging → prod like code, tuned by the first load
-test and the first weeks in prod. Overriding one for a single tenant (audited) needs the per-tenant overrides that are
-still open (section 10). NFR-14 lets phase 3 tighten its numbers; this page adds daily code caps (section 2) and the
-upload and download limits NFR-14 left open.
+test and the first weeks in prod. A limit changes only through deploy config, for every tenant at once: per-tenant
+overrides of limits and quotas are not in v1 (section 10). NFR-14 lets phase 3 tighten its numbers; this page adds daily
+code caps (section 2) and the upload and download limits NFR-14 left open.
 
 **Decisions in short**
 
@@ -373,7 +373,7 @@ threat protection does that job (#23).
 | Priority | Rule | Action | Why |
 |---|---|---|---|
 | 0, 1 | `block-list`; `AWSManagedRulesAmazonIpReputationList` | Block | As on the API web ACL |
-| 2 | `token-nat-only`: `/oauth2/token` and `/oauth2/revoke` from an IP outside the region's NAT IP set | Block | Only our API, a confidential client, exchanges codes and revokes tokens, and it reaches Cognito through the NAT gateways. Terraform builds the IP set from the gateways' Elastic IPs. |
+| 2 | `token-nat-only`: `/oauth2/token` and `/oauth2/revoke` from an IP outside the region's NAT IP set | Block | Only our API, a confidential client, exchanges codes and revokes tokens, and it reaches Cognito through its egress proxy listener and the NAT gateways behind it, the only way out of the VPC (ADR-0021). Terraform builds the IP set from the gateways' Elastic IPs. |
 | 3 | `rate-token-nat`: those two paths from the NAT IP set, per IP, 10,000 in 300 s | Block | Stops a runaway loop in our own code, far above the need |
 | 4 | `rate-signin-ip`: every request from other IPs, per IP, 2,000 in 300 s | Block | Flood backstop sized for a large tenant behind one address |
 | 5 | `rate-signin-post-ip`: `POST` requests (form submissions) from other IPs, per IP, 500 in 300 s | Block | Bounds password and code submissions per address |
@@ -437,7 +437,8 @@ $27 in Osaka at design load.
 ### 4.1 What it holds, and what it doesn't
 
 The counter store holds short-lived windows: requests per key, codes per address and per link, failures per IP,
-granted bytes per day, leases for streams and scans and, for #23, the sign-in state between redirect and callback.
+granted bytes per day, leases for streams and scans, the notification worker's per-address caps across tenants (7.2)
+and, for #23, the sign-in state between redirect and callback.
 Losing them resets some windows, which is acceptable because the state that decides access is in PostgreSQL: code
 attempts and lockouts (data model 2.4), download counts (2.3), grant byte use and storage quotas (sections 5 and 6).
 That state fails over with the database and is protected by NFR-10.
@@ -454,7 +455,7 @@ That state fails over with the database and is protected by NFR-10.
 | Consistency | Exact per key on the primary. Losing a few seconds of counts in a cache failover is acceptable. |
 | Durability and regions | None: nothing in the store is needed after a regional failover (4.1). One store per environment and region, nothing replicated; Osaka at its smallest size until a failover. |
 | Failure mode | Fail closed for sign-in and link verification; fail open to a per-pod limiter for the rest, with an alert (4.5) |
-| Data and security | No plain email address, token or cookie value in a key; every key has a TTL of at most 25 hours. TLS, IAM authentication, private subnets; reachable only from API pods and the sign-in trigger. |
+| Data and security | No plain email address, token or cookie value in a key; every key has a TTL of at most 25 hours. TLS, IAM authentication, isolated subnets; reachable only from the API, the sign-in triggers, the scan worker (scan leases, 6.4) and the notification worker (per-address caps, 7.2) |
 
 ### 4.3 Options
 
@@ -482,8 +483,8 @@ PostgreSQL holding the security state. The phase 4 ADR confirms it.
   victim's code cap. That costs up to four 1 ms round trips; one script over all keys would need one hash slot, which
   cluster mode denies.
 - **Key names** look like `rl:{group}:{key type}:{value}`, where the value is an ID, an HMAC or an IPv4 address.
-  Access is by IAM authentication from the API's and the trigger's roles, over TLS, through a security group open
-  only to them.
+  Access is by IAM authentication from the roles of the API, the sign-in triggers, the scan worker and the
+  notification worker, over TLS, through a security group open only to them (ADR-0014).
 - **Timeouts.** 50 ms per call. After 5 errors in a row, the API stops calling the store for 10 seconds and applies
   each group's failure mode, so a sick cache doesn't add latency to every request.
 
@@ -538,9 +539,10 @@ sequenceDiagram
     participant S3 as S3 files
     R->>API: POST /v1/session/files/{fid}/downloads with X-Link-Session
     API->>DB: check session, revocation, expiry, shareable file, limit
-    API->>AR: generate the grant ID, write the grant record in both regions
+    API->>AR: generate the grant ID, write the grant intent record in both regions
     API->>DB: count the download, create the grant, write the audit record, commit
     API-->>R: DownloadAccess with the content URL
+    API->>AR: in the background, write the grant committed record in both regions
     R->>API: navigate to the content URL with the link cookie, optional Range
     API->>DB: check grant, its session, transfer and file, take the stream lease
     API->>S3: GetObject for the scanned version, same range
@@ -551,7 +553,10 @@ sequenceDiagram
     Note over R,API: after a drop the browser asks again with Range under the same grant, which is not counted again
 ```
 
-- The archive record comes before the count (API contract): a `503` from the grant call means nothing was counted.
+- The intent record (`download.grant_intent`) comes before the count (API contract): a `503` from the grant call
+  means nothing was counted. After the commit, the committed record (`download.grant_committed`) goes to both
+  archives in the background, retried until both confirm. A failover or restore re-applies only grants that have a
+  committed record or a database row; an intent with neither was refused or rolled back (data model 2.3).
 - **Navigation, not `fetch`.** The web app starts a download by navigating to the content URL, so the browser's
   download manager saves and resumes it. A navigation can't send `X-Link-Session`, so the content GETs are exempt
   from it (every other `/session` call keeps it): the grant ID in the path names the grant, and the `__Host-sft_link`
@@ -559,8 +564,8 @@ sequenceDiagram
   the `SameSite=Strict` cookie is sent. Without it (a URL pasted elsewhere) the request gets `401`; with a cookie
   that doesn't hold the grant's session, `404` (NFR-12).
 - On a revocation, the transfer's link sessions are closed in the same transaction (data model 2.4). New grant and
-  content requests fail at once with `410 link_revoked`, and a running stream stops at its next re-check, within 30
-  seconds.
+  content requests fail at once with `410 link_revoked`, and a running stream stops at its next re-check, within 60
+  seconds of the revocation (NFR-6).
 - The member's download of a received file works the same way: `createReceivedFileDownload` creates a grant bound to
   the member's session, and `getReceivedFileDownloadContent` needs that session's cookie.
 
@@ -569,7 +574,7 @@ sequenceDiagram
 The `download_grants` table (data model): `id`, `tenant_id`, `file_id`, `s3_version_id`, either `recipient_id` and
 `link_session_id` or `user_id` and `member_session_id`, `byte_budget`, `bytes_served`, `request_count`, `expires_at`,
 `active_stream_id` and `active_stream_until` (the stream lease, renewed at each 30-second re-check), `archived_at`
-(when both regions' archive confirmed the grant record) and `created_at`.
+(when both regions' archive confirmed the committed record) and `created_at`.
 
 | Rule | Value | Why |
 |---|---|---|
@@ -577,13 +582,16 @@ The `download_grants` table (data model): `id`, `tenant_id`, `file_id`, `s3_vers
 | Where it works | Only with a cookie that holds that session. A recipient who verifies again gets a new session and a new, counted grant. | FR-14 |
 | Lifetime | 24 hours from creation, never past its session, the transfer's expiry or revocation | Bounded like the session (NFR-14) |
 | Budget | 3 × the file size in bytes; 20 content requests; one active stream, where a new request takes over and the old stream stops at its next re-check | Covers resumes and a full restart in browsers that can't resume; stops many small ranges from becoming many copies; bounds overlap to 30 s |
-| Counting | Once, at creation: the grant record goes to both regions' archive first, then the count, the grant and the audit record commit together (NFR-15, NFR-10) | FR-4 |
+| Counting | Once, at creation: the intent record goes to both regions' archive first, then the count, the grant and the audit record commit together, then the committed record follows (NFR-15, NFR-10) | FR-4 |
 | Resuming | `createSessionDownload` with `resume_grant_id`, in the same session, returns the same grant, uncounted, while it has time and bytes left; otherwise `403 download_grant_exhausted`, and a call without `resume_grant_id` counts a new download | FR-6 |
 | The grant ID in the URL | Not a credential: useless without the right session | FR-14 |
 | Audit | `download.granted` at creation (fail closed); `download.completed` when the last byte of the file is sent and `download.stopped` when a revocation cuts a stream (best effort, not fail closed) | FR-7, FR-27 |
 
 A grant's row is a security-critical record like the download count. After a regional failover the byte count may
-be up to 5 minutes behind (NFR-10), which can only allow a few extra bytes, never an extra download.
+be up to 5 minutes behind (NFR-10), which can only allow a few extra bytes. The one way to an extra download is the
+residual window of data model 2.3: a grant committed in Tokyo whose committed record and row hadn't reached Osaka
+when Tokyo was lost, normally under a second. Grant byte counters lost within the replication lag are a
+disaster-recovery gap tracked in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42).
 
 ### 5.5 FR-4, FR-6, FR-14 and NFR-6 together
 
@@ -668,26 +676,33 @@ exact because the real size must equal the declared one. The 2 TB default is abo
 
 ### 6.3 Completion checks (architecture 4.1)
 
-1. The API locks the transfer or upload request row and re-checks it: not revoked, expired or cancelled; the file
-   still `uploading`; the counted files and the total within FR-1, FR-2 and FR-11. If a check fails, the file becomes
-   `rejected`, the API aborts the multipart upload and releases its quota; no part is assembled.
-2. Still under the lock, it lists the parts in S3 itself, never trusting the client's list: every part from 1 to
-   `part_count`, each `part_size` long except the last.
-3. It completes the upload with that list, reads the size with `GetObjectAttributes` and records the version ID.
-4. If the size isn't the declared size, the file becomes `rejected`, its quota is released, and the deletion job
-   removes the object. Otherwise the file moves to `scanning`, with the outbox scan message and the audit record.
+Completion runs in three phases, and no lock is held across the S3 calls (data model 3.1):
 
-The lock is held across the S3 calls, so a revocation that arrives meanwhile waits (normally a few seconds) and then
-ends the completed file with its transfer. A revoked transfer never assembles parts (NFR-6). Completing a file that
-is already past `uploading` returns it unchanged.
+1. **Short transaction, row lock.** The API locks the transfer or upload request row and re-checks it: not revoked,
+   expired or cancelled; the file still `uploading`; the counted files and the total within FR-1, FR-2 and FR-11,
+   counting files already `completing`. If a check fails, the file is rejected (below) and no part is assembled.
+   Otherwise the file becomes `completing` and the transaction commits.
+2. **No transaction.** It lists the parts in S3 itself, never trusting the client's list (every part from 1 to
+   `part_count`, each `part_size` long except the last), completes the upload with that list, then reads the size and
+   version ID with `GetObjectAttributes`.
+3. **Short transaction, row lock.** It locks the row again and re-checks: the transfer or request still open, the file
+   still `completing`. If so and the size is the declared size, the file moves to `scanning`, with the outbox scan
+   message and the audit record. If parts were missing, it goes back to `uploading` and the client sends them.
+   Otherwise the file is rejected.
+
+**Rejecting a file** marks it `rejected`, sets `delete_after = now()` and releases its quota, with no S3 call; the
+deletion job aborts the multipart upload if it still exists and removes any object in both regions. Parallel
+completions don't queue behind each other's S3 calls, and a revocation that lands during phase 2 wins at phase 3, so a
+revoked transfer never gets a scannable file (NFR-6). A retry that finds the file `completing` runs phases 2 and 3
+again, which are safe to repeat; reconciliation does the same for a file left `completing` for 15 minutes.
 
 ### 6.4 Scan limits and zip bombs
 
-ClamAV can't scan files over 2 GB, so scanning is a hybrid: ClamAV up to 2 GB, GuardDuty Malware Protection for S3
-above (capacity 3.3, ADR-0019). A protection plan can't select by size, so files declared over 2 GB go to a second
-files bucket pair, chosen at upload start, with the same settings, keys and `tenants/{tenant_id}/` key layout, and
-the plan covers that whole bucket. GuardDuty's role may decrypt with the files key, through S3, for that bucket only
-(#22). Results map to file states like this:
+ClamAV can't scan files over 2 GB, so scanning is a hybrid: ClamAV for files up to 2,000,000,000 bytes, GuardDuty
+Malware Protection for S3 above (capacity 3.3, ADR-0019). A protection plan can't select by size, so files declared over
+2 GB go to a second files bucket pair, chosen at upload start, with the same settings, keys and `tenants/{tenant_id}/`
+key layout, and the plan covers that whole bucket. GuardDuty's role may decrypt with the files key, through S3, for that
+bucket only (#22). Results map to file states like this:
 
 | Engine result | ClamAV, files up to 2 GB | GuardDuty, files over 2 GB | File state |
 |---|---|---|---|
@@ -701,20 +716,23 @@ the plan covers that whole bucket. GuardDuty's role may decrypt with the files k
   clean. The scan ADR sets each engine's limits and tests them at its largest size: 2 GB for ClamAV, 5 GB for
   GuardDuty. Zip bombs stop at the nesting, file-count and ratio limits and become `unscannable`, blocked by default
   (FR-18); our code never extracts archives.
-- **Scan workers.** clamd requests 4 GiB, and each pod has up to 2 GB of scratch disk, enough for its largest file
-  (capacity 4.1). A file's timeout scales with its size (a scan takes about 1 s plus 0.058 s per MB, 2 minutes for
-  2 GB; capacity 3.3), and running out of time counts as a failed attempt. The engine container has a read-only root
-  file system, no service account token and no AWS credentials, and scans over a local socket. It shares the pod's
-  network namespace, so its network isolation is the pod's network policy: no ingress, and egress only to the
-  signature mirror and the AWS endpoints the worker needs. The engine can reach what the worker reaches, though it
-  holds nothing to authenticate with (ADR-0019).
-- **Fair scanning.** Scan queues are SQS fair queues keyed by tenant, and each tenant may run at most 4 small-file
-  and 2 large-file ClamAV scans at once, counted with leases in the counter store. A worker that receives a message
+- **clamd in its own pods** (ADR-0019). clamd runs as its own Deployment, one pod beside each scan worker on the scan
+  node pool, with no service account token, no AWS identity, no database access and a read-only root file system.
+  Its network policy allows ingress only from the scan workers and egress only to the signature mirror. The scan
+  worker reads the object from S3 and streams its bytes to clamd (INSTREAM); the worker needs no scratch disk. clamd
+  requests 4 GiB of memory and has 4 GiB of scratch for the streamed file and temporary extraction (capacity 4.1). A
+  compromised engine can reach neither the worker's AWS endpoints nor the database, and holds nothing to
+  authenticate with. A file's timeout scales with its size (a scan takes about 1 s plus 0.058 s per MB, 2 minutes for
+  2 GB; capacity 3.3), and running out of time counts as a failed attempt.
+- **Fair scanning.** Scan queues are SQS fair queues keyed by tenant. Each tenant may run at most 4 small-file ClamAV
+  scans at once, and max(1, large pool size − 1) large-file scans, so one tenant never fills the large pool; the
+  large pool keeps at least 3 pods while any large file waits. The scan worker counts them with leases in the counter
+  store. A worker that receives a message
   over its tenant's cap writes a new scan message to the outbox, which the relay sends with a 30-second delay, and
   once that commits deletes the one it received. It never changes the visibility to put a message back: each receive
   raises the receive count and would send a healthy file to the dead-letter queue. A duplicate is harmless; the
-  worker re-reads the file's state. Ten 2 GB files, 2 at a time, take about 10 minutes, inside NFR-5's 15 for a 20 GB
-  transfer. GuardDuty publishes no time-to-result target, so the scan ADR measures it. Without the counter store, the
+  worker re-reads the file's state. Ten 2 GB files run at least 2 at a time (the cap with the pool at its 3-pod
+  floor), so they take at most about 10 minutes, inside NFR-5's 15 for a 20 GB transfer, and less as the pool grows. GuardDuty publishes no time-to-result target, so the scan ADR measures it. Without the counter store, the
   cap is skipped and the fair queue alone applies.
 - **The declared content type is never used.** The scan worker reads the version recorded at completion and downloads
   serve that same version (5.6), so the bytes can't change between scan and download. Unscannable files allowed by
@@ -729,10 +747,11 @@ the plan covers that whole bucket. GuardDuty's role may decrypt with the files k
 | Transfer link; upload-request invitation | A member or API key (`sendTransfer` once every file is shareable; `createUploadRequest`) | Each recipient; the uploader | 50 recipients a transfer; group G caps |
 | Verification code | Anyone holding a valid link token | Only that link's invited address | Per address 5 an hour and 50 a day; per link 20 a day and 1 every 30 s; 1,000 an hour per tenant |
 | Member invitation | A tenant admin (`inviteUser`), or an operator for the first admin (`createTenant`) | The new member | 100 an hour per tenant; 3 a day per address |
-| Sign-in and MFA emails | Cognito (#23) | The member | Cognito's quotas and lockout |
+| Sign-in and MFA emails | Cognito (#23), sending through our SES identity with the same DKIM and DMARC (ADR-0015) | The member | Cognito's quotas and lockout; the same SES quota and reputation as ours |
 | First-download notice (FR-8) | The system, on the first download | The member | Once per transfer |
 | Files-arrived and blocked-file notices (FR-12) | The system, on scan results | The member; for blocked files also the uploader | Coalesced: at most one per upload request every 10 minutes |
 | Held-transfer and lockout notices (NFR-14) | The system | The member; for a lockout also the tenant admins | Once per hold or lockout |
+| Any email to an address the tenant had suppressed | A tenant admin clearing the suppression (`clearEmailSuppression`, 7.4) | That address, by the next email a member sends it | Tenant admins only, audited; the address's own later bounce or complaint suppresses it again |
 
 No unauthenticated person can make the service email an address of their choosing. The only public trigger, a code
 request, goes to an address a member chose.
@@ -780,15 +799,25 @@ The caps are in section 2.2, groups A and G. Three design points:
 
 ### 7.4 Suppression list
 
-- **A hard bounce suppresses the address everywhere; a complaint, only for the tenant that sent the email.** An
-  operator can remove an entry once the person confirms the address works.
-- **Our own `email_suppressions` table decides what we send:** `tenant_id` (empty for a hard bounce, which applies to
-  every tenant; set for a complaint, which applies to that tenant only), `email_hmac`, `hmac_key_id`, `reason`,
-  `created_at` and `expires_at` (data model). A lookup checks the address under every key that still has rows and
-  re-keys an old match (#22).
-- **SES's own lists back it up on the same rule.** The account-level suppression list is on for hard bounces only,
-  because a complaint there would block the address for every tenant. Complaints go to the SES tenant's own
-  suppression list (tenant-level suppression), so they stay per tenant (ADR-0015).
+- **Every suppression is per tenant** (ADR-0015). A bounce or complaint on one tenant's email never blocks another
+  tenant's, so a suppression reveals nothing across tenants (NFR-12). No entry applies to every tenant.
+  - **A hard bounce** suppresses the address for the sending tenant for 90 days. After that one email may go out
+    again; a second hard bounce suppresses it with no expiry, until a tenant admin clears it.
+  - **A complaint** suppresses the address for that tenant until a tenant admin clears it.
+  - **Clearing** is `clearEmailSuppression` (`POST /email-suppressions/clear`, the address in the JSON body, never the
+    URL), for tenant admins only, with a passkey for a local admin and never with an API key, because a complaint is
+    the recipient's own choice. It is audited and always answers `204`, whether or not an entry existed (authn-authz
+    6.3).
+- **Our own `email_suppressions` table decides what we send:** `tenant_id` (always set), `email_hmac`, `hmac_key_id`,
+  `reason`, `bounce_count`, `expires_at` and `ses_released_at` (data model 2.5). A lookup checks the address under
+  every key that still has rows and re-keys an old match (#22). An ended entry stays as a marker for 365 days, so a
+  second bounce is recognised.
+- **SES's tenant-level suppression lists back it up** for both kinds; the account-level list is off, because it would
+  block an address for every tenant. Our table holds only the address's HMAC, so an entry that ends doesn't release
+  the address from SES at once: on the first send after it ends, the notification worker removes the address from
+  that SES tenant's list.
+- Because suppression is per tenant, a dead address can bounce once for each tenant that sends to it. Those bounces
+  count in the account's rate, which the account alarms in 7.3 watch.
 - `createTransfer` and `createUploadRequest` refuse a suppressed recipient with `422 recipient_undeliverable`, shown
   in the recipient's status (FR-7). A code request for a suppressed address sends nothing, and the recipient page
   says the code couldn't be sent and to contact the sender.
@@ -851,7 +880,7 @@ The `account-compromise` runbook (AB-7) has no alert of its own; other alerts an
 |---|---|---|
 | Add IPs or networks to the WAF block list | Operator | Blocked at the WAF for the whole API |
 | Turn on `attack-mode-links` or `geo-block` | Operator | Link steps refused from anonymous or hosting networks, or from listed countries |
-| Lower a limit globally or for one tenant | Operator | Deploy config, or a per-tenant override (section 10) |
+| Lower a limit | Operator | Deploy config, for every tenant at once; per-tenant overrides are not in v1 (section 10) |
 | Pause a tenant's email; suspend a tenant | Operator | SES stops sending for that tenant only; or every call for that tenant is refused and its links stop working |
 | Revoke a transfer, upload request or API key; unlock a recipient; deactivate a member | Member or tenant admin; an operator in an emergency for keys and members | Immediate (NFR-6) |
 
@@ -896,7 +925,7 @@ verification funnel, streams and email reputation.
 | WAF challenge | More than 30 recipient-page loads in 5 minutes from one IP: a client that can't run JavaScript gets no page, and each browser of NFR-22 passes without the user noticing and still reads the link from the fragment | Staging browser matrix |
 | Sign-in WAF and failed sign-ins | Twice the busiest 5 minutes at design load (2,000 sign-ins, 80 of them from one address) pass with no block; a token request from outside the NAT IP set is blocked. 11 wrong passwords within 15 minutes: the 11th is denied by the trigger; a success clears the count. | Staging (needs Cognito) |
 | Byte, stream and storage caps | A recipient of a transfer with no download limit is refused past 25 GB of grants in a day; a tenant past 500 GB; a 7th stream for one session and a 201st for one tenant get `429`; a client reading below 2 KB/s for 2 minutes is cut. Declaring past 2 TB gets `413 storage_quota_exceeded`; past 200 GB in 24 hours, `429`. | CI |
-| Scan fairness | One tenant uploads 50 large files: other tenants' files still meet NFR-5, that tenant never has more than 2 large-file scans running, and no deferred message reaches the dead-letter queue | Staging load test |
+| Scan fairness | One tenant uploads 50 large files: other tenants' files still meet NFR-5, that tenant never has more large-file scans running than one fewer than the large pool's pods, the pool keeps at least 3 pods while its files wait, and no deferred message reaches the dead-letter queue | Staging load test |
 | Bounces, complaints and the automatic pause | SES mailbox simulator: bounce, complaint and suppression addresses give an undeliverable recipient, a suppression entry and the metrics. 3 complaints in 1,000 emails pause the tenant's sending, open a ticket and keep its emails in the outbox; 2 in 1,000, or 3 in 500, don't. | Staging |
 | Part URLs and completion checks | A different `Content-Length`, an expired URL, or a `GET` with a part URL: rejected by S3. Completing after a revocation returns `409` and calls no `CompleteMultipartUpload`; a size mismatch marks the file `rejected` and leaves the object to the deletion job; the API role's `DeleteObject` is denied. | CI with a mocked S3; dev, once the AWS profile exists |
 | Scan results and zip bombs | A corpus: a test signature in a nested archive is `infected`; an encrypted archive and a zip bomb are `unscannable`, never `clean`; a forced timeout ends `scan_failed`; a 3 GB file goes to GuardDuty, never ClamAV | Scan worker CI with the engine container; GuardDuty in dev |
@@ -928,6 +957,12 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
   and a cap on expiry extensions. The API README and the data model list them as open. Until they exist, a limit
   changes only through deploy config for every tenant, and the runbooks that raise a tenant's quota or suspend a tenant
   (AB-4, AB-5, 8.3) have no operator operation to call.
+
+- **Phase 4 review fixes** ([#41](https://github.com/codewithmuh/secure-file-transfer/issues/41)): no per-tenant
+  overrides in v1 (intro, 8.3); the egress proxy in front of Cognito (3.2); who reaches the counter store (4.2, 4.4);
+  grant intent and committed records and the 60-second stop (5.3, 5.4); three-phase completion and rejected-file
+  deletion (6.3); clamd in its own pods, the 2,000,000,000-byte boundary and the large-file cap (6.4); per-tenant
+  suppression with `clearEmailSuppression` (7.1, 7.4).
 
 **Open points for the maintainer:**
 

@@ -6,7 +6,7 @@
 | Architecture | [architecture.md](../architecture.md) |
 | Security design | [Authentication and authorization](../security/authn-authz.md), [encryption and keys](../security/encryption-and-keys.md), [abuse and rate limits](../security/abuse-and-rate-limits.md), [threat model](../threat-model.md) |
 | Decisions | [ADR-0003](../adr/0003-multi-tenancy-shared-schema.md) (tenancy model) |
-| Tracking | [#13](https://github.com/codewithmuh/secure-file-transfer/issues/13), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) |
+| Tracking | [#13](https://github.com/codewithmuh/secure-file-transfer/issues/13), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41) |
 
 PostgreSQL is the single system of record (architecture section 2). This page defines its tables, the states rows move
 through, how tenants are kept apart, and how the PRD's data lifecycle maps onto columns and jobs. Column lists show the
@@ -65,7 +65,7 @@ erDiagram
     FILE ||--o{ DOWNLOAD_GRANT : "is fetched under"
     LINK_SESSION ||--o{ DOWNLOAD_GRANT : creates
     MEMBER_SESSION ||--o{ DOWNLOAD_GRANT : creates
-    TENANT |o--o{ EMAIL_SUPPRESSION : "suppresses for"
+    TENANT ||--o{ EMAIL_SUPPRESSION : "suppresses for"
     TENANT ||--o{ AUDIT_EVENT : "is scoped to"
 ```
 
@@ -75,7 +75,6 @@ Every arrow is a composite foreign key that includes `tenant_id` (section 4.2), 
   describe (section 6).
 - `USER_IDENTITY` refers to its connection by ID alone, because the platform's own sign-in pools belong to no tenant
   (2.1).
-- `EMAIL_SUPPRESSION` has a plain foreign key to `tenants`, empty for a suppression that applies to every tenant (2.5).
 - `member_sessions.identity_id` names the identity a session signed in through by ID only, so a sign-in reset can
   delete identities while the sessions it revoked remain until the daily cleanup (2.4).
 
@@ -168,7 +167,7 @@ same for its uploader, and an unlock does it for the subject it unlocks (2.4). `
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1. |
+| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `completion_started_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1. |
 | `download_counters` | `tenant_id`, `recipient_id`, `file_id`, `download_limit`, `count`, `first_downloaded_at`, `last_downloaded_at` | Primary key `(recipient_id, file_id)`. All rows for a transfer are created in the transaction that moves it to `sent`, with the transfer's limit copied in, so a row always exists before the first download. The two times are the recipient's download status (FR-7). |
 | `download_grants` | `id`, `tenant_id`, `file_id`, `s3_version_id`, `recipient_id` and `link_session_id`, or `user_id` and `member_session_id`, `byte_budget`, `bytes_served`, `request_count`, `expires_at`, `active_stream_id`, `active_stream_until`, `archived_at` | One counted download of one file by one session (abuse and rate limits 5.4). A check constraint requires exactly one of the two pairs, each through composite foreign keys; the keys to the session cascade on delete. `id` is the API's `grant_id`. |
 
@@ -200,10 +199,24 @@ No row returned means the limit is reached. Parallel requests serialise on the r
 or `createReceivedFileDownload` (a member, for a received file) creates a grant in this order (architecture 4.2):
 
 1. Check the session, the transfer's or request's state and expiry, that the file is shareable, and the limit.
-2. Generate the grant ID and write the grant record to the audit archive in both regions.
+2. Generate the grant ID and write a grant **intent** record (`download.grant_intent`: grant ID, file, session,
+   recipient or member) to the audit archive in both regions. If either write fails, the call answers `503` and
+   counts nothing.
 3. In one transaction: count the download with the statement above (recipients only; received files have no limit),
-   insert the grant with `archived_at` set, and write `download.granted`. A `503` before this commit means nothing
-   was counted.
+   insert the grant, and write `download.granted`. A `503` before this commit means nothing was counted.
+4. After the commit, the API writes a **committed** record (`download.grant_committed`) to both archives in the
+   background, retried until both confirm, and then sets `archived_at`. Reconciliation retries any grant whose
+   `archived_at` is still empty a minute after creation. The archive job's copy of `download.granted` is a second
+   path for the same fact.
+
+**What a failover or restore re-applies** (architecture 7). The recovery job (`sft_recovery`, 4.2) re-applies a
+grant, and its count, only if the grant has a committed record in the archive or a row in the database it is
+restoring into. An intent with neither is ignored: that grant was refused (a parallel request took the last download)
+or rolled back, so it gave no access, and counting it would take a download the recipient never had. The residual
+window: a grant committed in Tokyo whose committed record hasn't reached Osaka yet, and whose row the replica hasn't
+received, is lost if Tokyo is lost at that moment. Both writes normally finish within a second of the commit. A grant
+lost this way can let that recipient download the file once more than the limit allows; its intent record shows
+which grant it was.
 
 A grant allows `byte_budget` (3 × `actual_size`) and at most 20 content requests until `expires_at`: 24 hours after
 creation, never past its session's or the transfer's expiry. The content operations (`getSessionDownloadContent`,
@@ -221,12 +234,31 @@ UPDATE download_grants
 RETURNING bytes_served, byte_budget;
 ```
 
-No row returned means the grant is used up or has expired. The stream sends at most the budget left. Every 30 seconds
-it re-checks the transfer, the session and the file, adds the bytes it sent and renews its lease, with
-`WHERE id = $1 AND active_stream_id = $2`. If a newer request has taken the grant over, nothing matches and the old
-stream stops, so two streams overlap for at most 30 seconds. `createSessionDownload` with `resume_grant_id`, in the
-grant's own session, returns the same grant, uncounted, while it has time, bytes and requests left (FR-6). A grant's
-row is a security-critical record like the count.
+No row returned means the grant is used up or has expired. The stream sends at most the budget left. Every 30 seconds,
+and once more when it ends, it re-checks the transfer, the session and the file, and records what it sent:
+
+```sql
+UPDATE download_grants
+   SET bytes_served = bytes_served + $3,
+       active_stream_until = CASE WHEN active_stream_id = $2
+                                  THEN now() + interval '60 seconds'
+                                  ELSE active_stream_until END
+ WHERE id = $1
+RETURNING active_stream_id = $2 AS holds_lease;
+```
+
+- **Bytes are added by grant ID alone**, so a stream that has been taken over still records the bytes it already
+  sent; only the lease columns depend on `active_stream_id`. If a newer request has taken the grant over,
+  `holds_lease` is false and the old stream stops, so two streams overlap for at most 30 seconds.
+- **The re-check enforces revocation.** A revoked or expired transfer or request, an ended session or a file that is
+  no longer shareable stops the stream, so a running download stops within 60 seconds of a revocation (NFR-6).
+- **A running stream counts as activity** for its session, a link session or a member session alike: the re-check
+  moves the session's `last_seen_at` forward (at most once a minute, 2.4), so a long download doesn't end its session
+  for idleness. The session's absolute expiry still applies.
+
+`createSessionDownload` with `resume_grant_id`, in the grant's own session, returns the same grant, uncounted, while
+it has time, bytes and requests left (FR-6). A grant is a security-critical record like the count (section 2.5
+lists them).
 
 For received files, `retention_until` and `delete_after` are both set at upload, from the tenant policy in force then
 (FR-13). A member deleting a file earlier moves `delete_after` forward.
@@ -241,7 +273,7 @@ constraint that exactly one is set. That keeps database-enforced isolation and l
 |---|---|---|
 | `verification_codes` | `id`, `tenant_id`, `recipient_id` or `upload_request_id`, `code_hmac`, `hmac_key_id`, `expires_at` (≤ 10 min), `attempts`, `superseded_at`, `consumed_at` | Created by the notification worker, which emails the code (architecture 4.2). `code_hmac` is `HMAC-SHA-256(K_code, "code/v1/" + id + "/" + code)` under the `code-hmac` keyring, and `hmac_key_id` names the key version (encryption and keys 6.2). Creating a code sets `superseded_at` on every older live code for the same subject, so only the newest code can ever match. |
 | `link_sessions` | `id`, `tenant_id`, `recipient_id` or `upload_request_id`, `session_hash`, `expires_at` (≤ 24 h), `last_seen_at`, `revoked_at` | A verified browser session (FR-15). It also ends after 1 hour without activity: `last_seen_at` is written at most once a minute, and a running download stream counts as activity. A browser can hold up to 10, one per subject, in one cookie (authentication and authorization 4.3). Revoking a transfer or request sets `revoked_at` on its sessions in the same transaction. There is no CSRF column: CSRF tokens are derived from the session token (authentication and authorization 3.4). |
-| `member_sessions` | `id`, `tenant_id`, `user_id`, `identity_id`, `session_hash`, `auth_time`, `auth_method` (passkey, password_totp, local, sso), `last_seen_at`, `expires_at` (12 h from sign-in), `revoked_at`, `revoked_reason`, `created_ip`, `user_agent` | Web app sessions for members and admins, kept in PostgreSQL so revocation is transactional and survives a failover (authentication and authorization 3.2). `session_hash` is unique. A request is refused once the session is revoked or expired, `last_seen_at` is 30 minutes old (it is written at most once a minute), or the user or tenant is inactive. The role is read from `users` on every request, never copied here. `auth_method` comes from the ID token's `amr` claim, and a local admin acts with the admin role only in a `passkey` session (authentication and authorization 3.3). A user has at most 10 live sessions; an 11th ends the oldest. There is no CSRF column. |
+| `member_sessions` | `id`, `tenant_id`, `user_id`, `identity_id`, `session_hash`, `auth_time`, `auth_method` (passkey, password_totp, local, sso), `last_seen_at`, `expires_at` (12 h from sign-in), `revoked_at`, `revoked_reason`, `created_ip`, `user_agent` | Web app sessions for members and admins, kept in PostgreSQL so revocation is transactional and survives a failover (authentication and authorization 3.2). `session_hash` is unique. A request is refused once the session is revoked or expired, `last_seen_at` is 30 minutes old (it is written at most once a minute, and a running download stream counts as activity, as for link sessions, 2.3), or the user or tenant is inactive. The role is read from `users` on every request, never copied here. `auth_method` comes from the ID token's `amr` claim, and a local admin acts with the admin role only in a `passkey` session (authentication and authorization 3.3). A user has at most 10 live sessions; an 11th ends the oldest. There is no CSRF column. |
 
 Sign-in and step-up always create a new member session. A role change, deactivation, sign-in reset, forced sign-out
 (`signOutUser`) or the tenant's suspension sets `revoked_at` and `revoked_reason` on every affected session, in the
@@ -283,10 +315,19 @@ doesn't lock the subject again.
 | `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `source_ip`, `user_agent`, `request_id`, `security_critical`, `details` (JSON) | Partitioned by month on `occurred_at`. `tx_id` defaults to `pg_current_xact_id()`. The application role can only insert. `details` holds IDs and enums, never file names or message text (FR-27, NFR-15). |
 | `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `archived_at` | One row: the current archive generation, and how far the archive job has got in it. |
 | `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `delay_seconds` asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4). |
-| `processed_messages` | `consumer`, `message_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. |
+| `processed_messages` | `consumer`, `message_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`), `message_id` is the SHA-256 of `mail.messageId`, `eventType`, the HMAC of the recipient address and the event's timestamp, not the SQS message ID, because SES can publish one event more than once and a bounce can name several recipients. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. |
-| `email_suppressions` | `id`, `tenant_id` (empty: every tenant), `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `expires_at` | Decides what we send; SES's account-level suppression list is a backstop (abuse and rate limits 7.4). A hard bounce suppresses the address for every tenant; a complaint, only for the tenant that sent the email. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(email_hmac, tenant_id)` with `NULLS NOT DISTINCT`. An operator removes an entry once the person confirms the address works. |
-| `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB by default) comes from configuration (section 10). |
+| `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
+| `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB) comes from deploy configuration and is the same for every tenant; v1 has no per-tenant overrides (section 10). |
+
+**Security-critical records** (NFR-10, architecture 5.2) are written by the API, or the operator API, straight to
+the audit archive in both regions before it answers `2xx`, and a failed write answers `503`: revocations of transfers
+and upload requests, API key revocations, user deactivations and demotions (with the keys they revoke), forced
+sign-outs, lockouts and unlocks, sign-in resets (`resetUserSignIn`, `recoverTenantAdmin`), and download grants. All
+but grants commit first and take effect at once, so their `503` means "done, record not confirmed yet", and a retry
+writes the record if it is still missing. A grant is the other way round (2.3): its intent record comes first, so its
+`503` means nothing was counted. Their audit events carry `security_critical`, and the failover and restore runbooks
+re-apply them from the archive through `sft_recovery` (4.2).
 
 **Archiving without gaps.** IDs and `occurred_at` follow insert time, not commit time, so a row from a slow transaction
 can commit after a row with a later ID. A cursor on either would skip it for good. The archive job therefore works by
@@ -298,11 +339,9 @@ commit, so nothing is skipped; then the cursor moves to `xmin`.
   transaction that writes stays short. The workload roles set `statement_timeout`, `idle_in_transaction_session_timeout`
   and `transaction_timeout` (PostgreSQL 17 or later), which ends any transaction open for more than 30 seconds. Jobs
   delete and purge in small batches, one transaction each (section 6). No code holds a transaction open across an S3
-  or SES call, with one exception: upload completion holds the transfer or request row lock across `ListParts`,
-  `CompleteMultipartUpload` and `GetObjectAttributes`, so a revocation that arrives meanwhile waits a few seconds and
-  then wins (abuse and rate limits 6.3). The 30-second `transaction_timeout` bounds it, and with it how long it can hold
-  the cursor back. Migrations are the other exception (section 7). An alert fires when the oldest unarchived audit row
-  is more than 2 minutes old (NFR-15).
+  or SES call. Upload completion, for example, runs in three phases with its S3 calls between two short transactions
+  (3.1). Migrations are the one exception (section 7). An alert fires when the oldest unarchived audit row is more
+  than 2 minutes old (NFR-15).
 - **Restores and failovers reuse transaction IDs.** A point-in-time restore, or a regional failover that loses the
   replica's unreplicated tail, takes the database back in time: transaction IDs used after that point are given out
   again, and the cursor row goes back too. So archive object keys start with the cursor's `generation`. The restore
@@ -334,8 +373,11 @@ State values use underscores, so the PRD's `scan-failed` is `scan_failed` here.
 ```mermaid
 stateDiagram-v2
     [*] --> uploading
-    uploading --> scanning: upload completed, size and state checks pass
+    uploading --> completing: completion starts, state and limit checks pass
     uploading --> rejected: check fails, owner ended or revoked, or no new part for 24 h
+    completing --> scanning: parts assembled, size matches, owner still open
+    completing --> uploading: parts missing
+    completing --> rejected: size mismatch, owner ended, or file removed
     scanning --> clean
     scanning --> infected
     scanning --> unscannable
@@ -356,10 +398,29 @@ stateDiagram-v2
   `unscannable_allowed` from the tenant's `unscannable_policy` in the same transaction. A later policy change applies
   only to files scanned after it: it never makes a shared file blocked or a held file shareable, so it never needs to
   run the evaluation (3.2). To stop sharing such a file, a member or admin revokes its transfer.
-- **Rejecting an upload** that was never completed aborts its multipart upload by `s3_upload_id`, so unfinished parts
-  are removed at once, not only by the 7-day bucket rule. A completed upload whose size doesn't match (abuse and rate
-  limits 6.3) leaves an object, which the deletion job removes: only lifecycle jobs delete objects. Either way the
-  file's storage reservation is released (2.5), and a rejection runs the transfer's evaluation (3.2).
+- **Completion runs in three phases, and no lock is held across S3** (abuse and rate limits 6.3):
+  1. *Short transaction, row lock.* Lock the transfer or upload request row and re-check it: a transfer still a
+     `draft`, a request still `open`; the file still `uploading`; the counted files and their total within FR-1, FR-2
+     and FR-11, with `completing` files counted. If a check fails, the file is rejected (below). Otherwise it becomes
+     `completing`, with `completion_started_at`, and the transaction commits.
+  2. *No transaction.* List the parts in S3 (never the client's list), call `CompleteMultipartUpload`, then
+     `GetObjectAttributes` for the real size and version ID. If parts are missing, nothing is assembled.
+  3. *Short transaction, row lock.* Lock the row again and re-check: the owner still a draft or open, the file still
+     `completing` and not removed. If so and the size is the declared size, the file moves to `scanning` with
+     `actual_size`, `s3_version_id`, its `scan_deadline` and the outbox scan message. If so but parts were missing, the
+     file goes back to `uploading` and the call answers `409 upload_incomplete`, so the client sends the missing parts.
+     Otherwise the file is rejected.
+
+  Parallel completions of a transfer's files hold the row lock only for phases 1 and 3, so they don't queue behind each
+  other's S3 calls, and a cancellation or revocation that lands during phase 2 wins at phase 3. `sendTransfer` refuses
+  while a file is `uploading` or `completing` (`409 upload_incomplete`). A call that finds the file already
+  `completing` runs phases 2 and 3 again, which are safe to repeat, so a retry after a lost response or a pod that died
+  finishes the file; reconciliation does the same for a file left `completing` for 15 minutes. The deletion job skips
+  `completing` files, as it skips `scanning` ones.
+- **Rejecting a file** sets `state = rejected` and `delete_after = now()`, releases its storage reservation (2.5) and,
+  for a file of a transfer, runs the evaluation (3.2), all in one transaction, with no S3 call. The deletion job then
+  aborts the multipart upload by `s3_upload_id` if it still exists and removes any object in both regions: only
+  lifecycle jobs delete objects.
 - **A scan has a deadline.** When a file enters `scanning`, `scan_deadline` is set from its size: long enough for
   every attempt's timeout and the backoff between them. If a worker dies without recording a result (for example out of
   memory on a zip bomb, with the message dead-lettered), reconciliation moves the file to `scan_failed` once the
@@ -405,7 +466,7 @@ counts the transfer's files that are not `rejected` and have no `removed_at`. Th
 | `expires_at` has passed | Nothing is sent; the transfer is treated as expired. |
 | No counted file remains | `draft`, with an outbox notice to the member. `submitted_at` and `expires_at` are cleared and `last_activity_at` is moved to now, so the next send starts the expiry again from `expires_in` (2.2). |
 | Any counted file is blocked | `held`, with an outbox message to the member, unless it is held already. |
-| Any counted file is still `uploading` or `scanning` | `submitted`: no change for a submitted transfer, and a held one goes back. A later scan result or rejection runs the evaluation again. |
+| Any counted file is still `uploading`, `completing` or `scanning` | `submitted`: no change for a submitted transfer, and a held one goes back. A later scan result or rejection runs the evaluation again. |
 | Every counted file is shareable | `sent`: download counters are created, the recipients' `delivery_state` becomes `queued`, and an outbox message notifies them. |
 
 A transfer can only be submitted with at least one counted file (FR-1), and the send call sets `expires_at` (2.2).
@@ -471,6 +532,8 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
      tenant's scope.
    - **Credential lookup:** the one place a request searches across tenants. It maps a credential to its owner and
      returns only IDs and status columns; the request then continues in tenant or resource scope.
+   - **Recovery:** the restore and failover jobs alone, as `sft_recovery`, while they re-apply security-critical
+     records from the audit archive across tenants (2.5) before the service or any worker starts.
 
    There is no other unscoped query method. Credential lookup is seven `SECURITY DEFINER` functions:
 
@@ -511,14 +574,20 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
        app_scope() = 'platform'`), by `sft_api` and `sft_operator`.
      - The pools' `idp_connections` rows are written by `sft_operator` in platform scope and read only through the
        connection lookup.
-     - Suppressions for every tenant (`email_suppressions` without a tenant) are written by `sft_notify` in system
-       scope from SES events, removed by `sft_operator` in platform scope, and read by `sft_api` and `sft_notify` in
-       any tenant's scope. They hold a pseudonym and a reason, and tell a tenant no more than
-       `recipient_undeliverable` already does.
+     - Suppressions aren't among them: every `email_suppressions` row has a tenant (2.5), under the tenant policy.
    - **One login role per workload**, through IAM database authentication: `sft_api`, `sft_operator`, `sft_scan`,
-     `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events only) and `sft_migrate`; plus
-     two roles nobody logs in as, `sft_owner`, which owns the tables, and `sft_lookup`, which owns the lookup functions.
-     The authentication and authorization design (7.3) lists each role's scopes and policies.
+     `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events only), `sft_recovery` and
+     `sft_migrate`; plus two roles nobody logs in as, `sft_owner`, which owns the tables, and `sft_lookup`, which owns
+     the lookup functions. The authentication and authorization design (7.3) lists each role's scopes and policies.
+   - **`sft_recovery`** (IAM role `sft-{env}-recovery`) is used only by the restore and failover jobs that the runbooks
+     start (architecture 7), never by a running service. Its `recovery_reapply` policies apply only in recovery scope
+     (`app_scope() = 'recovery'`) and let it read and update, across tenants, exactly the rows a security-critical
+     record changes: `transfers` (revocations), `upload_requests` (revocations, lockouts, unlocks),
+     `transfer_recipients` (lockouts, unlocks), `users` (deactivations, demotions), `api_keys`, `member_sessions` and
+     `link_sessions` (revocations), `user_identities` (deleted by a sign-in reset), and `download_counters` and
+     `download_grants` (grants, inserted if missing). It may insert into `audit_events` the archived rows it
+     re-imports, and it starts the new archive generation in `audit_archive_cursor` (2.5). It has no column grant on
+     `display_name_ct` or `message_ct`, and no other table.
    - **No `BYPASSRLS`.** Only the master user, used under break-glass alone, bypasses row-level security.
      `sft_lookup` reads the credential tables through `lookup_read` policies and column grants of its own. No workload
      role is granted `TRUNCATE` or privileges on `audit_events` partitions, and views use `security_invoker`.
@@ -559,12 +628,14 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 | Download counters of a file (purge) | `download_counters (file_id)` |
 | Grants of a file, recipient or session (foreign key checks) | `download_grants (file_id)`, `download_grants (recipient_id)`, `download_grants (link_session_id)`, `download_grants (member_session_id)` |
 | Rows that use a data key version | `files (tenant_id, data_key_version)`, `transfers (tenant_id, data_key_version)`, `upload_requests (tenant_id, data_key_version)` |
-| Suppression lookup | unique `email_suppressions (email_hmac, tenant_id) NULLS NOT DISTINCT` |
+| Suppression lookup | unique `email_suppressions (tenant_id, email_hmac)` |
 | Break-glass reconciliation | unique `break_glass_grants (assignment_request_id)` |
 | Expiry job | partial `transfers (expires_at) WHERE state IN ('submitted', 'sent', 'held')`, same for `upload_requests` |
 | Abandoned drafts | partial `transfers (last_activity_at) WHERE state = 'draft'` |
 | Abandoned uploads | partial `files (last_part_at) WHERE state = 'uploading'` |
+| Stuck completions | partial `files (completion_started_at) WHERE state = 'completing'` |
 | Stuck scans | partial `files (scan_deadline) WHERE state = 'scanning'` |
+| Grants without a confirmed committed record | partial `download_grants (created_at) WHERE archived_at IS NULL` |
 | Deletion job | partial `files (delete_after) WHERE deleted_at IS NULL` |
 | Reconciliation | unique `files (storage_key)` |
 | Purge job | partial `transfers (purge_after)`, `upload_requests (purge_after)` |
@@ -585,19 +656,21 @@ How the PRD's data lifecycle table and the architecture's operational retention 
 | Files of a transfer | `files.delete_after` set when the transfer is revoked, expires or is cancelled, or the file is removed | Deletion job: deletes every object version in Tokyo and Osaka, in the bucket pair its `storage_class` names, then sets `deleted_at` (architecture 4.5) |
 | Received files | `files.delete_after`, set at upload to `retention_until`, or earlier when the member deletes the file | Same deletion job |
 | Abandoned drafts | `transfers.last_activity_at` older than 7 days while `state = draft` | Draft job locks the row, checks again, and cancels the transfer, which sets `delete_after` on its files |
-| Unfinished uploads | `files.last_part_at` older than 24 hours while `state = uploading` | Reconciliation job rejects the file and aborts the multipart upload |
+| Rejected files | `files.delete_after`, set to the time of the rejection | Deletion job: aborts the multipart upload if it still exists, and deletes any object version in Tokyo and Osaka (3.1) |
+| Unfinished uploads | `files.last_part_at` older than 24 hours while `state = uploading` | Reconciliation job rejects the file, which leaves the multipart upload to the deletion job |
+| Unfinished completions | `files.completion_started_at` older than 15 minutes while `state = completing` | Reconciliation job runs completion phases 2 and 3 again (3.1) |
 | Stuck scans | `files.scan_deadline` passed while `state = scanning` | Reconciliation job moves the file to `scan_failed` and alerts (3.1) |
 | Orphan objects | An object no `files` row refers to, older than 24 hours, in either bucket pair | Reconciliation job |
 | Metadata of transfers | `purge_after = ended_at + 7 days + 365 days` | Purge job deletes the transfer and its child rows, only once every one of its files has `deleted_at`; audit events stay, because they have no foreign keys |
 | Metadata of upload requests | `purge_after` = the later of `ended_at` and the last received file's `retention_until`, plus 7 days and 365 days | Same purge job, with the same check |
 | Audit events | `occurred_at + 365 days` | Daily job deletes expired rows; empty monthly partitions are dropped |
 | Verification codes, link sessions, member sessions | `expires_at` (unusable from then), or `revoked_at` for member sessions | Deleted by the next daily run; a session's grants go with it |
-| Download grants | `expires_at` (24 hours at most) | Deleted by the next daily run. The count stays in `download_counters` and the record in the audit log. |
+| Download grants | `expires_at` (24 hours at most) | Deleted by the next daily run. The count stays in `download_counters` and the record in the audit log. A grant whose `archived_at` is still empty a minute after creation gets its committed record written again by reconciliation (2.3). |
 | Invitation tokens | `users.invitation_expires_at` (7 days) | The daily run clears the hash and the expiry |
 | Temporary recovery sign-ins | `user_identities.expires_at` (72 hours) | The daily run writes an outbox message; the notification worker deletes the Cognito user, then the identity |
 | Operator sessions | `expires_at` (15 minutes) | The operator API's daily job deletes them. A replayed signature is refused by its age (1 minute) once the row is gone. |
 | Break-glass grants | `ends_at + 365 days`, like audit events | The operator API's daily job |
-| Email suppressions | `expires_at` when set; otherwise until an operator removes the entry | Daily job |
+| Email suppressions | `expires_at + 365 days` for an ended entry (expired, or cleared by a tenant admin); an entry without `expires_at` stays until a tenant admin clears it (2.5) | Daily job |
 | Retired data key versions | No row's `data_key_version` uses the version any more | Purge job; the foreign key refuses the delete while a row still uses it |
 | Outbox rows | `published_at + 7 days` | Daily job |
 | Processed messages | `processed_at + 14 days` | Daily job |
@@ -611,7 +684,8 @@ contend with the evaluation lock.
 
 **The purge never orphans an object.** It skips a transfer or request that still has a file without `deleted_at`, and
 an alert fires, because deleting the `files` row would leave its object with nothing pointing at it. The scan deadline
-(3.1) keeps a file from staying in `scanning`, which deletion skips, so this should only fire on a bug.
+and the completion retry (3.1) keep a file from staying in `scanning` or `completing`, which deletion skips, so this
+should only fire on a bug.
 
 **Jobs work in small transactions.** Every job deletes or purges in batches of at most 1,000 rows, one transaction per
 batch, and never has a transaction open while it calls S3. The deletion job, for example, deletes the objects first
@@ -653,6 +727,13 @@ This keeps every deploy free of downtime (NFR-18).
   security is enabled but not forced (4.2), so it doesn't apply to them: a data migration sees every tenant, and is
   reviewed in its pull request for that reason. A new tenant-owned table ships with row-level security enabled and its
   policies in the same migration; the CI catalog check fails otherwise.
+- **Deploys and rollbacks never run a down-migration** (ADR-0005). Each release's migrations are expand-only towards
+  the previous release; the contract step comes in a later release. Each release also ships the list of earlier
+  application revisions its schema still serves. The Argo CD PreSync job runs `alembic upgrade head` only when the
+  image's head is newer than the database's, and then records that list with the new head in
+  `schema_compatibility`, a small table owned by `sft_owner` next to `alembic_version`. When the database is ahead (a
+  rollback), the job checks that the image's revision is in the list recorded for the database's head and skips; if
+  it isn't, the job fails and the sync stops.
 - The migration role isn't held to the 30-second transaction limit (2.5). Long steps can hold the archive cursor back
   while they run, so they run outside peak hours, and the archive lag alert shows any delay.
 
@@ -669,7 +750,7 @@ turns these into database sizing.
 | `download_counters` | about 60,000 | about 22 million | One per recipient per file |
 | `download_grants` | about 40,000 | about 80,000 | One per counted download (PRD 6.1); deleted within about 2 days |
 | `member_sessions` | about 20,000 | about 40,000 | One per sign-in (capacity A36); deleted after 12 hours at most, at the next daily run |
-| `email_suppressions` | under 300 | under 100,000 after a year | Assumes at most 1 % of about 30,000 link emails a day bounce or complain |
+| `email_suppressions` | under 300 | under 150,000 after a year, ended entries kept as markers included | Assumes at most 1 % of about 30,000 link emails a day bounce or complain |
 | `tenant_data_keys` | — | about 1,500 | 500 tenants, up to 3 versions while rows under old versions are purged |
 | `operator_sessions`, `break_glass_grants` | a few | hundreds | Negligible |
 | `audit_events` | about 300,000 | about 110 million | About 25 events per transfer, plus sign-ins |
@@ -696,14 +777,14 @@ take well under 1 GB together.
 | NFR-12 (tenant isolation) | `tenant_id` and composite foreign keys everywhere, row-level security (4.2), `tenant_data_keys` and the ciphertext columns |
 | NFR-14 (abuse resistance) | `verification_codes`, the lockout columns, `download_grants` budgets, `tenant_usage`, `email_suppressions` |
 
-## 10. Open items
+## 10. Not in v1, and open items
 
-- **Per-tenant limit overrides and quotas.** The abuse design lets an operator override a starting limit, or the 2 TB
-  storage quota, for one tenant; whether that becomes an operator operation is for the maintainer (abuse and rate
-  limits 10, item 5). If it does, a `tenant_limit_overrides` table (tenant, limit, value, set by, reason) holds the
-  values. Until then limits and quotas come from configuration.
-- **"Report this email"** (abuse and rate limits 7.5), if the maintainer adds it, gives `email_suppressions` a third
-  `reason`.
-- **Suppression retention.** Entries have no default expiry. The email ADR decides whether hard bounces should expire.
-- **Downloads while Osaka is unreachable.** If the storage ADR lets Tokyo count downloads when Osaka can't be written
-  and replay the archive writes later (threat model section 7, point 2), the pending writes need a table of their own.
+- **Per-tenant limit overrides and quotas are not in v1.** Rate limits and the 2 TB storage quota change only through
+  deploy configuration, for every tenant at once (PRD NFR-14, abuse and rate limits 10). If a later release lets an
+  operator override them for one tenant, a `tenant_limit_overrides` table (tenant, limit, value, set by, reason) holds
+  the values, and every change is audited.
+- **"Report this email"** (abuse and rate limits 7.5) is not in v1. If it is added, it gives `email_suppressions` a
+  third `reason`.
+- **Downloads while Osaka is unreachable.** Still open (threat model section 7, point 2): if a degraded mode lets Tokyo
+  count downloads when Osaka can't be written and replay the archive writes later, the pending writes need a table of
+  their own.

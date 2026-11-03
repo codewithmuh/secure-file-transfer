@@ -24,7 +24,9 @@ info:
 
 servers:
   - url: /v1
-    description: Relative to the API origin. The domain waits for PRD open question 5.
+    description: |
+      Relative to the API origin, on a subdomain of a domain the maintainer owns (PRD open question 5). The name is
+      set before the first deploy.
 
 tags:
   - name: Sign-in
@@ -353,8 +355,9 @@ paths:
         the tenant's `max_expiry`. When it is left out, it is 7 days, or the tenant's maximum if that is shorter. A
         draft has no `expires_at`: `sendTransfer` sets it to `submitted_at` plus `expires_in`, so time spent as a
         draft never shortens the transfer. Each recipient's domain is checked against the tenant's allowed and blocked
-        domains, and an address on the suppression list (a hard bounce, or a complaint about this tenant's email) is
-        refused with `422 recipient_undeliverable`, with a pointer to the recipient in `errors`.
+        domains, and an address this tenant's suppression list holds (a hard bounce in the last 90 days, or a
+        complaint) is refused with `422 recipient_undeliverable`, with a pointer to the recipient in `errors`. A tenant
+        admin can clear an entry with `clearEmailSuppression`.
 
         Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `422 recipient_undeliverable`,
         `409 idempotency_conflict`.
@@ -527,8 +530,8 @@ paths:
         sent is revoked instead (`revokeTransfer`). Only the transfer's owner can cancel it; a tenant admin gets
         `403 permission_denied` on another member's transfer and revokes it instead.
 
-        Cancelling a draft while one of its files is uploading wins over the upload: that file becomes `rejected`, and
-        the upload's next call gets `409 invalid_state`.
+        Cancelling a draft while one of its files is uploading or completing wins over the upload: that file becomes
+        `rejected`, and the upload's next call gets `409 invalid_state`.
 
         Errors: `403 permission_denied`, `409 invalid_state`.
 
@@ -566,8 +569,9 @@ paths:
       description: |
         Revokes a `submitted`, `held` or `sent` transfer. The member who created it can revoke it, and so can any
         tenant admin. In one transaction the transfer becomes `revoked`, every link session of the transfer ends and
-        the audit record is written. No new download can start within 5 seconds, and a download in progress stops
-        within 60 seconds (NFR-6). Recipients then see that the link was revoked (`link_revoked`).
+        the audit record is written. No new download can start more than 5 seconds after the revocation, and a running
+        download stops within 60 seconds of it, at its next 30-second re-check (NFR-6). Recipients then see that the
+        link was revoked (`link_revoked`).
 
         A revocation is a security-critical record (README section 5): the `200` comes only after the record is in
         the audit archive in both regions (NFR-10). If that write fails, the revocation has still taken effect and the
@@ -830,9 +834,9 @@ paths:
       operationId: getFile
       summary: Get a file
       description: |
-        Returns a file of a transfer or upload request the caller can see, with its state: `uploading`, `scanning`,
-        `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`. `shareable` says whether it can be
-        downloaded under the current tenant policy. The web app polls this while a file is scanning.
+        Returns a file of a transfer or upload request the caller can see, with its state: `uploading`, `completing`,
+        `scanning`, `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`. `shareable` says whether
+        it can be downloaded under the current tenant policy. The web app polls this while a file is scanning.
 
         A member sees the files of their own transfers and upload requests; a tenant admin sees every file's metadata
         in the tenant.
@@ -1000,20 +1004,27 @@ paths:
       operationId: completeUpload
       summary: Complete a file upload
       description: |
-        Completes the upload in this order (architecture 4.1, abuse-and-rate-limits 6.3):
+        Completes the upload in three phases, with no lock held across the object-storage calls (data model 3.1,
+        abuse-and-rate-limits 6.3):
 
-        1. Lock the transfer row and re-check it first: still a `draft`, the file still `uploading`, and the
-           transfer's files and their total size, counted again, within 50 files and 20 GB (FR-1, FR-2). So a
-           cancellation of the draft that lands meanwhile wins, and uploads added in parallel can't pass the limits.
-           If a check fails, the file becomes `rejected`, the multipart upload is aborted, its quota is released, and
-           no part is assembled.
-        2. Still under the lock, list the parts in object storage itself, never trusting the client's list, and
-           assemble them.
-        3. Read the object's real size. If it isn't the declared size, the file becomes `rejected` and the deletion
-           job removes the object; the API never deletes objects itself. Otherwise the file moves to `scanning`.
+        1. In a short transaction, lock the transfer row and re-check it: still a `draft`, the file still
+           `uploading`, and the transfer's files and their total size, counted again, within 50 files and 20 GB
+           (FR-1, FR-2). So a cancellation of the draft that lands first wins, and uploads added in parallel can't
+           pass the limits. If a check fails, the file becomes `rejected` and no part is assembled. Otherwise the file
+           becomes `completing`.
+        2. With no transaction open, list the parts in object storage itself, never trusting the client's list,
+           assemble them, and read the object's real size and version.
+        3. In a second short transaction, lock the transfer row again and re-check it. If the transfer is still a
+           draft, the file is still `completing` and the size is the declared size, the file moves to `scanning`. If
+           parts were missing, the file goes back to `uploading` (`409 upload_incomplete`) so the missing parts can
+           be sent. Otherwise, a size mismatch, a cancellation or a removal that landed meanwhile, the file becomes
+           `rejected`.
 
-        Completing a file that is already past `uploading` returns it unchanged, so a retry is safe. Only the
-        transfer's owner can call it.
+        Parallel completions of a transfer's files don't wait for each other's object-storage calls. A rejected
+        file's quota is released at once, and the deletion job removes its parts or object; the API never deletes
+        objects itself. Completing a file that is already `completing` runs phases 2 and 3 again, so a retry after a
+        lost response finishes it; completing a file that is already past `completing` returns it unchanged, so a
+        retry is always safe. Only the transfer's owner can call it.
 
         Errors: `403 permission_denied`, `409 upload_incomplete` (parts missing), `409 invalid_state` (the draft was
         cancelled meanwhile), `413 total_too_large`, `422 too_many_files`, `422 upload_size_mismatch`.
@@ -1059,8 +1070,9 @@ paths:
         can't download, and API keys can't download file contents.
 
         The grant belongs to the member session that created it: 24 hours, never past that session; 3 × the file size
-        in bytes, 20 content requests, one active stream (abuse-and-rate-limits 5.4). Its record is written to both
-        regions' audit archive before the grant is committed, so a `503` means no grant was issued (NFR-15). Passing
+        in bytes, 20 content requests, one active stream (abuse-and-rate-limits 5.4). As for `createSessionDownload`,
+        an intent record goes to both regions' audit archive before the grant is committed, so a `503` means no grant
+        was issued (NFR-15), and a committed record follows in the background. Passing
         `resume_grant_id` returns that grant again while it has time, bytes and requests left, otherwise
         `403 download_grant_exhausted`; a grant of another session or another file gets `404`. An `unscannable` file
         allowed by policy carries a warning (FR-18). This operation never replays a stored response, so it takes no
@@ -1123,6 +1135,11 @@ paths:
         A safe `GET` with no CSRF header; `SameSite=Strict` keeps the cookie off cross-site requests. Ranges, headers,
         the byte budget and the 30-second re-checks work as for `getSessionDownloadContent`. A file deleted or past
         its retention gets `404`.
+
+        **A running stream keeps the member session active,** as for a link session: each 30-second re-check counts as
+        activity, so a long download doesn't end the session after 30 idle minutes. The session's 12-hour limit still
+        applies, and a sign-out, a forced sign-out, a deactivation or a role change stops the stream within 60
+        seconds.
 
         Errors: `401 authentication_required`, `401 session_expired`, `403 download_grant_exhausted`, `404 not_found`,
         `416 range_not_satisfiable`, `429 rate_limited`, `503 service_unavailable`.
@@ -1785,12 +1802,14 @@ paths:
       operationId: completeSessionUpload
       summary: Complete an uploader's file upload
       description: |
-        For an uploader: the same order as `completeUpload`, against the upload request. The request row is locked
-        and re-checked before any part is assembled, so a request revoked or expired meanwhile never accepts the file
-        and never assembles its parts (NFR-6). Under the same lock the request's files and their total size are
-        counted again, so uploads added in parallel can't exceed 50 files or 20 GB (FR-11). A size mismatch marks the
-        file `rejected` and leaves the object to the deletion job. When the scan finishes, a shareable file becomes
-        available to the member, who is notified; a blocked file is reported to both sides (FR-12).
+        For an uploader: the same three phases as `completeUpload`, against the upload request. The request row is
+        locked and re-checked before any part is assembled, and again before the file is accepted, so a request revoked
+        or expired meanwhile never accepts the file, and one revoked first never assembles its parts (NFR-6). In the
+        first phase the request's files and their total size are counted again, so uploads added in parallel can't
+        exceed 50 files or 20 GB (FR-11). A size mismatch marks the file `rejected` and leaves the object to the
+        deletion job; missing parts send the file back to `uploading` (`409 upload_incomplete`). When the scan finishes,
+        a shareable file becomes available to the member, who is notified; a blocked file is reported to both sides
+        (FR-12).
 
         Errors: `403 permission_denied`, `409 upload_incomplete`, `410 link_revoked`, `410 link_expired`,
         `413 total_too_large`, `422 too_many_files`, `422 upload_size_mismatch`.
@@ -1837,17 +1856,20 @@ paths:
         at once (FR-6). A new download runs in this order, so that a `503` always means nothing was counted:
 
         1. Check the session, revocation, expiry, that the file is shareable and that the limit isn't used up.
-        2. Generate the grant's ID, and write the grant record under that ID to the audit archive in both regions
-           (NFR-10).
+        2. Generate the grant's ID, and write a grant intent record under that ID to the audit archive in both
+           regions (NFR-10).
         3. In one transaction: count the download with one conditional update, so parallel requests can't exceed
            the limit (FR-4); create the grant under that ID; write the audit record (NFR-15). Commit.
-        4. Return the grant.
+        4. Return the grant. In the background the service writes a committed record for it to both archives,
+           retrying until both confirm.
 
-        If the archive write or the commit fails, the call returns `503`, nothing was counted, and it can be
-        retried. If a parallel request took the last download between steps 1 and 3, the call returns
-        `403 download_limit_reached`. Either way the archive may hold a record for a grant that was never issued: it
-        gave no access, and re-applying it after a failover or restore can count one download too many, never one
-        too few.
+        If the intent write or the commit fails, the call returns `503`, nothing was counted, and it can be retried.
+        If a parallel request took the last download between steps 1 and 3, the call returns
+        `403 download_limit_reached`. Either way the archive holds an intent with no committed record. A failover or
+        restore re-applies only grants with a committed record or a database row, so such an intent never counts a
+        download (data model 2.3). The residual risk is a grant committed in Tokyo just before the region is lost,
+        before its committed record or its row reached Osaka: it isn't re-applied, so that recipient may download
+        the file once more than the limit allows.
 
         The browser then fetches the bytes from the grant's `url` with `getSessionDownloadContent` (PRD open question
         8: downloads stream through the API). A grant belongs to this link session and this file, and is bounded: 24
@@ -1923,11 +1945,14 @@ paths:
 
         **Each request** checks the grant, its session, the transfer and the file in PostgreSQL, so a request after a
         revocation fails at once with `410 link_revoked` (NFR-6). It takes the grant's stream lease: a new request
-        takes over, and the older stream stops at its next re-check. While streaming, the service re-checks the state
-        and adds the bytes served at least every 30 seconds, so a revocation stops a running download within 35
-        seconds. It serves the object version that was scanned.
+        takes over, and the older stream stops at its next re-check, after recording the bytes it already sent. While
+        streaming, the service re-checks the state and adds the bytes served at least every 30 seconds, so a running
+        download stops within 60 seconds of a revocation (NFR-6). Each re-check also counts as activity, so a long
+        download keeps the link session from ending for idleness. It serves the object version that was scanned.
 
-        **Ranges.** One range per request: `206` with `Content-Range`. Several ranges, or a range past the end: `416`.
+        **Ranges.** One range per request, `bytes=<start>-`, `bytes=<start>-<end>` or `bytes=-<suffix length>`: `206`
+        with `Content-Range`. Anything else gets `416 range_not_satisfiable`: several ranges, another unit, a malformed
+        value, or a range that doesn't fit the file (a start past the end, an end before the start).
         `If-Range` with the strong `ETag` resumes; a changed validator gets the whole file with `200`. Every request
         counts against the grant's 20 requests and every byte sent against its 3 × size budget; past either,
         `403 download_grant_exhausted`. `HEAD` isn't offered.
@@ -2386,12 +2411,20 @@ paths:
         user can't be reset (`409 invalid_state`). A new reset while one is still being processed replaces its
         invitation. A tenant's last admin who has lost their factor asks the operator (`recoverTenantAdmin`).
 
+        **A security-critical record** (README section 5). Step 1 commits first, so the old sign-in stops working at
+        once, and the `202` comes only after the reset's record is in both regions' audit archive (NFR-10), so a
+        failover or restore re-applies it and old credentials can't come back with an older copy of the database. If
+        that write fails, the reset has still taken effect and the call returns `503`; retry it, and don't tell the
+        admin it failed. A retry while the reset is still being processed finds it, writes the archive record if it
+        is still missing and returns `202`, without a second invitation.
+
         **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
         passkey sign-in (`403 passkey_required`).
 
-        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 invalid_state`.
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 invalid_state`,
+        `503 service_unavailable`.
 
-        Requirements: FR-22, FR-25.
+        Requirements: FR-22, FR-25, NFR-10.
       x-permission: user.reset_sign_in
       security:
         - memberSession: [admin]
@@ -2413,6 +2446,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /tenant/policy:
     get:
@@ -2474,6 +2509,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TenantPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /email-suppressions/clear:
+    post:
+      tags: [Tenant admin]
+      operationId: clearEmailSuppression
+      summary: Clear an address from the tenant's suppression list
+      description: |
+        Lets this tenant email an address again after it hard-bounced or complained (data model 2.5,
+        abuse-and-rate-limits 7.4). A hard bounce suppresses an address for this tenant for 90 days, then one email
+        may go out; a second hard bounce, or a complaint, keeps it suppressed until a tenant admin clears it here,
+        typically once the person confirms the address works or asks for email again. Suppressions are per tenant, so
+        this never affects another tenant.
+
+        The address travels in the request body, never in the URL. The service looks it up by its pseudonym and ends
+        this tenant's entry for it; the notification worker also removes it from the tenant's list at the email
+        provider before it next sends there. The answer is `204` whether or not the address was suppressed, so the
+        call reveals nothing. It is audited, with the admin as the actor and the address's pseudonym, never the
+        address.
+
+        Only a tenant admin signed in to the web app can clear an entry; a local admin needs a passkey sign-in
+        (`403 passkey_required`). API keys can't, because a complaint is the recipient's own choice.
+
+        Errors: `403 passkey_required`, `422 validation_failed`.
+
+        Requirements: FR-7, FR-27, NFR-14.
+      x-permission: email_suppression.clear
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailSuppressionClear'
+      responses:
+        '204':
+          description: The address is no longer suppressed for this tenant, or wasn't.
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -2580,10 +2663,17 @@ paths:
       description: |
         Revokes a key at once; later calls with it get `401`, because key lookups aren't cached. Any admin of the
         tenant can revoke any of its keys, and a local admin may do so without a passkey sign-in: a stolen session can
-        use it only to stop access. Revocation never counts against the tenant's request budget. Revoking a key that
-        is already revoked returns it unchanged.
+        use it only to stop access. Revocation never counts against the tenant's request budget.
 
-        Requirements: FR-32, FR-27.
+        **A security-critical record** (README section 5): the revocation commits first and takes effect at once, and
+        the `200` comes only after its record is in both regions' audit archive (NFR-10), so a failover or restore
+        can't bring the key back. If that write fails, the key is still revoked and the call returns `503`; retry it,
+        and don't tell the admin it failed. Revoking a key that is already revoked writes the archive record if it is
+        still missing and returns the key unchanged, so a retry is always safe.
+
+        Errors: `503 service_unavailable`.
+
+        Requirements: FR-32, FR-27, NFR-10.
       x-permission: api_key.revoke
       security:
         - memberSession: [admin]
@@ -2603,6 +2693,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /operator/token:
     servers:
@@ -2817,10 +2909,11 @@ paths:
         - **An admin of an SSO tenant:** they get a temporary local sign-in, created like a local invitation, which
           is deleted with its identity after 72 hours (`temporary_sign_in_expires_at`).
 
-        It is a security-critical record in the tenant's audit log, and every admin of the tenant is emailed. As with
-        other security-critical changes, it takes effect first and the `200`-class answer comes after the record is in
-        both regions' audit archive; a `503` means it took effect and a retry completes the record. Accepts an
-        `Idempotency-Key`, so a retry never starts a second recovery.
+        It is a security-critical record in the tenant's audit log (README section 5), and every admin of the tenant
+        is emailed. It commits first and takes effect at once, and the `202` comes only after its record is in both
+        regions' audit archive (NFR-10), so a failover or restore re-applies it. If that write fails, the recovery has
+        still taken effect and the call returns `503`. A retry with the same `Idempotency-Key` finds the recovery,
+        writes the archive record if it is still missing and returns `202`; it never starts a second recovery.
 
         Errors: `404 not_found` (tenant, or a user who isn't in it), `409 invalid_state` (the user isn't an active
         admin), `409 idempotency_conflict`, `422 validation_failed`, `503 service_unavailable`.
@@ -3192,12 +3285,14 @@ components:
       in: header
       required: false
       description: |
-        One byte range, such as `bytes=1048576-`, to resume a download. Several ranges, or a range past the end of the
-        file, get `416 range_not_satisfiable`.
+        One byte range, to resume a download: `bytes=<start>-` (such as `bytes=1048576-`), `bytes=<start>-<end>`, or
+        `bytes=-<suffix length>`. Anything that doesn't match the pattern, several ranges included, and a range that
+        doesn't fit the file (a start past the end, an end before the start) get `416 range_not_satisfiable`, never
+        `400`.
       schema:
         type: string
         maxLength: 100
-        pattern: '^bytes=[0-9]*-[0-9]*$'
+        pattern: '^bytes=(\d+-\d*|-\d+)$'
     IfRange:
       name: If-Range
       in: header
@@ -3444,10 +3539,11 @@ components:
 
         - **Download grants** (NFR-15), **verification** and **sign-in** (the rate-limit counters and the sign-in
           state store, NFR-14) fail closed: nothing changed, and no download was counted.
-        - **Security-critical changes** (a revocation, deactivation, demotion, unlock, forced sign-out or admin
-          recovery, NFR-10) have taken effect, but their record isn't yet confirmed in both regions' audit archive. A
-          retry finds the change already made, writes the record if it is still missing, and returns success. The web
-          app shows the change as done and retries in the background.
+        - **Security-critical changes** (NFR-10: a revocation of a transfer, upload request or API key, a deactivation,
+          a demotion, an unlock, a forced sign-out, a sign-in reset or an admin recovery) have taken effect, but their
+          record isn't yet confirmed in both regions' audit archive. A retry finds the change already made, writes
+          the record if it is still missing, and returns success. The web app shows the change as done and retries in
+          the background.
         - **Content downloads:** the API pod already serves its maximum of streams (`Retry-After: 10`), or object
           storage is unreachable; the browser resumes under the same grant.
 
@@ -3510,8 +3606,9 @@ components:
             contentMediaType: application/octet-stream
     RangeNotSatisfiable:
       description: |
-        The `Range` asks for several ranges, or starts past the end of the file. Only one range per request is served.
-        Code: `range_not_satisfiable`.
+        The `Range` isn't one range this file can serve: several ranges, another unit, a value that doesn't match
+        `^bytes=(\d+-\d*|-\d+)$`, a start past the end of the file, or an end before the start. Only one range per
+        request is served. Code: `range_not_satisfiable`.
       headers:
         Content-Range:
           $ref: '#/components/headers/ContentRange'
@@ -3548,8 +3645,10 @@ components:
 
     FileState:
       type: string
-      enum: [uploading, scanning, clean, infected, unscannable, scan_failed, rejected, deleted]
-      description: State of a file (data model section 3.1, FR-16).
+      enum: [uploading, completing, scanning, clean, infected, unscannable, scan_failed, rejected, deleted]
+      description: |
+        State of a file (data model section 3.1, FR-16). `completing` is brief: the upload is being assembled and
+        checked, after which the file is `scanning`, `rejected`, or back to `uploading` if parts are missing.
 
     UploadRequestState:
       type: string
@@ -3612,7 +3711,7 @@ components:
           format: uri
           description: |
             Stable URI of the problem type, `https://secure-file-transfer.example/problems/{code}`. The host changes to
-            the service's domain once PRD open question 5 is decided, before v1 is released.
+            the service's domain (PRD open question 5) once its name is set, before the first deploy.
           examples:
             - https://secure-file-transfer.example/problems/link_expired
         title:
@@ -4815,6 +4914,15 @@ components:
           $ref: '#/components/schemas/Locale'
         updated_at:
           $ref: '#/components/schemas/Timestamp'
+
+    EmailSuppressionClear:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+          description: The address to clear, as the recipient or uploader entered it; it is compared normalized.
 
     TenantPolicyUpdate:
       type: object

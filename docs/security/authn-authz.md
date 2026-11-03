@@ -314,10 +314,11 @@ Why PostgreSQL rather than the Valkey store:
   minute per session, small at the design load's bursts of 300 requests per second.
 
 On every request the API looks the session up by its hash (section 7.1) and checks that it isn't revoked, that
-`expires_at` hasn't passed, that `last_seen_at` is less than 30 minutes ago, and that the user and tenant are active.
-The role is read from `users` on every request, never copied into the session. A failed check returns
-`401 session_expired`. A member can have up to 10 sessions at once, for several devices; starting an 11th ends the
-oldest.
+`expires_at` hasn't passed, that `last_seen_at` is less than 30 minutes ago, and that the user and tenant are active. A
+download stream in progress under one of the session's grants counts as activity, as it does for link sessions (4.3), so
+a long download never times its member session out. The role is read from `users` on every request, never copied into
+the session. A failed check returns `401 session_expired`. A member can have up to 10 sessions at once, for several
+devices; starting an 11th ends the oldest.
 
 ### 3.3 Rotation
 
@@ -464,8 +465,9 @@ own.
   scope, section 7.1), or the answer is `404`.
 - **Bound to the browser** by the HttpOnly cookie. It is not bound to an IP address, because mobile and corporate
   networks change addresses during a session. The source IP and user agent go into every audit record (FR-27).
-- **Lifetime:** 24 hours (NFR-14) and never past the item's expiry; 1 hour idle. A download stream in progress counts as
-  activity (#24 re-checks its state at least every 30 seconds). `last_seen_at` is written at most once a minute.
+- **Lifetime:** 24 hours (NFR-14) and never past the item's expiry; 1 hour idle. A download stream in progress counts
+  as activity (#24): it re-checks its state every 30 seconds, so a revocation stops it within 60 seconds. `last_seen_at`
+  is written at most once a minute.
 - **Revocation** of the transfer or request ends its sessions in the same transaction (data model 2.4), and every call
   compares the item's `expires_at` with the current time.
 - **Downloads.** A download grant belongs to the link session that created it (#24). The browser fetches the bytes by
@@ -602,6 +604,7 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `user.deactivate` | `deactivateUser` | — | Tenant, step-up | — | — | — | — | Keeps one active admin; ends sessions; revokes the user's keys |
 | `tenant_policy.read` | `getTenantPolicy` | Yes | Yes | `transfers:read` or `upload_requests:read` | — | — | — | |
 | `tenant_policy.update` | `updateTenantPolicy` | — | Tenant, step-up | — | — | — | — | |
+| `email_suppression.clear` | `clearEmailSuppression` | — | Tenant | — | — | — | — | Clears this tenant's suppression of one address, a hard bounce or a complaint (abuse 7.4); the address travels in the body, never the URL. Audited. Always `204`, whether or not an entry existed, so it reveals nothing about the address |
 | `api_key.create` | `createApiKey` | — | Tenant, step-up | — | — | — | — | Web session only |
 | `api_key.read` | `listApiKeys` | — | Tenant | — | — | — | — | |
 | `api_key.revoke` | `revokeApiKey` | — | Tenant | — | — | — | — | Any key of the tenant |
@@ -635,7 +638,8 @@ authorization matrix test (9.2) is generated from it.
 |---|---|---|
 | Tenant | The member session or API key row, never a request parameter or header | That tenant's rows |
 | Resource | The link session row: the tenant, plus one recipient or one upload request | That item and its files |
-| System | A named job (expiry, deletion, reconciliation, purge, audit archive, outbox relay, failover replay), audited | The tables that job needs (7.3) |
+| System | A named job (expiry, deletion, reconciliation, purge, audit archive, outbox relay, the outbox re-publish after a failover), audited | The tables that job needs (7.3) |
+| Recovery | The restore and failover jobs that the runbooks start, as `sft_recovery`, before the service or any worker runs; audited | Across tenants, exactly the rows a security-critical record changes (7.3, data model 4.2) |
 | Credential lookup | The credential itself | Only the IDs and status of its owner; the request then continues in tenant or resource scope |
 | Platform | An operator token, or an event with no tenant, such as a refused sign-in by an unknown identity | Platform tables and platform audit events; one tenant's rows only after the operator API sets that tenant's scope |
 
@@ -738,6 +742,7 @@ The login roles use IAM database authentication, one per workload (#22).
 | `sft_relay` | Outbox relay | System | `outbox` only: reads and marks rows of every tenant, in system scope |
 | `sft_jobs` | Lifecycle jobs | System to find work, tenant to do it | `jobs_find` reads across tenants in system scope, with column grants limited to what the jobs need; every write under the tenant policy |
 | `sft_archive` | Audit archive job | System | Reads `audit_events` in system scope; no other table |
+| `sft_recovery` | Restore and failover jobs only (IAM role `sft-{env}-recovery`), never a running service | Recovery (`app_scope() = 'recovery'`) | `recovery_reapply` policies: read and update, across tenants, exactly the rows a security-critical record changes, and insert missing download counts and grants; insert-only on `audit_events` for re-imported rows; no column grant on file names or messages |
 | `sft_migrate` | Migration job | Becomes `sft_owner` with `SET ROLE` | Not applied: the table owner |
 | `sft_owner` | Nobody logs in; owns every table | — | — |
 | `sft_lookup` | Nobody logs in; owns the credential lookup functions | — | No `BYPASSRLS`: `lookup_read` policies and column-level `SELECT` on the credential tables only |
@@ -786,20 +791,25 @@ context (#22). A scoping bug that slips past both layers above returns a row tha
   and replication decide whether operators can sign in while Tokyo is down; the accounts ADR confirms this, and 8.4
   covers an outage.
 - Deploys run from GitHub Actions through OIDC roles, never from a person's credentials (architecture 3.3).
+- **Reaching the cluster.** The cluster API endpoint is private (ADR-0021). `ReadOnly` and `Operator` reach it, and
+  Argo CD's API server, by Systems Manager port forwarding to a `system` node, through our session document, which
+  forwards only to those two on 443; they may start no other session. Argo CD runs in normal mode with Identity Center
+  sign-in and read-only roles for both permission sets, so nobody syncs or changes an Application by hand: every
+  sync comes from Git (ADR-0004).
 
 | Permission set | For | May | May not |
 |---|---|---|---|
-| `ReadOnly` | Dashboards, logs, alarms | Read metrics, logs and configuration; port-forward to Grafana in its own namespace (ADR-0009) | Read objects in the files or audit buckets, decrypt with the files key, read secrets, connect to the database |
-| `Operator` | Runbooks and the operator CLI | What `ReadOnly` may, Grafana included, plus: port-forward to the operator API in the `sft-operator` namespace; view and sync Argo CD applications, which applies what Git holds; manage SSO providers in the user pools; run the AWS steps of the failover runbooks | Exec, attach, port-forward, debug or add containers in application namespaces; create, patch, scale, restart or delete workloads anywhere (restarts and changes go through Git and Argo CD); override Argo CD parameters; read Kubernetes secrets; anything `ReadOnly` may not |
+| `ReadOnly` | Dashboards, logs, alarms | Read metrics, logs and configuration; port-forward to Grafana in the `grafana` namespace (ADR-0009); view Argo CD applications, read-only | Read objects in the files or audit buckets, decrypt with the files key, read secrets, connect to the database |
+| `Operator` | Runbooks and the operator CLI | What `ReadOnly` may, Grafana included, plus: port-forward to the operator API in the `sft-operator` namespace; view Argo CD applications, read-only; manage SSO providers in the user pools; run the AWS steps of the failover runbooks | Exec, attach, port-forward, debug or add containers in application namespaces; create, patch, scale, restart or delete workloads anywhere; sync, change or override an Argo CD Application (every sync comes from Git); read Kubernetes secrets; anything `ReadOnly` may not |
 | `BreakGlassApprover` | A second operator | Assign `BreakGlass` to another operator for one hour (8.3) | Use `BreakGlass` itself |
 | `BreakGlass` | Emergencies only | See 8.3 | See 8.3 |
 
 - **No shell or tunnel into application pods.** A shell in an API pod carries the pod's IAM and database roles, which
-  can read files and unwrap tenant data keys, and a port-forward reaches its internal ports.
-  An EKS access entry maps `Operator` to a Kubernetes group whose RBAC allows `pods/portforward` only in
-  `sft-operator`, which runs nothing but the operator API, and in Grafana's namespace, which runs nothing but Grafana
-  and holds no role that can read files (ADR-0009). `ReadOnly` gets the Grafana port-forward only. Taking these away
-  is what makes "operators can't read file contents" true in normal operation.
+  can read files and unwrap tenant data keys, and a port-forward reaches its internal ports. An EKS access entry maps
+  `Operator` to a Kubernetes group whose RBAC allows `pods/portforward` only in `sft-operator`, which runs nothing but
+  the operator API, and in the `grafana` namespace, which runs nothing but Grafana and holds no role that can read files
+  (ADR-0009). `ReadOnly` gets the Grafana port-forward only. Taking these away is what makes "operators can't read file
+  contents" true in normal operation.
 - **Contents are protected by policy, not procedure.** The files buckets allow reads only by the API role (scan-tagged
   objects only), the scan worker, the S3 replication role, the GuardDuty Malware Protection role (the large-file bucket
   only) and `BreakGlass`; the files key allows decryption only by the same, plus EBS for the scan nodes' volumes (#22
@@ -853,9 +863,9 @@ flowchart LR
 | Record in the service | The tool then calls `recordBreakGlassGrant`: a security-critical platform audit record, plus a record in each affected tenant's audit log, where its admins can see it (UC-4). This is best effort. Every 15 minutes a job in `sft-operator` compares the `BreakGlass` assignments in CloudTrail with `break_glass_grants`, writes any missing record (marked as reconciled), and alerts if one is still missing an hour after the grant. |
 | Use | The requester signs in with MFA; the session lasts at most 1 hour, so access ends at most 2 hours after approval. Nobody holds a standing `BreakGlass` assignment, and a daily check alerts if one exists. |
 | Allows | Reading file objects and decrypting them with the files key; reading the database master password and connecting as the master user; administering the Kubernetes cluster. Cluster administration includes exec into application pods, and through a pod the operator acts with that workload's IAM and database roles: through an API pod they can unwrap tenant data keys and read file names and messages, although `BreakGlass` itself has no decrypt on the fields key (#22). It can also change object tags, so the tag that denies infected files to every principal (FR-17) doesn't stop it. |
-| Can't, through an SCP or Object Lock | Changing KMS key policies, or disabling or deleting keys: a service control policy denies these to everyone except the Terraform deploy role. Changing or deleting audit archive objects: Object Lock in compliance mode in prod. Stopping or changing CloudTrail, AWS Config, EKS control-plane audit logging or the alerting rules, and changing IAM: the same SCP. |
+| Can't, through an SCP or Object Lock | Disabling or deleting KMS keys, or changing a key policy directly: a service control policy denies these to everyone except the Terraform deploy roles, the bootstrap `Admin` role and the key-admin role `sft-{env}-keyadmin`. `BreakGlass` may assume the key-admin role only to put a broken key policy back, and every use pages (#22 4.4). Changing or deleting audit archive objects: Object Lock in compliance mode in prod. Stopping or changing CloudTrail, AWS Config, EKS control-plane audit logging or the alerting rules, and changing IAM: the same SCP. |
 | Alerts | EventBridge rules on the assignment, every sign-in with `BreakGlass`, every call by its role, every read of the master password, and every decryption with the files key by a person's role; and, from the Kubernetes audit log, every exec, attach or port-forward into an application pod. On-call is paged and every operator emailed within 5 minutes. Self-approval, and an assignment without a service record after an hour, raise their own alerts. |
-| Evidence | The organization trail (ADR-0006), with management events, KMS calls included, delivered to the shared account's log archive under Object Lock; S3 data events on the files buckets, from the environment's trail (#22 3.1), in the prod account's CloudTrail bucket, which has no Object Lock so that it can be torn down; pgaudit logs every statement of the master user; the Kubernetes audit log records each exec session, though not what is typed inside it |
+| Evidence | The organization trail (ADR-0006), with management events, KMS calls included, delivered to the shared account's log archive under Object Lock; S3 data events on the files buckets, from the environment's trail (#22 3.1), delivered to the same Object Lock log archive, so a `BreakGlass` session in the prod account can't change or delete the record of what it read; pgaudit logs every statement of the master user; the Kubernetes audit log records each exec session, though not what is typed inside it |
 | Afterwards | The master password is rotated (#22). An after-action review within 2 business days compares what was read (CloudTrail data events) with the approved scope, says whether the access was needed, and opens an issue to make it unnecessary next time. Uses are counted; the target is zero. |
 
 Break-glass is meant to be able to repair anything, so it can also read anything the workloads can. What limits it is
@@ -907,7 +917,7 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 | CSRF | Missing or wrong token; a token from another session, including another link session in the same browser; the token from `GET /me` still works after a page load and changes with the session; the previous key works for 24 hours after a rotation, then fails; missing or foreign `Origin`; cookie plus bearer refused; non-JSON body refused | Every pull request |
 | Link access | After an end-to-end run, no link token appears in load balancer, CDN, WAF or application logs. `resolveLink` reveals nothing; a code works only for its own subject; a superseded code fails; 5 attempts per code; lockout at 20; unlocking clears both `link_token_hash` and `link_issued_at`, issues a new link, and the old one fails; another transfer's file IDs get `404`; an uploader can't download and a recipient can't upload; revocation ends sessions within 5 seconds (NFR-6). One browser holds 10 link sessions, each picked by `X-Link-Session`, verifying a second link leaves the first working, and an 11th ends the oldest. The content GET works with the grant's session in the cookie and no `X-Link-Session`, gets `401` without the cookie and `404` with another session. | Every pull request; staging end to end |
 | API keys | The checksum rejects typos; only the hash is stored; scopes hold; a download gets `403`; a key can't create keys or unlock; every call, reads included, writes its own audit record; a second export within the hour and an export of more than 100,000 events are refused; a revoked or expired key gets `401` on the next call; deactivating the owner revokes their keys | Every pull request |
-| Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator` and Grafana's namespace, and can't exec, attach, port-forward, patch or restart in application namespaces. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
+| Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator` and the `grafana` namespace, and can't exec, attach, port-forward, patch or restart in application namespaces; Argo CD refuses a sync or change from `ReadOnly` or `Operator`. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
 | Break-glass | A drill: request, approval, alerts within 5 minutes (including one for an exec into an API pod), assignment removed after 1 hour, the service record written, or filled in by reconciliation when the drill stops the API first, review written | Staging, in every disaster recovery drill |
 | User pool configuration | Static checks on the Terraform: MFA required, Plus plan, threat protection enforced, admin-only sign-up, implicit grant off, no provider identifiers, the app client can't write `email` or `custom:tenant_id`, both triggers attached in both pools. Once deployed, a daily drift check. | Every pull request; daily |
 
@@ -941,6 +951,11 @@ Everything this design asked of the phase 2 documents was applied in
   through an SQS queue to the notification worker.
 - **PRD, done.** NFR-11 states that members without SSO re-enroll after a regional failover; FR-22 says that an address
   holds a local sign-in for one tenant only.
+
+- **Phase 4 review fixes** ([#41](https://github.com/codewithmuh/secure-file-transfer/issues/41)): the
+  `email_suppression.clear` permission (6.3); the recovery scope and `sft_recovery` (7.1, 7.3); a stream in progress
+  keeps a member session active (3.2); the private cluster endpoint and read-only Argo CD (8.1); data events in the
+  Object Lock log archive and the key-admin role (8.3).
 
 Left for later, on purpose: the admin passkey rule waits for the staging test that both pools issue `amr` (3.3); SCIM
 deprovisioning and SAML single logout come after v1 (3.5, 3.6); Cognito's replication is revisited by an ADR once it

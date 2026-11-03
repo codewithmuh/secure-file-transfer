@@ -18,7 +18,8 @@ production access and SPF, DKIM and DMARC, and is set up per region, so the fail
   complaints could get the whole account paused, which would stop verification for everyone
   ([abuse and rate limits](../security/abuse-and-rate-limits.md) AB-3, AB-4, section 7;
   [threat model](../threat-model.md) T-56 to T-59).
-- **Domain.** The service domain is still open (PRD open question 5).
+- **Domain.** Decided (PRD open question 5): a subdomain of a domain Rashid owns, delegated to Route 53 and held in
+  the shared account's zone ([ADR-0021](0021-network-design-and-egress.md)). The name is given before the first deploy.
 
 ## Decision
 
@@ -27,11 +28,11 @@ Osaka** for failover.
 
 - **Production access and quotas** in both regions, at least 100,000 emails a day and 20 a second, before the first load
   test (capacity 3.2). The failover drill sends real email from Osaka.
-- **A dedicated sending subdomain** of the service domain, for example `mail.<domain>`, verified as a domain identity in
-  each region with Easy DKIM, each region's DKIM records managed in Route 53 by Terraform. **One custom MAIL FROM
-  subdomain per region**, because SES requires exactly one MX record on it and that record points at one region's
-  feedback endpoint. SPF on each MAIL FROM subdomain, and **DMARC at `p=reject`** on the sending subdomain, with
-  aggregate reports to a mailbox we read.
+- **A dedicated sending subdomain** of the service domain, `mail.<domain>`, verified as a domain identity in each
+  region with Easy DKIM. Terraform writes each region's DKIM and MAIL FROM records into the shared account's zone
+  (ADR-0021). **One custom MAIL FROM subdomain per region**, because SES requires exactly one MX record on it and that
+  record points at one region's feedback endpoint. SPF on each MAIL FROM subdomain, and **DMARC at `p=reject`** on the
+  sending subdomain, with aggregate reports to a mailbox we read.
 - **One configuration set per region**: TLS required to receiving servers, reputation metrics on, and bounce, complaint,
   delivery, reject and delivery-delay events, tagged with tenant and email type, published through SNS to the
   notification worker's queue (ADR-0013).
@@ -41,10 +42,15 @@ Osaka** for failover.
 - **Per-tenant controls of our own** (abuse design 7.2, 7.3): sending caps applied by the notification worker, which
   holds over-cap email with the recipient shown as `queued`, and an automatic pause at 5 % hard bounces (at least 50)
   or 0.3 % complaints (at least 3) over the tenant's last 1,000 emails.
-- **Suppression.** Our `email_suppressions` table decides: a hard bounce suppresses an address everywhere, a complaint
-  only for the tenant that sent the email (abuse design 7.4). SES's account-level suppression list covers bounces as a
-  backstop. Complaints use SES's tenant-level suppression lists, not the account list, which would block a complaining
-  address for every tenant.
+- **Suppression, always per tenant.** Our `email_suppressions` table decides (abuse design 7.4). A bounce or
+  complaint on one tenant's email never blocks another tenant's, so it reveals nothing across tenants (NFR-12).
+  - A hard bounce suppresses the address for the sending tenant for 90 days. After that, one email may go out; a
+    second hard bounce suppresses it with no expiry.
+  - A complaint suppresses the address for that tenant until a tenant admin clears it.
+  - SES's tenant-level suppression lists back up both kinds. The account-level list is off, because it would block
+    an address for every tenant.
+  - Our table holds only the address's HMAC, so an entry that ends doesn't release the address from SES at once. On
+    the first send after the entry ends, the notification worker removes the address from that SES tenant's list.
 - **Content.** Fixed, localized templates with no file names or message text; `From` on our subdomain, `Reply-To` the
   sender; only links to our web app (abuse design 7.5). Shared sending IPs; no dedicated IPs in v1.
 
@@ -60,21 +66,28 @@ Osaka** for failover.
 
 - **Infrastructure.** Terraform manages identities, DNS records, configuration sets, event destinations and the
   tenant-pause rules in both regions. A daily check verifies SPF, DKIM and DMARC for both regions (threat model
-  section 6).
+  section 6). The notification worker reaches SES through the SES API's VPC endpoint, never through NAT or the egress
+  proxy (ADR-0021).
 - **Before load tests.** Production access and quotas confirmed in both regions. The first staging build confirms SES
-  tenant management and tenant-level suppression in Tokyo and Osaka (the SES guide lists no regional restriction). If
-  either is missing in a region, that region relies on our own per-tenant pause and suppression table, and this ADR is
-  revisited.
+  tenant management and tenant-level suppression in Tokyo and Osaka (the SES guide lists no regional restriction),
+  including removing an address from a tenant's list. It also confirms that each user pool sends through its own
+  region's identity. If tenant management or tenant-level suppression is missing in a region, that region relies on
+  our own per-tenant pause and suppression table, and this ADR is revisited.
 - **Monitoring.** Account bounce and complaint rates alarm at 2 % and 0.05 % held for 3 hours (abuse design 7.3);
-  NFR-7 is measured from outbox write to SES acceptance; the notification worker backs off when throttled.
+  NFR-7 is measured from outbox write to SES acceptance; the notification worker backs off when throttled. Because
+  suppression is per tenant, a dead address can bounce once for each tenant that sends to it. Those bounces count in
+  the account's rate, and the account alarms watch it.
 - **TLS required.** A receiving server without TLS gets no email; staging measures how often that happens (threat model
   open point 8).
 - **Failover.** Suppressions and our own pauses live in PostgreSQL and fail over with it. SES tenant pauses are per
   region, so the failover runbook applies Tokyo's open pauses in Osaka before workers start.
-- **Cognito's own emails** (sign-in and MFA) are configured with member sign-in, in the security ADRs (#33).
+- **Cognito's own emails**, the few the user pools send themselves, go through our SES identity on `mail.<domain>`
+  with Cognito's developer email sending (the notification worker sends invitations). Each pool sends through its own
+  region's identity, with that region's configuration set. They carry the same DKIM and DMARC as ours, and their
+  bounces and complaints reach the same queue. They count against the same quota and the account's reputation.
 
 ## When to revisit
 
-If tenant management or tenant-level suppression is unavailable in Tokyo or Osaka, if drills or the load test show
-NFR-7 or inbox placement failing, if volume grows enough to justify dedicated IPs, or once the domain (open question 5)
-is chosen and the subdomain names are fixed.
+If tenant management or tenant-level suppression is unavailable in Tokyo or Osaka, if a user pool can't send through
+its own region's identity, if drills or the load test show NFR-7 or inbox placement failing, or if volume grows enough
+to justify dedicated IPs.

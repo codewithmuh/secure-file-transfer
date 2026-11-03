@@ -4,9 +4,9 @@
 |---|---|
 | Contract | [openapi.yaml](openapi.yaml), OpenAPI 3.1 |
 | Requirements | [PRD](../prd.md), especially FR-31 and NFR-14 |
-| Design | [Architecture](../architecture.md), [ADR-0002](../adr/0002-api-framework.md) |
+| Design | [Architecture](../architecture.md), [data model](../design/data-model.md), [ADR-0002](../adr/0002-api-framework.md), [ADR-0018](../adr/0018-stream-downloads-through-api.md) (downloads) |
 | Security design | [Authentication and authorization](../security/authn-authz.md), [abuse prevention, rate limits and downloads](../security/abuse-and-rate-limits.md), [encryption and keys](../security/encryption-and-keys.md), [threat model](../threat-model.md) |
-| Tracking | [#14](https://github.com/codewithmuh/secure-file-transfer/issues/14), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) |
+| Tracking | [#14](https://github.com/codewithmuh/secure-file-transfer/issues/14), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41) |
 
 Everything the web app does goes through this API (FR-31), and tenant automation uses the same API with API keys
 (FR-32). The contract is **design-first**: phase 2 writes it before any code. Once code exists, the document generated
@@ -20,7 +20,8 @@ question 8, [abuse-and-rate-limits](../security/abuse-and-rate-limits.md) sectio
 
 ## 1. Base URL and versioning
 
-- Every path is relative to `/v1` on the API origin. The domain waits for PRD open question 5.
+- Every path is relative to `/v1` on the API origin, a subdomain of a domain the maintainer owns (PRD open question
+  5); the name is set before the first deploy.
 - The operator paths (`/operator/...`) are served by the operator API, a separate workload with its own `servers`
   entry in the spec. No load balancer or ingress routes to it; operators reach it with `kubectl port-forward` into the
   `sft-operator` namespace (authn-authz 8.2).
@@ -45,8 +46,10 @@ question 8, [abuse-and-rate-limits](../security/abuse-and-rate-limits.md) sectio
 | Platform operator | `operatorToken`, from `createOperatorToken` | `Authorization: Bearer` header, through a port-forward to the operator API | `createTenant`, `configureTenantSso`, `recoverTenantAdmin`, `recordBreakGlassGrant` |
 
 - Every operation declares its `security` explicitly. The only public operations are the three link steps, the three
-  sign-in steps and `createOperatorToken`, whose signed AWS request is itself the credential. Health checks and
-  metrics are not part of this API (architecture section 8).
+  sign-in steps and `createOperatorToken`, whose signed AWS request is itself the credential. There is no public
+  `/v1/health`. The load balancer checks `GET /readyz` on a target port its public listener doesn't route, Route 53's
+  health checks probe a fixed response that each load balancer answers itself, and metrics are scraped inside the
+  cluster (architecture section 8, ADR-0021). None of these is an API operation.
 - Every operation also declares `x-permission`: the permission the service layer checks, or `public` (ADR-0002). A lint
   rule fails if one is missing. The [permission table](../security/authn-authz.md#63-permission-table) lists every
   value with who may use it.
@@ -124,7 +127,7 @@ Every error is an RFC 9457 problem (`application/problem+json`) with these field
 
 | Field | Meaning |
 |---|---|
-| `type` | Stable URI per problem, `https://secure-file-transfer.example/problems/{code}`. The host changes to the real domain before v1 (open question 5). |
+| `type` | Stable URI per problem, `https://secure-file-transfer.example/problems/{code}`. The host changes to the service's domain once its name is set, before the first deploy (open question 5). |
 | `title`, `detail` | For people. They may change; never branch on them. |
 | `status` | The HTTP status. |
 | `code` | Stable, machine-readable code. Clients branch on this. |
@@ -185,14 +188,28 @@ State changes are safe to retry by design: `sendTransfer`, `cancelTransfer`, `re
 `signOutUser`, `revokeApiKey`, `configureTenantSso` (the same configuration) and `recordBreakGlassGrant` (the same
 `assignment_request_id`) return success with the current state when the change has already happened.
 
-**Security-critical changes** (revocations, deactivations, demotions with the API keys they revoke, unlocks, forced
-sign-outs and admin recoveries; NFR-10) are committed first, so they take effect at once, and then written to the audit
-archive in both regions before the `2xx`. If that write fails, the change stands and the call returns `503`. A retry
-finds the change already made, writes the archive record if it is still missing, and returns success; the archive job
-also copies the record within a minute (architecture 5.2). The web app must not tell the member such a change failed:
-it shows it as done and retries in the background. A download grant is the opposite: its ID is generated and its record
-goes to the archive first, and the download is counted after, so a `503` from `createSessionDownload` means nothing was
-counted. `recordBreakGlassGrant` is best effort: the Identity Center assignment and CloudTrail are the record, and a
+**Security-critical changes** (NFR-10, data model 2.5) are committed first, so they take effect at once, and then
+written to the audit archive in both regions before the `2xx`:
+
+| Change | Operations |
+|---|---|
+| Revocations of transfers and upload requests | `revokeTransfer`, `revokeUploadRequest` |
+| API key revocations | `revokeApiKey`, and the keys a deactivation or demotion revokes |
+| Deactivations and demotions | `deactivateUser`, `updateUser` (to `member`) |
+| Forced sign-outs | `signOutUser` |
+| Unlocks (and the lockouts that `createLinkSession` records) | `unlockRecipient`, `unlockUploader` |
+| Sign-in resets | `resetUserSignIn`, `recoverTenantAdmin` |
+
+If the archive write fails, the change stands and the call returns `503`. A retry finds the change already made, writes
+the archive record if it is still missing, and returns success; the archive job also copies the record within a
+minute (architecture 5.2). The web app must not tell the member such a change failed: it shows it as done and retries
+in the background. After a failover or restore, the runbooks re-apply these records before any worker starts.
+
+A **download grant** (`createSessionDownload`, `createReceivedFileDownload`) is the opposite: its ID is generated and
+an intent record goes to both archives first, then the download is counted, so a `503` means nothing was counted. A
+committed record follows in the background, and only committed records, or grants the database still holds, are
+re-applied after a failover or restore, so a refused grant never counts (data model 2.3).
+`recordBreakGlassGrant` is best effort: the Identity Center assignment and CloudTrail are the record, and a
 reconciliation job fills any gap (authn-authz 8.3).
 
 ## 6. Rate limiting
@@ -266,12 +283,15 @@ URLs end up in load balancer, CDN and WAF logs, in browser history and in `Refer
    browser `PUT`s the parts in parallel.
 3. After an interruption, `listUploadedParts` or `listSessionUploadedParts` shows which parts arrived, so only the
    missing ones are sent (NFR-3).
-4. `completeUpload` or `completeSessionUpload` first locks the transfer or request and re-checks it, so a cancellation
-   of the draft, or a revocation of the upload request, that lands meanwhile wins and no part is assembled (NFR-6).
-   Under the same lock it counts the files and the total again, so parallel uploads can't pass 50 files or 20 GB
-   (`422 too_many_files`, `413 total_too_large`). Only then does it assemble the parts and check the real size; a
-   mismatch marks the file `rejected`, and the deletion job removes the object, because the API never deletes objects.
-   The file moves to `scanning`.
+4. `completeUpload` or `completeSessionUpload` runs in three phases, and no lock is held across the object-storage
+   calls (data model 3.1). First, in a short transaction, it locks the transfer or request, re-checks it and counts
+   the files and the total again, so a cancellation or revocation that landed first wins and no part is assembled
+   (NFR-6), and parallel uploads can't pass 50 files or 20 GB (`422 too_many_files`, `413 total_too_large`); the file
+   becomes `completing`. Then, with no transaction open, it assembles the parts and reads the real size. Last, in a
+   second short transaction, it re-checks the transfer or request: the file moves to `scanning`, goes back to
+   `uploading` if parts were missing (`409 upload_incomplete`), or is `rejected` on a size mismatch or a cancellation
+   or revocation that landed meanwhile. A rejected file's object is removed by the deletion job, because the API never
+   deletes objects.
 
 A member uploads only to a `draft`. A draft is never revoked or expired, so the race to handle is a cancellation, by
 the member or by the 7-day job: the upload's next call gets `409 invalid_state` with `current_state: cancelled`.
@@ -279,22 +299,24 @@ the member or by the 7-day job: the upload's next call gets `409 invalid_state` 
 **Download** is two steps, streamed through the API (open question 8, abuse-and-rate-limits section 5):
 
 1. `createSessionDownload` (a recipient) or `createReceivedFileDownload` (a member) returns a `DownloadAccess` grant.
-   The grant's ID is generated first and its record written to both regions' audit archive (NFR-10); then one
-   transaction counts the download, creates the grant and commits its audit record (FR-4, NFR-15). So a `503` always
-   means nothing was counted.
+   The grant's ID is generated first and an intent record written to both regions' audit archive (NFR-10); then one
+   transaction counts the download, creates the grant and commits its audit record (FR-4, NFR-15), and a committed
+   record follows in the background (section 5). So a `503` always means nothing was counted.
 2. The web app navigates to the grant's `url`, `getSessionDownloadContent` or `getReceivedFileDownloadContent`, so the
    browser's own download manager saves and resumes the file. That `GET` is authorised by the grant ID in the path
    plus the cookie of the session that created the grant, with no `X-Link-Session` and no CSRF header: without the
    cookie the answer is `401`, with another session's cookie `404`.
 
-A grant belongs to one session and one file, lasts 24 hours, and allows 3 × the file size in bytes, 20 requests and
-one stream at a time. Range requests (one range each, `206`; otherwise `416`) and `If-Range` with the strong `ETag`
-resume under the same grant, uncounted. After a reload, `resume_grant_id` gets the grant back, in the same session,
-while it has time, bytes and requests left (FR-6); after that, `403 download_grant_exhausted`. Every content request
-re-checks revocation, and a running stream re-checks at least every 30 seconds, so a revoked transfer stops within 35
-seconds (NFR-6). Content is always `application/octet-stream` with `Content-Disposition: attachment`, `nosniff`, a
-sandbox CSP and `Cache-Control: no-store`; the bytes served are the object version that was scanned. There is no
-`HEAD`.
+A grant belongs to one session and one file, lasts 24 hours, and allows 3 × the file size in bytes, 20 requests and one
+stream at a time. Range requests (one range each, `206`; otherwise `416`) and `If-Range` with the strong `ETag` resume
+under the same grant, uncounted. A range is `bytes=<start>-`, `bytes=<start>-<end>` or `bytes=-<suffix>` (pattern
+`^bytes=(\d+-\d*|-\d+)$`); anything else, or a range that doesn't fit the file, gets `416 range_not_satisfiable`. After
+a reload, `resume_grant_id` gets the grant back, in the same session, while it has time, bytes and requests left (FR-6);
+after that, `403 download_grant_exhausted`. Every content request re-checks revocation, and a running stream re-checks
+at least every 30 seconds, so a running download stops within 60 seconds of a revocation (NFR-6). Each re-check also
+counts as activity for the session, a link session or a member session, so a long download doesn't end it for idleness.
+Content is always `application/octet-stream` with `Content-Disposition: attachment`, `nosniff`, a sandbox CSP and
+`Cache-Control: no-store`; the bytes served are the object version that was scanned. There is no `HEAD`.
 
 **Audit export** (`exportAuditEvents`) as CSV neutralises formulas, because fields such as `actor_email`, `user_agent`
 and `details` hold text an outsider chose (CWE-1236). Every cell is quoted (RFC 4180), and a cell that starts with `=`,
@@ -314,7 +336,7 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-4 | Download limit per recipient per file | `createTransfer`, `createSessionDownload`, `getSessionDownloadContent` |
 | FR-5 | Notify only when every file is shareable, otherwise held | `sendTransfer`, `getTransfer`, `deleteFile`, `cancelTransfer` |
 | FR-6 | Download files one by one; resume without using up the limit | `listSessionFiles`, `createSessionDownload` (`resume_grant_id`), `getSessionDownloadContent` (Range) |
-| FR-7 | Per-recipient status | `listTransferRecipients` (`delivery_state`, `notified_at`, verification and downloads); `getUploadRequest` for the uploader |
+| FR-7 | Per-recipient status | `listTransferRecipients` (`delivery_state`, `notified_at`, verification and downloads); `getUploadRequest` for the uploader; `clearEmailSuppression` lets a tenant admin email a `suppressed` address again |
 | FR-10 | Create an upload request | `createUploadRequest`, `listUploadRequests`, `getUploadRequest` |
 | FR-11 | Uploader uploads up to 50 files, resumable | `getLinkSession`, `addSessionUploadFile`, `requestSessionUploadPartUrls`, `listSessionUploadedParts`, `completeSessionUpload` |
 | FR-12 | Shareable files reach the member; blocked files reported to both sides | `listUploadRequestFiles`, `getFile`, `createReceivedFileDownload`, `getReceivedFileDownloadContent`, `listSessionFiles` |
@@ -329,6 +351,7 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-23 | Tenant policy | `getTenantPolicy`, `updateTenantPolicy` |
 | FR-25 | Sign in with MFA | `startSignIn`, `completeSignIn`, `signOut`, `getCurrentMember`; `resetUserSignIn` for a lost factor; `recoverTenantAdmin` for a tenant's last admin |
 | FR-28 | Search the audit log | `searchAuditEvents` |
+| FR-33 | English and Japanese recipient and uploader pages and emails, in v1 | `locale` on recipients and upload requests; `default_locale` in the tenant policy |
 | FR-34 | Provision a tenant and its first admin | `createTenant`; the operator API's `createOperatorToken` |
 | FR-35 | Operators can't read contents; break-glass time-limited, audited and alerted | `recordBreakGlassGrant` (best effort; the record is Identity Center plus CloudTrail); no operator operation returns file names, messages or contents |
 | NFR-14 | Member unlocks a locked-out recipient or uploader | `unlockRecipient`, `unlockUploader` |
@@ -343,7 +366,6 @@ Should requirements:
 | FR-26 Tenant single sign-on | `startSignIn` (`method=sso`), `startInvitationSignIn`, `configureTenantSso`; `sso_fallback` in `updateUser` |
 | FR-29 Export the audit log | `exportAuditEvents` |
 | FR-32 Tenant API keys | `createApiKey`, `listApiKeys`, `revokeApiKey`; the `tenantApiKey` scheme |
-| FR-33 English and Japanese | `locale` on recipients and upload requests; `default_locale` in the tenant policy |
 
 Requirements with no user action of their own: FR-19 (scan retries; the state shows in `getFile`), FR-21 (expiry; the
 `link_expired` and `transfer_expired` errors), FR-27 (every operation is audited, including searches, exports, every
@@ -356,14 +378,14 @@ derived CSRF tokens, the operator token exchange, and that API keys can't unlock
 
 | Point | Current choice |
 |---|---|
-| Problem `type` host (open question 5) | `secure-file-transfer.example` until the domain is chosen, before v1 |
+| Problem `type` host (open question 5) | `secure-file-transfer.example` until the subdomain's name is set, before the first deploy |
 | A refused sign-in | `completeSignIn` redirects to the web app with `error=sign_in_failed` and no reason; the audit log has the reason. It is a redirect value, not a problem `code`. |
 | Who owns what an API key creates | The admin who created the key; the audit log names the key as the actor. Deactivating or demoting that admin revokes their keys. |
 | Expiry (FR-3) and its extension (FR-9) | A draft holds a duration (`expires_in`); `expires_at` is set when it is submitted. Extensions are capped over the **whole lifetime**: `expires_at` is never more than 30 days, or the tenant's `max_expiry` if shorter, after `submitted_at`, so repeated extensions can't keep a transfer alive. Extending to the current expiry is a no-op, so a retry is safe. |
 | Lengths the PRD doesn't set | Message ≤ 2,000 characters; file name ≤ 255; API keys expire after 90 days by default, at most 365 |
 | Action paths | Verbs such as `/send`, `/revoke`, `/unlock`, `/sign-out`, `/reset-sign-in`. The architecture's illustrative `/revocation` becomes `/revoke`. |
 | Audit export | Streamed in the response, at most 1,000,000 events for an admin and 100,000 for an API key; an asynchronous export job only if that proves too small. CSV cells are formula-neutralised (section 8). |
-| Download grant budget | 3 × file size, 20 requests, 24 hours, one session and one stream, as the abuse design proposes; for the maintainer to confirm |
+| Download grant budget | 3 × file size, 20 requests, 24 hours, one session and one stream (ADR-0018) |
 | Operator API address | `http://127.0.0.1:{local_port}/v1`, the local end of the port-forward; the port is the operator's choice |
 | Deprecation notice | At least 6 months |
 
@@ -371,7 +393,8 @@ Later, not in v1 (each needs its own issue; none is required by the security des
 
 - Operator operations to suspend and resume a tenant. Until then a suspension is a runbook step, and the contract only
   shows its effect (`Tenant.status`, every session of the tenant ends).
-- Per-tenant limit overrides, set by an operator. Until then limits change by deploy configuration.
+- Per-tenant overrides of rate limits and quotas, set by an operator. In v1 they change only through deploy
+  configuration, for every tenant at once (PRD NFR-14).
 - A public operation behind a "report this email" link in emails, which would suppress the address for that tenant.
 - Source address ranges on an API key, and a cap on expiry extensions (for example 90 days after sending).
 - Tenant-admin self-service for SSO (requiring SSO, confirming MFA), SCIM deprovisioning and SAML single logout.

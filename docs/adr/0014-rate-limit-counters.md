@@ -19,7 +19,8 @@ limit and key (section 2), the WAF rules (section 3) and the store's requirement
   byte use and storage quotas decide access, so they stay in PostgreSQL and fail over with it (abuse design 4.1).
 - **Fail closed** for sign-in and link verification, which are the main defence against AB-1 to AB-3 and AB-8.
 
-The same store also holds stream and scan leases and the short sign-in state between redirect and callback
+The same store also holds stream and scan leases, the notification worker's per-address caps across tenants (abuse
+design 7.2), and the short sign-in state between redirect and callback
 ([authentication](../security/authn-authz.md), 2.4).
 
 ## Decision
@@ -32,11 +33,19 @@ rate-based rules** in front for coarse per-IP floods. PostgreSQL keeps the secur
   token or cookie value.
 - **Algorithms** (abuse design 4.4): GCRA for request rates; a sliding log for small quotas such as codes per address;
   a sorted set of leases for concurrent streams and scans. Limits run narrowest first, one script per key.
-- **Access.** IAM authentication over TLS, from the API's role and the sign-in trigger's role only, through a security
-  group open to them. Nothing is replicated between regions; Osaka's cache idles at its minimum until a failover.
+- **Access.** IAM authentication over TLS for four workloads only, each with its own role, through a security group
+  open to them:
+  - the API;
+  - the sign-in triggers;
+  - the scan worker, for scan leases;
+  - the notification worker, for the per-address caps across tenants.
+
+  Nothing is replicated between regions; Osaka's cache idles at its minimum until a failover.
 - **Failure.** 50 ms per call; after 5 errors in a row the API stops calling the store for 10 seconds. Link steps
   answer `503` with `Retry-After: 5` and the sign-in trigger denies sign-in (fail closed). Other groups fall back to a
-  per-pod limiter at a third of each limit; checks held in PostgreSQL are unchanged (abuse design 4.5).
+  per-pod limiter at a third of each limit; checks held in PostgreSQL are unchanged (abuse design 4.5). The scan worker
+  skips the per-tenant scan cap and the fair queues alone apply (abuse design 6.4). The notification worker holds the
+  per-address cap with a per-pod limiter, as group G does (abuse design 2.2).
 - **WAF** carries the per-IP backstops on the API, sign-in and web app web ACLs (abuse design 3.2).
 
 ## Options considered
@@ -61,8 +70,6 @@ rate-based rules** in front for coarse per-IP floods. PostgreSQL keeps the secur
   database (abuse design 4.1).
 - **Key rotation.** For 25 hours after an email HMAC key rotation, each per-address limit adds the old pseudonym's
   count, so a rotation never resets a cap ([encryption and keys](../security/encryption-and-keys.md), 6.5).
-- **Documents to align.** The [threat model](../threat-model.md) baseline (1.4) says "a small ElastiCache for Valkey
-  cluster"; it should say ElastiCache Serverless for Valkey. Architecture section 9 points here (#26).
 
 ## When to revisit
 

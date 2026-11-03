@@ -23,9 +23,11 @@ section 5, and the threats are in the [threat model](../threat-model.md) (T-22 t
 **Stream file bytes from S3 through the API service, under a download grant bound to the session that created it.**
 
 - **Grant.** `createSessionDownload` (or `createReceivedFileDownload` for a member's received file) generates the grant
-  ID, writes the grant record to the audit archive in both Regions first, then counts the download, creates the grant
-  and commits its audit record in one transaction. A `503` means nothing was counted. The count is one conditional
-  update, so parallel requests can't exceed the limit.
+  ID and writes a grant **intent** record (`download.grant_intent`) to the audit archive in both Regions. Only then
+  does one transaction count the download, create the grant and write `download.granted`. After the commit the API
+  writes a **committed** record (`download.grant_committed`) to both archives, in the background and retried until both
+  confirm. A `503` means nothing was counted. The count is one conditional update, so parallel requests can't exceed
+  the limit.
 - **Content by navigation.** The browser navigates to the content URL, so its own download manager saves and resumes
   the file. A navigation can't send `X-Link-Session`, so the content request is authorised by the grant ID in the path
   plus the `__Host-sft_link` cookie, which must hold the grant's session (for a member, their session cookie):
@@ -33,8 +35,14 @@ section 5, and the threats are in the [threat model](../threat-model.md) (T-22 t
 - **Bounds.** One file and one session; 24 hours, never past the session, the transfer's expiry or a revocation;
   3 × the file size in bytes; 20 content requests; one active stream, where a new request takes over. Range requests
   and `resume_grant_id` resume under the same grant without counting again.
+- **Streams.** Each content request takes the grant's stream lease (`active_stream_id`), which the stream renews at
+  every 30-second re-check. Bytes sent are added to `bytes_served` by grant ID alone, whichever stream sent them; only
+  the lease columns depend on `active_stream_id`, so a takeover never loses bytes already sent. A running stream counts
+  as activity for its session, a link session or a member session alike, so a long download doesn't end its session
+  for idleness; the session's absolute lifetime still applies.
 - **Revocation.** Grant and content requests read the state from the PostgreSQL writer, so they fail at once with
-  `410 link_revoked`; a running stream re-checks every 30 seconds and stops within 60.
+  `410 link_revoked`. A running stream re-checks every 30 seconds, so a running download stops within 60 seconds of a
+  revocation (NFR-6).
 - **Bytes served** are the S3 version recorded at completion and scanned, as an attachment with
   `application/octet-stream`, `nosniff`, `Content-Security-Policy: sandbox` and `no-store`. The API never issues
   pre-signed `GET` URLs for file objects.
@@ -59,20 +67,33 @@ section 5, and the threats are in the [threat model](../threat-model.md) (T-22 t
   150 seconds and the target group's deregistration delay exceeds the stream drain. With `maxUnavailable: 0` and
   `maxSurge: 25%`, new pods serve at once and rollback stays within NFR-18's 10 minutes. A cut stream resumes under the
   same grant, uncounted, and `download_streams_ended_total{reason="shutdown"}` measures how often it happens.
-- **A new `download_grants` table**, a security-critical record like the download count. After a regional failover its
-  byte count may be up to 5 minutes behind (NFR-10), which can allow a few extra bytes, never an extra download.
+- **A new `download_grants` table**, a security-critical record like the download count
+  ([data model](../design/data-model.md), section 2.3).
+- **Recovery re-applies only grants that happened.** A failover or restore re-applies a grant, and its count, only if
+  it has a committed record in the archive or a row in the database; an intent with neither was refused or rolled
+  back, so it never gave access and is ignored. One window remains: a grant committed in Tokyo whose committed record
+  hasn't reached the archive and whose row hasn't reached the Osaka replica is lost if Tokyo is lost at that moment.
+  Both normally land within a second of the commit; a grant lost this way lets that recipient download the file once
+  more than the limit allows, and its intent record shows which grant it was. Byte counts lost within the replication
+  lag are a disaster-recovery gap tracked in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42).
 - **Grants need both Regions' archive,** so an Osaka-only outage stops new downloads in Tokyo until Osaka returns
-  (threat model R-11).
+  (threat model R-11). Whether a degraded mode should serve grants during such an outage, and its effect on NFR-1, is
+  open in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42).
+- **Resuming depends on the browser sending the `SameSite=Strict` cookie.** A resume that starts from the browser's
+  download manager may arrive without `__Host-sft_link` or the member's cookie in some browsers; it then gets `401`,
+  and the user starts the download again from the page, which reuses the grant through `resume_grant_id`, uncounted,
+  within its byte budget. The staging browser matrix records the result for each browser of NFR-22
+  ([abuse and rate limits](../security/abuse-and-rate-limits.md), 9.1 and 9.2).
 - **Cost.** Internet egress is the same for every option, about $2,962 a month at design load; streaming adds the
   load balancer's $243 and almost nothing at idle.
 - **Limits bound fetches, not copies.** A recipient who keeps a file can share it; revocation stops further downloads.
-- **Contract and design changes** go to the phase 2 owners through
-  [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26): `DownloadMethod` keeps only `stream`, the
-  content operations `getSessionDownloadContent` and `getReceivedFileDownloadContent` are added, and the architecture
-  records the download decision and the 120-second stream drain.
+- **Contract and design.** In the [API contract](../api/openapi.yaml), `DownloadMethod` has only `stream`, and the
+  content operations are `getSessionDownloadContent` and `getReceivedFileDownloadContent`; the
+  [architecture](../architecture.md) records the download decision and the 120-second stream drain.
 - **Tests** ([abuse and rate limits](../security/abuse-and-rate-limits.md), 5.5): 50 parallel grant requests at a
-  limit of 1 give one grant; a download interrupted at 50 % resumes without a new count; the fourth copy and the 21st
-  request are refused; revoking during a 1 GB stream stops it within 35 seconds.
+  limit of 1 give one grant; a failed intent write gives `503` and no count; a download interrupted at 50 % resumes
+  without a new count; a takeover keeps the bytes the old stream sent; the fourth copy and the 21st request are
+  refused; revoking during a 1 GB stream stops it within 60 seconds.
 
 When to revisit: if `download_streams_ended_total{reason="shutdown"}` shows that deploys cut a noticeable share of long
 downloads, or streams on the API pods push ordinary calls past NFR-2 in the first load test, move the content routes

@@ -26,23 +26,34 @@ The scan result pins the object version it scanned, and downloads serve that ver
 Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
 
 - **Files.** One bucket per region with versioning on. A replication rule copies every object from Tokyo to Osaka with
-  **S3 Replication Time Control** and re-encrypts it with the Osaka replica of the files key. Default encryption is
-  SSE-KMS with **S3 Bucket Keys**; the bucket policy refuses other keys, SSE-C and requests without TLS. Public access
-  is blocked and ACLs are disabled. No Object Lock and no AWS Backup plan, so nothing keeps a copy deletion can't reach.
+  **S3 Replication Time Control** and re-encrypts it with the Osaka replica of the files key. The replication role
+  has `s3:GetObjectVersionTagging` and `s3:ReplicateTags`, so object tags reach Osaka, the `scan` tag included.
+  Default encryption is SSE-KMS with **S3 Bucket Keys**; the bucket policy refuses other keys, SSE-C and requests
+  without TLS. Public access is blocked and ACLs are disabled. No Object Lock and no AWS Backup plan, so nothing keeps
+  a copy deletion can't reach.
 - **Large files.** Files over 2 GB go to a **second files bucket pair** (Tokyo and Osaka) with the same settings, keys
   and key layout, chosen at upload start from the declared size. GuardDuty Malware Protection covers that whole bucket,
   because ClamAV can't scan files over 2 GB ([ADR-0019](0019-malware-scanning-clamav-guardduty.md)). Everything below
   about "the files buckets" applies to both pairs.
 - **Audit archive.** One bucket per region with versioning and **Object Lock**: compliance mode with 365-day retention
-  in prod, governance mode with 1 day in dev and staging. Batches replicate from Tokyo to Osaka; security-critical
-  records are also written straight to both regions by the API (architecture 5.2), so this rule doesn't need RTC.
+  in prod, governance mode with 1 day in dev and staging. Batches replicate from Tokyo to Osaka, without RTC. The API
+  also writes security-critical records straight to both regions before it answers, or answers `503` (architecture
+  5.2). These are revocations of transfers, upload requests and API keys, user deactivations and demotions, lockouts
+  and unlocks, sign-in resets and download grants, and they never depend on this rule.
 - **Only lifecycle jobs and lifecycle rules delete.** Only the lifecycle jobs' role has `s3:DeleteObjectVersion` on the
   files buckets; the API may only abort unfinished multipart uploads. The deletion job deletes **every version by
   version ID in Tokyo and again in Osaka**, because S3 replication doesn't copy deletes of specific versions. Delete
   marker replication stays off, since nothing creates delete markers on purpose.
-- **Lifecycle rules as safety nets** on both files buckets: expire noncurrent versions after 7 days, abort multipart
-  uploads still unfinished after 7 days, and remove expired delete markers. On the archive, a rule deletes each object
-  when its retention ends (NFR-9).
+- **Lifecycle rules as safety nets** on every files bucket, in each region, because lifecycle rules don't replicate:
+  expire noncurrent versions after 7 days, abort multipart uploads still unfinished after 7 days, and remove expired
+  delete markers.
+- **Archive lifecycle.** Each archive bucket, Tokyo and Osaka, has its own rule (NFR-9):
+  - Current versions expire at 365 days, when their Object Lock retention ends. In a versioned bucket that only adds a
+    delete marker and leaves the version itself in place.
+  - `NoncurrentVersionExpiration` with `NoncurrentDays` = 1 deletes the version. The 1 day is counted from the moment
+    the version becomes noncurrent, which is day 365, so records go about day 366. A 365-day setting would keep them
+    two years.
+  - Expired delete markers are removed.
 - **Object keys** start with `tenants/{tenant_id}/` and use file IDs, never file names (architecture 5.1).
 
 ## Options considered
@@ -56,8 +67,8 @@ Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
 
 ## Consequences
 
-- **Rejected uploads.** Where architecture 4.1 says the object of a rejected upload is deleted, the API marks the file
-  rejected with `delete_after` set to now and the deletion job removes it, so the API role keeps no delete permission
+- **Rejected uploads.** Rejecting a file sets `delete_after` to now. The deletion job then removes its object in both
+  regions, and aborts the multipart upload if it still exists. The API role keeps no delete permission
   ([threat model](../threat-model.md), T-51).
 - **Reconciliation.** The daily job lists objects and versions in both regions, compares them with `files`, reports
   leftovers and deletes orphans older than 24 hours, so a late replica is gone within 2 days (encryption and keys 8.1).
@@ -70,6 +81,16 @@ Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
 - **Archive.** Object Lock has to be on in both archive buckets for replication of locked objects, and replicas keep
   their retention. In prod the buckets, their replication rule and role sit in the retained stack, so an environment
   teardown can't reach them (encryption and keys 8.4).
+- **Disaster-recovery gaps**, open in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42), not
+  settled here:
+  - **Archive cursor.** Archive replication has no time bound, but the archive cursor travels with the database, so
+    after a failover the cursor can be past batches that never reached Osaka. The fix is RTC on the archive, or
+    rewinding the cursor to the newest batch in Osaka.
+  - **Failback.** Replication runs one way, Tokyo to Osaka. After a failover nothing copies Osaka's new objects back,
+    so failing back needs reverse replication.
+  - **Osaka-only outage.** Security-critical records must reach both archives before the API answers. While Osaka's
+    archive can't be written, new download grants and the other security-critical changes answer `503`. The degraded
+    mode for that case, and its effect on NFR-1, are not designed yet.
 
 ## When to revisit
 

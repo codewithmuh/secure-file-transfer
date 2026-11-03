@@ -8,16 +8,17 @@
 
 - **Where images live.** The registry can't live with prod: CI deploys to dev months before prod exists, and prod's
   teardown must neither take the images dev and staging use nor leave a registry billing. It replicates to Osaka once
-  staging exists, for the pilot light and its drills, and costs about $4 a month
+  staging exists, for the pilot light and its drills, and costs about $6 a month
   ([capacity](../design/capacity-and-cost.md) 5.4, A40; [architecture](../architecture.md) 3.2).
 - **Encryption.** Repositories use their own registry key in the shared stack, because a repository's encryption
   can't change after creation and an environment's keys go away with it. Node roles may only decrypt through ECR
   ([encryption](../security/encryption-and-keys.md) 3.1, 4.4).
 - **What may run** ([threat model](../threat-model.md) T-68, T-70). Our images are built once, signed keylessly with
-  cosign and deployed by digest. Third-party images (Argo CD, Karpenter, External Secrets, monitoring, CoreDNS, clamd)
-  are mirrored, pinned by digest in Git and checked against their vendor signatures where one exists. An admission
-  policy rejects anything else. No released image has a known critical or high vulnerability (NFR-13), and the same
-  digests are promoted dev → staging → prod (NFR-18).
+  cosign and deployed by digest. Third-party images (Argo CD, Karpenter, Kyverno, External Secrets, KEDA, monitoring,
+  the egress proxy, clamd) are mirrored, pinned by digest in Git and checked against their vendor signatures where one
+  exists. The EKS add-ons come from AWS's own registries ([ADR-0004](0004-compute-eks-karpenter-argo-cd.md)). An
+  admission policy rejects anything else. No released image has a known critical or high vulnerability (NFR-13), and
+  the same digests are promoted dev → staging → prod (NFR-18).
 - **What the template does.** `release.yml` publishes both sample images to GHCR when a release is created, signs them
   with cosign through GitHub OIDC, and attaches SBOMs and build provenance. Architecture section 9 lists GHCR as the
   main alternative.
@@ -28,8 +29,8 @@ Keep container images in **Amazon ECR in the shared account** ([ADR-0006](0006-a
 in Tokyo, replicated to Osaka once staging exists, encrypted with the registry key. Tags are immutable; each build is
 tagged with its Git SHA and deployed by digest. The build on `main` signs each digest keylessly with cosign through
 GitHub OIDC and attaches its SBOM and provenance. Third-party images are copied by digest into mirror repositories
-after their signatures and scans pass. An admission controller in every cluster enforces all of it. **GHCR publishing
-is dropped**: ECR is the only registry.
+after their signatures and scans pass. **Kyverno** enforces all of it in every cluster. **GHCR publishing is
+dropped**: ECR is the only registry for our images.
 
 ## Options considered
 
@@ -43,34 +44,50 @@ is dropped**: ECR is the only registry.
 ## Consequences
 
 - **Repositories.** `sft/app` holds the one application image (architecture 2); `mirror/…` holds third-party images.
-  The shared stack's deploy role creates them with the registry key and immutable tags. Lifecycle rules keep the last
-  30 builds from `main` and every released version (A40); a CI check fails a deploy config that names a digest not in
-  ECR.
-- **Build and sign** ([ADR-0005](0005-terraform-github-actions-argo-cd.md)). On every merge to `main`, CI builds once,
-  fails on a critical or high Trivy finding, pushes `sft/app:<git-sha>` through an OIDC role in shared that may push
-  only to `sft/*`, and signs the digest. The SBOM (SPDX) and provenance are attached as artifacts of that digest; the
-  release-please release links the digest and attaches the SBOM, as the template does today.
+  The shared stack's deploy role creates them with the registry key and immutable tags.
+- **Lifecycle.** The promotion job (ADR-0005) tags every digest it puts into an environment's deploy config
+  `deployed-<git-sha>`, a tag of its own because tags are immutable, before the pull request opens. The highest-priority
+  lifecycle rule selects `deployed-*` with a count no repository reaches, so a deployed image never expires, whichever
+  environment still pins it; only builds never tagged deployed expire, beyond the newest 30 (A40). Signatures, SBOMs
+  and provenance stay with their image. Mirror repositories keep every digest that Git pins. A CI check fails a deploy
+  config that names a digest not in ECR, and a daily check alerts on a pinned digest without its `deployed-` tag.
+- **Build and sign** ([ADR-0005](0005-terraform-github-actions-argo-cd.md)). On every merge to `main` that changes
+  code, CI builds once, fails on a critical or high Trivy finding, pushes `sft/app:<git-sha>` through an OIDC role in
+  shared that may push only to `sft/*`, and signs the digest. The SBOM (SPDX) and provenance are attached as artifacts
+  of that digest; the release-please release links the digest and attaches the SBOM, as the template does today.
 - **Signing identity.** Admission accepts an `sft/*` image only with a certificate whose identity is this repository's
   build workflow on `main`, issued by GitHub's OIDC issuer. Keyless signing records that identity and the digest in
-  the public Rekor log. The admission controller must verify from the bundle stored with the signature, so a deploy or
-  a failover doesn't depend on reaching Sigstore; the first build milestone confirms it.
+  the public Rekor log. Kyverno verifies offline, from the bundle stored with the signature and a Sigstore trust root
+  (Fulcio's root certificates and the Rekor and certificate-transparency log keys) pinned in Git, so admission never
+  calls Sigstore through the proxy, and a deploy or a failover doesn't depend on reaching it. A scheduled workflow
+  compares the pinned root with Sigstore's published one and opens a pull request when it rotates. The first build
+  milestone confirms the offline check.
 - **Third-party images** (T-70). A mirror workflow copies each image that Git pins, by digest, into `mirror/`, verifies
   the vendor's signature where one is published, and runs Trivy. Admission accepts a mirrored digest with its
   allow-listed vendor identity, or, for a vendor that publishes no signature, the digest reviewed and listed in Git.
   ECR pull-through cache, which capacity A40 assumes, is not used: what it stores depends on when a node first asks,
   and an Osaka node's first pull during a failover would depend on the upstream registry.
-- **Admission controller.** Kyverno, from the same mirror, requires a digest and a matching signature in every
-  namespace, the platform's included. It is a new item in capacity's platform list (4.3).
+- **Admission controller.** Kyverno, from the same mirror, runs on the `system` node group (ADR-0004) and requires a
+  digest and a matching signature from our mirrored or signed images. Its image policy also allows the named EKS
+  add-ons (the VPC CNI, kube-proxy, CoreDNS, the Pod Identity agent, the EBS CSI driver and the pause image) by
+  registry and repository from the AWS-owned EKS and Bottlerocket registry accounts for ap-northeast-1 and
+  ap-northeast-3, and nothing else from them. Its blocking webhooks exclude `kube-system`, `karpenter`, `kyverno` and
+  `argocd`, so a cold start can't deadlock (ADR-0004); there the same policies run in CI with the Kyverno CLI against
+  the rendered manifests, whose images are pinned by digest in Git, and in Kyverno's background reports, which alert on
+  a violation. It is in capacity's platform list (4.3).
 - **Osaka.** A replication rule copies every repository to ap-northeast-3; a repository creation template applies the
   Osaka copy of the registry key. Signatures and SBOMs live in the same repositories and replicate with the images.
-- **Pulls.** Each environment's node role may pull from `sft/*` and `mirror/*` and decrypt through ECR only; pulls go
-  through the VPC endpoints and add nothing to NAT.
+- **Pulls.** Each environment's node role may pull from `sft/*` and `mirror/*` and decrypt through ECR only, and pull
+  the EKS add-ons from AWS's registries. Pulls go through the VPC endpoints, whose policies allow exactly those
+  registries ([ADR-0021](0021-network-design-and-egress.md)), and add nothing to NAT.
 - **Re-scanning.** A scheduled workflow re-scans the digests that the deploy config names and opens an issue on any
   new critical or high finding (NFR-13).
 - **Dropping GHCR.** In the first build milestone, `release.yml` stops logging in to and publishing to GHCR, in the
-  same change that adds the ECR push and removes the Go sample ([ADR-0010](0010-no-go-in-v1.md)). Until then the
-  template's workflow runs unchanged. The README line about GHCR changes with it.
+  same change that adds the ECR push and removes the Go sample ([ADR-0010](0010-no-go-in-v1.md)). `SECURITY.md`'s
+  `cosign verify` example, which names the GHCR `api-go` image, changes to the ECR `sft/app` image and the build
+  workflow's identity, and the README line about GHCR changes with it. Until then the template's workflow runs
+  unchanged.
 
 When to revisit: if the project needs public images, for example a guide to run it yourself (add a public copy then);
-if verifying signatures turns out to need Sigstore at deploy time; or if a customer's dedicated deployment needs its
-own registry.
+if verifying signatures offline turns out not to work in Kyverno; or if a customer's dedicated deployment needs its own
+registry.

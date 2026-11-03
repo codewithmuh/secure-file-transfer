@@ -13,8 +13,8 @@ Sign-in, sessions, row-level security and break-glass access belong to the authe
 the download mechanism and rate limits belong to the abuse design. "Decision N" refers to the phase 3 cross-cutting
 decisions that all four phase 3 documents follow.
 
-Technologies are the architecture's candidates (section 9 there). If a phase 4 ADR picks something else, this page
-changes in the same pull request. Nothing here has been applied to an AWS account: until Rashid provides the AWS
+Technologies are the ones the phase 4 ADRs chose (architecture section 9). A change to one of those ADRs changes this
+page in the same pull request. Nothing here has been applied to an AWS account: until Rashid provides the AWS
 profile, every control is checked statically (section 9).
 
 Decisions on this page:
@@ -33,7 +33,9 @@ Decisions on this page:
   pseudonyms, link tokens and CSRF tokens. Sessions are random tokens stored as hashes, so there is no signing key
   (section 6).
 - **Only the Terraform deploy roles change or destroy keys.** A service control policy denies changing a key policy,
-  disabling a key or scheduling its deletion to everyone else, BreakGlass included (decision 13, section 4.4).
+  disabling a key or scheduling its deletion to everyone else, BreakGlass included, apart from the bootstrap `Admin`
+  role for the tfstate keys and the key-admin role `sft-{env}-keyadmin`, which only BreakGlass may assume and which may
+  only put a key policy back (decision 13, section 4.4).
 - **The audit archive and its key live in a self-contained retained stack** with deletion guards. It keeps its own
   Terraform state, trail and alerting under the audit key, so nothing else has to survive teardown, for about $2.20 a
   month (section 8).
@@ -42,7 +44,7 @@ Decisions on this page:
 
 | Class | Meaning | Rules |
 |---|---|---|
-| Restricted | File contents, the reason the service exists | Only in the files buckets, on a scan worker's scratch volume while its scan runs, inside GuardDuty Malware Protection while it scans a file over 2 GB (decision 15), and in API memory while a download streams. Never in PostgreSQL, queues, caches, logs, traces or email. |
+| Restricted | File contents, the reason the service exists | Only in the files buckets, in a scan worker's memory as it streams a file to clamd and on the clamd pod's scratch volume while its scan runs, inside GuardDuty Malware Protection while it scans a file over 2 GB (decision 15), and in API memory while a download streams. Never in PostgreSQL, queues, caches, logs, traces or email. |
 | Confidential | Personal and business data about transfers: file names, messages, email addresses, IP addresses, audit records, tenant settings | Only in the stores listed below. File names and messages are also field-encrypted (3.2). Never in object keys, work queue messages, metrics or log lines. |
 | Secret | Credentials: link tokens, session tokens, CSRF tokens, API keys, invitation tokens, verification codes, HMAC keys, client secrets, the database master password | Plain text exists only in transit, in memory, or once at creation (the emailed link, the cookie, the API key response). At rest only as a hash, an HMAC, or inside Secrets Manager. Link and CSRF tokens are derived (6.2), so they are never stored. |
 | Internal | Operational data with no customer content: application logs, metrics, traces, queue messages, container images, infrastructure state | Identifiers only: `tenant_id`, `request_id`, an HMAC of an email address. Application logs may also hold IP addresses. |
@@ -50,7 +52,7 @@ Decisions on this page:
 
 | Data | Class | Where it lives | Encrypted with |
 |---|---|---|---|
-| File contents | Restricted | S3 files buckets (Tokyo, Osaka replica): one pair for files up to 2 GB and one for larger files, always under `tenants/{tenant_id}/` (ADR-0012); scan worker scratch volumes, deleted after each scan; GuardDuty Malware Protection, which reads the large-file bucket in its Region (decision 15); API memory while streaming | files key |
+| File contents | Restricted | S3 files buckets (Tokyo, Osaka replica): one pair for files up to 2 GB and one for larger files, always under `tenants/{tenant_id}/` (ADR-0012); clamd scratch volumes (4 GiB per pod, ADR-0019), deleted after each scan, and scan worker memory while a file streams to clamd; GuardDuty Malware Protection, which reads the large-file bucket in its Region (decision 15); API memory while streaming | files key |
 | File names, transfer and upload request messages | Confidential | PostgreSQL `files.display_name_ct`, `transfers.message_ct`, `upload_requests.message_ct`, ciphertext only; the browser after verification (FR-14) | Per-tenant data key under the fields key (3.2), inside storage encrypted with the database key |
 | Email addresses of members, recipients and uploaders | Confidential, personal data | PostgreSQL, in plain text because we send mail to them and search by them (UC-4); Cognito for members; SES while sending. Logs, rate-limit counters and the suppression list hold only an HMAC (6.2). | database key; email HMAC keyring |
 | Source IP addresses and user agents | Confidential, personal data | Audit records; CloudFront, WAF and load balancer logs; rate-limit counters (at most 25 hours) | database, audit, logs and platform keys |
@@ -69,8 +71,10 @@ Decisions on this page:
 | Terraform state | Internal, sensitive | One state bucket per environment, holding no live secret value (6.4); the retained stack's own state bucket (8.4) | tfstate key; audit key for the retained stack |
 | Web app bundle | Public | S3 behind CloudFront | SSE-S3 (3.1) |
 
-Every store above is in Tokyo or Osaka (NFR-21). Keys can replicate only to Osaka (4.4). The CloudFront certificate in
-us-east-1 holds no customer data.
+Every store above is in Tokyo or Osaka (NFR-21). Keys can replicate only to Osaka (4.4). What lives in us-east-1 is
+limited to NFR-21's list, none of it holding file contents: CloudFront, its WAF and its certificate; CloudWatch metrics
+and alarms on CloudFront and the Route 53 health checks, with their SNS topic; the log delivery for the CloudFront WAF,
+which writes to Tokyo; and the DNSSEC signing key (4.1).
 
 ## 2. Encryption in transit
 
@@ -94,13 +98,13 @@ record lets only Amazon's certificate authority issue certificates for the domai
 | Hop | How |
 |---|---|
 | Load balancer to API pods | HTTPS target group. Each pod serves TLS 1.2 or later with a certificate it generates at start. The load balancer doesn't validate target certificates, so this encrypts the hop without authenticating it; security groups and network policies decide who can reach the pods. It is needed because the Nitro system's automatic encryption between instances doesn't cover traffic through a load balancer. The load balancer offers TLS 1.0 and up to targets, so the pod's TLS settings enforce the 1.2 minimum. |
-| Pods to AWS APIs (S3, KMS, SQS, Secrets Manager, STS, ECR) | HTTPS through the VPC endpoints (architecture 3.1); AWS APIs require TLS 1.2. Bucket and queue policies also deny requests with `aws:SecureTransport` false. |
-| Pods to SES | HTTPS through the NAT gateways |
+| Pods and nodes to AWS APIs (S3, KMS, SQS, Secrets Manager, STS, ECR, SES, EC2, EKS Auth) | HTTPS through the VPC endpoints (architecture 3.1, ADR-0021); AWS APIs require TLS 1.2. Bucket and queue policies also deny requests with `aws:SecureTransport` false. The notification worker sends email through SES's API endpoint, never through NAT. |
+| Pods to Cognito, GitHub and ClamAV's database | An HTTPS `CONNECT` tunnel through the egress proxy's listener for that workload, then the NAT gateways (ADR-0021). TLS runs end to end from the pod, so the proxy sees only the name and the byte counts. |
 | SES to recipients' mail servers | A configuration set with TLS policy `Require`: a message is delivered only over TLS. A mail server without TLS gets no email (section 9). |
 | Pods to Aurora PostgreSQL | `rds.force_ssl = 1` and `ssl_min_protocol_version = TLSv1.2` in the cluster parameter group. Clients connect with `sslmode=verify-full` and the RDS certificate bundle. IAM database authentication (6.3) also refuses connections without TLS. |
 | Pods to Valkey (rate-limit counters, sign-in state) | ElastiCache Serverless always uses TLS; clients verify the server certificate. |
-| Pod to pod (metrics scrapes, traces) | Plain HTTP inside the cluster. Between m8g nodes in one VPC the Nitro hardware encrypts it, and AWS encrypts all traffic between Availability Zones. No file contents, names, messages or secrets travel pod to pod, and network policies limit the paths. A service mesh would add mutual TLS; it is a moving part this design doesn't need yet. |
-| Scan worker to scan engine | Same pod, over a local socket |
+| Pod to pod (metrics scrapes, traces) | Plain HTTP inside the cluster. Between m8g nodes in one VPC the Nitro hardware encrypts it, and AWS encrypts all traffic between Availability Zones. No file contents, names, messages or secrets travel pod to pod, with the one exception below, and network policies limit the paths. A service mesh would add mutual TLS; it is a moving part this design doesn't need yet. |
+| Scan worker to clamd | Pod to pod inside the scan node pool: the worker streams the file's bytes to clamd with INSTREAM over plain TCP (ADR-0019). Between m8g nodes the Nitro hardware encrypts it, and the pair usually shares a node. Network policies allow ingress to clamd only from the scan workers, and both run only on the scan pool, never on the API's nodes. |
 
 Downloads stream from S3 through the API (abuse and download design, #24): S3 decrypts the object, the bytes reach
 the pod over TLS through the S3 endpoint, and leave over TLS through the load balancer. The API never writes them to
@@ -112,10 +116,10 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 
 | Flow | Protection |
 |---|---|
-| S3 replication: files, audit archive, Terraform state | S3 decrypts with the Tokyo key and re-encrypts with the Osaka key named in the replication rule. S3 treats multi-Region keys as single-Region keys here. |
+| S3 replication: files and their tags, audit archive | S3 decrypts with the Tokyo key and re-encrypts with the Osaka key named in the replication rule. S3 treats multi-Region keys as single-Region keys here. The replication role has `s3:GetObjectVersionTagging` and `s3:ReplicateTags`, so the `scan` tag reaches Osaka. Terraform state is per Region: Osaka's root modules keep their state in Osaka (ADR-0005); how Tokyo's state survives losing the Region is part of [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42). |
 | Aurora global database | Storage-level replication; the Osaka cluster is encrypted with the Osaka copy of the database key |
 | Secrets Manager replicas | Replicated by the service; each replica is encrypted with the Osaka secrets key |
-| Security-critical audit records written by the API and the operator API straight to Osaka (architecture 4.2, 4.4) | HTTPS to the Osaka S3 endpoint through NAT |
+| Security-critical audit records written by the API and the operator API straight to Osaka (architecture 5.2) | HTTPS through the cross-region interface endpoint for S3 in Osaka (ADR-0021), whose policy admits only our principals and our buckets there; never through NAT |
 | ECR replication | Replicated by the service; replicas are encrypted with the Osaka copy of the registry key |
 
 ## 3. Encryption at rest
@@ -128,7 +132,7 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 | S3 audit archive, Tokyo and Osaka | SSE-KMS with S3 Bucket Keys | audit | Object Lock in compliance mode with 365-day retention in prod. Governance mode with 1-day retention in dev and staging, so they can be torn down (NFR-15). Object Lock protects the objects, not their key, so the key has its own guards (8.4). |
 | S3 log buckets: CloudTrail, CloudFront, WAF, VPC flow logs, log and trace stores | SSE-KMS with S3 Bucket Keys | logs | The log delivery services write through key policy statements limited by `aws:SourceAccount` and `aws:SourceArn`. |
 | S3 load balancer access logs | SSE-S3 | — | **Exception to NFR-13:** load balancer access logs support only SSE-S3. They hold IP addresses, paths with opaque IDs and user agents. Link tokens never reach them, because they travel in the URL fragment (architecture 4.2). Only the log reader role can read the bucket. |
-| S3 server access logs | Not used | — | They also need SSE-S3. CloudTrail S3 data events are the "storage access logs" for NFR-15's daily match instead: for the files buckets through the environment's trail, under the logs key; for the prod audit archive through the retained stack's trail, under the audit key (8.4). |
+| S3 server access logs | Not used | — | They also need SSE-S3. CloudTrail S3 data events are the "storage access logs" for NFR-15's daily match instead: for the files buckets through the environment's trail, which delivers them to the shared account's log archive under Object Lock, so a break-glass session can't erase its own record (authentication and authorization 8.3); for the prod audit archive through the retained stack's trail, under the audit key (8.4). |
 | S3 web app bundle | SSE-S3 | — | Public content. A KMS key would add a CloudFront key policy to the failover path without protecting anything secret. |
 | S3 Terraform state, Tokyo and Osaka | SSE-KMS with S3 Bucket Keys; versioning | tfstate | Created by the bootstrap stack with its own key, because the environment's keys are created by the state this bucket holds. The retained stack keeps its state in its own bucket under the audit key (8.4). |
 | Aurora PostgreSQL: Tokyo cluster, Osaka secondary, automated backups (14-day point-in-time recovery), snapshots, Performance Insights | Aurora storage encryption, set at creation | database | Each Region's cluster uses that Region's copy of the key. An unencrypted cluster can't be encrypted in place, so CI rejects a plan that would create one (section 9). |
@@ -137,7 +141,7 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 | SQS work queues, intake queues and dead-letter queues | SSE-KMS, data key reused for 5 minutes | platform | Work queue messages hold IDs only; intake messages are classified in section 1. Only the outbox relay sends to the work queues. Each intake queue has one sender: the sign-in triggers' role for sign-in events, the SES events topic for sending events, and the EventBridge delivery role for GuardDuty scan results and SES tenant pauses, through the statements in 4.4. |
 | ElastiCache Serverless (Valkey) | Encryption at rest, always on | platform | Rate-limit counters and sign-in state |
 | EBS: node root volumes, observability volumes | EBS encryption by default, set for the account in each Region | platform | The node provisioner (Karpenter and the EC2 Fleet service-linked role) uses the key for each volume it launches (4.4). |
-| EBS: scan worker volumes | Encrypted | files | The scratch disk holds file contents during a scan, so the scan workers run in their own node pool whose volumes use the files key. The worker deletes each scratch file when its scan ends. The separate pool also keeps hostile files off the API's nodes. |
+| EBS: scan node volumes | Encrypted | files | clamd's scratch holds file contents during a scan, so the scan workers and clamd run in their own node pool whose volumes use the files key. The worker deletes each scratch file when its scan ends. The separate pool also keeps hostile files off the API's nodes. |
 | ECR images | KMS | registry | Repositories live in the shared registry stack (capacity 5.4), and a repository's encryption setting can't change after creation, so they can't use an environment's key, which goes away with that environment. The registry key belongs to the shared stack. Osaka replicas use its Osaka copy through a repository creation template. |
 | CloudWatch Logs: EKS control plane, Aurora | KMS | logs | |
 | Secrets Manager, Tokyo and Osaka | KMS | secrets | Section 6 |
@@ -188,7 +192,9 @@ cryptography, and a write is read back and checked before it commits.
 Each environment has eight customer managed symmetric encryption keys with key material generated by KMS
 (`AWS_KMS` origin). In staging and prod each one is a multi-Region key with its primary in Tokyo and one replica in
 Osaka. dev runs in Tokyo only, so its keys are multi-Region keys without a replica. Aliases are per Region, so
-Terraform creates the same alias in both. The shared registry stack has one more key of the same kind.
+Terraform creates the same alias in both. The shared registry stack has one more key of the same kind. One more key
+protects no data: the shared account's DNSSEC key-signing key, an asymmetric key that Route 53 requires in us-east-1
+(NFR-21), which only signs the DNS zone.
 
 | Key | Alias in prod | Protects | Created by |
 |---|---|---|---|
@@ -285,10 +291,12 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 
 - **Deletion needs no key.** Deleting object versions and aborting multipart uploads need no KMS permission, so the
   lifecycle jobs, which do the deleting (decision 1), can't read what they delete.
-- **The logs key for the storage-access match.** The lifecycle jobs role runs NFR-15's daily match of CloudTrail S3
-  data events against audit records. It may decrypt with the logs key only through S3, only in the CloudTrail bucket,
-  and only for CloudTrail log files (`kms:EncryptionContext:aws:cloudtrail:arn` present), so it can't read application
-  logs. No job copies Cognito logs: failed sign-ins reach the audit log through the sign-in triggers (decision 18).
+- **Reading data events for the storage-access match.** The lifecycle jobs role runs NFR-15's daily match of
+  CloudTrail S3 data events against audit records. The environment's trail writes them to the shared account's log
+  archive, so the role may read only its own trail's prefix there and decrypt with the archive's key only through S3 and
+  only for that trail's log files (`kms:EncryptionContext:aws:cloudtrail:arn` = the trail), so it can't read application
+  logs or another account's events. No job copies Cognito logs: failed sign-ins reach the audit log through the sign-in
+  triggers (decision 18).
 - **Narrow conditions.** Each workload statement is limited by `kms:ViaService` (S3, SQS, SNS, EC2 or Secrets Manager
   in the right Region) and by encryption context: the bucket ARN for S3 (`kms:EncryptionContext:aws:s3:arn`; with
   Bucket Keys it is the bucket, not the object), `SecretARN` for Secrets Manager, `aws:sqs:arn` for queues, the trail
@@ -297,7 +305,9 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
   `sft-{env}-notify`, `sft-{env}-relay`, `sft-{env}-jobs`, `sft-{env}-archive`, `sft-{env}-migrate` and
   `sft-{env}-operator` match the PostgreSQL login roles `sft_api` to `sft_operator`. This page adds
   `sft-{env}-recovery`, `sft-{env}-key-rotation`, `sft-{env}-db-bootstrap`, `sft-{env}-s3-replication`,
-  `sft-{env}-malware-protection`, `sft-{env}-events-delivery`, `sft-{env}-signin-trigger` and `sft-{env}-karpenter`.
+  `sft-{env}-malware-protection`, `sft-{env}-events-delivery`, `sft-{env}-signin-trigger`, `sft-{env}-karpenter` and the
+  bootstrap stack's key-admin role `sft-{env}-keyadmin` (4.4). The recovery role pairs with the PostgreSQL login role
+  `sft_recovery`.
 - **The recovery job** runs only from the failover and restore runbooks: in Osaka to re-apply security-critical
   changes from the archive (architecture section 7), in Tokyo after a point-in-time restore.
 
@@ -315,18 +325,24 @@ Every key policy follows these rules:
 4. **Osaka only.** `ReplicateKey` is allowed only with `kms:ReplicaRegion` set to `ap-northeast-3`.
 5. **Only the deploy roles change or destroy keys (decision 13).** A service control policy denies
    `kms:PutKeyPolicy`, `kms:DisableKey`, `kms:ScheduleKeyDeletion` and `kms:DeleteImportedKeyMaterial` to every
-   principal except the deploy roles, BreakGlass included. Each key policy repeats the denial of `DisableKey` and
+   principal except the deploy roles (the retained stack's included), the bootstrap `Admin` role for the tfstate keys
+   its stack creates, and the key-admin role of rule 6, which may only put a key policy; BreakGlass and every other
+   role are denied. Each key policy repeats the denial of `DisableKey` and
    `ScheduleKeyDeletion` (sketch below), so it holds even if the SCP changes. In prod any deletion must use the
    longest waiting period, 30 days. In dev and staging the deploy role may use 7 days, so teardown works. SCPs need
    AWS Organizations, which IAM Identity Center needs anyway; open question 4 chose it (ADR-0006).
 6. **BreakGlass recovers, it doesn't administer.** It may describe a key, list and revoke grants, enable a disabled
-   key and cancel a pending deletion. The key policy also names it for `PutKeyPolicy`, so a key whose deploy role was
-   deleted can still be repaired, but the SCP denies that call until someone with the organization's management
-   account lifts the SCP for it: a second, alerted step. With one maintainer the same person holds both, so this guards
-   against a mistake or one compromised role, not against the maintainer (decision 13 accepts that risk).
+   key and cancel a pending deletion. A broken key policy is put back through the **key-admin role**,
+   `sft-{env}-keyadmin` (ADR-0017): every key policy names it, for reading and putting the key policy and nothing
+   else. It is created once in the bootstrap stack with `prevent_destroy`, only BreakGlass may assume it, and every
+   use pages. KMS binds a key policy to a role's unique ID, so a deploy role that is deleted and re-created no longer
+   matches its keys' policies; the key-admin role can still put a corrected policy, so re-creating a deploy role can't
+   lock the keys. With one maintainer the same person holds BreakGlass and approves it, so this guards against a
+   mistake or one compromised role, not against the maintainer (decision 13 accepts that risk).
 7. **Changes are watched.** EventBridge rules on CloudTrail, in both Regions:
    - `PutKeyPolicy`, `DisableKey`, `DisableKeyRotation`, `ScheduleKeyDeletion`, `CancelKeyDeletion`, `RevokeGrant` or
      `ReplicateKey` by any principal other than a deploy role, and any denied attempt at one of them: page.
+   - Every `AssumeRole` into the key-admin role, and every call it makes: page.
    - `ScheduleKeyDeletion`, `DisableKey` or `DisableKeyRotation` on a prod key by anyone, the deploy role included:
      page. A planned prod teardown acknowledges the page in its runbook. In dev and staging the deploy role's deletions
      during teardown are expected and only logged.
@@ -362,8 +378,15 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
       "Principal": {"AWS": "<BreakGlass role ARN>"},
       "Action": [
         "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus", "kms:ListResourceTags",
-        "kms:ListGrants", "kms:RevokeGrant", "kms:EnableKey", "kms:CancelKeyDeletion", "kms:PutKeyPolicy"
+        "kms:ListGrants", "kms:RevokeGrant", "kms:EnableKey", "kms:CancelKeyDeletion"
       ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KeyAdminRepairsThePolicy",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-bootstrap/sft-prod-keyadmin"},
+      "Action": ["kms:GetKeyPolicy", "kms:PutKeyPolicy"],
       "Resource": "*"
     },
     {
@@ -573,7 +596,7 @@ Aurora storage stays under one shared key in every option, because a cluster has
 |---|---|---|---|---|---|
 | 1. Shared key per data class (the floor) | Encryption at rest, a key policy per workload, CloudTrail per key. No cryptographic separation between tenants. | Lowest: eight keys per environment, all in Terraform. | About 3 M a month with Bucket Keys (capacity A21), about $9 | 16 keys: $16 a month, up to $48 after two yearly rotations | None |
 | **2. Option 1 plus per-tenant data keys for file names and messages** (recommended) | Adds per-tenant binding for the most sensitive metadata. A scoping bug, SQL injection or a database-only reader can't read another tenant's names and messages. File contents stay under the shared key. | One small crypto module, one table, a key cache and tests (3.2). | Option 1 plus at most about 6 M a month for unwrapping, about $18 more | Same as option 1 | Negligible: well below the 20,000 requests a second shared quota in Tokyo and 10,000 in Osaka |
-| 3. A KMS key per tenant for files and fields, every tenant | The benefits in the list above, for every tenant. | A key per tenant in both Regions at provisioning, so either the operator API gets `CreateKey`, `PutKeyPolicy` and `ReplicateKey` (a privileged path inside a running service), or provisioning a tenant becomes a Terraform change. S3 replication needs one rule per tenant, because the replica key is set per rule. The bucket default can name only one key, so every upload must name its tenant's key, and a bucket policy can't check the match for 500 tenants. | More, because each tenant key needs its own Bucket Keys, but never more than the rate without Bucket Keys: at most about 12 M a month, about $35 | 500 tenants × 2 Regions = 1,000 keys: about $1,000 a month, $2,000 after the first rotation, $3,000 after the second. Prod idle costs $3,041 a month (capacity section 1). | 1,000 of the 100,000 keys allowed per Region. A replication configuration holds at most 1,000 rules, which caps a bucket pair at about 1,000 tenants. |
+| 3. A KMS key per tenant for files and fields, every tenant | The benefits in the list above, for every tenant. | A key per tenant in both Regions at provisioning, so either the operator API gets `CreateKey`, `PutKeyPolicy` and `ReplicateKey` (a privileged path inside a running service), or provisioning a tenant becomes a Terraform change. S3 replication needs one rule per tenant, because the replica key is set per rule. The bucket default can name only one key, so every upload must name its tenant's key, and a bucket policy can't check the match for 500 tenants. | More, because each tenant key needs its own Bucket Keys, but never more than the rate without Bucket Keys: at most about 12 M a month, about $35 | 500 tenants × 2 Regions = 1,000 keys: about $1,000 a month, $2,000 after the first rotation, $3,000 after the second. Prod idle costs $3,567 a month (capacity section 1). | 1,000 of the 100,000 keys allowed per Region. A replication configuration holds at most 1,000 rules, which caps a bucket pair at about 1,000 tenants. |
 | 4. Dedicated key per tenant, opt-in (later): a key we hold, or one in the tenant's own AWS account | Option 3 for the tenants that ask. A key held by the customer lets them cut off the service's access to their data. | Option 3's mechanics for a few tenants: a Terraform change and one replication rule per tenant. | Small | $2 a month per tenant, up to $6 after two rotations | Negligible |
 
 **Recommendation: option 2 for v1, with option 4 as the path for tenants that need a dedicated key.**
@@ -584,8 +607,10 @@ Aurora storage stays under one shared key in every option, because a cluster has
   hits the replication rule limit, without stronger isolation from the service's own roles. Large SaaS teams usually
   sell dedicated keys to the tenants that require them rather than give one to every small tenant.
 - **Moving to option 4 needs no data migration.** Object keys already start with `tenants/{tenant_id}/` (data model
-  4.2). For a tenant that moves to a dedicated key: Terraform creates the key pair and a replication rule for that
-  prefix with the tenant's Osaka key; the API names the tenant's key on every new upload; the tenant's field data keys
+  4.2). For a tenant that moves to a dedicated key: Terraform creates the key pair and, for both files bucket pairs, a
+  replication rule for that prefix with the tenant's Osaka key; the key policy gives the same uses as the files key to
+  the API, the scan worker, the replication role and GuardDuty Malware Protection's role on the large-file bucket; the
+  API names the tenant's key on every new upload; the tenant's field data keys
   are re-wrapped with `ReEncrypt`. Existing objects stay under the shared key until the data lifecycle deletes them,
   at most 97 days later (90 days of retention plus 7 days for deletion). No copy job is needed.
 - **Revisit when:** a tenant contract requires a dedicated or customer-held key; tenant offboarding needs
@@ -829,14 +854,14 @@ teardown removes (decision 19). From the day prod is created it holds:
 | Its own deploy role and the OIDC trust it uses | The environment's deploy role is destroyed too, and a key whose only administrator is gone can't be changed or scheduled for deletion. |
 | A trail for the archive buckets' data events and, from teardown, management events, writing to a small bucket under the audit key | EventBridge sees CloudTrail events only while a trail is logging. While prod runs, the organization trail (ADR-0006) logs the account's management events, the free copy, and EventBridge sees them from it; this trail adds management events at teardown, so it doesn't bill a second copy while prod runs (capacity A37). It is needed because the organization trail ends with the shared account. |
 | EventBridge rules in both Regions, an alert topic encrypted with the audit key, and the delivery role between them | The alerts below keep working after teardown |
-| The NFR-19 budget alarm at $7, emailing directly | Needs no topic or key |
+| The NFR-19 budget alarm at $7, emailing directly. The teardown apply creates it; a budget made earlier filters on the `retention = audit-archive` tag, so it never counts prod's spend and can't fire while prod runs (capacity 7.3) | Needs no topic or key |
 
 | Guard | What it stops |
 |---|---|
 | Separate root module and state; environment stacks refer to the archive only by ARN; `prevent_destroy` on the buckets and the key | An environment `terraform destroy` reaching the archive |
 | CI fails a plan that deletes or replaces any resource tagged `retention = audit-archive`, and plans the retained stack with no environment or bootstrap stack present | A refactor that moves them by accident, or a hidden dependency on something teardown removes |
 | Object Lock in compliance mode, 365 days | Deleting or overwriting records, even by the root user; a bucket that still holds objects can't be deleted either |
-| SCP and key policy (decision 13): `PutKeyPolicy`, `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait | Disabling or deleting the key, which would make the locked objects unreadable |
+| SCP and key policy (decision 13): `PutKeyPolicy`, `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait; while prod runs, `PutKeyPolicy` also for the key-admin role (4.4) | Disabling or deleting the key, which would make the locked objects unreadable |
 | Multi-Region key: replica first, then primary | Destroying the key takes at least 60 days; a deleted replica can be re-created from the primary |
 | SCP, on the prod OU (ADR-0006): changes to the archive buckets' policy, lifecycle rules and Object Lock settings only by the retained stack's deploy role | BreakGlass and every other role in the prod account |
 | EventBridge alerts on those calls against the retained resources, and on any SCP change | A change nobody notices |
@@ -847,8 +872,9 @@ Teardown, in order:
    policies. KMS refuses a key policy that names a role that no longer exists, so leaving them in would block every
    later change to the key. The same apply turns the audit key's rotation off (`DisableKeyRotation`): no new records
    are written, so rotating would add cost without protecting anything new. It also turns on management events in
-   the retained trail, before the organization trail can end with the shared account.
-2. Destroy the environment, then its bootstrap stack.
+   the retained trail, before the organization trail can end with the shared account, and creates the $7 budget.
+2. Destroy the environment, then its bootstrap stack. Its last apply lifts `prevent_destroy` on the key-admin role,
+   which step 1 removed from the audit key policy.
 3. Check the next bill (NFR-19).
 
 After teardown:
@@ -868,7 +894,8 @@ After teardown:
   `kms-cmk-not-scheduled-for-deletion` rule.
 - **Reading the archive** needs the audit reader permission set, through IAM Identity Center with MFA. Permission sets
   are managed at the organization level, not in the environment stack.
-- **When retention ends,** a lifecycle rule deletes each object as its retention expires. Then the retained stack's
+- **When retention ends,** each archive bucket's own lifecycle rule, in Tokyo and Osaka, deletes each object a day
+  after its retention expires (NFR-9). Then the retained stack's
   deploy role schedules the key for deletion with the 30-day wait, and the retained stack is destroyed.
 
 dev and staging keep their archive in the environment stack with a 1-day governance-mode lock and 7-day key deletion,
@@ -881,7 +908,7 @@ so they tear down completely.
 | Risk | Why it remains | Mitigation or acceptance |
 |---|---|---|
 | The API role can read every tenant's files | The service serves every tenant; per-tenant keys wouldn't change this (section 5) | Short-lived workload credentials; CloudTrail S3 data events; an alarm on unusual read volume per role; NFR-15's daily match flags any read without an audit record |
-| The deploy roles can rewrite key policies | Whoever may call `PutKeyPolicy` can grant themselves use | Only the deploy roles may (reviewed Terraform from `main`, prod behind an environment approval); the SCP denies everyone else, BreakGlass included (decision 13); an alert on any other attempt; CI checks every key policy. Someone with the management account can lift the SCP; with one maintainer that is the same person, which decision 13 accepts. |
+| The deploy roles can rewrite key policies | Whoever may call `PutKeyPolicy` can grant themselves use | Only the deploy roles may (reviewed Terraform from `main`, prod behind an environment approval), plus the key-admin role, which only BreakGlass may assume and whose every use pages (4.4); the SCP denies everyone else, BreakGlass included (decision 13); an alert on any other attempt; CI checks every key policy. Someone with the management account can lift the SCP; with one maintainer that is the same person, which decision 13 accepts. |
 | BreakGlass can reach file names and messages through an API pod | It has no Decrypt on the fields key and can't add it, but exec into an API pod acts as the pod's role, which unwraps data keys | The exec raises an alert from the Kubernetes audit log (decision 13); the after-action review compares what was done with the approved scope. Accepted. |
 | AWS runs the HSMs, and S3 decrypts on our behalf | No external key store; end-to-end encryption is a non-goal (PRD section 8) | Accepted |
 | Plain text in memory: file bytes while streaming and scanning, data keys, HMAC keys | Processing needs plain text | Graviton memory encryption against physical access; non-root, read-only filesystem, minimal image; scan workers on their own nodes; data keys cached at most 15 minutes |
@@ -946,6 +973,10 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
 - **Phase 4 ADRs.** ADR-0017 records open question 3 (section 5); ADR-0019 confirms GuardDuty Malware Protection for
   files over 2 GB and its role; ADR-0006 confirms AWS Organizations, on which the SCP in 4.4 depends, and keeps the
   retained stack in the prod account.
+
+- **Phase 4 review fixes** ([#41](https://github.com/codewithmuh/secure-file-transfer/issues/41)): egress through VPC
+  endpoints and the proxy (2.2, 2.3, ADR-0021); clamd in its own pods (2.2, ADR-0019); the key-admin role (4.4,
+  ADR-0017); data events in the shared log archive (3.1); the retained budget created at teardown (8.4).
 
 Left for later: every check in 9.2 that needs an AWS account waits for the AWS profile, and the on-demand rotation
 rehearsal (7.1) runs in the first staging build.
