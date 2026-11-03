@@ -80,7 +80,7 @@ Run `make` with no arguments to list every command.
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
-docs/                    PRD, architecture, ADRs, runbooks (threat model: placeholder until phase 3)
+docs/                    PRD, architecture, threat model, ADRs, runbooks
 services/api-python/     FastAPI sample service (to be replaced by the API service)
 services/api-go/         Go sample service (stays only if an ADR gives Go a job)
 compose.yaml             local run with production-like hardening
