@@ -67,6 +67,7 @@ flowchart TB
         files2[("S3: files replica")]
         audit2[("S3: audit archive replica")]
         ses2["SES"]
+        web2[("S3: web app bundle")]
     end
     browser --> r53
     r53 --> cf
@@ -93,6 +94,8 @@ flowchart TB
     db -. "replication" .-> db2
     files -. "replication with RTC" .-> files2
     audit -. "replication" .-> audit2
+    api -. "security-critical records" .-> audit2
+    web -. "copy" .-> web2
 ```
 
 The backend is **one codebase**: the API service and every worker are built from the same image with different entry
@@ -104,13 +107,13 @@ How file bytes reach a recipient's browser depends on open question 8 (section 4
 | Web app (S3 + CloudFront) | React app for members, admins, recipients and uploaders (FR-30) | CDN | CloudFront fails over to the Osaka copy of the bundle. The API is unaffected. |
 | API service | Every HTTP call: sign-in, policy checks, upload start and completion, verification, download access, revocation, audit writes | Pods across 3 AZs, at least 3; autoscaled on request rate and CPU | The load balancer stops sending traffic to failed pods. Uploads resume from their completed parts (NFR-3). |
 | Outbox relay | Publishes rows from the outbox table to SQS (section 5.3) | 2 replicas; rows are claimed with `FOR UPDATE SKIP LOCKED` | Messages wait safely in PostgreSQL. An alert fires when the oldest unpublished row is over 2 minutes old. |
-| Scan worker | Scans each uploaded file and records the result (FR-16 to FR-19) | Queue depth | Files stay in `scanning` and are never downloadable. Retries with backoff, then the dead-letter queue raises an alert. |
-| Notification worker | Sends links, codes and notices through SES (NFR-7) | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert. |
+| Scan worker | Scans each uploaded file and records the result (FR-16 to FR-19) | Queue depth | Files stay in `scanning`, never downloadable. Retries with backoff; the last retry marks the file `scan-failed`, and the dead-letter queue raises an alert. |
+| Notification worker | Creates each link token and code, stores only its hash, and sends it through SES (NFR-7). Outbox messages carry IDs, never secrets. | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert. |
 | Lifecycle jobs | Expiry, deletion in both regions, daily reconciliation, audit archiving (section 4.5, 5.2) | Scheduled jobs | Work waits for the next run. An alert fires on lag (NFR-8, NFR-15). |
 | PostgreSQL | Tenants, users, transfers, upload requests, files, sessions, audit events, outbox | Instance size; read replica for audit search | Fails over to another AZ automatically. For a region, the Osaka replica is promoted (section 7). |
 | S3: files | File contents, keyed by tenant and file ID, never by file name | Managed | Regional service. Replicates to Osaka with a 15-minute commitment for 99.99 % of objects (NFR-10). |
-| S3: audit archive | Immutable copy of every audit record (NFR-15) | Managed | The archive job retries; records are safe in PostgreSQL meanwhile. |
-| SQS | Work queues with dead-letter queues | Managed | Regional service. The outbox keeps every message until it is published. |
+| S3: audit archive | Immutable copy of every audit record (NFR-15). Security-critical records (revocations, lockouts, deactivations, download grants) are written straight to both regions. | Managed | The archive job retries; records are safe in PostgreSQL meanwhile. |
+| SQS | Work queues with dead-letter queues | Managed | Regional service. The outbox keeps every message until it is published; after a regional failover, unprocessed messages are published again (5.3, section 7). |
 | Rate-limit counters | Counters shared by all API replicas (NFR-14) | Depends on the ADR | Sign-in and verification fail closed; phase 3 decides the rest. |
 | SES | Outgoing email in Tokyo; a verified, production-approved setup in Osaka for failover | Managed | The notification worker retries; failover sends from Osaka (PRD section 10). |
 | KMS, Secrets Manager | Encryption keys for files, database, backups and logs; runtime secrets | Managed | Regional services. Multi-region keys and secret replicas exist in Osaka. |
@@ -121,17 +124,23 @@ How file bytes reach a recipient's browser depends on open question 8 (section 4
 
 - One VPC across 3 Availability Zones: public subnets for the load balancer and NAT gateways, private subnets for
   Kubernetes nodes, isolated subnets for PostgreSQL.
-- VPC endpoints for S3, SQS, KMS, Secrets Manager, ECR and STS, so traffic to AWS services stays off the internet and
-  off the NAT gateways.
+- VPC endpoints for S3, SQS, KMS, Secrets Manager, ECR and STS keep most traffic to AWS services off the internet and
+  the NAT gateways. SES API calls and writes to Osaka still go through NAT.
 - Each workload gets its own IAM role with only what it needs. The API can start and complete uploads and issue
   download access; the scan worker can read files and set their tags; only the lifecycle jobs can delete.
 
 ### 3.2 Osaka pilot light
 
-Running all the time: the PostgreSQL replica, S3 replica buckets for files and the audit archive, replicas of the KMS
-keys and secrets, a production-approved SES setup, a copy of the web app bundle, and the container images. Compute
-starts only on failover (section 7). Candidate: keep a Kubernetes control plane in Osaka with no worker nodes, so
-failover only adds nodes; the compute ADR confirms it against the RTO.
+Running all the time, so a failover only has to add compute (section 7):
+
+- **Data:** the PostgreSQL replica, S3 replica buckets for files and the audit archive, replicas of the KMS keys and
+  secrets.
+- **Network:** the VPC, subnets, NAT gateways, VPC endpoints, load balancer and WAF.
+- **Services:** SQS queues and dead-letter queues (idle), the rate-limit store at its smallest size, a
+  production-approved SES setup (SES is available in Osaka), a copy of the web app bundle, and the container images.
+- **Control:** a Kubernetes control plane with no worker nodes and Argo CD installed, so Argo CD starts syncing from Git
+  as soon as nodes join. Terraform state lives in an S3 bucket replicated to Osaka. The compute ADR confirms this
+  against the RTO.
 
 ### 3.3 Environments and delivery
 
@@ -139,7 +148,7 @@ failover only adds nodes; the compute ADR confirms it against the RTO.
 |---|---|---|
 | dev | Tokyo only, smallest sizes | Torn down when idle |
 | staging | Prod's shape at smaller sizes, including the Osaka pilot light | Where release rehearsals and drills run first |
-| prod | Section 3.1 and 3.2 | Destroyed after the operating period, except the audit archive (NFR-19) |
+| prod | Section 3.1 and 3.2 | Destroyed after the operating period, except the audit archive and its KMS key (NFR-19) |
 
 ```mermaid
 flowchart LR
@@ -156,7 +165,8 @@ flowchart LR
 ```
 
 The same image digests and the same web app bundle move from dev to staging to prod (NFR-18). Terraform owns AWS
-resources; Argo CD owns what runs in Kubernetes.
+resources; Argo CD owns what runs in Kubernetes; the delivery pipeline promotes the web app bundle (a versioned copy
+that CloudFront points to). A rollback reverts the version change in the deploy config, for both.
 
 ## 4. Key flows
 
@@ -183,32 +193,44 @@ sequenceDiagram
         API-->>M: pre-signed part URLs, valid up to 15 min
         M->>S3: PUT parts in parallel
         M->>API: POST /v1/files/{fid}/complete
-        API->>DB: check the transfer is still open
-        API->>S3: CompleteMultipartUpload
-        API->>DB: file to scanning, outbox scan message, audit, in one transaction
+        API->>S3: CompleteMultipartUpload, then HeadObject
+        API->>DB: lock the transfer row, re-check its state, the size and the limits
+        API->>DB: file to scanning, outbox scan message, audit, in the same transaction
     end
     M->>API: POST /v1/transfers/{id}/send
-    API->>DB: transfer to submitted, with audit
+    API->>DB: lock the transfer row, mark submitted, evaluate
     SW->>Q: receive scan message
     SW->>S3: read the object
-    SW->>DB: file to clean, infected or unscannable, with audit
-    alt every file shareable and transfer submitted
-        SW->>DB: transfer to sent, outbox notify message
+    SW->>DB: file to clean, infected, unscannable or scan-failed, with audit
+    SW->>DB: lock the transfer row, evaluate
+    alt submitted and every file shareable
+        Note over SW,DB: evaluate moves the transfer to sent, with an outbox notify message
         NW->>Q: receive notify message
+        NW->>DB: create each recipient's link token, store its hash
         NW->>E: one email per recipient, with its link
         NW->>DB: audit email sent
-    else a file is not shareable
-        SW->>DB: transfer to held, outbox message to the member
+    else submitted and a file is not shareable
+        Note over SW,DB: evaluate moves the transfer to held, with an outbox message to the member
+    else files still scanning, or not yet submitted
+        Note over SW,DB: evaluate changes nothing
     end
 ```
 
 - File bytes go straight from the browser to S3 in parts. The API never handles them, but it decides every state
-  change: it starts the upload, issues part URLs and completes the upload only after checking that the transfer is
-  still open (NFR-6).
+  change. It issues part URLs only for the parts the declared size needs, each signed with its exact `Content-Length`.
+  After completing the upload it checks the object's real size against the declared size and the limits (FR-2), and
+  re-checks the transfer under a row lock, so a revocation that lands meanwhile wins (NFR-6). If either check fails,
+  the object is deleted and the file is rejected.
 - Resuming an upload: the web app asks the API which parts S3 already has, and sends only the missing ones (NFR-3).
-- Whichever happens second, the member pressing send or the last scan finishing, triggers the notification (FR-5).
+- **One evaluation, under a lock.** The send call and every scan result lock the transfer row and run the same
+  evaluation: sent if submitted and every file is shareable, held if submitted and any file isn't, otherwise nothing.
+  Whichever happens last triggers the notification, and two scans finishing together can't both miss it (FR-5).
+- A scan that keeps failing ends in `scan-failed`, not stuck in `scanning`: the last retry records that state before
+  the message goes to the dead-letter queue, and the transfer is held (FR-19).
 - Every message to a worker goes through the outbox (section 5.3), so a crash between the database write and the queue
   send loses nothing.
+- Secrets never travel through the outbox or SQS: the notification worker creates each link token, stores only its
+  hash, and emails it.
 
 ### 4.2 Verify and download (UC-1, FR-14, FR-15)
 
@@ -221,31 +243,40 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant NW as Notification worker
     participant E as SES
-    R->>API: GET /v1/links/{token}
-    API->>DB: look up the link by token hash
+    R->>API: POST /v1/links/resolve with the token in the body
+    API->>DB: look up the link by token hash, check expiry
     API-->>R: verification required, no file names
-    R->>API: POST /v1/links/{token}/codes
+    R->>API: POST /v1/links/codes with the token
     API->>RL: check per-IP and per-address limits
-    API->>DB: store code hash, outbox send-code message, audit
+    API->>DB: outbox send-code message, audit
+    NW->>DB: create the code, store its hash
     NW->>E: send the code to the invited address
-    R->>API: POST /v1/links/{token}/sessions with the code
-    API->>DB: check code, attempts and lockout, then create session, with audit
+    R->>API: POST /v1/links/sessions with the token and the code
+    API->>DB: check code, attempts, lockout and expiry, then create session, with audit
     API-->>R: session cookie, HttpOnly and Secure
     R->>API: GET /v1/session/files
     API-->>R: shareable files only
     R->>API: POST /v1/session/files/{fid}/downloads
-    API->>DB: check revocation, expiry and limit, then commit the audit record
+    API->>DB: check revocation and expiry, count the download if under the limit, commit the audit record
+    API->>API: write the download grant to the audit archive in both regions
     API-->>R: download access, mechanism per open question 8
 ```
 
-- Link tokens and codes are stored only as hashes. A token alone returns nothing about the transfer (FR-14).
-- The audit record for a download is committed before any download access is returned (NFR-15, fail closed).
+- The emailed link carries the token in the URL fragment (`/t#token`), which browsers never send to servers; the web
+  app posts it in the request body. Tokens therefore never appear in load balancer, CDN or WAF logs, or in `Referer`
+  headers.
+- Link tokens and codes are stored only as hashes. A token alone returns nothing about the transfer (FR-14). Every call
+  compares `expires_at` with the current time, so a link stops working the moment it expires, not when the next job
+  runs (FR-21).
+- The download limit is enforced by one conditional update (`count = count + 1 WHERE count < limit`) in the same
+  transaction as the audit record, so parallel requests can't exceed it (FR-4). The audit record is committed, and the
+  grant written to both regions' archive, before any download access is returned (NFR-10, NFR-15).
 - **Download mechanism (open question 8, decided in phase 3).** The two leading candidates:
 
 | Candidate | How it meets FR-6, FR-14 and NFR-6 | Cost |
 |---|---|---|
 | Stream through the API | Each request carries the session cookie; HTTP Range requests resume a download within the same session; the stream re-checks state at least every 30 s, so revocation stops it within 60 s; counting happens on the server. | File bytes pass through Kubernetes, so pods need bandwidth headroom, and a deploy cuts long downloads (they resume). |
-| CDN signed cookies bound to the session | CloudFront serves the S3 object with caching off; the API issues signed cookies for that file's path, valid ≤ 60 s, which the web app refreshes while the session lasts; a browser retry with Range uses the refreshed cookie. | Counting downloads and enforcing the limit is harder, because the server sees cookie refreshes, not bytes. |
+| CDN signed cookies bound to the session | CloudFront serves the S3 object with caching off; the API issues signed cookies for that file's path, valid ≤ 60 s, which the web app refreshes while the session lasts; a browser retry with Range uses the refreshed cookie. | Counting downloads and enforcing the limit is harder, because the server sees cookie refreshes, not bytes. CloudFront checks the cookie only when a request starts, so meeting NFR-6 needs the web app to download in Range chunks of 60 s or less. |
 
 ### 4.3 Request files (UC-2)
 
@@ -261,10 +292,12 @@ sequenceDiagram
     M->>API: POST /v1/upload-requests with email, expiry, message
     API->>DB: insert request, outbox invite message, audit
     NW->>U: email with the upload link
-    U->>API: verify as in 4.2, steps 1 to 10
+    U->>API: verify as in 4.2, steps 1 to 11
     U->>API: upload files as in 4.1, under the request
     SW->>DB: each shareable file becomes available, outbox notice to the member
+    SW->>DB: each blocked file, outbox notice to the member and the uploader
     NW->>M: email that files arrived
+    M->>API: POST /v1/files/{fid}/downloads, same checks and audit as 4.2
 ```
 
 Each received file follows its own retention clock from its upload (FR-13). Revoking or expiring the request stops new
@@ -304,7 +337,7 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant T as S3 files, Tokyo
     participant O as S3 files, Osaka
-    J->>DB: mark transfers past expiry as expired, with audit
+    J->>DB: record expiry of transfers and upload requests past expires_at, with audit
     J->>DB: find data whose deletion trigger has passed
     J->>T: delete every version of each object
     J->>O: delete every version of the replica
@@ -313,20 +346,25 @@ sequenceDiagram
     J->>T: daily, list objects
     J->>O: daily, list objects
     J->>DB: compare with metadata, report leftovers, delete orphans older than 24 h
+    J->>T: list unfinished multipart uploads, abort those with no new part for 24 h
 ```
 
-A lifecycle rule on both buckets also expires noncurrent object versions after 7 days, as a safety net behind the job.
+Lifecycle rules on both buckets expire noncurrent object versions after 7 days and abort multipart uploads still
+unfinished after 7 days, as safety nets behind the job. The job records expiry for deletion; the API already refuses an
+expired link (4.2).
 
 ### 4.6 Coverage of the PRD
 
 | PRD | Where |
 |---|---|
-| UC-1, FR-1 to FR-9 | 4.1, 4.2 |
+| UC-1, FR-1 to FR-6 | 4.1, 4.2 |
+| FR-7 to FR-9: recipient status, first-download notice, expiry extension | Status is read from audit events; the first download adds an outbox notice (4.2); an extension is a checked update of `expires_at` |
 | UC-2, FR-10 to FR-13 | 4.3 |
 | UC-3, FR-20 | 4.4 |
 | UC-4, FR-27 to FR-29 | 5.2 (audit search and export read PostgreSQL) |
-| UC-5, FR-22 to FR-26 | API service and PostgreSQL; no asynchronous flow |
-| UC-6, FR-34, FR-35 | Operator API, section 7 |
+| UC-5, FR-22 to FR-26 | API service and PostgreSQL; invitations go through the outbox; deactivations are security-critical records (5.2) |
+| UC-6, FR-34 | Operator API; section 7 for disaster recovery |
+| FR-35 break-glass access | Phase 3 (security design) |
 | FR-14, FR-15 verification | 4.2 |
 | FR-16 to FR-19 scanning | 4.1 |
 | FR-21 lifecycle | 4.5 |
@@ -346,22 +384,29 @@ object keys or logs. The tenant isolation suite (NFR-12) tests the data-access l
    happen without its record. The application's database role can insert audit rows but not update or delete them.
 2. For downloads, the audit record is committed before download access is returned.
 3. The archive job copies new audit rows to the Object Lock bucket at least every minute (NFR-15), and the bucket
-   replicates to Osaka. Security-critical records (revocations, lockouts, deactivations) are also written straight
-   to both regions (4.4).
-4. Audit search and export (FR-28, FR-29) read PostgreSQL; the table is partitioned by month, and partitions older
-   than 365 days are dropped (NFR-9).
+   replicates to Osaka. Security-critical records (revocations, lockouts, deactivations, download grants) are also
+   written straight to both regions (4.2, 4.4).
+4. Audit search and export (FR-28, FR-29) read PostgreSQL. The table is partitioned by month; a daily job deletes rows
+   older than 365 days and drops partitions once they are empty. Archived objects carry a 365-day Object Lock
+   retention, and a lifecycle rule deletes them when it ends (NFR-9).
 
 ### 5.3 Transactional outbox
 
 Work for the workers is written to an outbox table in the same transaction as the change that causes it. The outbox
 relay publishes rows to SQS and marks them sent. Delivery is at least once, so every consumer is idempotent: it records
 the message ID it processed and skips duplicates. The trace context travels in the message, so one trace covers the
-API call, the queue and the worker.
+API call, the queue and the worker. Messages carry IDs, never link tokens or codes.
+
+After a regional failover, every outbox message from the last 24 hours that has no processed-message record is
+published again. That recovers work that was sitting in Tokyo's queues when the region failed (section 7); consumers
+skip anything already done.
 
 ### 5.4 Idempotent API requests
 
-Every `POST` that creates something accepts an `Idempotency-Key` header. The API stores the key and the response for
-24 hours per tenant, so a retried request after a timeout doesn't create a second transfer or send a second email.
+Every `POST` that creates something accepts an `Idempotency-Key` header. The key is scoped to the caller (member, API
+key or link session) and stored with a fingerprint of the request body for 24 hours. A retry with the same key and body
+gets the stored response; the same key with a different body is rejected with 409. Calls that grant access (download
+access, code requests, sessions) never replay a stored response: they are checked and audited every time.
 
 ### 5.5 Observability
 
@@ -370,12 +415,27 @@ The API and workers use OpenTelemetry for traces and Prometheus-format metrics. 
 depend on (scan latency, time to shareable, queue age, outbox age, replication lag) are metrics with alerts, and every
 alert links to a runbook (NFR-17).
 
+CloudFront and WAF logs go to S3 buckets in Tokyo, not CloudWatch Logs, because a CloudFront-scoped WAF can only log to
+CloudWatch in us-east-1 (NFR-21).
+
+### 5.6 Operational data retention
+
+Data this design adds beyond the PRD's data lifecycle table; the data model
+([#13](https://github.com/codewithmuh/secure-file-transfer/issues/13)) carries it:
+
+| Data | Kept for |
+|---|---|
+| Outbox rows after they are sent | 7 days (re-publishing after a failover looks back 24 hours) |
+| Processed-message records | 14 days, as long as a message can stay in a dead-letter queue |
+| SQS messages | 4 days in a work queue, 14 days in a dead-letter queue |
+| Stored idempotency responses | 24 hours |
+
 ## 6. Failure handling
 
 | Failure | How we notice | What happens | PRD target |
 |---|---|---|---|
-| Scan engine down or slow | Scan queue age, scan errors | Files stay in `scanning` and can't be downloaded. Retries with backoff; after the last retry the message goes to the dead-letter queue and an alert fires. | FR-19, NFR-5 |
-| Email provider failing or throttling | Send errors, bounce and complaint events | Retries with backoff. Code requests beyond the retry window return a retryable error. | NFR-7 |
+| Scan engine down or slow | Scan queue age, scan errors | Files stay in `scanning` and can't be downloaded. Retries with backoff; the last retry marks the file `scan-failed`, which holds its transfer, and the message goes to the dead-letter queue with an alert. | FR-19, NFR-5 |
+| Email provider failing or throttling | Send errors, bounce and complaint events | Retries with backoff. If a code can't be sent within NFR-7, an alert fires and the web app offers to send a new code. | NFR-7 |
 | Outbox relay stopped | Outbox age | Messages wait in PostgreSQL; nothing is lost. | NFR-5 |
 | API pod or node lost | Probes, load balancer health checks | Traffic moves to healthy pods. Uploads and downloads resume. | NFR-1, NFR-3 |
 | One AZ lost | AWS health events, error rate | PostgreSQL fails over to another AZ, typically within a minute; pods are rescheduled in the other two AZs. | NFR-11: ≤ 5 min |
@@ -383,7 +443,7 @@ alert links to a runbook (NFR-17).
 | Audit archive behind | Archive lag | Records are safe in PostgreSQL; the job catches up. Revocation returns an error, and can be retried, if the two-region write fails. | NFR-15 |
 | Rate-limit counters unavailable | Errors from the store | Sign-in and verification fail closed; phase 3 decides for other calls. | NFR-14 |
 | File replication lagging | Replication latency metrics | An alert fires; Tokyo is unaffected. | NFR-10 |
-| Bad deploy | Error-rate and latency burn alerts | Argo CD rolls back to the previous version. | NFR-18: ≤ 10 min |
+| Bad deploy | Error-rate and latency burn alerts | Revert the version change in the deploy config; Argo CD syncs the previous version. The web app bundle rolls back the same way. | NFR-18: ≤ 10 min |
 | Bad migration or data corruption | Errors, reconciliation report | Point-in-time restore to a new database, then re-apply security-critical changes from the audit archive. | NFR-11: ≤ 2 h |
 
 ## 7. Disaster recovery outline
@@ -395,14 +455,16 @@ drill, not measurements.
 |---|---|
 | Confirm the regional failure and decide to fail over | 10 min |
 | Promote the Osaka PostgreSQL replica to primary | 5 min |
-| Start compute in Osaka; Argo CD deploys the current versions | 20 min |
+| Add worker nodes in Osaka; Argo CD deploys the current versions with every worker scaled to zero | 20 min |
 | Re-apply security-critical changes from the Osaka audit archive | 5 min |
+| Re-publish unprocessed outbox messages from the last 24 hours, then scale the workers up | 5 min |
 | Switch DNS and the CDN origin to Osaka | 5 min |
-| Verify with the synthetic probe, including a real email from Osaka | 10 min |
+| Verify with the synthetic probe, including a real email from Osaka | 5 min |
 | **Total** | **55 min**, inside the 1-hour RTO |
 
-Files uploaded in the last minutes before the failure may not have reached Osaka; the service shows them as
-unavailable (NFR-10).
+Workers stay at zero until the security-critical changes are back, so no worker acts on a revocation the replica
+hadn't received. Files uploaded in the last minutes before the failure may not have reached Osaka; the service shows
+them as unavailable (NFR-10).
 
 ## 8. Runtime contract (every service)
 
