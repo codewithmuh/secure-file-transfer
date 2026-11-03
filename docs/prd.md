@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft, in review ([#2](https://github.com/codewithmuh/secure-file-transfer/issues/2)) |
+| Status | Accepted as the v1 baseline ([#2](https://github.com/codewithmuh/secure-file-transfer/issues/2)); changes go through pull requests |
 | Owner | Muhammad Rashid |
 | Last updated | 2026-11-03 |
 | Next step | Architecture and system design (planning phase 2) |
@@ -51,20 +51,20 @@ they get access to one transfer or one upload request at a time.
 1. A member creates a transfer: chooses files, adds recipient email addresses, sets an expiry, and optionally adds a
    message and a download limit.
 2. The files upload from the browser. An interrupted upload resumes where it stopped.
-3. Each file is scanned for malware. When every file is clean, each recipient gets an email with a link.
+3. Each file is scanned for malware. When every file is shareable (FR-16), each recipient gets an email with a link.
 4. A recipient opens the link, proves they control the invited address, and downloads the files one by one.
 5. The member sees, for each recipient, whether they were notified, verified and downloaded, and which files.
 
-If a file is infected, its scan keeps failing, or it can't be scanned and tenant policy blocks unscannable files
-(FR-18), the transfer is **held**: no recipient is notified, and the member sees which file failed and why. The member
+If any file isn't shareable (it is infected, its scan keeps failing, or it can't be scanned and tenant policy blocks
+unscannable files), the transfer is **held**: no recipient is notified, and the member sees which file failed and why. The member
 can remove that file and send the rest, or cancel the transfer.
 
 ### UC-2 Request files from someone outside the company
 
 1. A member creates an upload request for one external email address, with an expiry and an optional message.
 2. The uploader gets an email, opens the link, verifies their address and uploads files (same limits as UC-1).
-3. Each file is scanned. Clean files, and unscannable files if tenant policy allows them (FR-18), become available to
-   the member, who is notified. Other files are blocked, and both the member and the uploader are told.
+3. Each file is scanned. Shareable files (FR-16) become available to the member, who is notified. Other files are
+   blocked, and both the member and the uploader are told.
 
 ### UC-3 Revoke access
 
@@ -101,8 +101,8 @@ Priority: **Must** means v1 does not ship without it. **Should** means it is in 
 | FR-2 | Files are up to 5 GB each and 20 GB per transfer. Uploads are resumable: after an interruption, completed parts are not sent again. | Must |
 | FR-3 | Expiry is between 1 hour and 30 days, capped by tenant policy. The default is 7 days, or the tenant's maximum if that is shorter. | Must |
 | FR-4 | An optional download limit per recipient per file (1–100). | Must |
-| FR-5 | Recipients are notified only after every file in the transfer is clean, or unscannable and allowed by tenant policy (FR-18). A transfer with a blocked file is held (UC-1). | Must |
-| FR-6 | Recipients download each file individually. There is no server-side zip of several files. An interrupted download resumes where it stopped, and resuming within the same verified session doesn't count as a new download (FR-4). | Must |
+| FR-5 | Recipients are notified only after every file in the transfer is shareable (FR-16). Otherwise the transfer is held (UC-1). | Must |
+| FR-6 | Recipients download each file individually. There is no server-side zip of several files. An interrupted download of a large file can be resumed without using up the download limit (FR-4), and resuming can't be used to get around that limit. Phase 3 designs how (open question 8). | Must |
 | FR-7 | The member sees per-recipient status: notified, verified, and downloaded (which files, when). | Must |
 | FR-8 | The member can choose to be emailed on the first download of a transfer. | Should |
 | FR-9 | The member can extend the expiry of an active transfer, within tenant policy. | Should |
@@ -113,23 +113,23 @@ Priority: **Must** means v1 does not ship without it. **Should** means it is in 
 |---|---|---|
 | FR-10 | A member creates an upload request for one external email address, with an expiry (same range as FR-3) and an optional message. | Must |
 | FR-11 | The uploader can upload up to 50 files, up to 5 GB each and 20 GB in total, with resumable uploads. | Must |
-| FR-12 | Clean files become available to the requesting member, who is notified. Blocked files are reported to both sides. | Must |
+| FR-12 | Shareable files (FR-16) become available to the requesting member, who is notified. Blocked files are reported to both sides. | Must |
 | FR-13 | Files received through an upload request are kept for the tenant's retention period, counted from each file's upload (default 30 days, 1–90 days), then deleted. The request expiring or being revoked stops new uploads but doesn't shorten this. The member can delete received files earlier. | Must |
 
 ### Verification of external people
 
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-14 | Before any file name, message or content is shown, a recipient or uploader must prove they control the invited email address at that moment. A forwarded or leaked link alone grants nothing. The leading mechanism is a one-time code emailed to that address; security design (phase 3) confirms it. | Must |
+| FR-14 | Before any file name, message or content is shown, a recipient or uploader must prove they control the invited email address at that moment. A forwarded or leaked link alone grants nothing, and neither does a forwarded download address: downloads work only within the verified session (FR-15, open question 8). The leading mechanism is a one-time code emailed to that address; security design (phase 3) confirms it. | Must |
 | FR-15 | A successful verification is bound to that browser session and that transfer or request, and it expires (NFR-14). | Must |
 
 ### Malware scanning
 
 | ID | Requirement | Priority |
 |---|---|---|
-| FR-16 | Every uploaded file is scanned before it can be downloaded. Each file has a visible state: uploading, scanning, clean, infected, unscannable or scan-failed. | Must |
+| FR-16 | Every uploaded file is scanned before it can be downloaded. Each file has a visible state: uploading, scanning, clean, infected, unscannable or scan-failed. A file is **shareable** when it is clean, or unscannable and allowed by tenant policy (FR-18); only shareable files can be downloaded. | Must |
 | FR-17 | Infected files are quarantined and can never be downloaded by anyone, including the sender, tenant admins and platform operators. | Must |
-| FR-18 | Files the scanner can't inspect, such as password-protected archives, are blocked by default. Tenant policy can allow them, in which case recipients see a warning. | Must |
+| FR-18 | Files the scanner can't inspect, such as password-protected archives, are blocked by default. Tenant policy can allow them, in which case anyone downloading them (recipient or member) sees a warning. | Must |
 | FR-19 | A scan that fails because of an engine error is retried. If it keeps failing, the file stays blocked and an operator alert fires. The tenant policy for unscannable files never applies to scan failures. | Must |
 
 ### Control and lifecycle
@@ -141,16 +141,21 @@ Priority: **Must** means v1 does not ship without it. **Should** means it is in 
 
 #### Data lifecycle
 
-This table is the single source for when data is deleted. Deletion is complete in every copy (primary region, DR region
-and backups) within 7 days of the trigger (NFR-8).
+This table is the single source for when data is deleted. File contents are gone from every copy (primary region, DR
+region and backups) within 7 days of the trigger (NFR-8). Database records leave the live database at the trigger and
+age out of database backups within the 14-day restore window (NFR-11).
 
 | Data | Deletion is triggered when |
 |---|---|
-| Files of a transfer, including quarantined ones | The transfer expires, is revoked or is deleted by the member |
+| Files of a transfer, including quarantined ones | The transfer expires or is revoked |
+| Files removed from a held transfer, or of a cancelled transfer | The file is removed or the transfer is cancelled |
 | Files received through an upload request | Their retention period ends (FR-13), or the member deletes them |
 | Parts of an upload that never completed | 24 hours after the last part arrived, or when the transfer or request is revoked |
-| Metadata of transfers and upload requests | 365 days after the transfer or request ended, so audit records stay readable |
+| Stored objects that no transfer or request refers to (for example parts sent after a revocation) | 24 hours after they appear; the reconciliation job (NFR-8) finds them |
+| Metadata of transfers and upload requests | When no audit record refers to it any more, so audit records stay readable (at most 365 days after the item's last event) |
 | Audit records | 365 days after they were written (NFR-9) |
+| Verification codes and sessions | When they expire (NFR-14) |
+| Application, load balancer, CDN and WAF logs | 90 days after they were written |
 
 ### Tenant administration and sign-in
 
@@ -193,27 +198,27 @@ the last column are current candidates; the phase 4 ADRs confirm or replace them
 
 | ID | Quality | Target | How it is measured |
 |---|---|---|---|
-| NFR-1 | Availability | 99.9 % of valid requests to the API and the download path succeed, over a rolling 28 days while prod runs. | SLI from load-balancer and service metrics (5xx and timeouts count as failures), plus a synthetic probe every 5 minutes that runs the full send → verify → download journey from a dedicated synthetic tenant. That tenant is excluded from product metrics and exempt from the per-address verification limits only (NFR-14). Planned failover drill windows are logged and reported separately, not counted. |
+| NFR-1 | Availability | 99.9 % of valid requests to the API and the download path succeed, over a rolling 28 days while prod runs. | SLI from load-balancer and service metrics (5xx and timeouts count as failures), plus a synthetic probe every 5 minutes that runs the full send → verify → download journey from a dedicated synthetic tenant to the probe's own mailbox on our domain. That tenant is excluded from product metrics, and only the probe mailbox's addresses are exempt from the per-address verification limits (NFR-14). Planned drill windows that take prod down are logged and reported separately, not counted. A real regional failure is expected to breach this target; NFR-11 bounds the recovery. |
 | NFR-2 | API latency | p95 ≤ 300 ms and p99 ≤ 1 s for API calls at design load, excluding the time spent moving file bytes. | Server-side latency histograms; k6 load test. |
 | NFR-3 | Upload speed and resume | A 5 GB file uploads over a 100 Mbit/s link in ≤ 8 minutes (line rate plus ≤ 10 % overhead). After the connection drops, the upload resumes without re-sending completed parts. | Automated browser test on a throttled network, with a forced disconnect halfway through. |
 | NFR-4 | Download start | p95 ≤ 1 s from a verified recipient's click to the first byte. | Real-user timing in the web app; synthetic probe. |
-| NFR-5 | Time to shareable | From the last upload completing to every file clean and the recipient emails handed to the email provider (for an upload request: the files available to the member): p95 ≤ 2 minutes when the largest file is up to 100 MB; p95 ≤ 15 minutes for any transfer or request up to the 20 GB limit. | Timestamps on file state changes; traces. |
-| NFR-6 | Revocation | No new download or upload can start ≤ 5 s after revocation. A download URL stops working ≤ 60 s after it was issued, and an upload-part URL ≤ 15 minutes after. An upload only completes through a server-side call that checks the current state, so a revoked transfer or request never accepts a new file. | Automated test that revokes during an active download and an active upload, then retries both. |
+| NFR-5 | Time to shareable | For a transfer, from the last upload completing to every file shareable and the recipient emails handed to the email provider: p95 ≤ 2 minutes when the largest file is up to 100 MB; p95 ≤ 15 minutes for any transfer up to the 20 GB limit. For an upload request, the same targets apply to each file, from its upload completing to it being available to the member. | Timestamps on file state changes; traces. |
+| NFR-6 | Revocation | No new download or upload can start ≤ 5 s after revocation, and a download already in progress stops ≤ 60 s after revocation. Upload parts sent after revocation are never assembled into a file. An upload only completes through a server-side call that checks the current state, so a revoked transfer or request never accepts a new file. | Automated test that revokes during an active download and an active upload, then retries both. |
 | NFR-7 | Email | Verification and notification emails are handed to the email provider within p95 ≤ 10 s. | Service metrics; email provider delivery events. |
 | NFR-8 | Data deletion | A file's contents are deleted from every copy (primary region, DR region and backups) ≤ 7 days after its deletion trigger in the data lifecycle table (section 5). Audit records are kept. | A daily reconciliation job that compares metadata with storage in both regions and reports any leftovers. |
-| NFR-9 | Retention | Audit records are kept for 365 days and then deleted. Received files follow FR-13. Metadata of expired transfers is kept for 365 days so audit records stay readable. | Lifecycle rules plus the reconciliation job. |
-| NFR-10 | Durability and RPO | No acknowledged upload is lost short of losing the whole Tokyo region. Losing one Availability Zone loses no data (RPO 0). Losing the Tokyo region loses ≤ 5 minutes of metadata and ≤ 15 minutes of uploaded files (the cross-region replication guarantee for files). After a failover, files that hadn't reached Osaka are shown as unavailable, not as broken links. | Measured in AZ-failure and regional-failover drills, with a written report per drill. |
-| NFR-11 | Recovery (RTO) | AZ failure: automatic recovery, RTO ≤ 5 minutes. Tokyo region failure: service restored in Osaka, RTO ≤ 1 hour. Restore after data corruption (for example a bad migration), to any point in the last 14 days: RTO ≤ 2 hours, RPO ≤ 5 minutes. File contents deleted under NFR-8 can't be recovered, by design; restored metadata that points to them is marked deleted. | Timed drills in staging and prod; each drill report records the measured RTO and RPO. |
+| NFR-9 | Retention | Audit records are kept for 365 days and then deleted. Everything else follows the data lifecycle table (section 5). | Lifecycle rules plus the reconciliation job. |
+| NFR-10 | Durability and RPO | No acknowledged upload is lost short of losing the whole Tokyo region. Losing one Availability Zone loses no data (RPO 0). Losing the Tokyo region loses ≤ 5 minutes of metadata, and at most the last 15 minutes of uploads for 99.99 % of files (the commitment of S3 replication with Replication Time Control). After a failover, files that hadn't reached Osaka are shown as unavailable, not as broken links. Security-critical changes (revocations, lockouts, deactivations, download counts) are never lost in a failover or restore; phase 3 designs how. | Measured in AZ-failure and regional-failover drills, with a written report per drill. |
+| NFR-11 | Recovery (RTO) | AZ failure: automatic recovery, RTO ≤ 5 minutes. Tokyo region failure: service restored in Osaka, RTO ≤ 1 hour. Restore after data corruption (for example a bad migration), to any chosen point in the last 14 days, accurate to ≤ 5 minutes: RTO ≤ 2 hours. Changes after that point are lost, except the security-critical changes and audit records that NFR-10 and NFR-15 protect. File contents deleted under NFR-8 can't be recovered, by design; restored metadata that points to them is marked deleted. | Timed drills in staging and prod; each drill report records the measured RTO and RPO. |
 | NFR-12 | Tenant isolation | No API call, link or token gives access to another tenant's data. | An isolation test suite runs in CI on every pull request and against staging, trying every endpoint with another tenant's IDs and tokens. |
 | NFR-13 | Security baseline | Meets OWASP ASVS 5.0 Level 2 for the web app and API. TLS 1.2+ for all traffic. Files, database, backups and logs encrypted at rest with KMS keys. No known critical or high vulnerabilities in a released image. Secrets only in AWS Secrets Manager, never in git. | ASVS checklist in the security design; Trivy and gitleaks in CI; AWS Config rules. |
-| NFR-14 | Abuse resistance | Rate limits per IP address, per account and per tenant on sign-in, verification, link access, uploads and downloads. Starting limits: ≤ 10 failed sign-ins per account per 15 minutes; ≤ 5 verification codes per email address per hour; ≤ 60 link-page requests per IP per minute; ≤ 1,000 API requests per tenant per minute. A verification proof is valid ≤ 10 minutes and allows ≤ 5 attempts; codes have at least 6 digits. After 20 failed attempts in total for one recipient on one transfer or request, that recipient is locked out and the member is told. A verified session lasts ≤ 24 hours. Link tokens carry ≥ 128 bits of randomness. Phase 3 may tighten these numbers. | Automated tests for each limit; WAF and service metrics on rejected requests. |
-| NFR-15 | Audit integrity | Every action in FR-27 is recorded ≤ 60 s after it happens. A download is only served if its audit record has been written (fail closed). In prod, stored audit records can't be changed or deleted before their retention ends; dev and staging use a short, removable lock so they can be torn down. | Tests that make the audit write fail; a daily job that matches storage access logs against audit records; S3 Object Lock on archived records. |
+| NFR-14 | Abuse resistance | Rate limits per IP address, per account and per tenant on sign-in, verification, link access, uploads and downloads. Starting limits: ≤ 10 failed sign-ins per account per 15 minutes; ≤ 5 verification codes per email address per hour; ≤ 60 link-page requests per IP per minute; ≤ 1,000 API requests per tenant per minute. A verification proof is valid ≤ 10 minutes and allows ≤ 5 attempts; codes have at least 6 digits. After 20 failed attempts in total for one recipient on one transfer or request, that recipient is locked out until the member unlocks them; the member and tenant admins are told. A verified session lasts ≤ 24 hours. Link tokens carry ≥ 128 bits of randomness. Phase 3 may tighten these numbers. | Automated tests for each limit; WAF and service metrics on rejected requests. |
+| NFR-15 | Audit integrity | Every action in FR-27 is recorded ≤ 60 s after it happens. A download is only served if its audit record has been written (fail closed). In prod, stored audit records can't be changed or deleted before their retention ends, and no restore or failover removes them; dev and staging use a short, removable lock so they can be torn down. | Tests that make the audit write fail; a daily job that matches storage access logs against audit records; S3 Object Lock on archived records. |
 | NFR-16 | Scalability | Handles the design load (6.1) at the latency targets with no manual action, and scales out automatically beyond it. | k6 load test at 1× and 2× design load. |
 | NFR-17 | Observability | Every user journey is traced end to end, with structured logs and metrics. Every alert links to a runbook. Dashboards and alerts are defined as code. | Review in phase 6; a test that fails if an alert has no runbook. |
-| NFR-18 | Deployability | Zero-downtime deploys. The same build artifacts (container image digests and the versioned web app bundle) are promoted dev → staging → prod. Rollback ≤ 10 minutes. Releases several times a week are routine. | Deployment metrics from Argo CD; a timed rollback drill. |
-| NFR-19 | Rebuild and teardown | The whole prod environment can be built from Terraform and Argo CD in ≤ 2 hours, and destroyed in ≤ 1 hour, leaving nothing that still bills except the prod audit archive, which outlives the environment until its retention ends (NFR-9, NFR-15) and should cost well under $1 a month. | Timed rebuild and teardown, with the AWS bill checked afterwards. |
+| NFR-18 | Deployability | Zero-downtime deploys. The same build artifacts (container image digests and the versioned web app bundle) are promoted dev → staging → prod. Rollback ≤ 10 minutes. Releases several times a week are routine. | Deployment metrics from Argo CD and the web app release pipeline; a timed rollback drill for both. |
+| NFR-19 | Rebuild and teardown | The whole prod environment can be built from Terraform and Argo CD in ≤ 2 hours, and destroyed in ≤ 1 hour, leaving nothing that still bills except the prod audit archive and the KMS key that encrypts it. Both outlive the environment until the archive's retention ends (NFR-9, NFR-15), in an AWS account that stays open, for ≤ $5 a month. | Timed rebuild and teardown, with the AWS bill checked afterwards. |
 | NFR-20 | Cost control | AWS Budgets alarms at 50 %, 80 % and 100 % of the monthly budget. dev and staging are torn down when idle. | Budget configuration in Terraform; the monthly bill. |
-| NFR-21 | Data residency | All customer data (files, metadata, backups and logs) stays in Tokyo (ap-northeast-1) and Osaka (ap-northeast-3). Global AWS services that hold no customer data (CloudFront with its certificate and WAF, IAM, Route 53, Budgets) are exempt. File downloads are never cached at CDN edges. | AWS Config, plus an SCP or IAM condition that denies other regions except those global services; review of S3 replication, backup and CDN cache settings. |
+| NFR-21 | Data residency | All customer data (files, metadata, backups and logs) stays in Tokyo (ap-northeast-1) and Osaka (ap-northeast-3). Global AWS services (CloudFront with its certificate and WAF, IAM, Route 53, Budgets) are exempt from the region guard; their logs are delivered to storage in Tokyo, or phase 2 records the exception. Traffic may pass through CDN edges outside Japan for users abroad, but file contents are never cached or stored there. | AWS Config, plus an SCP or IAM condition that denies other regions except those global services; review of S3 replication, backup, log delivery and CDN cache settings. |
 | NFR-22 | Web app quality | Recipient and uploader pages meet WCAG 2.2 AA. They support the latest two versions of Chrome, Edge, Firefox and Safari. | Automated accessibility checks (axe) in CI plus a manual pass; a browser test matrix. |
 
 ### 6.1 Design load
@@ -228,7 +233,7 @@ These are the targets the system is designed and load-tested for. The capacity e
 | Files per transfer | 3 on average, 50 at most |
 | File size | median 5 MB, p95 200 MB, maximum 5 GB |
 | New data | about 1 TB per day |
-| Stored data at steady state | about 15 TB in Tokyo (7-day transfers, 30-day retention of received files, and up to 7 days until deletion completes), replicated to Osaka |
+| Stored data at steady state | about 15 TB in Tokyo, replicated to Osaka (assumes 80 % of new data arrives through transfers kept 7 days and 20 % through upload requests kept 30 days, plus up to 7 days until deletion completes) |
 | File downloads | about 40,000 per day |
 | API requests | about 50 per second on average, 150 per second in the peak hour, bursts to 300 per second |
 
@@ -299,9 +304,10 @@ verification failure rate, infected-file rate, and revocations per 1,000 transfe
 | Some scan engines can't handle files near 5 GB, or are too slow for NFR-5. | Large files stay blocked or miss the time target. | Phase 4 ADR compares engines on 5 GB files before the design is fixed; keep the scan step behind an interface. |
 | Data transfer and cross-region replication costs grow with the 1 TB/day design load. | Bills higher than planned during load tests and drills. | Sampled byte load (6.1), budget alarms (NFR-20), teardown after each test window. |
 | Email deliverability: verification emails land in spam or are delayed. | Recipients can't verify, so files can't be downloaded. | SPF, DKIM and DMARC; SES reputation metrics on a dashboard; NFR-7 alerting. |
-| A download URL works for anyone who holds it during its short lifetime. | A URL forwarded within 60 s works for someone who never verified; repeated use could slip past the download limit; a download started just before revocation may finish. | URLs live ≤ 60 s (NFR-6); every URL issue is checked against current state, counted and audited; phase 3 decides whether downloads must be single-use or bound to the client (open question 8). |
+| The simplest download mechanism, a short-lived pre-signed URL, is a bearer token. | It would break FR-14 (a forwarded URL works without verification), make FR-4 limits and FR-6 resumes hard to enforce, and briefly outlive a revocation. | Phase 3 must choose a mechanism that meets FR-6, FR-14 and NFR-6 together (open question 8). The PRD does not accept a bearer URL as a residual risk. |
 | File replication to Osaka lags during heavy uploads. | Files uploaded in the last ≤ 15 minutes before a regional failure are lost (NFR-10). | Replication with a time guarantee and an alarm on lag; files not yet replicated are marked unavailable after failover. |
 | Email isn't ready in Osaka when Tokyo fails. | Recipients can't verify, so the service is down for them even though the API is up. | SES set up and approved in both regions (section 10); the failover drill sends real verification emails from Osaka. |
+| A leaked link lets someone lock the real recipient out (NFR-14). | The recipient can't download until the member acts. | The member and tenant admins are told; the member can unlock the recipient, or revoke and re-send the transfer. |
 | Scope: a React app, multi-region DR and three environments for one maintainer. | Schedule slips. | Must/Should split; thin slices; the Osaka pilot light comes after the single-region slice works. |
 
 ## 12. Open questions
@@ -315,7 +321,7 @@ verification failure rate, infected-file rate, and revocations per 1,000 transfe
 | 5 | Which domain name does the service use (web app, links, email sender)? | Rashid | Before phase 5 |
 | 6 | Is Japanese localization (FR-33) in v1 or the first release after? | Rashid | Phase 5 (delivery plan) |
 | 7 | Monthly AWS budget for the prod operating period, and how long that period is. | Rashid | Phase 6 (operations) |
-| 8 | Must each download be single-use or bound to the verified client (for example by streaming through the service), or is a bearer URL that lives ≤ 60 s an acceptable risk? | Rashid | Phase 3 |
+| 8 | Which download mechanism meets FR-6, FR-14 and NFR-6 together: streaming through the service, CDN signed cookies bound to the verified session, or something else? | Rashid | Phase 3 |
 
 ## 13. Glossary
 
@@ -325,7 +331,8 @@ verification failure rate, infected-file rate, and revocations per 1,000 transfe
 | Upload request | One request for an external person to deliver files to a member. |
 | Tenant | One customer company and everything that belongs to it. |
 | Verification | Proof that an external person controls the invited email address at the moment of access. |
-| Held transfer | A transfer that can't be sent because a file failed the malware scan. |
+| Held transfer | A transfer that can't be sent because one of its files isn't shareable. |
+| Shareable | A file that is clean, or unscannable and allowed by tenant policy (FR-16). |
 | Pilot light | A disaster recovery setup where data is replicated to a second region continuously, but compute there starts only during a failover. |
 | RPO / RTO | Recovery point objective (how much recent data can be lost) and recovery time objective (how long until service is back). |
 | SLI / SLO | Service level indicator (what is measured) and service level objective (the target for it). |
