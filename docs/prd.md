@@ -148,7 +148,7 @@ age out of database backups within the 14-day restore window (NFR-11).
 | Data | Deletion is triggered when |
 |---|---|
 | Files of a transfer, including quarantined ones | The transfer expires or is revoked |
-| Files removed from a held transfer, or of a cancelled transfer | The file is removed or the transfer is cancelled |
+| Files removed from a held transfer, or of a cancelled transfer | The file is removed, or the transfer is cancelled by the member or after 7 days as an unsent draft |
 | Files received through an upload request | Their retention period ends (FR-13), or the member deletes them |
 | Parts of an upload that never completed | 24 hours after the last part arrived, or when the transfer or request is revoked |
 | Stored objects that no transfer or request refers to (for example parts sent after a revocation) | 24 hours after they appear; the reconciliation job (NFR-8) finds them |

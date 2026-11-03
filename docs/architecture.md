@@ -483,6 +483,7 @@ them as unavailable (NFR-10).
 | Area | Candidate | Main alternative | Decided by |
 |---|---|---|---|
 | API framework | FastAPI, SQLAlchemy 2.0, Alembic | Django + Django Ninja | [ADR-0002](adr/0002-api-framework.md), accepted |
+| Multi-tenancy | Shared schema with `tenant_id` on every row | Schema or database per tenant | [ADR-0003](adr/0003-multi-tenancy-shared-schema.md), accepted |
 | Compute | EKS with Argo CD | ECS on Fargate | ADR pending |
 | Database | Aurora PostgreSQL with a global database in Osaka | RDS PostgreSQL Multi-AZ with a cross-region replica | ADR pending |
 | Object storage | S3 with versioning and replication with RTC to Osaka | — | ADR pending |
