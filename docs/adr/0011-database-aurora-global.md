@@ -37,6 +37,9 @@ reader in different AZs, and a secondary cluster in Osaka.
 - **Access.** IAM database authentication for every workload role, TLS with `sslmode=verify-full`, and a master
   password set through Terraform write-only arguments (encryption and keys 6.3).
 - **Backups.** 14 days of point-in-time recovery on the primary cluster (NFR-11), encrypted with the database key.
+  Automated backups stay in their region. Two things are not decided yet and are open in
+  [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42): whether the Osaka cluster keeps the same 14
+  days once promoted, so the restore target still holds after a failover, and cross-region backup copies.
 - **Regional failover** uses Aurora's managed failover (allow data loss) first, and detach-and-promote if that can't
   run. The old Tokyo cluster only ever returns as a secondary ([threat model](../threat-model.md), T-78).
 
@@ -66,7 +69,9 @@ reader in different AZs, and a secondary cluster in Osaka.
   starts (architecture section 7). The first drill times the promote step against its 5-minute budget.
 - **Restore after corruption.** A point-in-time restore goes to a new cluster (Aurora PostgreSQL has no backtrack), then
   follows architecture section 6. Until a new Osaka secondary is added and caught up, which can take hours at 150 GB,
-  a regional loss would fall back to backups, so the restore runbook adds it straight away and the drill times both.
+  the restored cluster has no copy outside Tokyo, and its backups are in Tokyo too. A regional loss in that window
+  isn't covered. The restore runbook adds the secondary straight away and the drill times both steps. What protects
+  the database in that window is open in #42.
 - **Upgrades.** Both regions run the same engine version; minor and major upgrades are rehearsed in staging first.
 
 ## When to revisit

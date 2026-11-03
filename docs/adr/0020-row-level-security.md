@@ -30,10 +30,16 @@ layer behind scoped data access.
 - **Tenant policies** compare each row's `tenant_id` with `app.tenant_id` for reads and writes (`USING` and
   `WITH CHECK`). A missing tenant is null and matches nothing.
 - **One login role per workload,** through IAM database authentication: `sft_api`, `sft_operator`, `sft_scan`,
-  `sft_notify`, `sft_relay`, `sft_jobs`, `sft_archive` and `sft_migrate`. Tables belong to `sft_owner`, which nobody
-  logs in as; only migrations reach it, with `SET ROLE`. No workload role owns a table, and no role but the master
-  user, kept for break-glass, has `BYPASSRLS`. Every role has explicit policies for its scopes: lifecycle jobs find due
-  work across tenants in system scope, read only, then act on each item in its own transaction with its tenant set.
+  `sft_notify`, `sft_relay`, `sft_jobs`, `sft_archive` and `sft_recovery` for the workloads, and `sft_migrate` for
+  migrations. Tables belong to `sft_owner`, which nobody logs in as; `sft_migrate` is the only role that may become it,
+  with `SET ROLE`. No workload role owns a table, and no role but the master user, kept for break-glass, has
+  `BYPASSRLS`. Every role has explicit policies for its scopes: lifecycle jobs find due work across tenants in system
+  scope, read only, then act on each item in its own transaction with its tenant set.
+- **A recovery role** for the failover and restore jobs alone. `sft_recovery` (IAM role `sft-{env}-recovery`) runs
+  only from the runbooks, before the service or any worker starts, never in a running service. Its `recovery_reapply`
+  policies apply only in the `recovery` scope and let it read and update, across tenants, exactly the rows that
+  security-critical records change, so it can re-apply them from the audit archive. It may insert the audit events it
+  re-imports, and has no grant on the ciphertext columns or any other table.
 - **Credential lookup** goes through seven `SECURITY DEFINER` functions owned by `sft_lookup`, which also lacks
   `BYPASSRLS` and reads through policies and column grants of its own. They pin `search_path`, return IDs and status
   only, and only `sft_api` may execute them.
@@ -60,19 +66,21 @@ layer behind scoped data access.
   which must see every tenant; forcing it would leave data migrations with no rows.
 - **Where the tenant comes from.** Request scopes take it from the credential row, never from a parameter. Workers take
   it from the outbox message, which only our own workloads can send; sign-in events take it from `custom:tenant_id`,
-  which only the notification worker can set.
+  which only the notification worker can set; the recovery job takes it from each archived record, which only our own
+  workloads write.
 - **Tenant boundary only.** Within a tenant, a link session's resource scope and the own-or-tenant rule stay with the
   data-access layer and the service checks.
 - **A third layer** catches a wrong tenant that passes both: file names and messages are encrypted with the data key
   of the caller's tenant ([ADR-0017](0017-kms-keys-per-data-class.md)), so another tenant's row fails to decrypt.
 - **CI checks the catalog on every pull request:** every table with a `tenant_id` column has row-level security and a
   policy for each command granted to each role; no role but the master user has `BYPASSRLS`; no workload role owns a
-  table or can become `sft_owner`; a pooled connection carries no tenant or scope after commit. Policy tests cover the
-  platform audit insert, writes outside the tenant set, and the jobs, relay, archive and lookup roles.
+  table, and `sft_migrate` is the only member of `sft_owner`; only `sft_recovery` has policies for the `recovery`
+  scope; a pooled connection carries no tenant or scope after commit. Policy tests cover the platform audit insert,
+  writes outside the tenant set, and the jobs, relay, archive, recovery and lookup roles.
 - **Performance budget:** 5 % added p95 latency in the first load test (NFR-2). Above that, indexes and plans are fixed
   first; turning row-level security off would need an ADR.
-- The data model's section 4.2 item becomes a scope setting next to the tenant and per-role policies, through
-  [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26).
+- The [data model](../design/data-model.md), section 4.2, records the scope setting next to the tenant, the roles and
+  their policies.
 
 When to revisit: if the first load test shows more than 5 % added p95 latency that indexes and plans can't remove; if
 a connection pooler or proxy is put between the service and the database, which must be shown to keep settings

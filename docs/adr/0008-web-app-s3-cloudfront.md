@@ -54,17 +54,20 @@ to the API or the files buckets, so file contents never reach an edge.
 - **Failover.** The origin group fails over on 500, 502, 503 and 504 and on connection errors, for GET and HEAD. The
   synthetic probe checks both origins.
 - **Headers**, per environment. The `Content-Security-Policy` sets `default-src 'self'`, `script-src 'self'`,
-  `frame-ancestors 'none'`, `base-uri 'none'` and `object-src 'none'`, and limits `connect-src` to the API origin and
-  the files buckets' endpoints in Tokyo and Osaka; no inline script. HSTS as in encryption 2.1,
+  `frame-ancestors 'none'`, `base-uri 'none'` and `object-src 'none'`, and
+  `connect-src 'self' https://api.<domain> <S3 upload origins>`: `'self'` for `config.json`, the API origin, and the
+  files buckets' upload endpoints in Tokyo and Osaka; no inline script. HSTS as in encryption 2.1,
   `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`. No third-party scripts, fonts or analytics;
   the WAF JavaScript SDK isn't used (T-02).
 - **TLS** with the `TLSv1.2_2025` policy and an ACM certificate in us-east-1; HTTP only redirects (encryption 2.1).
 - **Logs.** CloudFront standard logs and the web ACL's logs go to S3 in Tokyo under the logs key and are kept 90 days
-  (architecture 5.5, abuse 3.4); none go to CloudWatch Logs in us-east-1. The link token stays in the fragment, so it
+  (architecture 5.5, abuse 3.4). The web ACL's are sent by CloudWatch Logs delivery, configured in us-east-1 as the
+  region guard allows (ADR-0006), with no log group there; none are stored in us-east-1. The link token stays in the fragment, so it
   never reaches CloudFront, the WAF or their logs.
 - **Checks.** AWS Config rules for viewer HTTPS, origin access control and the security policy (encryption 9.2), and a
   CI check that fails a distribution with any origin other than the bundle buckets, so nothing else can ever be cached
-  at an edge. DNS records are Terraform-managed only (T-01).
+  at an edge. DNS records are Terraform-managed only, in the shared zone (T-01,
+  [ADR-0021](0021-network-design-and-egress.md)).
 
 When to revisit: if a page needs server-side rendering, or the product wants a third-party script such as analytics
 or error reporting, which the CSP and T-02 rule out today.

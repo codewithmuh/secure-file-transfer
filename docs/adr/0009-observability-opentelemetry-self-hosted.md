@@ -17,7 +17,7 @@
 - **Each environment stands alone.** Nothing is shared between environments, so each tears down by itself; dev and
   staging run a cut-down platform ([capacity](../design/capacity-and-cost.md) 4.3).
 - **Numbers.** In prod, Prometheus (2 replicas), Alertmanager, Grafana, Loki, Tempo and the gateway collectors request
-  4.3 vCPU and 12.8 GiB (capacity 4.3), about $230 a month of main-pool nodes, plus 300 GB of volumes at $29 (A28).
+  4.3 vCPU and 12.8 GiB (capacity 4.3), about $230 a month of main-pool nodes, plus 500 GB of volumes at $48 (A28).
   Loki chunks and Tempo traces in S3 add a few dollars (A33). CloudWatch prices a custom metric at $0.30 a month and log
   ingestion at $0.76/GB in Tokyo (capacity 5.1).
 
@@ -46,23 +46,26 @@ only the AWS-service alarms (A34), EKS control-plane logs (A19) and an out-of-cl
 - **Traces.** W3C trace context runs from the web app's API calls through the API, the outbox and SQS to the workers.
   The gateway's tail sampling keeps every error and slow trace and 10 % of the rest, for 14 days (A33).
 - **Metrics.** Prometheus scrapes `/metrics` on a port outside the load balancer's target group (architecture 8).
-  Recording rules compute the SLIs. Prod keeps **30 days**, not A28's 15, so NFR-1's 28-day window is computed from
-  local data; its volumes grow from 2 × 100 GB to 2 × 200 GB, about $19 a month more. High-cardinality metrics carry no
-  tenant label; per-tenant views come from logs.
+  Recording rules compute the SLIs. Prod keeps **30 days** on 2 × 200 GB volumes (A28), so NFR-1's 28-day window is
+  computed from local data. High-cardinality metrics carry no tenant label; per-tenant views come from logs.
 - **Logs.** Loki keeps 90 days (PRD data lifecycle table). EKS control-plane and audit logs stay in CloudWatch Logs,
   where the exec and break-glass alerts read them ([authn-authz](../security/authn-authz.md) 8.3).
 - **Alerts.** Prometheus rules live in Git, each with a `runbook_url`; a CI test fails an alert without a runbook
   (NFR-17). Alertmanager pages through SNS in its own region. The in-cluster stack publishes a heartbeat metric to
   CloudWatch every minute, and a CloudWatch alarm that treats missing data as breaching pages if it stops, so a dead
-  cluster still pages. AWS-service alarms and the synthetic probe also run outside the cluster.
-- **Dashboards.** Grafana is provisioned from Git and is read-only in its UI. It runs alone in its own namespace, on no
-  load balancer (T-05), and `ReadOnly` and `Operator` reach it by port-forward to that namespace. authn-authz 8.1 and
-  T-63 allow port-forward only in `sft-operator`, so they gain this one namespace, which holds no role that can read
-  files.
-- **Osaka.** Its stack starts with the cluster after a failover, with empty history; Tokyo's data stays in Tokyo's
-  buckets until the failback.
-- **Capacity model.** The 30-day retention adds about $19 a month in prod; dev and staging keep the 3 and 7 days of
-  capacity 4.3.
+  cluster still pages. SNS and CloudWatch have no VPC endpoint here, so both calls go through the egress proxy's
+  platform listener ([ADR-0021](0021-network-design-and-egress.md)); if the proxy fails, the heartbeat stops and the
+  alarm pages. AWS-service alarms and the synthetic probe also run outside the cluster.
+- **Dashboards.** Grafana is provisioned from Git and is read-only in its UI. It runs alone in its own namespace,
+  `grafana`, on no load balancer (T-05), and `ReadOnly` and `Operator` reach it by port-forward to that namespace
+  through the cluster tunnel ([ADR-0004](0004-compute-eks-karpenter-argo-cd.md)). It is the only port-forward
+  `ReadOnly` has, and the only one `Operator` has besides `sft-operator` (authn-authz 8.1, T-63); the namespace holds
+  no role that can read files.
+- **Osaka.** Its stack isn't deployed in the pilot light (ADR-0004) and starts after a failover, with empty history;
+  Tokyo's data stays in Tokyo's buckets until the failback. Osaka's heartbeat alarm stays disabled until then, so the
+  pilot light doesn't page for a stack that isn't meant to run; the failover runbook enables it.
+- **Capacity model.** Capacity 4.3 and A28 carry the 30 days and their volumes in prod; dev and staging keep 3 and
+  7 days.
 
 When to revisit: if running the stack takes more of the maintainer's time than the slices it supports; if managed
 Prometheus and Grafana are confirmed in Osaka and price below the self-hosted line; or if the operating period needs

@@ -17,9 +17,10 @@ downloadable, every action is written to an audit log, and an admin can revoke a
 
 ## Status
 
-**Planning, phase 4 of 6** (decisions, [#34]). There is no product code yet. The two sample services from the
+**Planning, phase 4 of 6** (decisions, [#34]; review fixes, [#41]). The ADRs are recorded and there is no product code
+yet. The two sample services from the
 [production repo template](https://github.com/codewithmuh/production-repo-template) stay in place, so every CI
-pipeline runs against real code until the stack ADRs replace them.
+pipeline runs against real code until the first vertical slices replace them.
 
 ## What v1 will do
 
@@ -47,9 +48,10 @@ Each phase produces documents in `docs/` through its own issue and pull request.
 | 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | — |
 | 6. Operations | SLOs, dashboards, alerts, runbooks, backup/restore and DR drills with measured RTO/RPO | — |
 
-Candidate stack, to be confirmed or replaced by ADRs: Python (FastAPI), PostgreSQL, Amazon S3 + KMS, Kubernetes (EKS)
-with Argo CD, Terraform, and GitHub Actions with OIDC. The design keeps the moving parts few: one API service plus
-workers, and one system of record.
+Stack, as the phase 4 ADRs decided ([architecture](docs/architecture.md) section 9): Python (FastAPI) only, Aurora
+PostgreSQL, Amazon S3 + KMS, Kubernetes (EKS with Karpenter) with Argo CD, Terraform, and GitHub Actions with OIDC,
+plus SQS, SES, Cognito, ElastiCache for Valkey, and ClamAV with GuardDuty Malware Protection for scanning. The design
+keeps the moving parts few: one API service plus workers, and one system of record.
 
 ## How changes flow
 
@@ -82,7 +84,7 @@ Run `make` with no arguments to list every command.
 .devcontainer/           reproducible dev environment
 docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api-python/     FastAPI sample service (to be replaced by the API service)
-services/api-go/         Go sample service (stays only if an ADR gives Go a job)
+services/api-go/         Go sample service (to be removed: ADR-0010 keeps v1 Python only)
 compose.yaml             local run with production-like hardening
 Makefile                 every command you need
 ```
@@ -94,7 +96,7 @@ Every service keeps this runtime contract:
 | Endpoint / behaviour | Meaning |
 |---|---|
 | `GET /healthz` | Liveness: the process is up (never checks dependencies) |
-| `GET /readyz` | Readiness: 503 until started and while shutting down |
+| `GET /readyz` | Readiness: 503 until started and while shutting down. The load balancer checks it on a port the public listener doesn't route to; there is no public health endpoint |
 | `GET /metrics` | Prometheus metrics: request count and latency by route and status |
 | Logs | JSON on stdout, one line per request, with `request_id` (taken from `X-Request-Id` or generated) |
 | `SIGTERM` | Fail readiness → finish in-flight requests (≤ 20 s; the API's download streams ≤ 120 s) → exit |
@@ -114,3 +116,4 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 [#16]: https://github.com/codewithmuh/secure-file-transfer/issues/16
 [#25]: https://github.com/codewithmuh/secure-file-transfer/issues/25
 [#34]: https://github.com/codewithmuh/secure-file-transfer/issues/34
+[#41]: https://github.com/codewithmuh/secure-file-transfer/issues/41

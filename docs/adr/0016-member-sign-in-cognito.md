@@ -37,6 +37,11 @@ Use **Amazon Cognito for sign-in only**, and keep sessions and authorization in 
   ID token's `amr` claim shows a passkey; otherwise it acts as a member and admin operations return
   `403 passkey_required` (revocations excepted). The switch goes on in staging and prod once a staging test shows that
   both pools issue `amr`.
+- **Cognito's own email goes through our SES identity.** Each pool uses Cognito's developer email sending
+  (`EmailSendingAccount` `DEVELOPER`) with the SES domain identity on our sending subdomain, `mail.<domain>`, in the
+  pool's own Region. The few emails Cognito sends itself, such as managed login's password-reset codes, carry the same
+  DKIM, SPF and DMARC as every other service email and use that Region's configuration set
+  ([ADR-0015](0015-email-ses.md)). Cognito's default sender, an Amazon address limited to 50 emails a day, isn't used.
 
 ## Options considered
 
@@ -68,13 +73,17 @@ What we build and run:
 - **Failover.** The runbook re-creates every active local member in the Osaka pool and emails a re-enrolment
   invitation; tenant admins are told and every re-enrolment is audited. Signed-in members keep their sessions, which
   replicate with PostgreSQL. Recipients, uploaders and API keys don't depend on Cognito, so the synthetic probe keeps
-  measuring them.
+  measuring them. Which role creates those users while Osaka's workers are still scaled to zero, given that only the
+  notification worker may call Cognito's admin operations, isn't decided yet; it is a disaster-recovery gap tracked in
+  [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42).
+- **Email.** Each pool names its own Region's SES identity, so the Osaka standby pool sends through Osaka's after a
+  failover. An identity policy on each SES identity lets Cognito send as it for that Region's pool only.
 - One pool serves every tenant, because a pool per tenant would need a custom domain each and Cognito allows four per
   Region. Isolation between tenants in the pool comes from our identity mapping, which the isolation suite tests.
 - Until the passkey switch is on, local admins on TOTP can be phished in real time like members (R-01). If the pools
   don't issue `amr` by launch, an ADR records running without the rule.
-- The sign-in operations, `member_sessions` and per-pool `user_identities` go to the phase 2 owners through
-  [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26).
+- The sign-in operations are in the [API contract](../api/openapi.yaml), and `member_sessions` and the per-pool
+  `user_identities` in the [data model](../design/data-model.md), section 2.
 
 When to revisit: if the first regional failover drill shows that local-member re-enrolment can't meet NFR-11, or most
 tenants turn out to need local accounts, write a superseding ADR for our own passkey sign-in, keeping Cognito for

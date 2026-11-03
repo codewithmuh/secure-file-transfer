@@ -19,7 +19,7 @@ load ([capacity](../design/capacity-and-cost.md) A8, 3.1, 4.1):
 | Component | Work at design load | Would Go earn its place? |
 |---|---|---|
 | API service | 150 requests/s in the peak hour, bursts to 300; about 10 ms of CPU each | No: ADR-0002 chose FastAPI |
-| Download streams through the API ([abuse](../security/abuse-and-rate-limits.md) 5.7) | 35 MB/s in the peak hour, 70 MB/s in bursts, about 15 streams: 0.35 to 0.7 vCPU | The best candidate, but small, and every stream starts with the grant checks of the service layer |
+| Download streams through the API ([abuse](../security/abuse-and-rate-limits.md) 5.7) | 35 MB/s in the peak hour, 70 MB/s in bursts, about 15 streams: 0.35 to 0.7 vCPU | The strongest case, but small, and every stream starts with the grant checks of the service layer |
 | Scan worker | Waits on S3 and the scan engine's socket | No |
 | Outbox relay, notification worker, lifecycle jobs | I/O-bound, a few messages a second | No |
 | Operator CLI | One operator | A static binary would be convenient; Python installed with uv is enough |
@@ -43,8 +43,10 @@ milestone (phase 5), in the same change that adds the ECR push ([ADR-0007](0007-
 - **What goes**, in one pull request: `services/api-go/`; the `go` job in `ci.yml`, the `api-go` entry in the `images`
   matrix and `go` in its `needs`; the `api-go` entry in `release.yml`'s publish matrix; the `GO` variable and its steps
   in the `Makefile`; the `api-go` service in `compose.yaml`; the `gomod` entry and the Go directory of the Docker
-  entry in `.github/dependabot.yml`; the Go feature and extension in `.devcontainer/devcontainer.json`; and Go in the
-  requirements and layout of `README.md` and `CONTRIBUTING.md`.
+  entry in `.github/dependabot.yml`; the Go feature and extension in `.devcontainer/devcontainer.json`; the
+  `cosign verify` example for the GHCR `api-go` image in `SECURITY.md`, replaced by the ECR one (ADR-0007); the Go
+  globs in `.editorconfig` (`*.go` and `go.mod`; the `Makefile` keeps its tabs); the Go block in `.gitignore`
+  (`coverage.out`, `/bin/`); and Go in the requirements and layout of `README.md` and `CONTRIBUTING.md`.
 - **Required checks.** The `protect-main` ruleset requires five checks, two of them Go's. They come off the ruleset
   when that pull request merges, because a required check that never runs blocks every later merge.
 - **What stays**: the Python service, its CI job and image checks, release-please and the signing steps, which
