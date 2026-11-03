@@ -1,59 +1,447 @@
 # Architecture
 
-> **Placeholder from the template.** It describes the two sample services. Planning phase 2 replaces it with this
-> service's architecture.
-
 > Keep this page current: update it in the same pull request that changes the architecture.
 
-## Context
+| | |
+|---|---|
+| Requirements | [PRD](prd.md) |
+| Decisions | [ADRs](adr/) |
+| Tracking | [#12](https://github.com/codewithmuh/secure-file-transfer/issues/12), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)) |
 
-What problem the system solves, for whom, and what is out of scope.
+Technologies marked **candidate** are the current proposal. An ADR in phase 4 confirms or replaces each one (section 9).
+API paths in the diagrams are illustrative; the contract is defined in [#14](https://github.com/codewithmuh/secure-file-transfer/issues/14).
 
-## Overview
+## 1. Context
 
 ```mermaid
 flowchart LR
-    client([Client]) --> py[api-python<br/>FastAPI :8000]
-    client --> go[api-go<br/>Go :8080]
-    py -. /metrics .-> prom[(Prometheus)]
-    go -. /metrics .-> prom
+    member(["Member or tenant admin<br/>browser"])
+    ext(["Recipient or uploader<br/>browser"])
+    auto(["Tenant automation<br/>API key"])
+    op(["Platform operator<br/>CLI"])
+    sft["secure-file-transfer"]
+    email["Email provider<br/>candidate: Amazon SES"]
+    inbox(["Invited person's inbox"])
+    idp["Customer identity provider<br/>SSO, FR-26"]
+    member -->|"send, request, revoke, audit"| sft
+    ext -->|"verify, download, upload"| sft
+    auto -->|"REST API"| sft
+    op -->|"operator API"| sft
+    sft -->|"links, codes, notices"| email
+    email --> inbox
+    sft -.->|"OIDC or SAML"| idp
 ```
 
-## Components
+The service sends every link, code and notice by email, so the email provider is on the critical path: if recipients
+can't receive a code, they can't download (FR-14).
 
-| Component | Responsibility | Tech | Owner |
+## 2. Containers
+
+```mermaid
+flowchart TB
+    browser(["Browsers"])
+    subgraph edge["Edge, global"]
+        r53["Route 53<br/>DNS and failover"]
+        cf["CloudFront + WAF"]
+    end
+    subgraph tokyo["Tokyo ap-northeast-1, 3 AZs"]
+        alb["Load balancer + WAF"]
+        subgraph k8s["Kubernetes, candidate: EKS"]
+            api["API service<br/>FastAPI"]
+            relay["Outbox relay"]
+            scan["Scan worker<br/>+ scan engine"]
+            notify["Notification worker"]
+            jobs["Lifecycle jobs<br/>expiry, deletion,<br/>reconciliation, audit archive"]
+        end
+        db[("PostgreSQL<br/>candidate: Aurora")]
+        files[("S3: files")]
+        audit[("S3: audit archive<br/>Object Lock")]
+        web[("S3: web app bundle")]
+        sqs[["SQS queues + DLQs"]]
+        rl[("Rate-limit counters<br/>ADR pending")]
+        ses["SES"]
+        kms["KMS, Secrets Manager"]
+    end
+    subgraph osaka["Osaka ap-northeast-3, pilot light"]
+        db2[("PostgreSQL replica")]
+        files2[("S3: files replica")]
+        audit2[("S3: audit archive replica")]
+        ses2["SES"]
+    end
+    browser --> r53
+    r53 --> cf
+    cf --> web
+    r53 --> alb
+    alb --> api
+    browser -. "upload parts, pre-signed" .-> files
+    api --> db
+    api --> files
+    api --> rl
+    api --> kms
+    api --> audit
+    relay --> db
+    relay --> sqs
+    sqs --> scan
+    sqs --> notify
+    scan --> files
+    scan --> db
+    notify --> ses
+    notify --> db
+    jobs --> db
+    jobs --> files
+    jobs --> audit
+    db -. "replication" .-> db2
+    files -. "replication with RTC" .-> files2
+    audit -. "replication" .-> audit2
+```
+
+The backend is **one codebase**: the API service and every worker are built from the same image with different entry
+points, so they share the data model and the service layer (ADR-0002). PostgreSQL is the single system of record.
+How file bytes reach a recipient's browser depends on open question 8 (section 4.2).
+
+| Container | Responsibility | Scales by | When it fails |
 |---|---|---|---|
-| `api-python` | Sample HTTP API | Python 3.13, FastAPI, uvicorn | @codewithmuh |
-| `api-go` | Sample HTTP API | Go 1.27, net/http | @codewithmuh |
+| Web app (S3 + CloudFront) | React app for members, admins, recipients and uploaders (FR-30) | CDN | CloudFront fails over to the Osaka copy of the bundle. The API is unaffected. |
+| API service | Every HTTP call: sign-in, policy checks, upload start and completion, verification, download access, revocation, audit writes | Pods across 3 AZs, at least 3; autoscaled on request rate and CPU | The load balancer stops sending traffic to failed pods. Uploads resume from their completed parts (NFR-3). |
+| Outbox relay | Publishes rows from the outbox table to SQS (section 5.3) | 2 replicas; rows are claimed with `FOR UPDATE SKIP LOCKED` | Messages wait safely in PostgreSQL. An alert fires when the oldest unpublished row is over 2 minutes old. |
+| Scan worker | Scans each uploaded file and records the result (FR-16 to FR-19) | Queue depth | Files stay in `scanning` and are never downloadable. Retries with backoff, then the dead-letter queue raises an alert. |
+| Notification worker | Sends links, codes and notices through SES (NFR-7) | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert. |
+| Lifecycle jobs | Expiry, deletion in both regions, daily reconciliation, audit archiving (section 4.5, 5.2) | Scheduled jobs | Work waits for the next run. An alert fires on lag (NFR-8, NFR-15). |
+| PostgreSQL | Tenants, users, transfers, upload requests, files, sessions, audit events, outbox | Instance size; read replica for audit search | Fails over to another AZ automatically. For a region, the Osaka replica is promoted (section 7). |
+| S3: files | File contents, keyed by tenant and file ID, never by file name | Managed | Regional service. Replicates to Osaka with a 15-minute commitment for 99.99 % of objects (NFR-10). |
+| S3: audit archive | Immutable copy of every audit record (NFR-15) | Managed | The archive job retries; records are safe in PostgreSQL meanwhile. |
+| SQS | Work queues with dead-letter queues | Managed | Regional service. The outbox keeps every message until it is published. |
+| Rate-limit counters | Counters shared by all API replicas (NFR-14) | Depends on the ADR | Sign-in and verification fail closed; phase 3 decides the rest. |
+| SES | Outgoing email in Tokyo; a verified, production-approved setup in Osaka for failover | Managed | The notification worker retries; failover sends from Osaka (PRD section 10). |
+| KMS, Secrets Manager | Encryption keys for files, database, backups and logs; runtime secrets | Managed | Regional services. Multi-region keys and secret replicas exist in Osaka. |
 
-## Runtime contract (every service)
+## 3. Deployment
+
+### 3.1 Prod in Tokyo
+
+- One VPC across 3 Availability Zones: public subnets for the load balancer and NAT gateways, private subnets for
+  Kubernetes nodes, isolated subnets for PostgreSQL.
+- VPC endpoints for S3, SQS, KMS, Secrets Manager, ECR and STS, so traffic to AWS services stays off the internet and
+  off the NAT gateways.
+- Each workload gets its own IAM role with only what it needs. The API can start and complete uploads and issue
+  download access; the scan worker can read files and set their tags; only the lifecycle jobs can delete.
+
+### 3.2 Osaka pilot light
+
+Running all the time: the PostgreSQL replica, S3 replica buckets for files and the audit archive, replicas of the KMS
+keys and secrets, a production-approved SES setup, a copy of the web app bundle, and the container images. Compute
+starts only on failover (section 7). Candidate: keep a Kubernetes control plane in Osaka with no worker nodes, so
+failover only adds nodes; the compute ADR confirms it against the RTO.
+
+### 3.3 Environments and delivery
+
+| Environment | Shape | Notes |
+|---|---|---|
+| dev | Tokyo only, smallest sizes | Torn down when idle |
+| staging | Prod's shape at smaller sizes, including the Osaka pilot light | Where release rehearsals and drills run first |
+| prod | Section 3.1 and 3.2 | Destroyed after the operating period, except the audit archive (NFR-19) |
+
+```mermaid
+flowchart LR
+    pr["Pull request"] --> ci["CI: lint, test, scan"]
+    ci --> main["main"]
+    main --> build["Build and sign images,<br/>build web app bundle"]
+    build --> reg[("Container registry")]
+    build --> cfg["Deploy config:<br/>new versions"]
+    cfg --> argo["Argo CD"]
+    argo --> dev["dev"]
+    dev --> stg["staging"]
+    stg -->|"manual approval"| prod["prod"]
+    tf["Terraform via GitHub OIDC"] --> aws[("AWS")]
+```
+
+The same image digests and the same web app bundle move from dev to staging to prod (NFR-18). Terraform owns AWS
+resources; Argo CD owns what runs in Kubernetes.
+
+## 4. Key flows
+
+### 4.1 Send a transfer (UC-1)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Member, web app
+    participant API as API service
+    participant DB as PostgreSQL
+    participant S3 as S3 files
+    participant Q as SQS
+    participant SW as Scan worker
+    participant NW as Notification worker
+    participant E as SES
+    M->>API: POST /v1/transfers with recipients, expiry, message
+    API->>DB: insert transfer as draft, with audit
+    loop each file
+        M->>API: POST /v1/transfers/{id}/files with name and size
+        API->>S3: CreateMultipartUpload
+        API->>DB: insert file as uploading, with audit
+        M->>API: POST /v1/files/{fid}/parts
+        API-->>M: pre-signed part URLs, valid up to 15 min
+        M->>S3: PUT parts in parallel
+        M->>API: POST /v1/files/{fid}/complete
+        API->>DB: check the transfer is still open
+        API->>S3: CompleteMultipartUpload
+        API->>DB: file to scanning, outbox scan message, audit, in one transaction
+    end
+    M->>API: POST /v1/transfers/{id}/send
+    API->>DB: transfer to submitted, with audit
+    SW->>Q: receive scan message
+    SW->>S3: read the object
+    SW->>DB: file to clean, infected or unscannable, with audit
+    alt every file shareable and transfer submitted
+        SW->>DB: transfer to sent, outbox notify message
+        NW->>Q: receive notify message
+        NW->>E: one email per recipient, with its link
+        NW->>DB: audit email sent
+    else a file is not shareable
+        SW->>DB: transfer to held, outbox message to the member
+    end
+```
+
+- File bytes go straight from the browser to S3 in parts. The API never handles them, but it decides every state
+  change: it starts the upload, issues part URLs and completes the upload only after checking that the transfer is
+  still open (NFR-6).
+- Resuming an upload: the web app asks the API which parts S3 already has, and sends only the missing ones (NFR-3).
+- Whichever happens second, the member pressing send or the last scan finishing, triggers the notification (FR-5).
+- Every message to a worker goes through the outbox (section 5.3), so a crash between the database write and the queue
+  send loses nothing.
+
+### 4.2 Verify and download (UC-1, FR-14, FR-15)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor R as Recipient, browser
+    participant API as API service
+    participant RL as Rate-limit counters
+    participant DB as PostgreSQL
+    participant NW as Notification worker
+    participant E as SES
+    R->>API: GET /v1/links/{token}
+    API->>DB: look up the link by token hash
+    API-->>R: verification required, no file names
+    R->>API: POST /v1/links/{token}/codes
+    API->>RL: check per-IP and per-address limits
+    API->>DB: store code hash, outbox send-code message, audit
+    NW->>E: send the code to the invited address
+    R->>API: POST /v1/links/{token}/sessions with the code
+    API->>DB: check code, attempts and lockout, then create session, with audit
+    API-->>R: session cookie, HttpOnly and Secure
+    R->>API: GET /v1/session/files
+    API-->>R: shareable files only
+    R->>API: POST /v1/session/files/{fid}/downloads
+    API->>DB: check revocation, expiry and limit, then commit the audit record
+    API-->>R: download access, mechanism per open question 8
+```
+
+- Link tokens and codes are stored only as hashes. A token alone returns nothing about the transfer (FR-14).
+- The audit record for a download is committed before any download access is returned (NFR-15, fail closed).
+- **Download mechanism (open question 8, decided in phase 3).** The two leading candidates:
+
+| Candidate | How it meets FR-6, FR-14 and NFR-6 | Cost |
+|---|---|---|
+| Stream through the API | Each request carries the session cookie; HTTP Range requests resume a download within the same session; the stream re-checks state at least every 30 s, so revocation stops it within 60 s; counting happens on the server. | File bytes pass through Kubernetes, so pods need bandwidth headroom, and a deploy cuts long downloads (they resume). |
+| CDN signed cookies bound to the session | CloudFront serves the S3 object with caching off; the API issues signed cookies for that file's path, valid ≤ 60 s, which the web app refreshes while the session lasts; a browser retry with Range uses the refreshed cookie. | Counting downloads and enforcing the limit is harder, because the server sees cookie refreshes, not bytes. |
+
+### 4.3 Request files (UC-2)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Member
+    participant API as API service
+    participant DB as PostgreSQL
+    participant NW as Notification worker
+    actor U as Uploader, browser
+    participant SW as Scan worker
+    M->>API: POST /v1/upload-requests with email, expiry, message
+    API->>DB: insert request, outbox invite message, audit
+    NW->>U: email with the upload link
+    U->>API: verify as in 4.2, steps 1 to 10
+    U->>API: upload files as in 4.1, under the request
+    SW->>DB: each shareable file becomes available, outbox notice to the member
+    NW->>M: email that files arrived
+```
+
+Each received file follows its own retention clock from its upload (FR-13). Revoking or expiring the request stops new
+uploads but keeps received files.
+
+### 4.4 Revoke (UC-3)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Member or tenant admin
+    participant API as API service
+    participant DB as PostgreSQL
+    participant AR as Audit archive, Tokyo and Osaka
+    participant J as Lifecycle jobs
+    participant S3 as S3 files
+    A->>API: POST /v1/transfers/{id}/revocation
+    API->>DB: transfer to revoked, close its sessions, audit, in one transaction
+    API->>AR: write the revocation record in both regions
+    API-->>A: revoked
+    Note over API,DB: every later call checks state, so new downloads and uploads fail at once
+    J->>S3: abort unfinished multipart uploads
+    J->>DB: deletion becomes due per the data lifecycle table
+```
+
+- The API answers "revoked" only after the record is in the audit archive in both regions. This is the candidate way
+  to meet NFR-10's rule that a revocation is never lost in a failover; phase 3 confirms it.
+- Parts already sent with a valid part URL are never assembled into a file, because completion is server-side. The
+  reconciliation job removes any object no file refers to (PRD data lifecycle table).
+
+### 4.5 Expiry and deletion (FR-21, NFR-8)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as Lifecycle jobs, scheduled
+    participant DB as PostgreSQL
+    participant T as S3 files, Tokyo
+    participant O as S3 files, Osaka
+    J->>DB: mark transfers past expiry as expired, with audit
+    J->>DB: find data whose deletion trigger has passed
+    J->>T: delete every version of each object
+    J->>O: delete every version of the replica
+    J->>DB: mark each file deleted, with audit
+    Note over T,O: S3 replication does not copy deletes of specific versions, so both regions are deleted explicitly
+    J->>T: daily, list objects
+    J->>O: daily, list objects
+    J->>DB: compare with metadata, report leftovers, delete orphans older than 24 h
+```
+
+A lifecycle rule on both buckets also expires noncurrent object versions after 7 days, as a safety net behind the job.
+
+### 4.6 Coverage of the PRD
+
+| PRD | Where |
+|---|---|
+| UC-1, FR-1 to FR-9 | 4.1, 4.2 |
+| UC-2, FR-10 to FR-13 | 4.3 |
+| UC-3, FR-20 | 4.4 |
+| UC-4, FR-27 to FR-29 | 5.2 (audit search and export read PostgreSQL) |
+| UC-5, FR-22 to FR-26 | API service and PostgreSQL; no asynchronous flow |
+| UC-6, FR-34, FR-35 | Operator API, section 7 |
+| FR-14, FR-15 verification | 4.2 |
+| FR-16 to FR-19 scanning | 4.1 |
+| FR-21 lifecycle | 4.5 |
+
+## 5. Cross-cutting patterns
+
+### 5.1 Tenant scoping
+
+Every tenant-owned row carries `tenant_id`, and every query runs with an explicit scope: a tenant, a single resource
+reached through a verified link, or a named system job (ADR-0002). Object keys start with the tenant ID, which keeps
+per-tenant keys (open question 3) and per-tenant deletion simple. File names and email addresses never appear in
+object keys or logs. The tenant isolation suite (NFR-12) tests the data-access layer and every endpoint.
+
+### 5.2 Audit trail
+
+1. The API writes the audit record in the same database transaction as the change it describes, so a change can't
+   happen without its record. The application's database role can insert audit rows but not update or delete them.
+2. For downloads, the audit record is committed before download access is returned.
+3. The archive job copies new audit rows to the Object Lock bucket at least every minute (NFR-15), and the bucket
+   replicates to Osaka. Security-critical records (revocations, lockouts, deactivations) are also written straight
+   to both regions (4.4).
+4. Audit search and export (FR-28, FR-29) read PostgreSQL; the table is partitioned by month, and partitions older
+   than 365 days are dropped (NFR-9).
+
+### 5.3 Transactional outbox
+
+Work for the workers is written to an outbox table in the same transaction as the change that causes it. The outbox
+relay publishes rows to SQS and marks them sent. Delivery is at least once, so every consumer is idempotent: it records
+the message ID it processed and skips duplicates. The trace context travels in the message, so one trace covers the
+API call, the queue and the worker.
+
+### 5.4 Idempotent API requests
+
+Every `POST` that creates something accepts an `Idempotency-Key` header. The API stores the key and the response for
+24 hours per tenant, so a retried request after a timeout doesn't create a second transfer or send a second email.
+
+### 5.5 Observability
+
+The API and workers use OpenTelemetry for traces and Prometheus-format metrics. JSON logs carry `request_id`,
+`trace_id` and `tenant_id`, never file names, message text or plain email addresses. Business signals that the SLOs
+depend on (scan latency, time to shareable, queue age, outbox age, replication lag) are metrics with alerts, and every
+alert links to a runbook (NFR-17).
+
+## 6. Failure handling
+
+| Failure | How we notice | What happens | PRD target |
+|---|---|---|---|
+| Scan engine down or slow | Scan queue age, scan errors | Files stay in `scanning` and can't be downloaded. Retries with backoff; after the last retry the message goes to the dead-letter queue and an alert fires. | FR-19, NFR-5 |
+| Email provider failing or throttling | Send errors, bounce and complaint events | Retries with backoff. Code requests beyond the retry window return a retryable error. | NFR-7 |
+| Outbox relay stopped | Outbox age | Messages wait in PostgreSQL; nothing is lost. | NFR-5 |
+| API pod or node lost | Probes, load balancer health checks | Traffic moves to healthy pods. Uploads and downloads resume. | NFR-1, NFR-3 |
+| One AZ lost | AWS health events, error rate | PostgreSQL fails over to another AZ, typically within a minute; pods are rescheduled in the other two AZs. | NFR-11: ≤ 5 min |
+| Tokyo region lost | Route 53 health checks, alarms | An operator decides and runs the regional failover (section 7). | NFR-11: ≤ 1 h |
+| Audit archive behind | Archive lag | Records are safe in PostgreSQL; the job catches up. Revocation returns an error, and can be retried, if the two-region write fails. | NFR-15 |
+| Rate-limit counters unavailable | Errors from the store | Sign-in and verification fail closed; phase 3 decides for other calls. | NFR-14 |
+| File replication lagging | Replication latency metrics | An alert fires; Tokyo is unaffected. | NFR-10 |
+| Bad deploy | Error-rate and latency burn alerts | Argo CD rolls back to the previous version. | NFR-18: ≤ 10 min |
+| Bad migration or data corruption | Errors, reconciliation report | Point-in-time restore to a new database, then re-apply security-critical changes from the audit archive. | NFR-11: ≤ 2 h |
+
+## 7. Disaster recovery outline
+
+Losing the Tokyo region, in the order the runbook (phase 6) will follow. The minutes are a budget to check in the first
+drill, not measurements.
+
+| Step | Budget |
+|---|---|
+| Confirm the regional failure and decide to fail over | 10 min |
+| Promote the Osaka PostgreSQL replica to primary | 5 min |
+| Start compute in Osaka; Argo CD deploys the current versions | 20 min |
+| Re-apply security-critical changes from the Osaka audit archive | 5 min |
+| Switch DNS and the CDN origin to Osaka | 5 min |
+| Verify with the synthetic probe, including a real email from Osaka | 10 min |
+| **Total** | **55 min**, inside the 1-hour RTO |
+
+Files uploaded in the last minutes before the failure may not have reached Osaka; the service shows them as
+unavailable (NFR-10).
+
+## 8. Runtime contract (every service)
 
 | Concern | How |
 |---|---|
-| Liveness | `GET /healthz` — process is up; never checks dependencies |
-| Readiness | `GET /readyz` — 503 until started and during shutdown |
-| Metrics | `GET /metrics` — Prometheus: `http_requests_total`, `http_request_duration_seconds` |
-| Logs | One JSON line per event on stdout, with `request_id` |
+| Liveness | `GET /healthz`: the process is up; never checks dependencies |
+| Readiness | `GET /readyz`: 503 until started and during shutdown |
+| Metrics | `GET /metrics` in Prometheus format, not exposed through the public load balancer |
+| Logs | One JSON line per event on stdout, with `request_id` and `trace_id` |
 | Shutdown | On SIGTERM: fail readiness, drain in-flight requests (≤ 20 s), exit 0 |
-| Config | Environment variables only; secrets from the platform's secret manager |
+| Config | Environment variables only; secrets from AWS Secrets Manager |
 | Security | Non-root user, read-only filesystem, no capabilities, minimal base image |
 
-## Data
+## 9. Technology candidates and pending decisions
 
-Stores, schemas, retention and backup/restore.
+| Area | Candidate | Main alternative | Decided by |
+|---|---|---|---|
+| API framework | FastAPI, SQLAlchemy 2.0, Alembic | Django + Django Ninja | [ADR-0002](adr/0002-api-framework.md), accepted |
+| Compute | EKS with Argo CD | ECS on Fargate | ADR pending |
+| Database | Aurora PostgreSQL with a global database in Osaka | RDS PostgreSQL Multi-AZ with a cross-region replica | ADR pending |
+| Object storage | S3 with versioning and replication with RTC to Osaka | — | ADR pending |
+| Queues | SQS with dead-letter queues, fed by the outbox | EventBridge; a PostgreSQL-based queue | ADR pending |
+| Malware scanning | ClamAV in the scan worker | GuardDuty Malware Protection for S3 | ADR pending (open question 2) |
+| Rate-limit counters | Redis-compatible cache | PostgreSQL counters; WAF rate rules for per-IP limits | ADR pending |
+| Download mechanism | Section 4.2 | — | Phase 3 (open question 8) |
+| Member sign-in | Managed identity provider with MFA | Built in; tenant SSO only | Phase 3 (open question 1) |
+| Email | SES in Tokyo and Osaka | — | ADR pending |
+| Web app hosting | S3 + CloudFront | — | ADR pending |
+| Container registry | ECR, replicated to Osaka | GHCR (what the template publishes to) | ADR pending |
+| Observability | OpenTelemetry with Prometheus, Grafana, Loki and Tempo | AWS managed Prometheus and Grafana | ADR pending |
+| Infrastructure and delivery | Terraform, GitHub Actions with OIDC, Argo CD | — | ADR pending |
+| AWS accounts | One account per environment | One account for all | ADR pending (open question 4) |
 
-## Deployment
+## 10. PRD open questions this design depends on
 
-Environments, how a change reaches production, and how to roll back.
-
-## Reliability
-
-SLOs (SLI, target, window), alerts and the runbook each one links to.
-
-## Security
-
-Trust boundaries and controls — see [threat-model.md](threat-model.md).
-
-## Decisions
-
-See [adr/](adr/).
+| Open question | Where it matters |
+|---|---|
+| 1. Member sign-in | API caller resolution, section 4 |
+| 2. Scan engine for 5 GB files | Scan worker, 4.1, NFR-5 |
+| 3. KMS keys per tenant | Object keys (5.1), IAM roles (3.1) |
+| 4. AWS accounts per environment | Deployment (3) |
+| 8. Download mechanism | 4.2, API pod sizing, CDN setup |

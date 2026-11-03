@@ -17,7 +17,7 @@ downloadable, every action is written to an audit log, and an admin can revoke a
 
 ## Status
 
-**Planning, phase 1 of 6.** There is no product code yet. The two sample services from the
+**Planning, phase 2 of 6** (architecture and system design, [#16]). There is no product code yet. The two sample services from the
 [production repo template](https://github.com/codewithmuh/production-repo-template) stay in place, so every CI
 pipeline runs against real code until the stack ADRs replace them.
 
@@ -41,7 +41,7 @@ Each phase produces documents in `docs/` through its own issue and pull request.
 | Phase | Output | Tracking |
 |---|---|---|
 | 1. Requirements | [PRD](docs/prd.md): users, use cases, non-goals, measurable non-functional requirements | [#2] |
-| 2. Architecture and system design | Context and container diagrams, upload and download flows, data model, OpenAPI contract, multi-tenancy model, capacity estimates | — |
+| 2. Architecture and system design | [Architecture](docs/architecture.md): context and container diagrams, upload and download flows; data model, OpenAPI contract, multi-tenancy model, capacity estimates | [#16] |
 | 3. Security design | STRIDE threat model, encryption and key management, authn/authz, abuse and rate limiting | — |
 | 4. Decisions | One ADR per significant choice in `docs/adr/` | — |
 | 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | — |
@@ -80,7 +80,7 @@ Run `make` with no arguments to list every command.
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
-docs/                    planning docs, ADRs, runbooks (architecture + threat model: placeholders until phases 2–3)
+docs/                    PRD, architecture, ADRs, runbooks (threat model: placeholder until phase 3)
 services/api-python/     FastAPI sample service (to be replaced by the API service)
 services/api-go/         Go sample service (stays only if an ADR gives Go a job)
 compose.yaml             local run with production-like hardening
@@ -111,3 +111,4 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 [#2]: https://github.com/codewithmuh/secure-file-transfer/issues/2
 [#6]: https://github.com/codewithmuh/secure-file-transfer/issues/6
+[#16]: https://github.com/codewithmuh/secure-file-transfer/issues/16
