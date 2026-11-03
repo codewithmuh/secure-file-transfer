@@ -17,7 +17,7 @@ downloadable, every action is written to an audit log, and an admin can revoke a
 
 ## Status
 
-**Planning, phase 2 of 6** (architecture and system design, [#16]). There is no product code yet. The two sample services from the
+**Planning, phase 4 of 6** (decisions, [#34]). There is no product code yet. The two sample services from the
 [production repo template](https://github.com/codewithmuh/production-repo-template) stay in place, so every CI
 pipeline runs against real code until the stack ADRs replace them.
 
@@ -42,8 +42,8 @@ Each phase produces documents in `docs/` through its own issue and pull request.
 |---|---|---|
 | 1. Requirements | [PRD](docs/prd.md): users, use cases, non-goals, measurable non-functional requirements | [#2] |
 | 2. Architecture and system design | [Architecture](docs/architecture.md): context and container diagrams, upload and download flows; data model, OpenAPI contract, multi-tenancy model, capacity estimates | [#16] |
-| 3. Security design | STRIDE threat model, encryption and key management, authn/authz, abuse and rate limiting | — |
-| 4. Decisions | One ADR per significant choice in `docs/adr/` | — |
+| 3. Security design | [STRIDE threat model](docs/threat-model.md), [encryption and key management](docs/security/encryption-and-keys.md), [authn/authz](docs/security/authn-authz.md), [abuse and rate limiting](docs/security/abuse-and-rate-limits.md) | [#25] |
+| 4. Decisions | [One ADR per significant choice](docs/adr/) | [#34] |
 | 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | — |
 | 6. Operations | SLOs, dashboards, alerts, runbooks, backup/restore and DR drills with measured RTO/RPO | — |
 
@@ -80,7 +80,7 @@ Run `make` with no arguments to list every command.
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
-docs/                    PRD, architecture, design notes, ADRs, runbooks (threat model: placeholder until phase 3)
+docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api-python/     FastAPI sample service (to be replaced by the API service)
 services/api-go/         Go sample service (stays only if an ADR gives Go a job)
 compose.yaml             local run with production-like hardening
@@ -97,7 +97,7 @@ Every service keeps this runtime contract:
 | `GET /readyz` | Readiness: 503 until started and while shutting down |
 | `GET /metrics` | Prometheus metrics: request count and latency by route and status |
 | Logs | JSON on stdout, one line per request, with `request_id` (taken from `X-Request-Id` or generated) |
-| `SIGTERM` | Fail readiness → finish in-flight requests (≤ 20 s) → exit |
+| `SIGTERM` | Fail readiness → finish in-flight requests (≤ 20 s; the API's download streams ≤ 120 s) → exit |
 | Image | Non-root user, read-only filesystem, built-in `HEALTHCHECK` |
 
 ## Security
@@ -112,3 +112,5 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 [#2]: https://github.com/codewithmuh/secure-file-transfer/issues/2
 [#6]: https://github.com/codewithmuh/secure-file-transfer/issues/6
 [#16]: https://github.com/codewithmuh/secure-file-transfer/issues/16
+[#25]: https://github.com/codewithmuh/secure-file-transfer/issues/25
+[#34]: https://github.com/codewithmuh/secure-file-transfer/issues/34

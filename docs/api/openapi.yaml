@@ -7,12 +7,14 @@ info:
     The public, versioned REST API of secure-file-transfer (FR-31). The web app (FR-30) and tenant automation (FR-32)
     use it; nothing the web app does bypasses it.
 
-    This is the design-first contract from planning phase 2 (issue #14). Once code exists, the document generated from
-    the code replaces this file and CI fails if the two differ (ADR-0002). See `docs/api/README.md` for the
-    conventions: authentication, errors, pagination, idempotency and rate limits.
+    This is the design-first contract from planning phase 2 (issue #14), aligned with the phase 3 security design
+    (issue #26): member sign-in through Amazon Cognito (PRD open question 1, `docs/security/authn-authz.md`) and
+    downloads streamed through the API (open question 8, `docs/security/abuse-and-rate-limits.md`). Once code exists,
+    the document generated from the code replaces this file and CI fails if the two differ (ADR-0002). See
+    `docs/api/README.md` for the conventions: authentication, errors, pagination, idempotency and rate limits.
 
-    Parts marked **provisional** wait for a phase 3 decision: member sign-in (PRD open question 1) and the download
-    mechanism (PRD open question 8).
+    The operator API (`/operator` paths) is a separate workload with its own server entry: no load balancer routes to
+    it, and operators reach it only through a port-forward (authn-authz section 8.2).
   license:
     name: MIT
     identifier: MIT
@@ -25,6 +27,10 @@ servers:
     description: Relative to the API origin. The domain waits for PRD open question 5.
 
 tags:
+  - name: Sign-in
+    description: |
+      Member and admin sign-in through Amazon Cognito managed login or the tenant's own identity provider, and sign-out
+      (FR-25, FR-26). The API issues its own server-side session; no Cognito token reaches the browser.
   - name: Account
     description: The signed-in member or admin.
   - name: Transfers
@@ -44,20 +50,276 @@ tags:
   - name: API keys
     description: Tenant-scoped API keys for automation (FR-32).
   - name: Operator
-    description: Platform operator actions (UC-6, FR-34).
+    description: |
+      Platform operator actions (UC-6, FR-34, FR-35), served by the operator API: its own Deployment in the
+      `sft-operator` namespace, reached only by port-forward. It never returns file names, messages or contents.
 
 paths:
+  /auth/sign-in:
+    get:
+      tags: [Sign-in]
+      operationId: startSignIn
+      summary: Start a member sign-in
+      description: |
+        The web app's sign-in page navigates the browser here. The API stores the sign-in state, the PKCE verifier,
+        the nonce, the connection chosen and the return path for 10 minutes, single use, under a new random
+        `__Host-sft_auth` cookie, and redirects to Cognito managed login with `prompt=login` and the identity provider
+        it chose (authn-authz 2.4). The verifier never leaves the server.
+
+        - `method=sso` sends only the domain of the member's address (`sso_domain`). If a tenant has proven that
+          domain, the browser goes to that tenant's identity provider; otherwise it falls back to local sign-in.
+        - `method=local` always goes to Cognito's own sign-in: a password and TOTP, or a passkey with user
+          verification.
+
+        The web app also uses this operation for step-up, after a `reauthentication_required` answer, and to sign an
+        admin in with a passkey, after `passkey_required`, the same way in as before. Every sign-in creates a new
+        session.
+
+        Public. Rate limit: 60 sign-in starts per IP address per minute. When the sign-in state store or the
+        rate-limit counters are unavailable, it fails closed with `503`.
+
+        Errors: `422 validation_failed` (`method=sso` without `sso_domain`), `429 rate_limited`,
+        `503 service_unavailable`.
+
+        Requirements: FR-25, FR-26, NFR-14.
+      x-permission: public
+      security: []
+      parameters:
+        - name: method
+          in: query
+          required: true
+          description: The way in the member chose on the sign-in page.
+          schema:
+            type: string
+            enum: [sso, local]
+        - name: sso_domain
+          in: query
+          required: false
+          description: |
+            For `method=sso`, the domain of the member's work address, such as `example.co.jp`. Only the domain is
+            sent, never the address.
+          schema:
+            type: string
+            format: hostname
+            maxLength: 253
+        - $ref: '#/components/parameters/ReturnTo'
+      responses:
+        '302':
+          description: Redirect to Cognito managed login.
+          headers:
+            Location:
+              $ref: '#/components/headers/RedirectLocation'
+            Set-Cookie:
+              $ref: '#/components/headers/SetAuthCookie'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/callback:
+    get:
+      tags: [Sign-in]
+      operationId: completeSignIn
+      summary: Complete a member sign-in
+      description: |
+        Cognito redirects the browser here after sign-in. The API takes the pre-auth record named by the
+        `__Host-sft_auth` cookie (deleting it), compares `state` in constant time, exchanges the code with the client
+        secret and the PKCE verifier, and validates the ID token: signature, `iss`, `aud`, `token_use`, `exp` and
+        `nonce`. It finds the connection from how the sign-in arrived and the identity by
+        `(idp_connection_id, subject)`, never by an email claim, then creates a new member session, revokes any
+        session cookie the browser sent, revokes Cognito's refresh token and keeps no Cognito token
+        (authn-authz 2.4, 3.3). For an invitation (`startInvitationSignIn`) it binds the identity provider's subject
+        to the invited user in the same transaction.
+
+        `code` is Cognito's authorization code: valid for 5 minutes, single use, and useless without the PKCE
+        verifier and the client secret, which never leave the server. It is the one credential-like value in a query
+        string (README section 7); application logs drop this route's query string.
+
+        On success: `302` to the web app's return path, with the session cookie. The web app then calls
+        `getCurrentMember` for the member, the tenant and the CSRF token.
+
+        On any refusal, `302` to the web app's sign-in page with `error=sign_in_failed`, which names no reason. The
+        API audits the reason: a state that is missing, reused or wrong; an invalid token; an unknown identity; a
+        deactivated user; a suspended tenant; an inactive connection; an invitation that is used, expired or for
+        another connection; a subject already bound to another user; or a local sign-in to a tenant that requires
+        SSO by someone who isn't one of its fallback admins. Nobody is created just in time: someone nobody invited
+        is told to ask their admin.
+
+        Public. Rate limit: 60 callbacks per IP address per minute; fails closed with `503` when the sign-in state
+        store or the counters are unavailable.
+
+        Errors: `429 rate_limited`, `503 service_unavailable`.
+
+        Requirements: FR-25, FR-26, FR-27, NFR-14.
+      x-permission: public
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: false
+          description: Cognito's single-use authorization code. Absent when Cognito returns `error`.
+          schema:
+            type: string
+            maxLength: 2048
+        - name: state
+          in: query
+          required: false
+          description: The state value `startSignIn` sent, compared with the pre-auth record. Not a credential on its own.
+          schema:
+            type: string
+            maxLength: 512
+        - name: error
+          in: query
+          required: false
+          description: An OAuth error from Cognito, such as `access_denied`. The sign-in is refused.
+          schema:
+            type: string
+            maxLength: 128
+        - name: error_description
+          in: query
+          required: false
+          description: Cognito's description of `error`. Logged, never shown.
+          schema:
+            type: string
+            maxLength: 1024
+      responses:
+        '302':
+          description: |
+            Redirect to the web app: to the return path with a new session cookie on success, or to its sign-in page
+            with `error=sign_in_failed`.
+          headers:
+            Location:
+              $ref: '#/components/headers/RedirectLocation'
+            Set-Cookie:
+              $ref: '#/components/headers/SetSessionCookie'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/invitations:
+    post:
+      tags: [Sign-in]
+      operationId: startInvitationSignIn
+      summary: Start sign-in from an SSO invitation
+      description: |
+        For a member of a tenant that uses SSO: the web app reads the invitation token from the fragment of the
+        emailed link (`/invite#<token>`), removes it from the address bar, and posts it here. The API checks the
+        token, stores the invited user and the tenant's connection in a new pre-auth record (as `startSignIn` does),
+        sets `__Host-sft_auth`, and returns the URL of the tenant's identity provider sign-in, where the web app sends
+        the browser. `completeSignIn` then binds the identity provider's subject to the invited user, consumes the
+        token and activates the user, in one transaction (authn-authz 2.5).
+
+        An invitation token has 256 random bits, is stored only as a hash and is valid for 7 days; a new invitation
+        replaces it. It travels only in this request body. Local members don't use this operation: Cognito asks them
+        to choose a password and enroll TOTP at their first sign-in.
+
+        Public, but unsafe: `Origin` must be the web app's origin, otherwise `403 csrf_failed`. Rate limited per IP
+        address with the sign-in starts; fails closed with `503`.
+
+        Errors: `403 csrf_failed`, `404 not_found` (an unknown, used, replaced or expired invitation),
+        `429 rate_limited`, `503 service_unavailable`.
+
+        Requirements: FR-22, FR-26.
+      x-permission: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationSignInRequest'
+      responses:
+        '200':
+          description: Where to send the browser to sign in, sent with `Cache-Control` set to `no-store`.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetAuthCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignInRedirect'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/sign-out:
+    post:
+      tags: [Sign-in]
+      operationId: signOut
+      summary: Sign out
+      description: |
+        Revokes the calling session, clears the `__Host-sft_session` cookie and returns the logout URL of the user
+        pool that signed the member in. The web app goes there, so managed login's own cookie is cleared too. With
+        `all_sessions: true` it ends every session of the member, on every device.
+
+        SSO members stay signed in at their own identity provider; SAML single logout is not in v1. A routine sign-out
+        is not a security-critical record. Signing out of a session that has already ended gets
+        `401 session_expired`, which the web app treats as signed out.
+
+        Requirements: FR-25.
+      x-permission: account.sign_out
+      security:
+        - memberSession: []
+          csrfToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignOutRequest'
+      responses:
+        '200':
+          description: Signed out. The session cookie is cleared.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearSessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignOutResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
   /me:
     get:
       tags: [Account]
       operationId: getCurrentMember
       summary: Get the signed-in member
       description: |
-        Returns the signed-in member or admin, their tenant and the session's CSRF token (`csrf_token`, see the
-        `csrfToken` scheme). The web app calls it after sign-in and after every page load, uses it to decide what to
-        show, and keeps the token in memory for unsafe requests. The response is sent with `Cache-Control: no-store`.
-        Signing in and out is provisional: those operations are added once PRD open question 1 decides how members
-        sign in with MFA.
+        Returns the signed-in member or admin, their tenant, how the session was signed in, and the session's CSRF
+        token (`csrf_token`, see the `csrfToken` scheme). The token is derived from the session token, not stored, so
+        this call returns the same token after every page load until the session changes. The web app calls it after
+        sign-in and after every page load, uses it to decide what to show, and keeps the token in memory for unsafe
+        requests. The response is sent with `Cache-Control: no-store`.
+
+        `session.effective_role` is the role the session acts with: a local admin whose session wasn't signed in with
+        a passkey acts as a member (authn-authz 3.3), so the web app can offer a passkey sign-in before admin work.
 
         Requirements: FR-22, FR-25, FR-30.
       x-permission: account.read
@@ -91,11 +353,13 @@ paths:
         the tenant's `max_expiry`. When it is left out, it is 7 days, or the tenant's maximum if that is shorter. A
         draft has no `expires_at`: `sendTransfer` sets it to `submitted_at` plus `expires_in`, so time spent as a
         draft never shortens the transfer. Each recipient's domain is checked against the tenant's allowed and blocked
-        domains.
+        domains, and an address on the suppression list (a hard bounce, or a complaint about this tenant's email) is
+        refused with `422 recipient_undeliverable`, with a pointer to the recipient in `errors`.
 
-        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `409 idempotency_conflict`.
+        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `422 recipient_undeliverable`,
+        `409 idempotency_conflict`.
 
-        Requirements: FR-1, FR-3, FR-4, FR-8, FR-24, FR-33.
+        Requirements: FR-1, FR-3, FR-4, FR-7, FR-8, FR-24, FR-33.
       x-permission: transfer.create
       security:
         - memberSession: []
@@ -218,10 +482,15 @@ paths:
         a retry is safe. Only the transfer's owner can send it; a tenant admin gets `403 permission_denied` on another
         member's transfer.
 
-        Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
-        (cancelled), `409 transfer_revoked`, `409 transfer_expired`.
+        Link emails count against the email caps (abuse-and-rate-limits 2.2, group G): 200 recipient emails an hour per
+        member or API key, 2,000 per tenant, and 20 link emails a day to one address from this tenant (`429`). A
+        platform-wide cap per address delays an email instead of refusing it: the recipient's `delivery_state` stays
+        `queued`, which never says why (`listTransferRecipients`).
 
-        Requirements: FR-1, FR-5.
+        Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
+        (cancelled), `409 transfer_revoked`, `409 transfer_expired`, `429 rate_limited`.
+
+        Requirements: FR-1, FR-5, FR-7.
       x-permission: transfer.send
       security:
         - memberSession: []
@@ -302,8 +571,12 @@ paths:
 
         A revocation is a security-critical record (README section 5): the `200` comes only after the record is in
         the audit archive in both regions (NFR-10). If that write fails, the revocation has still taken effect and the
-        call returns `503`; retry it. Revoking a transfer that is already `revoked` writes the archive record if it is
-        still missing and returns `200` with the transfer, so a retry is always safe.
+        call returns `503`; retry it. The web app must not tell the member the revocation failed: it says the transfer
+        is revoked and retries in the background. Revoking a transfer that is already `revoked` writes the archive
+        record if it is still missing and returns `200` with the transfer, so a retry is always safe.
+
+        A revocation never counts against the tenant's request budget, and a local admin may revoke without a passkey
+        sign-in (authn-authz 3.3): a stolen session can use it only to stop sharing.
 
         Errors: `409 invalid_state` (draft or cancelled), `409 transfer_expired`, `503 service_unavailable`.
 
@@ -400,8 +673,13 @@ paths:
       operationId: listTransferRecipients
       summary: Get per-recipient status
       description: |
-        For each recipient: whether they were notified, when they verified, whether they are locked out, and which
-        files they downloaded and when. A transfer has at most 50 recipients, so the list isn't paginated.
+        For each recipient: where their link email stands (`delivery_state`), when it was sent, when they verified,
+        whether they are locked out, and which files they downloaded and when. A transfer has at most 50 recipients,
+        so the list isn't paginated.
+
+        `delivery_state` is `queued` for every kind of delay (a platform-wide cap on emails to one address, a paused
+        tenant, email provider throttling, a backlog), and never says which, so one tenant learns nothing about what
+        other tenants send to an address (NFR-12).
 
         The same people see it as with `getTransfer`: the owner, and every tenant admin and API key with
         `transfers:read` for any transfer in the tenant, so an admin can find and unlock a locked-out recipient.
@@ -438,20 +716,30 @@ paths:
       description: |
         A recipient is locked out after 20 failed verification attempts on this transfer (NFR-14). The member who
         created the transfer, or a tenant admin, unlocks them; the count of failed attempts starts again from zero.
-        Unlocking a recipient who isn't locked returns their status unchanged. The lockout and the unlock are
-        security-critical audit records.
 
-        Errors: `409 transfer_revoked`, `409 transfer_expired`.
+        **Unlocking always issues a new link.** It clears the link's token hash and its issue time, so the
+        notification worker derives a new token and emails the recipient a new link; the old link stops working
+        (`404 link_not_found`). Whoever caused the lockout with a leaked link is cut off, and a recipient who mistyped
+        just gets a new email (authn-authz 4.4). Unlocking a recipient who isn't locked returns their status unchanged
+        and sends nothing.
+
+        **A person decides:** API keys can't unlock, because a lockout signals a possible attack. A local admin
+        unlocking another member's recipient needs a passkey sign-in (`403 passkey_required`).
+
+        The lockout and the unlock are security-critical records (README section 5): the unlock takes effect at once,
+        and the `200` comes after its record is in both regions' audit archive. If that write fails, the call returns
+        `503`; a retry writes the record if it is still missing and returns `200`.
+
+        Errors: `403 passkey_required`, `409 transfer_revoked`, `409 transfer_expired`, `503 service_unavailable`.
 
         Requirements: NFR-14, FR-7, FR-27.
       x-permission: recipient.unlock
       security:
         - memberSession: []
           csrfToken: []
-        - tenantApiKey: ['transfers:write']
       responses:
         '200':
-          description: The recipient's status after the unlock.
+          description: The recipient's status after the unlock. Their new link email is on its way.
           content:
             application/json:
               schema:
@@ -466,6 +754,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /transfers/{transfer_id}/files:
     parameters:
@@ -483,9 +773,13 @@ paths:
         Limits (FR-1, FR-2): 50 files per transfer, 5 GB (5,000,000,000 bytes) per file, 20 GB per transfer, counted
         from the declared sizes. `completeUpload` counts them again under a lock.
 
+        Declaring a file reserves its size in the tenant's storage quota (2 TB of files uploading, scanning or stored
+        by default; `413 storage_quota_exceeded`) and counts against the tenant's daily upload volume (200 GB declared
+        in 24 hours; `429`). Removing or rejecting the file releases the reservation (abuse-and-rate-limits 6.1).
+
         Errors: `403 permission_denied`, `409 invalid_state` (the transfer isn't a draft; `current_state` says what it
-        is, for example `cancelled`), `413 file_too_large`, `413 total_too_large`, `422 too_many_files`,
-        `409 idempotency_conflict`.
+        is, for example `cancelled`), `413 file_too_large`, `413 total_too_large`, `413 storage_quota_exceeded`,
+        `422 too_many_files`, `409 idempotency_conflict`, `429 rate_limited`.
 
         Requirements: FR-1, FR-2.
       x-permission: file.upload
@@ -577,8 +871,9 @@ paths:
         For a file of a transfer: removes it while the transfer is a `draft`, `submitted` or `held`. When files remain,
         removing one from a `submitted` or `held` transfer runs the evaluation again (a `held` transfer moves back to
         `submitted` first), so removing the blocked file lets the remaining files be sent (UC-1). Removing the last
-        file moves the transfer back to `draft` (data model 3.2): no recipient was ever notified, `submitted_at` and
-        `expires_at` are cleared, and the member can add files and send it again, or cancel it.
+        counted file (one that isn't `rejected`) moves the transfer back to `draft` (data model 3.2): no recipient was
+        ever notified, `submitted_at` and `expires_at` are cleared, and the member can add files and send it again, or
+        cancel it.
 
         For a file received through an upload request: deletes it before its retention ends (FR-13).
 
@@ -705,11 +1000,17 @@ paths:
       operationId: completeUpload
       summary: Complete a file upload
       description: |
-        Assembles the uploaded parts into one object, checks its real size against the declared size, and re-checks
-        the transfer under a row lock, so a cancellation of the draft that lands meanwhile wins: a cancelled draft
-        never accepts the file. Under the same lock it counts the transfer's files and their total size again, so
-        uploads added in parallel can't exceed 50 files or 20 GB (FR-1, FR-2). On success the file moves to
-        `scanning`. If a check fails, the object is deleted and the file becomes `rejected`.
+        Completes the upload in this order (architecture 4.1, abuse-and-rate-limits 6.3):
+
+        1. Lock the transfer row and re-check it first: still a `draft`, the file still `uploading`, and the
+           transfer's files and their total size, counted again, within 50 files and 20 GB (FR-1, FR-2). So a
+           cancellation of the draft that lands meanwhile wins, and uploads added in parallel can't pass the limits.
+           If a check fails, the file becomes `rejected`, the multipart upload is aborted, its quota is released, and
+           no part is assembled.
+        2. Still under the lock, list the parts in object storage itself, never trusting the client's list, and
+           assemble them.
+        3. Read the object's real size. If it isn't the declared size, the file becomes `rejected` and the deletion
+           job removes the object; the API never deletes objects itself. Otherwise the file moves to `scanning`.
 
         Completing a file that is already past `uploading` returns it unchanged, so a retry is safe. Only the
         transfer's owner can call it.
@@ -753,18 +1054,25 @@ paths:
       operationId: createReceivedFileDownload
       summary: Download a received file
       description: |
-        Grants the member who created an upload request access to one shareable file received through it (FR-12).
-        Tenant admins see metadata only and can't download, and API keys can't download file contents.
+        Grants the member who created an upload request access to one shareable file received through it (FR-12),
+        then the browser fetches the bytes with `getReceivedFileDownloadContent`. Tenant admins see metadata only and
+        can't download, and API keys can't download file contents.
 
-        Every call is checked and audited; the audit record is committed before access is returned, and if it can't
-        be written the call fails with `503` (NFR-15). An `unscannable` file allowed by policy carries a warning
-        (FR-18). This operation never replays a stored response, so it takes no `Idempotency-Key`.
+        The grant belongs to the member session that created it: 24 hours, never past that session; 3 × the file size
+        in bytes, 20 content requests, one active stream (abuse-and-rate-limits 5.4). Its record is written to both
+        regions' audit archive before the grant is committed, so a `503` means no grant was issued (NFR-15). Passing
+        `resume_grant_id` returns that grant again while it has time, bytes and requests left, otherwise
+        `403 download_grant_exhausted`; a grant of another session or another file gets `404`. An `unscannable` file
+        allowed by policy carries a warning (FR-18). This operation never replays a stored response, so it takes no
+        `Idempotency-Key`.
 
-        **Provisional:** the shape of `DownloadAccess` waits for PRD open question 8.
+        Rate limits (group D): 300 grant requests an hour per member and per IP address, 2,000 grants an hour and
+        500 GB of granted bytes a day per tenant.
 
-        Errors: `403 permission_denied`, `409 file_not_shareable`, `503 service_unavailable`.
+        Errors: `403 permission_denied`, `403 download_grant_exhausted`, `409 file_not_shareable`,
+        `429 rate_limited`, `503 service_unavailable`.
 
-        Requirements: FR-12, FR-16, FR-17, FR-18, NFR-15.
+        Requirements: FR-6, FR-12, FR-16, FR-17, FR-18, NFR-15.
       x-permission: file.download_received
       security:
         - memberSession: []
@@ -797,6 +1105,53 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
+  /files/{file_id}/downloads/{grant_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+      - $ref: '#/components/parameters/GrantId'
+    get:
+      tags: [Files]
+      operationId: getReceivedFileDownloadContent
+      summary: Fetch the bytes of a received file
+      description: |
+        Streams the bytes of a received file under a grant from `createReceivedFileDownload` (its `url`). The web app
+        starts it by navigation, so the browser's own download manager saves and resumes it. It is authorised by the
+        grant ID in the path together with the member session cookie that created the grant: without the cookie the
+        answer is `401`, and with another session, even the same member's on another device, `404`. The grant ID is
+        not a credential, so a forwarded URL grants nothing (FR-14).
+
+        A safe `GET` with no CSRF header; `SameSite=Strict` keeps the cookie off cross-site requests. Ranges, headers,
+        the byte budget and the 30-second re-checks work as for `getSessionDownloadContent`. A file deleted or past
+        its retention gets `404`.
+
+        Errors: `401 authentication_required`, `401 session_expired`, `403 download_grant_exhausted`, `404 not_found`,
+        `416 range_not_satisfiable`, `429 rate_limited`, `503 service_unavailable`.
+
+        Requirements: FR-6, FR-12, FR-14, FR-17, NFR-4.
+      x-permission: file.download_received
+      security:
+        - memberSession: []
+      parameters:
+        - $ref: '#/components/parameters/Range'
+        - $ref: '#/components/parameters/IfRange'
+      responses:
+        '200':
+          $ref: '#/components/responses/FileContent'
+        '206':
+          $ref: '#/components/responses/PartialFileContent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '416':
+          $ref: '#/components/responses/RangeNotSatisfiable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
   /upload-requests:
     post:
       tags: [Upload requests]
@@ -805,9 +1160,11 @@ paths:
       description: |
         Creates an `open` upload request for one external email address and emails them an upload link. The expiry
         follows the same rules as a transfer (FR-3), and the address is checked against the tenant's allowed and
-        blocked domains.
+        blocked domains and the suppression list (`422 recipient_undeliverable`). The email counts against the same
+        caps as `sendTransfer`; `delivery_state` shows where it stands, `queued` for every delay.
 
-        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `409 idempotency_conflict`.
+        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `422 recipient_undeliverable`,
+        `409 idempotency_conflict`, `429 rate_limited`.
 
         Requirements: FR-10, FR-3, FR-24, FR-33.
       x-permission: upload_request.create
@@ -927,8 +1284,9 @@ paths:
         tenant admin, can revoke it.
 
         As with `revokeTransfer`, the `200` comes only after the revocation record is in the audit archive in both
-        regions. A `503` means the revocation has taken effect but its record isn't confirmed yet; retry it. Revoking
-        a request that is already `revoked` writes the archive record if it is still missing and returns `200`.
+        regions. A `503` means the revocation has taken effect but its record isn't confirmed yet; retry it, and don't
+        tell the member it failed. Revoking a request that is already `revoked` writes the archive record if it is
+        still missing and returns `200`. A local admin may revoke without a passkey sign-in.
 
         Errors: `409 upload_request_expired`, `503 service_unavailable`.
 
@@ -967,19 +1325,21 @@ paths:
       summary: Unlock a locked-out uploader
       description: |
         Unlocks the uploader after 20 failed verification attempts on this request (NFR-14), the same way as
-        `unlockRecipient`. Unlocking an uploader who isn't locked returns the request unchanged.
+        `unlockRecipient`: it **always issues a new link**, emailed to the uploader, and the old link stops working
+        (`404 link_not_found`). API keys can't unlock. Unlocking an uploader who isn't locked returns the request
+        unchanged and sends nothing. A security-critical record, with the same `503` meaning as `unlockRecipient`.
 
-        Errors: `409 upload_request_revoked`, `409 upload_request_expired`.
+        Errors: `403 passkey_required`, `409 upload_request_revoked`, `409 upload_request_expired`,
+        `503 service_unavailable`.
 
         Requirements: NFR-14, FR-27.
       x-permission: uploader.unlock
       security:
         - memberSession: []
           csrfToken: []
-        - tenantApiKey: ['upload_requests:write']
       responses:
         '200':
-          description: The upload request after the unlock.
+          description: The upload request after the unlock. The new link email is on its way.
           content:
             application/json:
               schema:
@@ -994,6 +1354,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /upload-requests/{upload_request_id}/files:
     parameters:
@@ -1082,11 +1444,16 @@ paths:
         recipient or uploader.
 
         Public. Every call is checked and audited and never replays a stored response, so it takes no
-        `Idempotency-Key`. Rate limits (NFR-14): 5 codes per email address per hour, and the per-IP link limit. If the
-        rate-limit counters are unavailable, the call fails closed with `503`.
+        `Idempotency-Key`. Rate limits (NFR-14, abuse-and-rate-limits 2.2 group A): 1 code every 30 seconds and 20 a
+        day per link issued; 5 an hour and 50 a day per email address, across all tenants; 1,000 an hour per tenant;
+        and the per-IP link limits. If the rate-limit counters are unavailable, the call fails closed with `503`.
+
+        A locked recipient or uploader gets no email (`403 recipient_locked`). An address on the suppression list gets
+        no email either, and `422 recipient_undeliverable` lets the page say the code couldn't be sent and to contact
+        the sender.
 
         Errors: `403 recipient_locked`, `404 link_not_found`, `410 link_revoked`, `410 link_expired`,
-        `429 rate_limited`, `503 service_unavailable`.
+        `422 recipient_undeliverable`, `429 rate_limited`, `503 service_unavailable`.
 
         Requirements: FR-14, NFR-7, NFR-14.
       x-permission: public
@@ -1127,8 +1494,9 @@ paths:
       description: |
         Checks the code against the newest code for this recipient or uploader. Attempts are counted atomically. On
         success a new link session starts, bound to this browser and to this one transfer recipient or upload request,
-        valid for at most 24 hours (FR-15). The response body carries the session's `id`, which every `/session` call
-        sends in `X-Link-Session`, and its own `csrf_token`. It is sent with `Cache-Control: no-store`.
+        valid for at most 24 hours and 1 hour idle, never past the item's expiry (FR-15). The response body carries the
+        session's `id`, which every `/session` call except the content download sends in `X-Link-Session`, and its own
+        `csrf_token`, derived from the new session token. It is sent with `Cache-Control: no-store`.
 
         A browser can hold several link sessions at once, one per transfer recipient or upload request, so verifying a
         second link never ends the first. The response sets a new `__Host-sft_link` value, and the browser's other
@@ -1191,8 +1559,8 @@ paths:
       description: |
         Returns what the verified recipient or uploader may now see, in the link session named by `X-Link-Session`:
         the message, the sender, the expiry and, for an upload request, the limits and what has been received so far.
-        It also returns the session's `csrf_token`, so the web app gets it back after a page load; the response is
-        sent with `Cache-Control: no-store`.
+        It also returns the session's `csrf_token`, derived from the session token and never stored, so the web app
+        gets the same token back after a page load; the response is sent with `Cache-Control: no-store`.
 
         Errors: `401 authentication_required` (no `X-Link-Session`, or one this browser doesn't hold),
         `401 session_expired`, `410 link_revoked`, `410 link_expired`.
@@ -1282,10 +1650,13 @@ paths:
       summary: Add a file to an upload request
       description: |
         For an uploader: declares a file and starts its multipart upload, as `addTransferFile` does for a member. The
-        same limits apply: 50 files, 5 GB per file, 20 GB in total (FR-11). Not allowed for a recipient session.
+        same limits apply: 50 files, 5 GB per file, 20 GB in total (FR-11), and at most 100 file declarations per
+        request, rejected files included. The upload counts against the requesting tenant's storage quota and daily
+        upload volume. Not allowed for a recipient session.
 
         Errors: `403 permission_denied`, `410 link_revoked`, `410 link_expired`, `413 file_too_large`,
-        `413 total_too_large`, `422 too_many_files`, `409 idempotency_conflict`.
+        `413 total_too_large`, `413 storage_quota_exceeded`, `422 too_many_files`, `409 idempotency_conflict`,
+        `429 rate_limited`.
 
         Requirements: FR-11, FR-2.
       x-permission: session.upload
@@ -1414,11 +1785,12 @@ paths:
       operationId: completeSessionUpload
       summary: Complete an uploader's file upload
       description: |
-        For an uploader: the same checks as `completeUpload`, against the upload request under a row lock. A request
-        revoked or expired meanwhile never accepts the file (NFR-6). Under the same lock the request's files and their
-        total size are counted again, so uploads added in parallel can't exceed 50 files or 20 GB (FR-11). When the
-        scan finishes, a shareable file becomes available to the member, who is notified; a blocked file is reported
-        to both sides (FR-12).
+        For an uploader: the same order as `completeUpload`, against the upload request. The request row is locked
+        and re-checked before any part is assembled, so a request revoked or expired meanwhile never accepts the file
+        and never assembles its parts (NFR-6). Under the same lock the request's files and their total size are
+        counted again, so uploads added in parallel can't exceed 50 files or 20 GB (FR-11). A size mismatch marks the
+        file `rejected` and leaves the object to the deletion job. When the scan finishes, a shareable file becomes
+        available to the member, who is notified; a blocked file is reported to both sides (FR-12).
 
         Errors: `403 permission_denied`, `409 upload_incomplete`, `410 link_revoked`, `410 link_expired`,
         `413 total_too_large`, `422 too_many_files`, `422 upload_size_mismatch`.
@@ -1477,15 +1849,24 @@ paths:
         gave no access, and re-applying it after a failover or restore can count one download too many, never one
         too few.
 
-        Resuming an interrupted download passes `resume_grant_id` and doesn't count again (FR-6). Every call is
-        checked and audited and never replays a stored response, so it takes no `Idempotency-Key`. Rate limits:
-        per IP address, per tenant and per recipient (NFR-14).
+        The browser then fetches the bytes from the grant's `url` with `getSessionDownloadContent` (PRD open question
+        8: downloads stream through the API). A grant belongs to this link session and this file, and is bounded: 24
+        hours, never past the session, the transfer's expiry or a revocation; 3 × the file size in bytes; 20 content
+        requests; one active stream (abuse-and-rate-limits 5.4).
 
-        **Provisional:** how the bytes are delivered, and how resuming is bounded so it can't get around the limit,
-        wait for PRD open question 8.
+        **Resuming.** Range requests under the same grant are free. After a reload, passing `resume_grant_id` returns
+        the same grant, uncounted, while it has time, bytes and requests left; once it hasn't, the answer is
+        `403 download_grant_exhausted`, and a call without `resume_grant_id` counts a new download. `resume_grant_id`
+        works only in the session that created the grant and for the same file; any other grant gets `404`. A
+        recipient who verifies again has a new session, so finishing a download then counts a new one (FR-6).
 
-        Errors: `403 download_limit_reached`, `403 permission_denied` (an uploader session), `409 file_not_shareable`,
-        `410 link_revoked`, `410 link_expired`, `503 service_unavailable`.
+        Every call is checked and audited and never replays a stored response, so it takes no `Idempotency-Key`. Rate
+        limits (group D): 100 grant requests an hour per recipient, resumes included, and 25 GB of granted bytes a day
+        per recipient; 300 an hour per IP address; 2,000 grants an hour and 500 GB a day per tenant (NFR-14).
+
+        Errors: `403 download_limit_reached`, `403 download_grant_exhausted`, `403 permission_denied` (an uploader
+        session), `409 file_not_shareable`, `410 link_revoked`, `410 link_expired`, `429 rate_limited`,
+        `503 service_unavailable`.
 
         Requirements: FR-4, FR-6, FR-14, FR-17, FR-18, NFR-6, NFR-15.
       x-permission: session.download
@@ -1522,6 +1903,71 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
+  /session/downloads/{grant_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/GrantId'
+    get:
+      tags: [Recipient session]
+      operationId: getSessionDownloadContent
+      summary: Fetch the bytes of a file
+      description: |
+        Streams the bytes of one file under a grant from `createSessionDownload` (its `url`). The web app starts it by
+        navigation, so the browser's own download manager saves and resumes it, in every browser of NFR-22.
+
+        **No `X-Link-Session`.** A navigation can't send headers, so this is the one `/session` operation exempt from
+        it. It is authorised by the grant ID in the path together with the `__Host-sft_link` cookie, which must hold
+        the session the grant belongs to: without the cookie (a URL pasted elsewhere or opened from another site)
+        the answer is `401`; with a cookie that doesn't hold that session, such as another recipient's, `404`. The
+        grant ID is not a credential, so a forwarded URL grants nothing (FR-14). It is a safe `GET` with no CSRF
+        header; `SameSite=Strict` keeps the cookie off cross-site requests.
+
+        **Each request** checks the grant, its session, the transfer and the file in PostgreSQL, so a request after a
+        revocation fails at once with `410 link_revoked` (NFR-6). It takes the grant's stream lease: a new request
+        takes over, and the older stream stops at its next re-check. While streaming, the service re-checks the state
+        and adds the bytes served at least every 30 seconds, so a revocation stops a running download within 35
+        seconds. It serves the object version that was scanned.
+
+        **Ranges.** One range per request: `206` with `Content-Range`. Several ranges, or a range past the end: `416`.
+        `If-Range` with the strong `ETag` resumes; a changed validator gets the whole file with `200`. Every request
+        counts against the grant's 20 requests and every byte sent against its 3 × size budget; past either,
+        `403 download_grant_exhausted`. `HEAD` isn't offered.
+
+        **Limits** (group E): 6 concurrent streams per link session, 20 per IP address, 200 per tenant (`429`); a
+        stream that averages under 2 KB/s for 2 minutes is closed and the browser resumes under the same grant; a pod
+        already serving 100 streams answers `503` with `Retry-After: 10`. A deploy closes streams still running after
+        120 seconds, and they resume under the same grant.
+
+        Errors: `401 authentication_required`, `401 session_expired`, `403 download_grant_exhausted`, `404 not_found`,
+        `410 link_revoked`, `410 link_expired`, `416 range_not_satisfiable`, `429 rate_limited`,
+        `503 service_unavailable`.
+
+        Requirements: FR-4, FR-6, FR-14, FR-17, NFR-4, NFR-6, NFR-21, NFR-22.
+      x-permission: session.download
+      security:
+        - linkSession: []
+      parameters:
+        - $ref: '#/components/parameters/Range'
+        - $ref: '#/components/parameters/IfRange'
+      responses:
+        '200':
+          $ref: '#/components/responses/FileContent'
+        '206':
+          $ref: '#/components/responses/PartialFileContent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '416':
+          $ref: '#/components/responses/RangeNotSatisfiable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
   /audit/events/search:
     post:
       tags: [Audit]
@@ -1532,9 +1978,10 @@ paths:
         time range (UC-4). Filters travel in the request body, not the query string, so email addresses and IP
         addresses never appear in URLs or access logs. The search itself is recorded in the audit log (FR-27).
 
-        Needs the admin role or an API key with `audit:read`.
+        Needs the admin role, from a session signed in with a passkey or SSO for a local admin
+        (`403 passkey_required`), or an API key with `audit:read`. Rate limit: 60 searches a minute per tenant.
 
-        Errors: `400 invalid_cursor`, `422 validation_failed`.
+        Errors: `400 invalid_cursor`, `403 passkey_required`, `422 validation_failed`, `429 rate_limited`.
 
         Requirements: FR-28, FR-27.
       x-permission: audit.search
@@ -1573,19 +2020,28 @@ paths:
       summary: Export audit log results
       description: |
         Streams every event that matches the filter as CSV or JSON, newest first, with the same filters as
-        `searchAuditEvents`. At most 1,000,000 events per export; narrow the time range beyond that. The export is
-        recorded in the audit log (FR-27).
+        `searchAuditEvents`. Every export is its own audit record (FR-27).
+
+        **Who may export, and how much** (authn-authz 3.3 and 5.3):
+
+        - **An admin** in the web app, with a sign-in in the last 15 minutes (`401 reauthentication_required`) and,
+          for a local admin, a passkey sign-in (`403 passkey_required`). At most 1,000,000 events per export.
+        - **An API key** with `audit:read`: at most one export an hour per key (`429 rate_limited`) and at most
+          100,000 events per export (`422 export_too_large`). The tenant's admins are emailed the first time each key
+          exports, so a leaked key can pull at most 100,000 events an hour and its first pull is seen at once.
+        - Per tenant, at most 10 exports an hour and one at a time (`429`).
+
+        Narrow the time range when an export is too large.
 
         **CSV formula neutralisation.** Fields such as `actor_email`, `user_agent` and `details` hold text an outsider
         chose, which a spreadsheet could run as a formula (CWE-1236). So every CSV cell that starts with `=`, `+`, `-`,
         `@`, a tab or a carriage return is prefixed with a single quote (`'`), and every cell is quoted as in RFC 4180.
         The JSON format is unchanged, because it is never opened as a spreadsheet.
 
-        Needs the admin role or an API key with `audit:read`.
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `422 export_too_large`,
+        `422 validation_failed`, `429 rate_limited`.
 
-        Errors: `422 export_too_large`, `422 validation_failed`.
-
-        Requirements: FR-29, FR-27.
+        Requirements: FR-29, FR-27, FR-32.
       x-permission: audit.export
       security:
         - memberSession: [admin]
@@ -1634,11 +2090,24 @@ paths:
       summary: Invite a member or admin
       description: |
         Invites a person to the tenant with the `member` or `admin` role and emails them an invitation. They are
-        `invited` until they first sign in.
+        `invited` until they first sign in. For a local member the notification worker creates their sign-in and
+        emails it; for a tenant that uses SSO the email carries a one-time invitation link for
+        `startInvitationSignIn` (authn-authz 2.5).
 
-        Errors: `409 user_exists`, `409 idempotency_conflict`.
+        **Step-up:** an invitation can create an admin, so it needs a sign-in in the last 15 minutes
+        (`401 reauthentication_required`) and, for a local admin, a passkey sign-in (`403 passkey_required`).
 
-        Requirements: FR-22.
+        `409 user_exists` means only that the address is already a user of **this** tenant. Other tenants are never
+        checked, so the answer reveals nothing about them (NFR-12). An invitation never changes an existing user's
+        role; only `updateUser` does. An address that already signs in locally for another tenant is still invited:
+        the inviting tenant sees the user as `invited`, and the email tells the person how to proceed.
+
+        Rate limits: 100 invitations an hour per tenant and 3 a day per address (`429`).
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 user_exists`,
+        `409 idempotency_conflict`, `429 rate_limited`.
+
+        Requirements: FR-22, FR-25, FR-26, NFR-12.
       x-permission: user.invite
       security:
         - memberSession: [admin]
@@ -1678,7 +2147,8 @@ paths:
       operationId: listUsers
       summary: List members and admins
       description: |
-        Lists the tenant's users, optionally filtered by role and status.
+        Lists the tenant's users, optionally filtered by role and status. A local admin needs a passkey sign-in
+        (`403 passkey_required`), as for every operation that needs the admin role.
 
         Requirements: FR-22.
       x-permission: user.read
@@ -1713,7 +2183,7 @@ paths:
       operationId: getUser
       summary: Get a member or admin
       description: |
-        Returns one user of the tenant.
+        Returns one user of the tenant. A local admin needs a passkey sign-in (`403 passkey_required`).
 
         Requirements: FR-22.
       x-permission: user.read
@@ -1737,10 +2207,21 @@ paths:
     patch:
       tags: [Tenant admin]
       operationId: updateUser
-      summary: Change a user's role
+      summary: Change a user's role or fallback status
       description: |
-        Assigns the `admin` or `member` role. The tenant always keeps at least one active admin. Role changes are
-        audited (FR-27). Setting the role a user already has returns them unchanged.
+        Assigns the `admin` or `member` role, or names an admin as an SSO fallback admin (`sso_fallback`). The tenant
+        always keeps at least one active admin. Role changes are audited (FR-27). Setting the values a user already
+        has returns them unchanged.
+
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`).
+
+        **A role change ends every session of the user,** for a promotion as well as a demotion, so privileges never
+        change under a live session (authn-authz 3.3).
+
+        **Fallback admins.** A tenant that uses SSO may name up to two admins with `sso_fallback: true`. They keep a
+        local sign-in for when the identity provider breaks, and need a passkey for admin rights. A third, a member,
+        or a tenant without SSO gets `422 validation_failed`. Demoting a fallback admin to `member` clears the flag.
 
         **Demoting an admin to `member` revokes every API key they own,** in the same transaction as the role change,
         because a key acts as the admin who created it (FR-32). Before the demotion the web app shows the keys the
@@ -1749,9 +2230,10 @@ paths:
         the audit archive in both regions. If that write fails, the demotion and the key revocations have still taken
         effect and the call returns `503`; retry it, and the retry writes the record if it is still missing.
 
-        Errors: `409 last_admin`, `409 invalid_state` (deactivated user), `503 service_unavailable`.
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 last_admin`, `409 invalid_state`
+        (deactivated user), `422 validation_failed`, `503 service_unavailable`.
 
-        Requirements: FR-22, FR-32, NFR-10.
+        Requirements: FR-22, FR-26, FR-32, NFR-10.
       x-permission: user.update_role
       security:
         - memberSession: [admin]
@@ -1802,10 +2284,16 @@ paths:
 
         A deactivation is a security-critical record (README section 5): the `200` comes only after it is in the
         audit archive in both regions (NFR-10). If that write fails, the deactivation has still taken effect and the
-        call returns `503`; retry it. Deactivating a user who is already deactivated writes the archive record if it
-        is still missing and returns `200` with the user, so a retry is always safe.
+        call returns `503`; retry it, and don't tell the admin it failed. Deactivating a user who is already
+        deactivated writes the archive record if it is still missing and returns `200` with the user, so a retry is
+        always safe. Afterwards the notification worker also disables the user in Cognito and signs them out
+        everywhere, as defence in depth.
 
-        Errors: `409 last_admin`, `503 service_unavailable`.
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`). Deactivation never counts against the tenant's request budget.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 last_admin`,
+        `503 service_unavailable`.
 
         Requirements: FR-22, FR-32, NFR-10.
       x-permission: user.deactivate
@@ -1831,6 +2319,100 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+
+  /users/{user_id}/sign-out:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Tenant admin]
+      operationId: signOutUser
+      summary: Sign a user out everywhere
+      description: |
+        Ends every session of a member or admin without deactivating them, for example after a lost laptop
+        (authn-authz 3.6). Their next request from any browser gets `401 session_expired`; they can sign in again.
+        Their API keys are unchanged; revoke those with `revokeApiKey`.
+
+        A forced sign-out is a security-critical record (README section 5): the sessions end at once, and the `200`
+        comes after the record is in both regions' audit archive. If that write fails, the call returns `503`; a retry
+        writes the record if it is still missing and returns `200`.
+
+        A local admin needs a passkey sign-in (`403 passkey_required`).
+
+        Errors: `403 passkey_required`, `503 service_unavailable`.
+
+        Requirements: FR-22, FR-25, NFR-10.
+      x-permission: user.sign_out
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '200':
+          description: The user, whose sessions have all ended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /users/{user_id}/reset-sign-in:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Tenant admin]
+      operationId: resetUserSignIn
+      summary: Reset a member's sign-in
+      description: |
+        For a member who lost their password, authenticator or passkey: removes their local sign-in and sends a new
+        invitation, the same assurance as the first enrollment (authn-authz 2.5). It acts on both user pools, so old
+        credentials can't come back with a regional failover or failback:
+
+        1. In the transaction that accepts the reset, every session of the user ends and their local identities in
+           both pools are deleted, so no old credential maps to the user any more.
+        2. The notification worker deletes their Cognito user in each pool where one exists; a pool that can't be
+           reached gets the deletion before it serves sign-ins again.
+        3. The worker creates the user again in the active pool, with no password, TOTP or passkey, and emails a new
+           invitation.
+
+        Only for a user with a local sign-in: an SSO member resets at their own identity provider, and a deactivated
+        user can't be reset (`409 invalid_state`). A new reset while one is still being processed replaces its
+        invitation. A tenant's last admin who has lost their factor asks the operator (`recoverTenantAdmin`).
+
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`).
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 invalid_state`.
+
+        Requirements: FR-22, FR-25.
+      x-permission: user.reset_sign_in
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '202':
+          description: The reset is accepted. The user's sessions have ended, and the new invitation is on its way.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
   /tenant/policy:
     get:
@@ -1869,7 +2451,10 @@ paths:
         extensions, not to existing ones. A new `received_file_retention_days` applies to files received from then on
         (FR-13). Policy changes are audited (FR-27).
 
-        Errors: `422 validation_failed`.
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`).
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `422 validation_failed`.
 
         Requirements: FR-23, FR-24, FR-18, FR-13.
       x-permission: tenant_policy.update
@@ -1906,12 +2491,22 @@ paths:
       operationId: createApiKey
       summary: Create an API key
       description: |
-        Creates a tenant API key with the given scopes. The full key appears once, in this response; the service
-        stores only its hash and `key_prefix`. Only a tenant admin signed in to the web app can create keys; a key
-        can't create another key.
+        Creates a tenant API key with the given scopes, which never change; a new key is how scopes change. The full
+        key appears once, in this response (`ApiKeyCreated.secret`); the service stores only its SHA-256 and
+        `key_prefix`. Only a tenant admin signed in to the web app can create keys; a key can't create another key.
+        The key is owned by that admin and is revoked if they are deactivated or demoted (authn-authz 5.2).
 
-        This operation takes no `Idempotency-Key`: a stored response would hold the key in plain text. If the
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`).
+
+        Limits: at most 25 active keys per tenant (`422 validation_failed`) and 20 new keys a day (`429`). A key
+        expires after 90 days by default, at most 365.
+
+        This operation takes no `Idempotency-Key`: the secret is never stored, so a retry couldn't return it. If the
         response is lost, revoke the key by its prefix and create another.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `422 validation_failed`,
+        `429 rate_limited`.
 
         Requirements: FR-32, FR-27.
       x-permission: api_key.create
@@ -1949,7 +2544,8 @@ paths:
       operationId: listApiKeys
       summary: List API keys
       description: |
-        Lists the tenant's API keys with their prefix, scopes and last use. The full key is never returned again.
+        Lists the tenant's API keys with their prefix, scopes and last use. The full key is never returned again. A
+        local admin needs a passkey sign-in (`403 passkey_required`).
 
         Requirements: FR-32.
       x-permission: api_key.read
@@ -1982,8 +2578,10 @@ paths:
       operationId: revokeApiKey
       summary: Revoke an API key
       description: |
-        Revokes a key at once; later calls with it get `401`. Revoking a key that is already revoked returns it
-        unchanged.
+        Revokes a key at once; later calls with it get `401`, because key lookups aren't cached. Any admin of the
+        tenant can revoke any of its keys, and a local admin may do so without a passkey sign-in: a stolen session can
+        use it only to stop access. Revocation never counts against the tenant's request budget. Revoking a key that
+        is already revoked returns it unchanged.
 
         Requirements: FR-32, FR-27.
       x-permission: api_key.revoke
@@ -2006,16 +2604,92 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
+  /operator/token:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    post:
+      tags: [Operator]
+      operationId: createOperatorToken
+      summary: Exchange a signed AWS identity for an operator token
+      description: |
+        The operator CLI signs an STS `GetCallerIdentity` request with the operator's IAM Identity Center
+        credentials, including a signed `X-SFT-Audience: operator-api-<env>` header, and sends the signed request
+        here, never the secret access key (authn-authz 8.2). The operator API:
+
+        1. accepts only a `GetCallerIdentity` request signed for STS in its own Region, whose signed headers include
+           its own environment's audience;
+        2. refuses a signature older than 1 minute, or one it has seen before;
+        3. sends the request itself to the regional STS endpoint in its configuration, never to a host taken from
+           the request;
+        4. checks STS's answer: the account must be this environment's account and the role exactly its `Operator`
+           permission set role. Any other account, including another environment's, and any other role, including
+           `BreakGlass`, is refused;
+        5. issues an operator token valid for 15 minutes, stored only as a hash with the account and the operator's
+           Identity Center user name.
+
+        Public: the signed request is the credential. Every refusal is `401 credentials_invalid` and is audited as a
+        platform event; the answer never says which check failed.
+
+        Errors: `401 credentials_invalid`, `422 validation_failed`, `429 rate_limited`, `503 service_unavailable`
+        (STS unreachable).
+
+        Requirements: FR-34, FR-35, FR-27.
+      x-permission: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OperatorTokenRequest'
+      responses:
+        '201':
+          description: An operator token, sent with `Cache-Control` set to `no-store`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperatorToken'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
   /operator/tenants:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
     post:
       tags: [Operator]
       operationId: createTenant
       summary: Provision a tenant and its first admin
       description: |
-        Creates a tenant with the default policy and invites its first admin. There is no self-service sign-up.
-        Operators never get access to file contents through this API (FR-35).
+        Creates a tenant with the default policy and invites its first admin. There is no self-service sign-up. The
+        `recovery_contact`, a second contact besides the first admin, is how an operator later confirms an admin
+        recovery (`recoverTenantAdmin`). It
+        also creates the tenant's own sending reputation with the email provider, in both regions
+        (abuse-and-rate-limits 7.3). Operators never get access to file contents through this API (FR-35). Rate
+        limit: 30 new tenants an hour per operator.
 
-        Errors: `409 idempotency_conflict`.
+        Errors: `409 idempotency_conflict`, `429 rate_limited`.
 
         Requirements: FR-34, FR-35.
       x-permission: operator.tenant.create
@@ -2052,6 +2726,205 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
+  /operator/tenants/{tenant_id}/sso:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    put:
+      tags: [Operator]
+      operationId: configureTenantSso
+      summary: Record a tenant's SSO configuration
+      description: |
+        A tenant admin asks for SSO, and an operator sets it up with the operator CLI (authn-authz 2.5, FR-26). The
+        CLI first creates the SAML or OIDC provider in both user pools with the operator's own AWS credentials, named
+        after the tenant ID, mapping only email and subject and requiring signed SAML assertions. It then records the
+        result here: the provider, the email domains the tenant proved with a DNS TXT record, whether the tenant
+        requires SSO, and which tenant admin confirmed that their identity provider enforces MFA. The operator API
+        never manages providers itself.
+
+        This writes the tenant's `idp_connections` row and its proven domains. A domain belongs to one tenant at most.
+        When the connection becomes `active`, every existing member is emailed an invitation link to bind their SSO
+        identity; their local sign-in keeps working until the tenant requires SSO. With `sso_required: true`, members
+        can sign in only through the identity provider, except the tenant's fallback admins (`updateUser`). Every
+        change is a record in the tenant's audit log. Sending the configuration the tenant already has returns it
+        unchanged.
+
+        Errors: `404 not_found` (tenant), `422 validation_failed` (a domain held by another tenant, a provider name
+        that doesn't match the tenant ID, or an `sso_mfa_confirmed_by` who isn't an active admin of the tenant).
+
+        Requirements: FR-26, FR-34.
+      x-permission: operator.tenant.sso.update
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantSsoUpdate'
+      responses:
+        '200':
+          description: The tenant's SSO configuration as recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantSso'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /operator/tenants/{tenant_id}/admin-recovery:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      tags: [Operator]
+      operationId: recoverTenantAdmin
+      summary: Recover a tenant admin's sign-in
+      description: |
+        Operator-assisted recovery for a tenant whose last admin has lost their factor, or an SSO tenant whose
+        identity provider is down with no fallback admin available (authn-authz 2.5). The operator calls it for a
+        named admin of the tenant only after confirming the request through the tenant's `recovery_contact`, the
+        second contact recorded by `createTenant`, and records how it was confirmed (`confirmed_via`).
+
+        - **A local admin:** their sign-in is reset as by `resetUserSignIn`: every session ends, their identities in
+          both pools are removed, and a new invitation is emailed.
+        - **An admin of an SSO tenant:** they get a temporary local sign-in, created like a local invitation, which
+          is deleted with its identity after 72 hours (`temporary_sign_in_expires_at`).
+
+        It is a security-critical record in the tenant's audit log, and every admin of the tenant is emailed. As with
+        other security-critical changes, it takes effect first and the `200`-class answer comes after the record is in
+        both regions' audit archive; a `503` means it took effect and a retry completes the record. Accepts an
+        `Idempotency-Key`, so a retry never starts a second recovery.
+
+        Errors: `404 not_found` (tenant, or a user who isn't in it), `409 invalid_state` (the user isn't an active
+        admin), `409 idempotency_conflict`, `422 validation_failed`, `503 service_unavailable`.
+
+        Requirements: FR-22, FR-25, FR-34, NFR-10.
+      x-permission: operator.tenant.admin_recovery
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminRecoveryRequest'
+      responses:
+        '202':
+          description: The recovery is accepted and the admin is being emailed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminRecovery'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /operator/break-glass-grants:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    post:
+      tags: [Operator]
+      operationId: recordBreakGlassGrant
+      summary: Record a break-glass grant
+      description: |
+        The break-glass tool calls this after a second operator approves a `BreakGlass` assignment (authn-authz 8.3,
+        FR-35). It writes a security-critical platform audit record, and a record in each affected tenant's audit
+        log, where its admins can see it (UC-4).
+
+        **Best effort.** The record of the grant is the IAM Identity Center assignment plus CloudTrail, so break-glass
+        works when this API or the database is down. Every 15 minutes a job compares the `BreakGlass` assignments in
+        CloudTrail with the recorded grants, writes any missing one (`recorded_by: reconciliation`), and alerts if one
+        is still missing an hour after the grant. A grant already recorded under the same `assignment_request_id`,
+        by the tool or by the job, returns `200` with that record, so a retry is safe.
+
+        Errors: `422 validation_failed` (for example a grant longer than 1 hour, or an unknown tenant),
+        `503 service_unavailable`.
+
+        Requirements: FR-35, FR-27.
+      x-permission: operator.break_glass.record
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BreakGlassGrantCreate'
+      responses:
+        '200':
+          description: The grant was already recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassGrant'
+        '201':
+          description: The grant is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BreakGlassGrant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
 components:
   securitySchemes:
     memberSession:
@@ -2059,58 +2932,88 @@ components:
       in: cookie
       name: __Host-sft_session
       description: |
-        Web app session of a member or admin: HttpOnly, Secure, SameSite=Strict, host-only. **Provisional:** how it is
-        issued waits for PRD open question 1 (sign-in with MFA, FR-25). Where a requirement lists `admin`, the member
-        needs the admin role. Unsafe methods also need `csrfToken`, with the token `getCurrentMember` returns.
+        Web app session of a member or admin (authn-authz section 3), issued by `completeSignIn` after sign-in through
+        Cognito managed login or the tenant's identity provider. The cookie is HttpOnly, Secure, `SameSite=Strict`,
+        `Path=/`, host-only and without `Max-Age`; it holds a 256-bit random token, and the server keeps only its
+        hash. A session lasts at most 12 hours from sign-in and 30 minutes idle; a member has at most 10 at once.
+        The role is read on every request, never copied into the session. Unsafe methods also need `csrfToken`, with
+        the token `getCurrentMember` returns.
+
+        - **`admin`** in a requirement means the session must act with the admin role. A local admin acts as an admin
+          only in a session signed in with a passkey (SSO admins with their identity provider's assurance); otherwise
+          the session acts as a member, and operations that need the admin role answer `403 passkey_required`.
+          Revocations (`revokeTransfer`, `revokeUploadRequest`, `revokeApiKey`) are exempt (authn-authz 3.3).
+        - **Step-up.** `inviteUser`, `updateUser`, `deactivateUser`, `updateTenantPolicy`, `createApiKey`,
+          `resetUserSignIn` and `exportAuditEvents` need a sign-in within the last 15 minutes, otherwise
+          `401 reauthentication_required`; the web app runs `startSignIn` again the same way in, then retries.
+        - **One credential per request.** A request that carries this cookie and an `Authorization` header together
+          gets `401 credentials_invalid`.
     csrfToken:
       type: apiKey
       in: header
       name: X-CSRF-Token
       description: |
-        Synchronizer CSRF token for cookie sessions. **Each member session and each link session has its own token**,
-        returned in response bodies: `csrf_token` in `getCurrentMember` for a member session, and in
-        `createLinkSession` and `getLinkSession` for a link session. Those responses are sent with
-        `Cache-Control: no-store`. The web app keeps the token in memory only and sends it in this header on every
-        POST, PATCH and DELETE.
+        Synchronizer CSRF token for cookie sessions, on every POST, PATCH and DELETE (authn-authz 3.4). **Each member
+        session and each link session has its own token**, derived, never stored:
+        `key_id + "." + base64url(HMAC-SHA-256(K_csrf, raw session token))`. It is returned in response bodies, always
+        with `Cache-Control: no-store`: `csrf_token` in `getCurrentMember` for a member session, and in
+        `createLinkSession` and `getLinkSession` for a link session. Because it is derived, those calls return the
+        same token after every page load until the session changes. The web app keeps it in memory only.
 
-        The service checks the token against the session the request uses: the member session on member routes, and
-        the link session named by `X-Link-Session` on `/session` routes. Starting a link session therefore never
-        changes a member's token, and two link sessions in one browser have independent tokens. A token changes
-        whenever its session does. The service also checks that `Origin` is the web app's origin on every unsafe
-        request. A missing or wrong token, or a foreign `Origin`, gets `403 csrf_failed`.
+        The service computes the token again from the session token in the cookie and compares in constant time: the
+        member session on member routes, and the link session named by `X-Link-Session` on `/session` routes. Starting
+        a link session therefore never changes a member's token, and two link sessions in one browser have different
+        tokens. A token changes whenever its session token does. After a key rotation the previous key is accepted for
+        24 hours. On every unsafe request the service also checks that `Origin` is the web app's origin and that
+        `Sec-Fetch-Site`, when sent, is `same-origin` or `same-site`. A missing or wrong token, or a foreign `Origin`,
+        gets `403 csrf_failed`.
 
         There is no readable CSRF cookie: the web app and the API are separate origins, so the web app couldn't read a
-        cookie of the API host.
+        cookie of the API host. API keys and operator tokens need no CSRF token, because browsers never attach an
+        `Authorization` header on their own.
     tenantApiKey:
       type: http
       scheme: bearer
-      bearerFormat: opaque tenant API key
+      bearerFormat: 'sft_{env}_ tenant API key'
       description: |
-        Tenant API key for automation (FR-32), sent as `Authorization: Bearer <key>`. A key acts as the tenant admin
-        who created it, limited to the scopes listed in each requirement (`ApiKeyScope`). What a key creates is owned
-        by that admin, and the audit log names the key as the actor. Keys never download file contents.
+        Tenant API key for automation (FR-32), sent only as `Authorization: Bearer <key>`, never in a query string or
+        a body. The format is in `ApiKeyCreated.secret`: `sft_dev_`, `sft_stg_` or `sft_prd_`, 43 random base62
+        characters and a 6-character checksum, so the service and secret scanners reject typos without a database
+        lookup. A key acts as the tenant admin who created it, limited to the scopes listed in each requirement
+        (`ApiKeyScope`). What a key creates is owned by that admin, and the audit log names the key as the actor.
+        Every call a key makes, reads included, is audited on its own.
 
-        A key is valid only while its owner is an active admin: deactivating the owner (`deactivateUser`) or demoting
-        them to `member` (`updateUser`) revokes every key they own in the same transaction, and the next call with
-        such a key gets `401`.
+        A key never downloads file contents, never unlocks a recipient or uploader, and never manages users, roles,
+        policy, SSO or keys (authn-authz 5.3). A key is valid only while its owner is an active admin and the tenant
+        is active: deactivating the owner (`deactivateUser`) or demoting them to `member` (`updateUser`) revokes every
+        key they own in the same transaction, and the next call with such a key gets `401`.
     linkSession:
       type: apiKey
       in: cookie
       name: __Host-sft_link
       description: |
-        Link sessions of a verified recipient or uploader (FR-15). The cookie is HttpOnly, Secure, SameSite=Strict and
-        host-only, and identifies the browser. A browser can hold several link sessions at once, one per transfer
-        recipient or upload request, each with its own ID, expiry (at most 24 hours) and CSRF token, so verifying a
-        second link never ends the first. Every `/session` call names the session it acts in with the
-        `X-Link-Session` header and gets only that session's transfer or request. Set by `createLinkSession`. Unsafe
-        methods also need `csrfToken`, with that session's token.
+        Link sessions of a verified recipient or uploader (FR-15, authn-authz 4.3). The cookie is HttpOnly, Secure,
+        `SameSite=Strict`, `Path=/` and host-only, and identifies the browser. A browser can hold up to 10 link
+        sessions at once, one per transfer recipient or upload request, each with its own ID, expiry (at most 24
+        hours, 1 hour idle) and CSRF token, so verifying a second link never ends the first. Every `/session` call
+        names the session it acts in with the `X-Link-Session` header and gets only that session's transfer or
+        request, except `getSessionDownloadContent`, which a navigation starts: it finds the session from the grant
+        and needs only the cookie. Set by `createLinkSession`. Unsafe methods also need `csrfToken`, with that
+        session's token.
     operatorToken:
       type: http
       scheme: bearer
       bearerFormat: short-lived operator token
       description: |
-        Short-lived token of a platform operator, used by the operator CLI. How operators obtain it, and whether the
-        operator API is also restricted by network, is decided in phase 3 (security design).
+        Token of a platform operator, used by the operator CLI against the operator API only (authn-authz 8.2). The
+        CLI gets it from `createOperatorToken` by exchanging an STS `GetCallerIdentity` request signed with the
+        operator's IAM Identity Center credentials; only this environment's `Operator` permission set role is
+        accepted. It is valid for 15 minutes and stored only as a hash.
+
+        The operator API is its own Deployment in the `sft-operator` namespace, with its own IAM and database roles.
+        No load balancer or ingress routes to it: operators reach it with `kubectl port-forward`, which only the
+        `Operator` permission set may do, and only in that namespace. It never returns file names, messages or
+        contents.
 
   parameters:
     TransferId:
@@ -2181,7 +3084,7 @@ components:
       required: false
       description: |
         `own` returns the caller's own items. `tenant` returns every item in the tenant and needs the admin role or an
-        API key.
+        API key; a local admin whose session wasn't signed in with a passkey gets `403 passkey_required`.
       schema:
         type: string
         enum: [own, tenant]
@@ -2233,10 +3136,11 @@ components:
       description: |
         A unique key per logical request, such as a UUID, so a retry can't apply a change twice. The key is scoped to
         the caller and kept for 24 hours with a fingerprint of the method, the path with its resource IDs filled in
-        (such as `POST /v1/transfers/{id}/files` for one transfer) and the body. A retry with the same key, method,
-        path and body gets the stored response. The same key with any of them different gets
-        `409 idempotency_conflict`, so a key reused on another resource is refused rather than answered with the first
-        resource's response. A retry while the first request is still running gets `409 idempotency_in_progress`
+        (such as `POST /v1/transfers/{id}/files` for one transfer) and the body. The service keeps the response status
+        and the ID of what was created, never the response body. A retry with the same key, method, path and body gets
+        the same status, with the response rebuilt from the resource as it is now. The same key with any of them
+        different gets `409 idempotency_conflict`, so a key reused on another resource is refused rather than answered
+        with the first resource. A retry while the first request is still running gets `409 idempotency_in_progress`
         (architecture 5.4).
       schema:
         type: string
@@ -2252,9 +3156,58 @@ components:
         browser can hold several link sessions at once under its `__Host-sft_link` cookie, one per transfer recipient
         or upload request; this header picks one, and the call sees only that session's transfer or request. The ID
         is not a credential: it works only with the cookie of the browser that verified it, so the web app may keep it
-        across a page reload. A missing ID, or one this browser doesn't hold, gets `401`.
+        across a page reload. A missing ID, or one this browser doesn't hold, gets `401 authentication_required`.
+        Every `/session` operation takes it except `getSessionDownloadContent`, which a navigation starts.
       schema:
         $ref: '#/components/schemas/Id'
+    TenantId:
+      name: tenant_id
+      in: path
+      required: true
+      description: ID of the tenant.
+      schema:
+        $ref: '#/components/schemas/Id'
+    GrantId:
+      name: grant_id
+      in: path
+      required: true
+      description: |
+        ID of a download grant (`DownloadAccess.grant_id`). Not a credential: it works only together with the cookie
+        of the session that created the grant, so a forwarded URL grants nothing (FR-14).
+      schema:
+        $ref: '#/components/schemas/Id'
+    ReturnTo:
+      name: return_to
+      in: query
+      required: false
+      description: |
+        Where the web app wants the member after sign-in: a relative path on the web app, such as `/transfers`.
+        Anything else, an absolute URL included, becomes `/`, so the API is never an open redirect.
+      schema:
+        type: string
+        maxLength: 512
+        default: /
+    Range:
+      name: Range
+      in: header
+      required: false
+      description: |
+        One byte range, such as `bytes=1048576-`, to resume a download. Several ranges, or a range past the end of the
+        file, get `416 range_not_satisfiable`.
+      schema:
+        type: string
+        maxLength: 100
+        pattern: '^bytes=[0-9]*-[0-9]*$'
+    IfRange:
+      name: If-Range
+      in: header
+      required: false
+      description: |
+        The `ETag` from an earlier response. If it still matches, the `Range` is served (`206`); otherwise the whole
+        file is sent (`200`).
+      schema:
+        type: string
+        maxLength: 100
 
   headers:
     RetryAfter:
@@ -2282,6 +3235,56 @@ components:
       description: '`attachment` with a file name such as `audit-export.csv`.'
       schema:
         type: string
+    RedirectLocation:
+      description: Where the browser goes next.
+      schema:
+        type: string
+        format: uri
+    SetAuthCookie:
+      description: |
+        Sets `__Host-sft_auth` (HttpOnly, Secure, `SameSite=Lax`, Path=/, `Max-Age=600`), a 256-bit random value that
+        finds the pre-auth record of this sign-in. `Lax`, because the callback arrives as a cross-site redirect from
+        Cognito. `completeSignIn` clears it.
+      schema:
+        type: string
+    SetSessionCookie:
+      description: |
+        On success, sets `__Host-sft_session` (HttpOnly, Secure, `SameSite=Strict`, Path=/, no Domain, no Max-Age) to
+        a new session token, and clears `__Host-sft_auth`. On a refusal, only clears `__Host-sft_auth`.
+      schema:
+        type: string
+    ClearSessionCookie:
+      description: Clears `__Host-sft_session`.
+      schema:
+        type: string
+    FileDisposition:
+      description: |
+        `attachment; filename*=UTF-8''...` with the file's display name, percent-encoded, so the browser saves the file
+        and never displays it (FR-6).
+      schema:
+        type: string
+    ETag:
+      description: A strong validator derived from the file's SHA-256, so browsers can resume with `If-Range`.
+      schema:
+        type: string
+    AcceptRanges:
+      description: Always `bytes`.
+      schema:
+        type: string
+        enum: [bytes]
+    ContentRange:
+      description: The range sent, such as `bytes 1048576-5242879/5242880`; on a `416`, `bytes */<size>`.
+      schema:
+        type: string
+    ContentSecurityPolicy:
+      description: Always `sandbox; default-src 'none'`, so a file that looks like HTML can never run on the API origin.
+      schema:
+        type: string
+    NoStore:
+      description: Always `no-store`.
+      schema:
+        type: string
+        enum: [no-store]
 
   responses:
     BadRequest:
@@ -2294,8 +3297,10 @@ components:
             $ref: '#/components/schemas/Problem'
     Unauthorized:
       description: |
-        No valid credentials: the session or link session is missing or has expired, or the API key or operator token
-        is invalid, expired or revoked. Codes: `authentication_required`, `session_expired`, `credentials_invalid`.
+        No valid credentials: the session or link session is missing or has expired, the API key or operator token is
+        invalid, expired or revoked, or a cookie and an `Authorization` header came together. Or the operation needs a
+        recent sign-in (step-up) and the session's is older than 15 minutes: sign in again the same way in and retry.
+        Codes: `authentication_required`, `session_expired`, `credentials_invalid`, `reauthentication_required`.
       headers:
         WWW-Authenticate:
           $ref: '#/components/headers/WWWAuthenticate'
@@ -2305,14 +3310,25 @@ components:
             $ref: '#/components/schemas/Problem'
     Forbidden:
       description: |
-        The caller is known but may not do this: the role, scope or session kind doesn't allow it, the CSRF check
-        failed, the recipient or uploader is locked out, or the download limit is used up. Codes: `permission_denied`,
-        `csrf_failed`, `recipient_locked`, `download_limit_reached`.
+        The caller is known but may not do this: the role, scope or session kind doesn't allow it; a local admin's
+        session wasn't signed in with a passkey and the operation needs the admin role; the CSRF check failed; the
+        recipient or uploader is locked out; the download limit is used up; or a download grant has no time, bytes or
+        requests left. Codes: `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`,
+        `download_limit_reached`, `download_grant_exhausted`.
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
           examples:
+            passkeyRequired:
+              summary: A local admin signed in with a password and TOTP
+              value:
+                type: https://secure-file-transfer.example/problems/passkey_required
+                title: Passkey sign-in needed
+                status: 403
+                code: passkey_required
+                detail: Sign in with a passkey to use admin features.
+                request_id: req_2b8d41f0
             recipientLocked:
               summary: Locked out after 20 failed attempts
               value:
@@ -2383,8 +3399,9 @@ components:
                 request_id: req_0b9a64cc
     ContentTooLarge:
       description: |
-        A declared file size, or the total for the transfer or upload request, is over the limit (FR-2, FR-11), or the
-        request body is too large. Codes: `file_too_large`, `total_too_large`, `request_too_large`.
+        A declared file size, or the total for the transfer or upload request, is over the limit (FR-2, FR-11); the
+        tenant's storage quota is used up; or the request body is too large. Codes: `file_too_large`,
+        `total_too_large`, `storage_quota_exceeded`, `request_too_large`.
       content:
         application/problem+json:
           schema:
@@ -2392,8 +3409,9 @@ components:
     UnprocessableContent:
       description: |
         The request is well formed but breaks a rule. `validation_failed` lists each problem in `errors`. Codes:
-        `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `too_many_files`,
-        `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large`.
+        `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`,
+        `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`,
+        `export_too_large`.
       content:
         application/problem+json:
           schema:
@@ -2424,16 +3442,79 @@ components:
         A dependency the call must not do without is unavailable. Retry after `Retry-After`. What the `503` means
         depends on the call (README section 5):
 
-        - **Download grants** (NFR-15) and **verification** (the rate-limit counters, NFR-14) fail closed: nothing
-          changed, and no download was counted.
-        - **Security-critical changes** (a revocation, deactivation or demotion, NFR-10) have taken effect, but their
-          record isn't yet confirmed in both regions' audit archive. A retry finds the change already made, writes the
-          record if it is still missing, and returns success.
+        - **Download grants** (NFR-15), **verification** and **sign-in** (the rate-limit counters and the sign-in
+          state store, NFR-14) fail closed: nothing changed, and no download was counted.
+        - **Security-critical changes** (a revocation, deactivation, demotion, unlock, forced sign-out or admin
+          recovery, NFR-10) have taken effect, but their record isn't yet confirmed in both regions' audit archive. A
+          retry finds the change already made, writes the record if it is still missing, and returns success. The web
+          app shows the change as done and retries in the background.
+        - **Content downloads:** the API pod already serves its maximum of streams (`Retry-After: 10`), or object
+          storage is unreachable; the browser resumes under the same grant.
 
         Code: `service_unavailable`.
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnexpectedError:
+      description: |
+        An unexpected server error, as a problem document. Declared on the sign-in navigations, which succeed with a
+        redirect: apart from `429` and `503`, it is the only answer they give that isn't a redirect.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    FileContent:
+      description: |
+        The whole file, streamed. The response is never cached or rendered: `Content-Type` is always
+        `application/octet-stream`, and `X-Content-Type-Options: nosniff`, `Cross-Origin-Resource-Policy: same-origin`
+        and `Referrer-Policy: no-referrer` are always sent (abuse-and-rate-limits 5.6).
+      headers:
+        Content-Disposition:
+          $ref: '#/components/headers/FileDisposition'
+        Accept-Ranges:
+          $ref: '#/components/headers/AcceptRanges'
+        ETag:
+          $ref: '#/components/headers/ETag'
+        Content-Security-Policy:
+          $ref: '#/components/headers/ContentSecurityPolicy'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            contentMediaType: application/octet-stream
+    PartialFileContent:
+      description: The requested range of the file, streamed, with the same headers as a `200`.
+      headers:
+        Content-Range:
+          $ref: '#/components/headers/ContentRange'
+        Content-Disposition:
+          $ref: '#/components/headers/FileDisposition'
+        Accept-Ranges:
+          $ref: '#/components/headers/AcceptRanges'
+        ETag:
+          $ref: '#/components/headers/ETag'
+        Content-Security-Policy:
+          $ref: '#/components/headers/ContentSecurityPolicy'
+        Cache-Control:
+          $ref: '#/components/headers/NoStore'
+      content:
+        application/octet-stream:
+          schema:
+            type: string
+            contentMediaType: application/octet-stream
+    RangeNotSatisfiable:
+      description: |
+        The `Range` asks for several ranges, or starts past the end of the file. Only one range per request is served.
+        Code: `range_not_satisfiable`.
+      headers:
+        Content-Range:
+          $ref: '#/components/headers/ContentRange'
       content:
         application/problem+json:
           schema:
@@ -2481,6 +3562,18 @@ components:
       description: |
         Where a recipient or uploader stands (data model section 3.4): `invited` (link emailed, no active session),
         `verified` (an active link session), `locked` (20 failed attempts, until the member unlocks them).
+
+    DeliveryState:
+      type: string
+      enum: [pending, queued, sent, bounced, suppressed]
+      description: |
+        Where the latest link email of a recipient or uploader stands (FR-7, abuse-and-rate-limits 7.2, data model
+        2.2): `pending` (no email is due yet: the transfer hasn't been sent), `queued` (an email is due and hasn't
+        been handed to the email provider yet, whatever the reason: a backlog, provider throttling, a paused tenant or
+        the per-address cap across tenants; it never says which), `sent` (the provider accepted it, see
+        `notified_at`), `bounced` (the provider reported a bounce) and `suppressed` (the address was on the
+        suppression list when the email was due, so nothing was sent). An unlock issues a new link, so the state goes
+        back to `queued`.
 
     Role:
       type: string
@@ -2566,10 +3659,13 @@ components:
         - authentication_required
         - session_expired
         - credentials_invalid
+        - reauthentication_required
         - permission_denied
+        - passkey_required
         - csrf_failed
         - recipient_locked
         - download_limit_reached
+        - download_grant_exhausted
         - not_found
         - link_not_found
         - idempotency_conflict
@@ -2588,10 +3684,13 @@ components:
         - link_expired
         - file_too_large
         - total_too_large
+        - storage_quota_exceeded
         - request_too_large
+        - range_not_satisfiable
         - validation_failed
         - expiry_out_of_range
         - recipient_domain_not_allowed
+        - recipient_undeliverable
         - too_many_files
         - upload_size_mismatch
         - code_invalid
@@ -2829,7 +3928,7 @@ components:
 
     RecipientStatus:
       type: object
-      required: [id, email, locale, access_state, notified_at, first_verified_at, last_verified_at, failed_attempts, locked_at, downloads]
+      required: [id, email, locale, access_state, delivery_state, notified_at, first_verified_at, last_verified_at, failed_attempts, locked_at, downloads]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -2839,10 +3938,12 @@ components:
           $ref: '#/components/schemas/Locale'
         access_state:
           $ref: '#/components/schemas/AccessState'
+        delivery_state:
+          $ref: '#/components/schemas/DeliveryState'
         notified_at:
           type: [string, 'null']
           format: date-time
-          description: When the link email was handed to the email provider.
+          description: When the latest link email was handed to the email provider. Empty while it is `pending` or `queued`.
         first_verified_at:
           type: [string, 'null']
           format: date-time
@@ -2948,6 +4049,12 @@ components:
         scanned_at:
           type: [string, 'null']
           format: date-time
+        scan_engine:
+          type: [string, 'null']
+          enum: [clamav, guardduty, null]
+          description: |
+            Which engine scanned the file, once scanned: ClamAV for files up to 2 GB, GuardDuty Malware Protection for
+            larger ones (abuse-and-rate-limits 6.4).
         retention_until:
           type: [string, 'null']
           format: date-time
@@ -3050,7 +4157,7 @@ components:
           items:
             $ref: '#/components/schemas/UploadedPart'
 
-    # Downloads (provisional, PRD open question 8)
+    # Downloads (PRD open question 8: streamed through the API)
 
     DownloadRequest:
       type: object
@@ -3059,25 +4166,28 @@ components:
         resume_grant_id:
           $ref: '#/components/schemas/Id'
           description: |
-            **Provisional.** The grant of an interrupted download to resume. Resuming within a valid grant isn't
-            counted again (FR-6). Phase 3 decides how a grant is bounded so resuming can't get around the limit.
+            The grant of an interrupted download to resume, after a reload of the page. In the session that created
+            it and for the same file, the same grant comes back, uncounted (FR-6), while it has time, bytes and
+            requests left; otherwise `403 download_grant_exhausted`, and a call without `resume_grant_id` counts a
+            new download. A grant of another session or another file gets `404`. Range requests under a grant the
+            browser still has need no new call.
 
     DownloadMethod:
       type: string
-      enum: [stream, signed_cookie]
+      enum: [stream]
       description: |
-        **Provisional (PRD open question 8).** `stream`: the browser fetches `url` from the API with its session
-        cookie, using HTTP Range requests to resume. `signed_cookie`: this response sets short-lived CDN cookies for
-        this one file, the browser fetches `url` from the CDN, and asks again before `refresh_after`. Phase 3 picks
-        one; the other is removed before v1.
+        How the bytes are delivered. `stream` (PRD open question 8): the browser navigates to `url`, served by the
+        API with the session cookie, and resumes with HTTP Range requests under the same grant. It is the only method
+        in v1.
 
     DownloadAccess:
       type: object
       description: |
-        **Provisional (PRD open question 8).** One audited, counted grant to fetch one file's bytes. `url` never
-        carries a credential: access works only together with the verified session or the cookies set on this
-        response, so a forwarded URL grants nothing (FR-14), and a revocation stops new requests at once (NFR-6).
-      required: [grant_id, method, url, expires_at, file]
+        One audited, counted grant to fetch one file's bytes (abuse-and-rate-limits 5.4). It belongs to the session
+        that created it and to this one file. `url` never carries a credential: it works only with the cookie of that
+        session, so a forwarded URL grants nothing (FR-14), and every request re-checks revocation (NFR-6). A grant is
+        bounded by `expires_at`, `byte_budget` and `request_limit`, and serves one stream at a time.
+      required: [grant_id, method, url, expires_at, byte_budget, request_limit, file]
       properties:
         grant_id:
           $ref: '#/components/schemas/Id'
@@ -3086,14 +4196,27 @@ components:
         url:
           type: string
           format: uri-reference
-          description: Where the browser fetches the bytes.
+          description: |
+            Where the browser fetches the bytes: `/v1/session/downloads/{grant_id}/content`
+            (`getSessionDownloadContent`) for a recipient, `/v1/files/{file_id}/downloads/{grant_id}/content`
+            (`getReceivedFileDownloadContent`) for a member.
+          examples:
+            - /v1/session/downloads/01933b6e-8f2a-7c41-9d5e-2a6f0b3c4d5e/content
         expires_at:
           $ref: '#/components/schemas/Timestamp'
-          description: No new request can start under this grant after this time.
-        refresh_after:
-          type: [string, 'null']
-          format: date-time
-          description: For `signed_cookie`, when to call again with `resume_grant_id` to refresh the cookies.
+          description: |
+            No new request can start under this grant after this time: 24 hours after it was created, or earlier if
+            the session ends, the transfer expires or it is revoked.
+        byte_budget:
+          type: integer
+          minimum: 1
+          description: |
+            Bytes the grant may serve in total, 3 × the file size, so restarts in browsers that can't resume still fit.
+        request_limit:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: Content requests the grant allows, 20.
         file:
           $ref: '#/components/schemas/DownloadFile'
         warning:
@@ -3159,6 +4282,8 @@ components:
         - revoked_at
         - revoked_by
         - uploader_access_state
+        - delivery_state
+        - notified_at
         - failed_attempts
         - locked_at
         - file_count
@@ -3188,6 +4313,13 @@ components:
           format: uuid
         uploader_access_state:
           $ref: '#/components/schemas/AccessState'
+        delivery_state:
+          $ref: '#/components/schemas/DeliveryState'
+          description: Where the uploader's latest link email stands, `queued` for every kind of delay.
+        notified_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the uploader's latest link email was handed to the email provider.
         failed_attempts:
           type: integer
           minimum: 0
@@ -3542,7 +4674,7 @@ components:
 
     User:
       type: object
-      required: [id, email, role, status, created_at]
+      required: [id, email, role, status, sso_fallback, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -3552,29 +4684,63 @@ components:
           $ref: '#/components/schemas/Role'
         status:
           $ref: '#/components/schemas/UserStatus'
+        sso_fallback:
+          type: boolean
+          description: |
+            For an admin of a tenant that uses SSO: keeps a local sign-in for when the identity provider breaks. At
+            most two per tenant (`updateUser`).
         created_at:
           $ref: '#/components/schemas/Timestamp'
 
+    AuthMethod:
+      type: string
+      enum: [passkey, password_totp, local, sso]
+      description: |
+        How the session was signed in, from the ID token's `amr` claim (authn-authz 3.3): `passkey`, a password with
+        TOTP (`password_totp`), a local sign-in whose method Cognito didn't report (`local`), or the tenant's identity
+        provider (`sso`). A local admin acts with the admin role only with `passkey`.
+
+    CurrentSession:
+      type: object
+      required: [auth_method, auth_time, effective_role, expires_at]
+      properties:
+        auth_method:
+          $ref: '#/components/schemas/AuthMethod'
+        auth_time:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the member signed in. Step-up operations need it within the last 15 minutes.
+        effective_role:
+          $ref: '#/components/schemas/Role'
+          description: |
+            The role this session acts with. A local admin whose session wasn't signed in with a passkey acts as
+            `member`.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the session ends at the latest, 12 hours after sign-in. It also ends after 30 minutes idle.
+
     CurrentMember:
       type: object
-      required: [user, tenant, csrf_token]
+      required: [user, tenant, session, csrf_token]
       properties:
         user:
           $ref: '#/components/schemas/User'
         tenant:
           $ref: '#/components/schemas/Tenant'
+        session:
+          $ref: '#/components/schemas/CurrentSession'
         csrf_token:
           $ref: '#/components/schemas/CsrfToken'
 
     CsrfToken:
       type: string
-      minLength: 43
-      maxLength: 128
-      pattern: '^[A-Za-z0-9_-]+$'
+      minLength: 45
+      maxLength: 108
+      pattern: '^[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{43}$'
       description: |
-        The CSRF token of this one session (member or link), base64url with 256 random bits. Send it in
-        `X-CSRF-Token` on every POST, PATCH and DELETE of this session. Keep it in memory only; never put it in a URL,
-        storage or a log.
+        The CSRF token of this one session (member or link): a key ID, a dot, and the base64url HMAC-SHA-256 of the
+        session token under that key (authn-authz 3.4). It is derived, never stored, and changes whenever the session
+        token does. Send it in `X-CSRF-Token` on every POST, PATCH and DELETE of this session. Keep it in memory only;
+        never put it in a URL, storage or a log.
 
     UserInvite:
       type: object
@@ -3590,10 +4756,16 @@ components:
     UserUpdate:
       type: object
       additionalProperties: false
-      required: [role]
+      minProperties: 1
+      description: Only the fields sent are changed.
       properties:
         role:
           $ref: '#/components/schemas/Role'
+        sso_fallback:
+          type: boolean
+          description: |
+            Names an admin of a tenant that uses SSO as a fallback admin, with a local sign-in, or takes it away. At
+            most two per tenant (authn-authz 2.5).
 
     UserPage:
       type: object
@@ -3709,7 +4881,10 @@ components:
           type: string
         key_prefix:
           type: string
-          description: The first characters of the key, so an admin can recognise it without seeing it.
+          pattern: '^sft_(dev|stg|prd)_[0-9A-Za-z]{8}$'
+          description: |
+            The environment prefix and the first 8 characters of the secret, such as `sft_prd_` and 8 more, so an
+            admin can recognise a key without seeing it.
         scopes:
           type: array
           items:
@@ -3736,8 +4911,13 @@ components:
           properties:
             secret:
               type: string
+              pattern: '^sft_(dev|stg|prd)_[0-9A-Za-z]{43}_[0-9A-Za-z]{6}$'
               description: |
-                The full API key, sent as an `Authorization` bearer token. Store it in a secret manager.
+                The full API key, sent as an `Authorization` bearer token (authn-authz 5.1): `sft_`, the environment
+                (`dev`, `stg` or `prd`) and `_`, then 43 base62 characters (256 random bits), `_` and a 6-character
+                base62 CRC-32 checksum of the rest. The checksum lets the service and secret scanners reject typos
+                and random strings without a database lookup. The service stores only its SHA-256. Store it in a
+                secret manager.
 
     ApiKeyPage:
       type: object
@@ -3755,7 +4935,7 @@ components:
     TenantCreate:
       type: object
       additionalProperties: false
-      required: [name, first_admin_email]
+      required: [name, first_admin_email, recovery_contact]
       properties:
         name:
           type: string
@@ -3763,6 +4943,13 @@ components:
           maxLength: 200
         first_admin_email:
           $ref: '#/components/schemas/EmailAddress'
+        recovery_contact:
+          type: string
+          minLength: 1
+          maxLength: 320
+          description: |
+            A second contact at the tenant besides the first admin, such as an email address or phone number. An
+            operator confirms every `recoverTenantAdmin` request through it. Visible only in the operator API.
         default_locale:
           $ref: '#/components/schemas/Locale'
           default: en
@@ -3775,6 +4962,303 @@ components:
           $ref: '#/components/schemas/Tenant'
         first_admin:
           $ref: '#/components/schemas/User'
+
+    # Sign-in
+
+    SignInRedirect:
+      type: object
+      required: [location]
+      properties:
+        location:
+          type: string
+          format: uri
+          description: |
+            The identity provider sign-in URL, through Cognito, for the web app to send the browser to. It carries the
+            sign-in state and the PKCE challenge, which are useless without the `__Host-sft_auth` cookie.
+
+    InvitationToken:
+      type: string
+      minLength: 43
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: |
+        The one-time invitation token from the fragment of the emailed invitation link, base64url with 256 random
+        bits, valid for 7 days. Sent only in a request body.
+
+    InvitationSignInRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          $ref: '#/components/schemas/InvitationToken'
+
+    SignOutRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        all_sessions:
+          type: boolean
+          default: false
+          description: End every session of the member, not only this one.
+
+    SignOutResult:
+      type: object
+      required: [logout_url]
+      properties:
+        logout_url:
+          type: string
+          format: uri
+          description: The logout URL of the user pool that signed the member in, so managed login's own cookie is cleared too.
+
+    # Operator API
+
+    OperatorTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [sts_request]
+      properties:
+        sts_request:
+          $ref: '#/components/schemas/SignedStsRequest'
+
+    SignedStsRequest:
+      type: object
+      additionalProperties: false
+      required: [headers, body]
+      description: |
+        An STS `GetCallerIdentity` request signed with AWS Signature Version 4 by the operator CLI. The operator API
+        sends it to its own configured regional STS endpoint, never to a host taken from here.
+      properties:
+        headers:
+          type: object
+          maxProperties: 20
+          additionalProperties:
+            type: string
+            maxLength: 4096
+          description: |
+            The signed request's headers: `Authorization`, `X-Amz-Date`, `X-SFT-Audience` (`operator-api-<env>`, among
+            the signed headers) and, for Identity Center's temporary credentials, `X-Amz-Security-Token`, which STS
+            needs to check the signature. Never the secret access key.
+        body:
+          type: string
+          enum: ['Action=GetCallerIdentity&Version=2011-06-15']
+          description: The signed body. Only `GetCallerIdentity` is accepted.
+
+    OperatorToken:
+      type: object
+      required: [token, expires_at, aws_account_id, operator_name]
+      properties:
+        token:
+          type: string
+          minLength: 43
+          maxLength: 128
+          pattern: '^[A-Za-z0-9_-]+$'
+          description: |
+            The operator token, 256 random bits, sent as `Authorization: Bearer` to the operator API only. Stored only
+            as a hash. Keep it in memory; the CLI never writes it to disk.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: 15 minutes after it was issued.
+        aws_account_id:
+          type: string
+          pattern: '^[0-9]{12}$'
+          description: The environment's AWS account, as STS answered.
+        operator_name:
+          type: string
+          maxLength: 128
+          description: The operator's IAM Identity Center user name (the role session name), named in every audit record.
+
+    TenantSsoUpdate:
+      type: object
+      additionalProperties: false
+      required: [kind, provider_name, status, domains, sso_required]
+      properties:
+        kind:
+          type: string
+          enum: [oidc, saml]
+        provider_name:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: The name of the provider in both user pools, which the operator CLI derives from the tenant ID.
+        issuer:
+          type: string
+          maxLength: 1024
+          description: The identity provider's issuer or SAML entity ID, recorded for checks and display, never to find a tenant.
+        status:
+          type: string
+          enum: [active, inactive]
+          description: |
+            `active` lets members sign in through the provider; `inactive` refuses every sign-in through it, for
+            example while the tenant changes provider.
+        domains:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          description: Email domains the tenant proved with a DNS TXT record. A domain belongs to one tenant at most.
+          items:
+            type: string
+            format: hostname
+        sso_required:
+          type: boolean
+          description: Members may sign in only through the identity provider, except the tenant's fallback admins.
+        sso_mfa_confirmed_by:
+          $ref: '#/components/schemas/Id'
+          description: |
+            The tenant admin who confirmed that their identity provider enforces MFA, because Cognito's MFA doesn't
+            apply to federated users. Needed for `status: active`.
+
+    TenantSso:
+      type: object
+      required: [tenant_id, idp_connection_id, kind, provider_name, issuer, status, domains, sso_required, sso_mfa_confirmed_by, sso_mfa_confirmed_at, updated_at]
+      properties:
+        tenant_id:
+          $ref: '#/components/schemas/Id'
+        idp_connection_id:
+          $ref: '#/components/schemas/Id'
+        kind:
+          type: string
+          enum: [oidc, saml]
+        provider_name:
+          type: string
+        issuer:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [active, inactive]
+        domains:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            required: [domain, verified_at]
+            properties:
+              domain:
+                type: string
+                format: hostname
+              verified_at:
+                $ref: '#/components/schemas/Timestamp'
+        sso_required:
+          type: boolean
+        sso_mfa_confirmed_by:
+          type: [string, 'null']
+          format: uuid
+        sso_mfa_confirmed_at:
+          type: [string, 'null']
+          format: date-time
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    AdminRecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, confirmed_via]
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+          description: The admin to recover, an active admin of the tenant.
+        confirmed_via:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: How the operator confirmed the request through the tenant's recovery contact, recorded in the audit log.
+
+    AdminRecovery:
+      type: object
+      required: [id, tenant_id, user_id, kind, temporary_sign_in_expires_at, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        tenant_id:
+          $ref: '#/components/schemas/Id'
+        user_id:
+          $ref: '#/components/schemas/Id'
+        kind:
+          type: string
+          enum: [sign_in_reset, temporary_local_sign_in]
+          description: A reset for a local admin; a temporary local sign-in for an admin of an SSO tenant.
+        temporary_sign_in_expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: For `temporary_local_sign_in`, when the sign-in and its identity are deleted, 72 hours later.
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    BreakGlassGrantCreate:
+      type: object
+      additionalProperties: false
+      required: [assignment_request_id, requester, approver, incident_id, reason, tenant_ids, starts_at, ends_at]
+      properties:
+        assignment_request_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: The IAM Identity Center account assignment request ID, which CloudTrail records. Unique.
+        requester:
+          type: string
+          maxLength: 128
+          description: Identity Center user name of the operator given `BreakGlass`.
+        approver:
+          type: string
+          maxLength: 128
+          description: Identity Center user name of the approving operator. With one maintainer it can be the requester, which alerts.
+        incident_id:
+          type: string
+          maxLength: 64
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        tenant_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          description: The tenants concerned; each gets a record in its audit log. Empty for platform-wide work.
+          items:
+            $ref: '#/components/schemas/Id'
+        starts_at:
+          $ref: '#/components/schemas/Timestamp'
+        ends_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: At most 1 hour after `starts_at`.
+
+    BreakGlassGrant:
+      type: object
+      description: A recorded break-glass grant, with the fields of `BreakGlassGrantCreate`.
+      required: [id, assignment_request_id, requester, approver, incident_id, reason, tenant_ids, starts_at, ends_at, recorded_by, review_due_at, review_url]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        assignment_request_id:
+          type: string
+        requester:
+          type: string
+        approver:
+          type: string
+        incident_id:
+          type: string
+        reason:
+          type: string
+        tenant_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        starts_at:
+          $ref: '#/components/schemas/Timestamp'
+        ends_at:
+          $ref: '#/components/schemas/Timestamp'
+        recorded_by:
+          type: string
+          enum: [tool, reconciliation]
+          description: Whether the break-glass tool recorded it, or the reconciliation job found it in CloudTrail.
+        review_due_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the after-action review is due, 2 business days after the grant.
+        review_url:
+          type: [string, 'null']
+          format: uri
+          description: Link to the after-action review once it is written.
 
     # Pagination
 

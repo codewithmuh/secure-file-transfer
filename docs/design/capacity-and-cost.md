@@ -4,8 +4,8 @@
 |---|---|
 | Requirements | [PRD](../prd.md), especially section 6.1 (design load), FR-2, NFR-1, NFR-2, NFR-5, NFR-10, NFR-11, NFR-16, NFR-19, NFR-20 |
 | Architecture | [architecture.md](../architecture.md) |
-| Security design | Phase 3 drafts: encryption and keys ([#22](https://github.com/codewithmuh/secure-file-transfer/issues/22)), authentication and authorization ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)), abuse and rate limits ([#24](https://github.com/codewithmuh/secure-file-transfer/issues/24)) |
-| Tracking | [#15](https://github.com/codewithmuh/secure-file-transfer/issues/15), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)) |
+| Security design | [Encryption and keys](../security/encryption-and-keys.md) ([#22](https://github.com/codewithmuh/secure-file-transfer/issues/22)), [authentication and authorization](../security/authn-authz.md) ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)), [abuse and rate limits](../security/abuse-and-rate-limits.md) ([#24](https://github.com/codewithmuh/secure-file-transfer/issues/24)) |
+| Tracking | [#15](https://github.com/codewithmuh/secure-file-transfer/issues/15), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) |
 
 This page turns the PRD design load into workload numbers, sizes each component for prod, and prices dev, staging
 and prod with AWS on-demand prices for Tokyo (ap-northeast-1) and Osaka (ap-northeast-3). Every number is an
@@ -14,33 +14,39 @@ The first load test (section 8) replaces the assumptions with measurements.
 
 Technologies are the architecture's current candidates (architecture section 9). If a phase 4 ADR picks something
 else, this page is updated in the same pull request. Lines and assumptions marked #22, #23 or #24 follow the phase 3
-security drafts for those issues; if a draft changes before it merges, so does this page.
+security documents of those issues; a change there updates this page in the same pull request.
 
 ## 1. Summary
 
 | Environment | Running | Per month | Per day |
 |---|---|---:|---:|
-| prod, (a) idle or demo traffic | 24×7 | $3,036 | $100 |
-| prod, (b) full design load, steady state | 24×7 | $12,065 | $397 |
-| staging | 24×7 | $2,250 | $74 |
-| staging | Expected: 162 billed hours a month (A22) | $501 | — |
-| dev | 24×7 | $817 | $27 |
-| dev | Expected: 260 billed hours a month (A22) | $292 | — |
-| Shared container registry (section 5.4) | Every phase until the final teardown | $4 | — |
+| prod, (a) idle or demo traffic | 24×7 | $3,233 | $106 |
+| prod, (b) full design load, steady state | 24×7 | $12,262 | $403 |
+| staging | 24×7 | $2,344 | $77 |
+| staging | Expected: 162 billed hours a month (A22) | $522 | — |
+| dev | 24×7 | $909 | $30 |
+| dev | Expected: 260 billed hours a month (A22) | $324 | — |
+| Shared container registry and its key (section 5.4) | Every phase until the final teardown; $3 before it replicates to Osaka | $6 | — |
+| Retained stack after teardown (section 7.4) | Until the audit archive's retention ends | about $2.20 | — |
 
-- Prod includes the Osaka pilot light: $747 a month at idle, $4,406 at design load.
+- Prod includes the Osaka pilot light: $749 a month at idle, $4,408 at design load.
 - Scenario (a) is the realistic case for a reference service: fixed infrastructure, the synthetic probe and a few demo
   users. Scenario (b) is a month at the full design load after 12 months of growth, with every byte moved for real.
 - At design load the three biggest costs are S3 replication to Osaka ($3,214), internet egress for downloads
-  ($2,962) and EKS worker nodes ($1,354). At idle they are worker nodes ($1,100), the three Aurora instances ($728),
-  and NAT gateways, interface endpoints and public IPv4 addresses in two regions ($686).
-- The phase 3 drafts add, at design load, Cognito on the Plus plan ($501, #23), streamed downloads on the load
-  balancer ($243, #24), and smaller lines for WAF, KMS, CloudTrail data events and SES tenants. The scan workers' own
-  node pool (#22) is inside the worker-node cost.
+  ($2,962) and EKS nodes ($1,523). At idle they are EKS nodes ($1,269: both Karpenter pools and the `system` node
+  group that Karpenter itself runs on, ADR-0004), the three Aurora instances ($728), and NAT gateways, interface
+  endpoints and public IPv4 addresses in two regions ($686).
+- The phase 3 documents add, at design load, Cognito on the Plus plan ($501, #23), streamed downloads on the load
+  balancer ($243, #24), ElastiCache Serverless for the counters ($8 per region, #24), and smaller lines for WAF, KMS,
+  CloudTrail data events and SES tenants. The scan workers' own node pool (#22) is inside the worker-node cost.
 - ClamAV can't scan files over 2 GB, so the totals cost a hybrid: ClamAV up to 2 GB, GuardDuty above. GuardDuty for
-  every file would cost $443 a month less at idle and $2,904 more at design load (section 5.5). The scan ADR decides.
-- Recommended budget for the operating period (open question 7): **$6,000 a month**, with alarms at $3,000, $4,800
-  and $6,000. The planned month, load tests included, is $4,081: 68 % of the budget (section 7.3).
+  every file would cost $443 a month less at idle and $2,904 more at design load (section 5.5). ADR-0019 chose the
+  hybrid.
+- Budget for the operating period (open question 7, decided): **$6,000 a month**, with alarms at $3,000, $4,800 and
+  $6,000. The planned month, load tests included, is $4,333: 72 % of the budget. dev and staging cost about $850 a
+  month during the build (section 7.3).
+- After teardown the retained stack costs about $2.20 a month, and about $6.00 in the worst case, both inside
+  NFR-19's $7 with the audit key's yearly rotation kept (section 7.4).
 
 ## 2. Assumptions
 
@@ -61,7 +67,7 @@ security drafts for those issues; if a draft changes before it merges, so does t
 | A13 | Aurora at design load does 3 M write I/Os and 7 M read I/Os a day. At most 4 KB crosses to Osaka per replicated write I/O. | Estimate from about 1 M write transactions a day; to measure |
 | A14 | The audit archive stores 0.2 KB per audit row after compression, plus about 40,000 security-critical records a day as separate objects in each region (download grants dominate). That is about 0.1 GB a day per region. | Architecture 5.2 |
 | A15 | The web app serves 30,000 sessions a day, each 0.5 MB and 20 requests through CloudFront. | Estimate (25,000 members, about 18,000 external people a day) |
-| A16 | Prod's main node pool runs 4 nodes at idle, 6 in the peak hour and 9 at 2× design load; its scan node pool 5, 10 and about 20. At design load each pool averages a third of the way from idle to peak: 4.67 and 6.67 nodes. | Section 4.2; the peak hour carries 3× the average hour |
+| A16 | Prod's main node pool runs 4 nodes at idle, 6 in the peak hour and 8 at 2× design load; its scan node pool 5, 10 and about 20; the `system` node group 2 throughout (ADR-0004). At design load each pool averages a third of the way from idle to peak: 4.67 and 6.67 nodes. | Section 4.2; the peak hour carries 3× the average hour |
 | A17 | NAT traffic is 1 GB a day at idle and 2 GB a day at design load: SES API calls, writes to Osaka, Git and signature updates. S3 and image layers use endpoints. | Architecture 3.1 |
 | A18 | Cross-AZ traffic is 3 GB a day at idle and 40 GB a day at design load (database, metrics, logs). | Estimate |
 | A19 | EKS control-plane logs go to CloudWatch Logs: prod 1 GB a day at idle and 2 GB at design load, staging 0.5, dev 0.3. VPC flow logs go to S3: prod 0.5 and 5 GB a day, staging 0.2, dev 0.1. WAF logs keep only blocked, challenged and counted requests (#24 3.4); with Cognito's user activity logs that is about 1 GB a month at idle and 4 GB at design load. | Estimate |
@@ -71,23 +77,23 @@ security drafts for those issues; if a draft changes before it merges, so does t
 | A23 | Idle prod traffic is the synthetic probe every 5 minutes (NFR-1) plus a few demo users: about 10 GB of file bytes and 20,000 emails a month. | NFR-1 |
 | A24 | Rate limiting costs 2 counter operations per API request. | NFR-14 |
 | A25 | SQS costs 3 requests per message (send, receive, delete), plus 20-second long polling by about 8 consumers. | Architecture 5.3 |
-| A26 | Platform requests: prod's cluster-level components 6.4 vCPU and 17.5 GiB; the cut-down set in dev and staging 2.6 vCPU and 7 GiB; per-node agents 0.3 vCPU and 0.4 GiB on every node. Breakdown in section 4.3. | Our starting requests, from the components' chart defaults where they give one; to measure |
+| A26 | Platform requests on the main pool: prod's cluster-level components 5.6 vCPU and 14.6 GiB; the cut-down set in dev and staging 2.05 vCPU and 5.65 GiB. On the `system` node group (Karpenter, Argo CD, CoreDNS; ADR-0004): 1.7 vCPU and 3.65 GiB in prod, 0.95 vCPU and 1.65 GiB in dev and staging. Per-node agents 0.3 vCPU and 0.4 GiB on every node. Breakdown in section 4.3. | Our starting requests, from the components' chart defaults where they give one; to measure |
 | A27 | Allocatable per node: m8g.xlarge about 3.9 vCPU and 14 GiB, m8g.large about 1.9 vCPU and 6.5 GiB. Requests fill at most 80 % of allocatable CPU. | EKS node reservations; the 20 % leaves room for rollouts (`maxSurge: 25%`, #24 5.7) and node churn |
-| A28 | EBS gp3: a 100 GB root volume per main-pool node and 50 GB per scan node (image, signatures, one file of up to 2 GB). Observability volumes: 300 GB in prod (Prometheus 2 × 100 GB for 15 days, Loki and Tempo write-ahead logs 4 × 25 GB), 100 GB in staging, 50 GB in dev. | Sized for 2× the expected series and log rate; to measure |
-| A29 | WAF per #24 3.1 and 3.2: in each region an API web ACL with 12 rules and a sign-in web ACL with 3; the CloudFront web ACL for the web app with 4. Requests: every API request, every CloudFront request and about 10 per sign-in (A36): 1 M a month at idle, 155 M at design load; under 1 M challenges. | #24 |
-| A30 | KMS: 8 customer managed keys per environment (#22 4.1), each with an Osaka replica in staging and prod, billed as a key each. Requests: A21's 3 M a month plus up to 6 M for unwrapping field data keys at design load (#22 3.2); about 0.35 M at idle. A key costs $1 a month until its first yearly rotation, which comes after an operating period of under a year. | #22 |
+| A28 | EBS gp3: a 100 GB root volume per main-pool node, 50 GB per scan node (image, signatures, one file of up to 2 GB) and 20 GB per `system` node, the managed node group default. Observability volumes: 500 GB in prod (Prometheus 2 × 200 GB for 30 days, so NFR-1's 28-day window is computed from local data, ADR-0009; Loki and Tempo write-ahead logs 4 × 25 GB), 100 GB in staging, 50 GB in dev. | Sized for 2× the expected series and log rate; to measure |
+| A29 | WAF per #24 3.1 and 3.2: in each region an API web ACL with 11 rules and a sign-in web ACL with 6; the CloudFront web ACL for the web app with 5. Requests: every API request, every CloudFront request and about 10 per sign-in (A36): 1 M a month at idle, 155 M at design load. Challenges come only from recipient and uploader page loads above 30 per IP in 5 minutes: under 0.1 M a month. | #24 |
+| A30 | KMS: 8 customer managed keys per environment (#22 4.1), each with an Osaka replica in staging and prod, billed as a key each, plus the registry key in the shared stack (section 5.4). Requests: A21's 3 M a month plus up to 6 M for unwrapping field data keys at design load (#22 3.2); about 0.35 M at idle. A key costs $1 a month until its first yearly rotation, which comes after an operating period of under a year. | #22 |
 | A31 | 10 secrets per environment and region: the 4 application secrets of #22 6.1 and up to 6 for platform components. Pods that read secrets call Secrets Manager every 5 minutes, External Secrets every hour: about 0.05 M calls a month in prod at idle, 0.07 M at design load. | #22 |
 | A32 | Route 53: one hosted zone per environment, 2 health checks with HTTPS and string matching in prod and staging. Queries: 1 M a month at idle, 10 M at design load (A15's 30,000 sessions a day × about 10 lookups, with 60-second TTLs on the failover records). | Estimate |
 | A33 | Log and trace storage in S3: 90 days of VPC flow logs (A19), plus about 0.5 GB a day at design load (0.05 GB at idle) of load balancer, WAF, CloudFront, Cognito and CloudTrail logs, Loki chunks (90 days) and Tempo traces (14 days, 10 % sampled). That is about 50 GB at idle and 500 GB at design load, with 0.5 M and 3 M PUTs a month. CloudWatch Logs keeps control-plane logs 90 days, stored at about 15 % of their ingested size. | PRD data lifecycle (logs kept 90 days); the compression ratio is an estimate |
 | A34 | CloudWatch alarms on AWS-service metrics: prod 60 (about 4 on each of 15 resources), staging 40, dev 10. Custom metrics (synthetic probe, job heartbeats): prod 30, staging 10, dev 5. Application alerts run in Alertmanager at no AWS charge. | Estimate |
 | A35 | Idle Aurora: 10 GB stored and about 1 M I/Os a day, a third of them writes (the probe's 288 transfers a day, lifecycle jobs, vacuum). | Estimate |
 | A36 | Cognito (#23): the Plus plan at $0.02 per monthly active user; all 25,000 members active at design load and priced as local members (federated members cost $0.015, so this is the top of #23's range); about 50 at idle. 20,000 sign-ins a day at design load, each about 10 requests through the sign-in web ACL and two trigger invocations (pre- and post-authentication, #24 2.3) of about 100 ms at 256 MB on Arm. The Osaka standby pool has no users until a failover. | #23, #24; sign-ins estimated from 12-hour sessions on working days |
-| A37 | CloudTrail S3 data events on the files and audit buckets (#22): one event per S3 request in Tokyo (section 3.1), 15.7 M a month at design load and 0.3 M at idle, plus 1.2 M a month for the API's direct writes to the Osaka archive. | #22 |
-| A38 | Files over 2 GB are about 0.1 % of files (30 a day) and 10 % of bytes (100 GB a day, a mean of about 3.3 GB). | Between a Pareto fit of A9's large-file tail (about 6 % of bytes) and a log-normal fit of the PRD's median and p95 (about 17 %); to measure |
+| A37 | CloudTrail S3 data events on the files buckets, through the environment's trail, and on the audit archive, through the retained stack's trail (#22 3.1, 8.4): one event per S3 request in Tokyo (section 3.1), 15.7 M a month at design load and 0.3 M at idle, plus 1.2 M a month for the API's direct writes to the Osaka archive. Management events are free for one trail per account: in prod that is the organization trail (ADR-0006), and the environment's trail logs data events only. The retained trail adds management events at teardown (#22 8.4), so no second copy bills while prod runs. | #22 |
+| A38 | Files over 2 GB are about 0.1 % of files (30 a day) and 10 % of bytes (100 GB a day, a mean of about 3.3 GB). They go to a second files bucket pair, Tokyo and Osaka, that GuardDuty covers whole (ADR-0019). S3 has no per-bucket fee, so the S3 and replication lines cover both pairs. | Between a Pareto fit of A9's large-file tail (about 6 % of bytes) and a log-normal fit of the PRD's median and p95 (about 17 %); to measure |
 | A39 | A scan worker copies a file from S3 to its scratch disk at about 125 MB/s, the gp3 volume's baseline throughput: 16 s for 2 GB, 40 s for 5 GB. | gp3 baseline; to measure |
-| A40 | The registry holds 20 GB per region: the application image (one image for the API and workers, architecture 2) at about 0.4 GB × 30 kept versions, plus about 8 GB of platform images through pull-through cache. About 5 GB of new layers a month replicate to Osaka. | Estimate |
+| A40 | The registry holds 20 GB per region: the application image (one image for the API and workers, architecture 2) at about 0.4 GB × 30 kept versions, plus about 8 GB of third-party images that a mirror workflow copies by digest into `mirror/` repositories (ADR-0007; no pull-through cache). About 5 GB of new layers a month replicate to Osaka. | Estimate |
 | A41 | App pods: dev runs 1 API pod, 1 outbox relay, 1 notification worker and 1 scan pod for both queues; staging 3 API pods (one per AZ, for AZ drills), 1 relay, 1 notification worker and 2 scan pods (one per queue). Requests per pod as in prod. | Smallest shapes that still exercise every path |
-| A42 | In the operating period, at most two load-test windows and one prod drill a month. A window runs 12 hours in prod: 8 at 1× and 4 at 2× the peak-hour rate (NFR-16), with file bytes at a 10 % sample except one 4-hour full-byte window; 2 × m8g.2xlarge load generators; 1,000 test members. A drill runs Osaka's idle compute shape for 8 hours. | Input to the phase 6 test plan (PRD 6.1) |
+| A42 | In the operating period, at most two load-test windows and one prod drill a month. A window runs 12 hours in prod: 8 at 1× and 4 at 2× the peak-hour rate (NFR-16), with file bytes at a 10 % sample except one 4-hour full-byte window; 2 × m8g.2xlarge load generators; 1,000 test members. A drill runs Osaka's idle compute shape, the `system` group included, for 8 hours. | Input to the phase 6 test plan (PRD 6.1) |
 | A43 | SES tenant management (#24 7.3): one SES tenant per tenant, in Tokyo and in Osaka. | #24 |
 | A44 | An Aurora Serverless v2 secondary in Osaka would run at about 1 ACU idle and 1.5 ACU on average at design load. | It only applies the writer's changes to its cache, and AWS notes that a global database can keep instances above their minimum; to measure (section 4.5) |
 
@@ -140,17 +146,17 @@ up to 20 GB.
 with ClamAV says: "Technical design limitations prevent ClamAV from scanning files greater than 2 GB at this time."
 A file between 2 and 5 GB would end `unscannable`, because a limit is never a pass (#24 6.4), and stay blocked by
 default (FR-18). ClamAV alone therefore can't deliver a clean 5 GB file. GuardDuty Malware Protection for S3 scans
-objects up to 100 GB, a quota AWS doesn't adjust (section 6). The scan ADR (open question 2) chooses between three
-options; section 5.5 compares their cost:
+objects up to 100 GB, a quota AWS doesn't adjust (section 6). The scan ADR (open question 2, ADR-0019) chose between
+three options; section 5.5 compares their cost:
 
 | Option | Files up to 2 GB | Files over 2 GB | What changes |
 |---|---|---|---|
 | (a) GuardDuty for every file | GuardDuty | GuardDuty | No scan engine of ours; the scan worker only records GuardDuty's results |
-| (b) Hybrid | ClamAV in the scan workers | GuardDuty, on a key prefix only those files use | Two engines and two result paths |
+| (b) Hybrid | ClamAV in the scan workers | GuardDuty, on a second files bucket pair only those files use | Two engines and two result paths |
 | (c) Lower FR-2's file limit to 2 GB | ClamAV | Not accepted | A PRD change, which this page doesn't make |
 
 The totals in section 5 cost **(b)**: it keeps FR-2 and is the cheaper of the two options that do at design load.
-That is a costing baseline, not a decision.
+ADR-0019 (phase 4) chose it.
 
 Each ClamAV scan keeps a worker busy for 1 s, plus the copy to scratch disk at 125 MB/s (A39), plus the scan at
 20 MB/s per vCPU (A9): about 1 s + 0.058 s per MB. A 2 GB file takes about 2 minutes, a 100 MB file about 7 s. For
@@ -168,7 +174,7 @@ Files over 2 GB never reach them.
   large transfers at once, each tenant limited to 2 large-file scans (#24 6.4). Both pools scale on queue age.
 - **A 20 GB transfer.** Under (b), four 5 GB files go to GuardDuty, which scans outside our pods. Ten 2 GB files run
   2 at a time (the tenant cap) in about 10 minutes, leaving 5 of NFR-5's 15 for queueing. GuardDuty publishes no
-  time-to-result target, so the scan ADR must measure it for 5 GB objects and, for option (a), for small files
+  time-to-result target, so staging must measure it for 5 GB objects and, for option (a), for small files
   against the 2-minute target.
 - **clamd memory during signature updates.** With `ConcurrentDatabaseReload` on (the default), clamd loads a second
   engine while the first keeps scanning, so for a short time it holds two copies of the signatures. ClamAV's Docker
@@ -213,8 +219,8 @@ kept 365 days, and reaches the data model's 100–150 GB (this page costs the up
 | Outbox relay | 2 pods, 0.25 vCPU and 0.25 GiB each | Architecture 2 |
 | Notification worker | 2 pods, 0.25 vCPU and 0.5 GiB each; peaks at about 5 emails/s | Section 3.2 |
 | Lifecycle jobs | Scheduled jobs, 0.5 vCPU and 1 GiB while they run | Architecture 4.5 |
-| Platform | Argo CD, Prometheus (2 replicas), Alertmanager, Grafana, Loki, Tempo, OpenTelemetry collectors, Karpenter, AWS Load Balancer Controller, External Secrets, KEDA, CoreDNS: 6.4 vCPU and 17.5 GiB of requests, plus 0.3 vCPU and 0.4 GiB of agents on every node. dev and staging run a cut-down set. | A26, section 4.3 |
-| EKS worker nodes | Two Karpenter node pools over 3 AZs. **Main pool, m8g.xlarge** (Graviton4, 4 vCPU, 16 GiB): 4 at idle, 6 in the peak hour, 9 at 2× design load. **Scan pool, m8g.large** (2 vCPU, 8 GiB), one scan pod per node, volumes under the files key (#22): 5 at idle, 10 in the peak hour, about 20 at 2×. | Section 4.2, A27 |
+| Platform | On the main pool: Prometheus (2 replicas), Alertmanager, Grafana, Loki, Tempo, OpenTelemetry collectors, AWS Load Balancer Controller, External Secrets, KEDA, metrics-server and Kyverno (ADR-0007): 5.6 vCPU and 14.6 GiB of requests. On the `system` node group: Karpenter, Argo CD and CoreDNS, 1.7 vCPU and 3.65 GiB. Plus 0.3 vCPU and 0.4 GiB of agents on every node. dev and staging run a cut-down set. | A26, section 4.3 |
+| EKS worker nodes | Two Karpenter node pools over 3 AZs. **Main pool, m8g.xlarge** (Graviton4, 4 vCPU, 16 GiB): 4 at idle, 6 in the peak hour, 8 at 2× design load. **Scan pool, m8g.large** (2 vCPU, 8 GiB), one scan pod per node, volumes under the files key (#22): 5 at idle, 10 in the peak hour, about 20 at 2×. Karpenter can't run on nodes it manages, so a **`system` managed node group** of 2 × m8g.large in two AZs runs Karpenter, Argo CD and CoreDNS (ADR-0004); Osaka's is at zero nodes until a failover. | Section 4.2, A27 |
 | Aurora PostgreSQL | **db.r8g.large** (2 vCPU, 16 GiB) writer and reader in different Tokyo AZs, plus one db.r8g.large in the Osaka secondary. Standard storage, 150 GB per region at steady state. Move up to db.r8g.xlarge if writer CPU stays above 60 % in the peak hour or the buffer cache hit ratio drops below 99 %. | Sections 4.4 and 4.5 |
 | Rate-limit counters | ElastiCache Serverless for Valkey, one cache per environment and region (#24), at its 100 MB minimum; about 600 operations/s at burst. It also holds stream and scan leases and sign-in state (#23, #24). | A24 |
 | SQS | Standard queues with dead-letter queues; the scan queues are fair queues keyed by tenant (#24 6.4). About 100,000 messages a day, each under 1 KB. Large-file scans extend their visibility timeout while they run. | Architecture 5.3 |
@@ -222,7 +228,7 @@ kept 365 days, and reaches the data model's 100–150 GB (this page costs the up
 | NAT gateways | 3 per region (one per AZ); about 2 GB a day of traffic | A17 |
 | Load balancer | One Application Load Balancer per region; about 2 LCU of API traffic plus 41.7 LCU of streamed downloads at design load (#24) | Section 5.6 |
 | CloudFront | One distribution, for the web app bundle only | Architecture 4.2 |
-| GuardDuty Malware Protection for S3 | Under option (b), one protection plan on the files bucket, scoped to the prefix that files over 2 GB use | Section 5.5 |
+| GuardDuty Malware Protection for S3 | Under option (b), one protection plan on the whole large-file bucket in Tokyo, which holds only files over 2 GB; the plan on the Osaka large-file bucket is enabled by the failover runbook (ADR-0019) | Section 5.5 |
 
 Even at 2× design load the API needs about 200 database connections (15 pods × 10, plus workers), far below what a
 db.r8g.large allows. Streaming downloads (#24) adds about 35 MB/s in the peak hour and about 15 concurrent streams,
@@ -237,10 +243,10 @@ well within the pods' and nodes' network capacity.
 | API | 3 / 8 / 15 | 1 vCPU, 1 GiB | 3 vCPU, 3 GiB | 8 vCPU, 8 GiB | 15 vCPU, 15 GiB |
 | Outbox relay and notification worker | 4 / 4 / 4 | 0.25 vCPU, 0.25–0.5 GiB | 1 vCPU, 1.5 GiB | 1 vCPU, 1.5 GiB | 1 vCPU, 1.5 GiB |
 | Lifecycle jobs | while running | 0.5 vCPU, 1 GiB | 0.5 vCPU, 1 GiB | 0.5 vCPU, 1 GiB | 0.5 vCPU, 1 GiB |
-| Platform, cluster-level (A26) | — | — | 6.4 vCPU, 17.5 GiB | 6.4 vCPU, 17.5 GiB | 6.4 vCPU, 17.5 GiB |
-| Per-node agents, 0.3 vCPU and 0.4 GiB a node | — | — | 1.2 vCPU, 1.6 GiB | 1.8 vCPU, 2.4 GiB | 2.7 vCPU, 3.6 GiB |
-| **Total** | | | **12.1 vCPU, 24.6 GiB** | **17.7 vCPU, 30.4 GiB** | **25.6 vCPU, 38.6 GiB** |
-| **m8g.xlarge nodes** | | | **4** (78 % of CPU) | **6** (76 %) | **9** (73 %) |
+| Platform, cluster-level, on the main pool (A26) | — | — | 5.6 vCPU, 14.6 GiB | 5.6 vCPU, 14.6 GiB | 5.6 vCPU, 14.6 GiB |
+| Per-node agents, 0.3 vCPU and 0.4 GiB a node | — | — | 1.2 vCPU, 1.6 GiB | 1.8 vCPU, 2.4 GiB | 2.4 vCPU, 3.2 GiB |
+| **Total** | | | **11.3 vCPU, 21.7 GiB** | **16.9 vCPU, 27.5 GiB** | **24.5 vCPU, 35.3 GiB** |
+| **m8g.xlarge nodes** | | | **4** (72 % of CPU) | **6** (72 %) | **8** (79 %) |
 
 **Scan pool, m8g.large**, one scan pod per node: the pod's 1.2 vCPU and 4.25 GiB plus 0.3 vCPU and 0.4 GiB of
 agents fill 79 % of a node's 1.9 allocatable vCPU and 72 % of its 6.5 GiB.
@@ -251,11 +257,15 @@ agents fill 79 % of a node's 1.9 allocatable vCPU and 72 % of its 6.5 GiB.
 | Large-file scan pods | 2 | 6 | 12 |
 | **m8g.large nodes** | **5** | **10** | **20** |
 
-CPU requests decide the node count in both pools; eight main-pool nodes at 2× would be 81 %, so it takes nine. The
-main pool's memory stays under half used, but a compute-optimised type (c8g.xlarge, 8 GiB) would fill it to about
-90 % at idle, so m8g.xlarge stays. The scan pool uses the smaller m8g.large because one pod per node keeps hostile
-files on their own nodes (#22) and leaves room for clamd's reload, and two m8g.large cost the same as one
-m8g.xlarge.
+CPU requests decide the node count in both pools; at 2× design load eight main-pool nodes run at 79 %. The main
+pool's memory stays under half used, but a compute-optimised type (c8g.xlarge, 8 GiB) would fill about 80 % of it at
+idle, with no room for Prometheus and Loki to grow, so m8g.xlarge stays. The scan pool uses the smaller m8g.large
+because one pod per node keeps hostile files on their own nodes (#22) and leaves room for clamd's reload, and two
+m8g.large cost the same as one m8g.xlarge.
+
+**The `system` node group** in prod, 2 × m8g.large: Karpenter, Argo CD and CoreDNS request 1.7 vCPU and 3.65 GiB,
+plus 0.6 vCPU and 0.8 GiB of agents, so 61 % of the two nodes' allocatable CPU. Taking them off the main pool leaves
+room for Kyverno there without another node.
 
 If an AZ fails at idle, the main pool can lose 2 of its 4 nodes: the API pods keep a higher priority, and Karpenter
 adds nodes in the other two AZs within minutes, inside NFR-11's 5-minute target. The scan pool loses one or two
@@ -266,25 +276,32 @@ nodes; files wait in the queues meanwhile and are never downloadable before thei
 dev and staging run every platform component, so the same manifests are tested before prod, but without the
 high-availability replicas, with Loki and Tempo in single-binary mode, and with shorter retention. Nothing is shared
 between environments: each cluster keeps its own Argo CD and observability, so each environment tears down alone and
-stays inside its own account if open question 4 chooses one per environment.
+stays inside its own account (open question 4 chose an account per environment).
 
 | Component | prod: vCPU, GiB | dev and staging: vCPU, GiB |
 |---|---|---|
-| Argo CD | Controller, 2 repo servers, 2 API servers, Redis, ApplicationSet: 1.0, 2.5 | One of each: 0.5, 1.0 |
-| Prometheus | 2 replicas, 15 days: 2.0, 7.0 | 1 replica, 3 days (dev) or 7 days (staging): 0.5, 2.0 |
+| Argo CD, on the `system` group | Controller, 2 repo servers, 2 API servers, Redis, ApplicationSet: 1.0, 2.5 | One of each: 0.5, 1.0 |
+| Prometheus | 2 replicas, 30 days (ADR-0009): 2.0, 7.0 | 1 replica, 3 days (dev) or 7 days (staging): 0.5, 2.0 |
 | Alertmanager and Grafana | 2 + 1: 0.4, 1.0 | 1 + 1: 0.2, 0.5 |
 | Loki | Simple scalable (2 write, 2 read, 1 backend): 1.0, 2.5 | Single binary: 0.25, 1.0 |
 | Tempo | Distributor, 2 ingesters, querier, compactor: 0.5, 1.5 | Single binary: 0.25, 0.75 |
 | OpenTelemetry gateway collectors | 2: 0.4, 0.8 | 1: 0.2, 0.4 |
-| Karpenter | 2: 0.5, 1.0 | 1: 0.25, 0.5 |
-| Load Balancer Controller, External Secrets, KEDA, CoreDNS (2), metrics-server | 0.6, 1.2 | 0.45, 0.85 |
-| **Cluster-level total** | **6.4, 17.5** | **2.6, 7.0** |
+| Karpenter, on the `system` group | 2: 0.5, 1.0 | 1: 0.25, 0.5 |
+| CoreDNS, on the `system` group | 2: 0.2, 0.15 | 2: 0.2, 0.15 |
+| Load Balancer Controller, External Secrets, KEDA, metrics-server | 0.4, 1.05 | 0.25, 0.7 |
+| Kyverno, admission policy and image verification (ADR-0007) | 3 admission controllers; background, cleanup and reports controllers, 2 each: 0.9, 0.75 | One of each: 0.4, 0.3 |
+| **Cluster-level, main pool** | **5.6, 14.6** | **2.05, 5.65** |
+| **Cluster-level, `system` group** | **1.7, 3.65** | **0.95, 1.65** |
 | Per-node agents: VPC CNI, kube-proxy, EBS CSI node, Pod Identity agent, node exporter, log and telemetry agent | 0.3, 0.4 per node | 0.3, 0.4 per node |
 
-| Environment | App pods (A41) | Platform and agents | Total requests | Main pool | Scan pool |
-|---|---|---|---|---|---|
-| staging | 4.0 vCPU, 4.75 GiB | 2.6 + 0.9 vCPU, 7.0 + 1.2 GiB | 7.5 vCPU, 12.95 GiB | 3 m8g.xlarge, one per AZ (64 % of CPU) | 2 m8g.large |
-| dev | 2.0 vCPU, 2.75 GiB | 2.6 + 0.6 vCPU, 7.0 + 0.8 GiB | 5.2 vCPU, 10.55 GiB | 2 m8g.xlarge (67 %) | 1 m8g.large |
+| Environment | App pods (A41) | Main-pool platform and agents | Main-pool requests | Main pool | Scan pool | `system` group |
+|---|---|---|---|---|---|---|
+| staging | 4.0 vCPU, 4.75 GiB | 2.05 + 0.9 vCPU, 5.65 + 1.2 GiB | 6.95 vCPU, 11.6 GiB | 3 m8g.xlarge, one per AZ (59 % of CPU) | 2 m8g.large | 2 m8g.medium |
+| dev | 2.0 vCPU, 2.75 GiB | 2.05 + 0.6 vCPU, 5.65 + 0.8 GiB | 4.65 vCPU, 9.2 GiB | 2 m8g.xlarge (60 %) | 1 m8g.large | 2 m8g.medium |
+
+The `system` group in dev and staging is tight: its 0.95 vCPU plus 0.6 vCPU of agents fill about 85 % of two
+m8g.medium nodes' allocatable CPU, above A27's 80 %, and an m8g.medium holds only 8 pods unless the VPC CNI uses prefix
+delegation. The first dev build measures it; m8g.large instead would add $85 a month per environment while it runs.
 
 ### 4.4 Aurora: Standard or I/O-Optimized
 
@@ -329,7 +346,7 @@ both regions (Standard storage). Instances in a secondary cluster never auto-pau
 
 Line items use the Tokyo price for Tokyo resources and the Osaka price for Osaka resources. Each line is rounded to
 whole dollars; each total is the sum of the rounded lines. Per-day figures are the monthly total ÷ 30.4. Lines marked
-#22, #23 or #24 follow those phase 3 drafts.
+#22, #23 or #24 follow those phase 3 documents.
 
 ### 5.1 prod
 
@@ -342,12 +359,13 @@ whole dollars; each total is the sum of the rounded lines. Per-day figures are t
 | EKS | Control plane, 1 cluster | $0.10/h | 730 h | 73 | 730 h | 73 |
 | EC2 | Main node pool, m8g.xlarge (4 vCPU, 16 GiB), 3 AZs | $0.23188/h | 4 nodes | 677 | 4.67 nodes avg (peak 6) | 790 |
 | EC2 | Scan node pool, m8g.large (2 vCPU, 8 GiB), one scan pod each (#22) | $0.11594/h | 5 nodes | 423 | 6.67 nodes avg (peak 10) | 564 |
-| EBS | gp3: 100 GB root per main node, 50 GB per scan node, 300 GB observability volumes (A28) | $0.096/GB-mo | 950 GB | 91 | 1,100 GB | 106 |
+| EC2 | `system` managed node group, m8g.large: Karpenter, Argo CD, CoreDNS (ADR-0004) | $0.11594/h | 2 nodes | 169 | 2 nodes | 169 |
+| EBS | gp3: 100 GB root per main node, 50 GB per scan node, 20 GB per `system` node, 500 GB observability volumes (A28) | $0.096/GB-mo | 1,190 GB | 114 | 1,340 GB | 129 |
 | VPC | NAT gateways, one per AZ | $0.062/h + $0.062/GB | 3 × 730 h + 30 GB | 138 | 3 × 730 h + 61 GB | 140 |
 | VPC | Public IPv4: 3 NAT + 3 load balancer | $0.005/h | 6 | 22 | 6 | 22 |
 | VPC | Interface endpoints: SQS, KMS, Secrets Manager, ECR ×2, STS; 3 AZs | $0.014/h per AZ + $0.01/GB | 18 ENIs + 10 GB | 184 | 18 ENIs + 50 GB | 184 |
 | ELB | Application Load Balancer; carries the streamed downloads (#24) | $0.0243/h + $0.008/LCU-h | 730 h + 0.1 LCU | 18 | 730 h + 43.7 LCU | 273 |
-| WAF | API (12 rules) and sign-in (3) web ACLs, web app web ACL on CloudFront (4) (#24, A29) | $5/ACL + $1/rule + $0.60/M req + $0.40/M challenges | 3 ACLs, 19 rules + 1 M req | 35 | 3 ACLs, 19 rules + 155 M req + 1 M challenges | 127 |
+| WAF | API (11 rules) and sign-in (6) web ACLs, web app web ACL on CloudFront (5) (#24, A29) | $5/ACL + $1/rule + $0.60/M req + $0.40/M challenges | 3 ACLs, 22 rules + 1 M req | 38 | 3 ACLs, 22 rules + 155 M req + 0.1 M challenges | 130 |
 | CloudFront | Web app bundle (Japan edge prices) | $0.114/GB + $0.012/10k req | 5 GB + 1 M req | 2 | 456 GB + 18 M req | 74 |
 | Data transfer | File downloads to the internet | $0.114/GB first 10 TB, $0.089/GB next 40 TB | 10 GB | 1 | 30,400 GB | 2,962 |
 | Data transfer | Cross-AZ (database, metrics, logs) | $0.01/GB each way | 91 GB | 2 | 1,216 GB | 24 |
@@ -365,18 +383,18 @@ whole dollars; each total is the sum of the rounded lines. Per-day figures are t
 | CloudTrail | S3 data events on the files and audit buckets (#22, A37) | $1/M events | 0.3 M | 0 | 15.7 M | 16 |
 | GuardDuty | Malware Protection for S3, files over 2 GB only (option (b), A38) | $0.1185/GB + $0.000282/object | none | 0 | 3,040 GB + 912 objects | 360 |
 | Security services | GuardDuty threat detection with S3 Protection, AWS Config (A20) | estimate | — | 50 | — | 96 |
-| **Tokyo and global** | | | | **2,289** | | **7,659** |
+| **Tokyo and global** | | | | **2,484** | | **7,854** |
 
 **Osaka pilot light**
 
 | Service | What | Unit price | (a) Quantity | (a) $/month | (b) Quantity | (b) $/month |
 |---|---|---|---|---:|---|---:|
-| EKS | Control plane, no worker nodes | $0.10/h | 730 h | 73 | 730 h | 73 |
+| EKS | Control plane; the `system` node group at zero nodes and no worker nodes until a failover (ADR-0004) | $0.10/h | 730 h | 73 | 730 h | 73 |
 | VPC | NAT gateways, one per AZ | $0.062/h | 3 × 730 h | 136 | 3 × 730 h | 136 |
 | VPC | Public IPv4: 3 NAT + 3 load balancer | $0.005/h | 6 | 22 | 6 | 22 |
 | VPC | Interface endpoints, same 6 services, 3 AZs | $0.014/h per AZ | 18 ENIs | 184 | 18 ENIs | 184 |
 | ELB | Application Load Balancer, idle | $0.0243/h | 730 h | 18 | 730 h | 18 |
-| WAF | API (12 rules) and sign-in (3) web ACLs (#24) | $5/ACL + $1/rule | 2 ACLs, 15 rules | 25 | 2 ACLs, 15 rules | 25 |
+| WAF | API (11 rules) and sign-in (6) web ACLs (#24) | $5/ACL + $1/rule | 2 ACLs, 17 rules | 27 | 2 ACLs, 17 rules | 27 |
 | Aurora | Global database secondary, db.r8g.large (Serverless v2 in section 4.5) | $0.332/h | 730 h | 242 | 730 h | 242 |
 | Aurora | Secondary storage | $0.12/GB-mo | 10 GB | 1 | 150 GB | 18 |
 | Aurora | Global database: replicated write I/O + cross-Region transfer (≤ 4 KB per I/O) | $0.24/M I/O + $0.09/GB | 9 M I/O + 36 GB | 5 | 91 M I/O + 365 GB | 55 |
@@ -386,25 +404,25 @@ whole dollars; each total is the sum of the rounded lines. Per-day figures are t
 | KMS, Secrets Manager | 8 multi-Region key replicas (#22), 10 secret replicas | $1/key, $0.40/secret | 8 + 10 | 12 | 8 + 10 | 12 |
 | CloudWatch and idle services | Replication-lag alarms; idle SQS and SES; SES tenants (#24) and data events for the API's direct archive writes (#22) | estimate + $0.005/tenant-mo + $1/M events | 5 tenants | 5 | 500 tenants + 1.2 M events | 9 |
 | Security services | GuardDuty threat detection, AWS Config | estimate | — | 15 | — | 15 |
-| **Osaka pilot light** | | | | **747** | | **4,406** |
+| **Osaka pilot light** | | | | **749** | | **4,408** |
 
 The Osaka standby user pool (#23) has no users, so it bills nothing until a failover, when re-enrolled local members
 become monthly active users there too (up to $500 in that month at design load).
 
 | prod total | (a) idle or demo | (b) design load |
 |---|---:|---:|
-| Per month | $3,036 | $12,065 |
-| Per day | $100 | $397 |
+| Per month | $3,233 | $12,262 |
+| Per day | $106 | $403 |
 
 At design load that is about $0.040 per transfer or upload request and about $0.40 per GB delivered. During a
-regional failover, Osaka adds worker nodes at the same hourly price as Tokyo (the idle shape, 4 main and 5 scan
-nodes, costs about $36 a day).
+regional failover, Osaka adds nodes at the same hourly price as Tokyo (the idle shape, 2 `system`, 4 main and 5 scan
+nodes, costs about $42 a day).
 
 ### 5.2 staging
 
 Prod's shape at smaller sizes, with the Osaka pilot light, so drills can run here first (PRD section 7). Traffic is
-test traffic only, and the platform is the cut-down set (section 4.3). Running 24×7 costs $2,250 a month ($74 a day);
-torn down outside its windows and billed for 162 hours (A22) it costs about $501 a month.
+test traffic only, and the platform is the cut-down set (section 4.3). Running 24×7 costs $2,344 a month ($77 a day);
+torn down outside its windows and billed for 162 hours (A22) it costs about $522 a month.
 
 **Tokyo**
 
@@ -413,12 +431,13 @@ torn down outside its windows and billed for 162 hours (A22) it costs about $501
 | EKS | Control plane | $0.10/h | 730 h | 73 |
 | EC2 | Main node pool, m8g.xlarge, one per AZ (section 4.3) | $0.23188/h | 3 nodes | 508 |
 | EC2 | Scan node pool, m8g.large (#22) | $0.11594/h | 2 nodes | 169 |
-| EBS | gp3: 100 GB root per main node, 50 GB per scan node, 100 GB volumes (A28) | $0.096/GB-mo | 500 GB | 48 |
+| EC2 | `system` managed node group, m8g.medium (ADR-0004) | $0.05797/h | 2 nodes | 85 |
+| EBS | gp3: 100 GB root per main node, 50 GB per scan node, 20 GB per `system` node, 100 GB volumes (A28) | $0.096/GB-mo | 540 GB | 52 |
 | VPC | NAT gateways, one per AZ | $0.062/h + $0.062/GB | 3 × 730 h + 10 GB | 136 |
 | VPC | Public IPv4: 3 NAT + 3 load balancer | $0.005/h | 6 | 22 |
 | VPC | Interface endpoints, 6 services, 3 AZs | $0.014/h per AZ | 18 ENIs | 184 |
 | ELB | Application Load Balancer | $0.0243/h + $0.008/LCU-h | 730 h + 0.1 LCU | 18 |
-| WAF | 3 web ACLs, 19 rules, as prod (#24) | $5/ACL + $1/rule + $0.60/M req | 3 ACLs + 0.5 M req | 34 |
+| WAF | 3 web ACLs, 22 rules, as prod (#24) | $5/ACL + $1/rule + $0.60/M req | 3 ACLs + 0.5 M req | 37 |
 | Aurora | Writer only, db.r8g.large (sections 4.4 and 4.5) | $0.333/h | 730 h | 243 |
 | Aurora | Storage and I/O | $0.12/GB-mo + $0.24/M I/O | 10 GB + 10 M I/O | 4 |
 | ElastiCache | Serverless Valkey (100 MB minimum) | $0.101/GB-h | 0.1 GB | 7 |
@@ -426,49 +445,50 @@ torn down outside its windows and billed for 162 hours (A22) it costs about $501
 | S3, CloudFront, Route 53, SQS, SES, Cognito | Small buckets, web bundle, zone + 2 health checks, test email, test users in two pools (#23) | various | — | 8 |
 | CloudWatch | EKS control-plane logs, flow logs to S3, 40 alarms, 10 metrics (A19, A34) | $0.76/GB ingest, $0.38/GB to S3 | 15 GB + 6 GB to S3 | 21 |
 | Security services | GuardDuty, AWS Config | estimate | — | 25 |
-| **Tokyo** | | | | **1,512** |
+| **Tokyo** | | | | **1,604** |
 
 **Osaka pilot light**
 
 | Service | What | Unit price | Quantity | $/month |
 |---|---|---|---|---:|
-| EKS | Control plane, no worker nodes | $0.10/h | 730 h | 73 |
+| EKS | Control plane; the `system` node group at zero nodes and no worker nodes | $0.10/h | 730 h | 73 |
 | VPC | NAT gateways, one per AZ | $0.062/h | 3 × 730 h | 136 |
 | VPC | Public IPv4 | $0.005/h | 6 | 22 |
 | VPC | Interface endpoints, 3 AZs | $0.014/h per AZ | 18 ENIs | 184 |
 | ELB | Application Load Balancer, idle | $0.0243/h | 730 h | 18 |
-| WAF | API and sign-in web ACLs (#24) | $5/ACL + $1/rule | 2 ACLs, 15 rules | 25 |
+| WAF | API and sign-in web ACLs (#24) | $5/ACL + $1/rule | 2 ACLs, 17 rules | 27 |
 | Aurora | Global database secondary, db.r8g.large (section 4.5) | $0.332/h | 730 h | 242 |
 | Aurora, S3 | Secondary storage, replication, replica buckets | various | — | 4 |
 | ElastiCache | Serverless Valkey, idle | $0.101/GB-h | 0.1 GB | 7 |
 | KMS, Secrets Manager | 8 key replicas (#22), 10 secret replicas | $1/key, $0.40/secret | 8 + 10 | 12 |
 | CloudWatch, security services | Alarms, GuardDuty, AWS Config | estimate | — | 15 |
-| **Osaka pilot light** | | | | **738** |
+| **Osaka pilot light** | | | | **740** |
 
 | staging total | 24×7 | Expected, 162 billed hours (A22) |
 |---|---:|---:|
-| Per month | $2,250 | $501 |
-| Per day while running | $74 | $74 |
+| Per month | $2,344 | $522 |
+| Per day while running | $77 | $77 |
 
-The expected figure is $2,248 × 162 ÷ 730, plus the $2 of Terraform state keys that bill all month.
+The expected figure is $2,342 × 162 ÷ 730, plus the $2 of Terraform state keys that bill all month.
 
 ### 5.3 dev
 
 Tokyo only, smallest sizes, single-AZ where AWS allows it (PRD section 7), with the cut-down platform (section 4.3).
-The load balancer still needs two AZs. Running 24×7 costs $817 a month ($27 a day); billed for 260 hours a month
-(A22) it costs about $292.
+The load balancer still needs two AZs. Running 24×7 costs $909 a month ($30 a day); billed for 260 hours a month
+(A22) it costs about $324.
 
 | Service | What | Unit price | Quantity | $/month |
 |---|---|---|---|---:|
 | EKS | Control plane | $0.10/h | 730 h | 73 |
 | EC2 | Main node pool, m8g.xlarge (section 4.3) | $0.23188/h | 2 nodes | 339 |
 | EC2 | Scan node pool, m8g.large (#22) | $0.11594/h | 1 node | 85 |
-| EBS | gp3: 50 GB root per node + 50 GB volumes (A28) | $0.096/GB-mo | 200 GB | 19 |
+| EC2 | `system` managed node group, m8g.medium (ADR-0004) | $0.05797/h | 2 nodes | 85 |
+| EBS | gp3: 50 GB root per main and scan node, 20 GB per `system` node, 50 GB volumes (A28) | $0.096/GB-mo | 240 GB | 23 |
 | VPC | 1 NAT gateway | $0.062/h + $0.062/GB | 730 h + 10 GB | 46 |
 | VPC | Public IPv4: 1 NAT + 2 load balancer | $0.005/h | 3 | 11 |
 | VPC | Interface endpoints, 6 services, 1 AZ | $0.014/h per AZ | 6 ENIs | 61 |
 | ELB | Application Load Balancer (needs 2 AZs) | $0.0243/h + $0.008/LCU-h | 730 h + 0.1 LCU | 18 |
-| WAF | 3 web ACLs, 19 rules, as prod (#24) | $5/ACL + $1/rule | 3 ACLs | 34 |
+| WAF | 3 web ACLs, 22 rules, as prod (#24) | $5/ACL + $1/rule | 3 ACLs | 37 |
 | Aurora | Single instance, db.t4g.medium, no global database | $0.113/h | 730 h | 82 |
 | Aurora | Storage and I/O | $0.12/GB-mo + $0.24/M I/O | 5 GB + 5 M I/O | 2 |
 | ElastiCache | Serverless Valkey (100 MB minimum) | $0.101/GB-h | 0.1 GB | 7 |
@@ -476,42 +496,49 @@ The load balancer still needs two AZs. Running 24×7 costs $817 a month ($27 a d
 | S3, CloudFront, Route 53, SQS, SES, Cognito | Small buckets, web bundle, dev zone, sandbox email, test users | various | — | 2 |
 | CloudWatch | EKS control-plane logs, flow logs to S3, 10 alarms, 5 metrics (A19, A34) | $0.76/GB ingest, $0.38/GB to S3 | 9 GB + 3 GB to S3 | 11 |
 | Security services | GuardDuty, AWS Config | estimate | — | 15 |
-| **dev, if left running** | | | | **817** |
+| **dev, if left running** | | | | **909** |
 
-The expected figure is $816 × 260 ÷ 730, plus the $1 Terraform state key that bills all month.
+The expected figure is $908 × 260 ÷ 730, plus the $1 Terraform state key that bills all month.
 
 ### 5.4 Shared: container registry
 
 The registry can't live with prod. CI builds and promotes images from the first dev deploy, months before prod
 exists, and prod's teardown (NFR-19) must neither take the images dev and staging still use nor leave a registry
-billing afterwards. ECR therefore lives in its own shared stack, from the bootstrap until the final teardown. If open
-question 4 chooses an account per environment, that stack gets its own shared account, and each environment account
-is allowed to pull.
+billing afterwards. ECR therefore lives in its own shared stack, from the bootstrap until the final teardown. Open
+question 4 chose an account per environment plus a shared account, so the stack lives in the shared account, and each
+environment account is allowed to pull.
 
 | Phase | Where | Why |
 |---|---|---|
 | Build, before staging exists | Tokyo | dev pulls images by digest |
 | Build, once staging exists | Tokyo, replicated to Osaka | Staging's Osaka pilot light and its drills need the images there (architecture 3.2) |
 | Operating period | Tokyo, replicated to Osaka | dev, staging and prod pull the same digests (NFR-18) |
-| After teardown | Deleted with the last environment | NFR-19 leaves only the audit archive and its key |
+| After teardown | Deleted with the last environment | NFR-19 leaves only the retained stack (section 7.4) |
+
+Repositories are encrypted with the registry key, which belongs to this stack because a repository's key can't change
+and an environment's keys go away with it (#22 3.1, 4.1). It is a multi-Region key: 1 key resource while only Tokyo
+exists, 2 once ECR replicates to Osaka.
 
 | Service | What | Unit price | Quantity | $/month |
 |---|---|---|---|---:|
 | ECR | Images in Tokyo (A40) | $0.10/GB-mo | 20 GB | 2 |
 | ECR | Replica in Osaka, plus new layers replicated in | $0.10/GB-mo + $0.09/GB | 20 GB + 5 GB | 2 |
-| **Shared registry** | | | | **4** |
+| KMS | Registry key: primary in Tokyo, replica in Osaka (#22 4.1); requests through ECR's grants are a few thousand a month | $1/key + $0.03/10k req | 2 keys | 2 |
+| **Shared registry** | | | | **6** |
 
-Nodes pull through their VPC's ECR interface endpoints and the S3 gateway endpoint, so pulls add nothing to NAT.
+Before staging exists only the Tokyo lines bill: $3 a month. Nodes pull through their VPC's ECR interface endpoints and
+the S3 gateway endpoint, so pulls add nothing to NAT.
 
 ### 5.5 Malware scanning options (open question 2)
 
-Section 3.3 explains why ClamAV alone doesn't meet FR-2. This is the cost side of the scan ADR; the totals in 5.1 use
-option (b). The scan node pool is its own node pool (#22), so removing ClamAV removes whole nodes.
+Section 3.3 explains why ClamAV alone doesn't meet FR-2. This is the cost side of the scan ADR (ADR-0019, which chose
+option (b)); the totals in 5.1 use option (b). The scan node pool is its own node pool (#22), so removing ClamAV
+removes whole nodes.
 
 | Option | Meets FR-2 | (a) idle or demo | (b) design load | Notes |
 |---|---|---:|---:|---|
 | (a) GuardDuty Malware Protection for S3 for every file | Yes: objects up to 100 GB | $4: 10 GB + 10,000 objects | $3,860: 30,400 GB × $0.1185 + 912,000 objects × $0.000282 | No scan pods and no signature mirror; the scan worker only records results from EventBridge, in 2 small pods on the main pool. No published time-to-result target. The files key policy must let GuardDuty's role decrypt (#22). Osaka prices are about 5 % higher. |
-| (b) Hybrid: ClamAV up to 2 GB, GuardDuty above (in the totals) | Yes | $447: 5 scan nodes ($423) and their volumes ($24); GuardDuty about $0 | $956: 6.67 scan nodes ($564), their volumes ($32), GuardDuty for 3,040 GB ($360, A38) | Two engines, two result paths and a signature mirror. A GuardDuty plan covers a whole bucket or up to five prefixes, so the API puts files declared over 2 GB under their own prefix, ahead of the tenant ID (architecture 5.1); per-tenant deletion then covers two prefixes. |
+| (b) Hybrid: ClamAV up to 2 GB, GuardDuty above (in the totals) | Yes | $447: 5 scan nodes ($423) and their volumes ($24); GuardDuty about $0 | $956: 6.67 scan nodes ($564), their volumes ($32), GuardDuty for 3,040 GB ($360, A38) | Two engines, two result paths and a signature mirror. A GuardDuty plan can't select by size, and every object key starts with `tenants/{tenant_id}/`, so files declared over 2 GB go to a second files bucket pair in Tokyo and Osaka, with the same settings, keys and key layout, chosen at upload start; the plan covers that whole bucket (ADR-0019, ADR-0012). The second pair adds no line of its own: the same bytes are stored and replicated either way, and S3 has no per-bucket fee. Deletion and reconciliation cover both pairs. |
 | (c) Lower FR-2's limit to 2 GB, ClamAV only | No: a PRD change | $447 | $596 | One engine and the lowest cost at design load, but it changes a Must requirement. A 20 GB transfer still fits, as ten 2 GB files. |
 
 - Against (b), option (a) saves **$443 a month at idle, net**: five whole m8g.large nodes and their volumes ($447),
@@ -521,8 +548,9 @@ option (b). The scan node pool is its own node pool (#22), so removing ClamAV re
 - GuardDuty's results map to file states as #24 6.4 lists, including `UNSUPPORTED` for encrypted and over-limit
   archives. Its S3 reads, optional object tags and EventBridge events bill separately, a few dollars a month at
   design load.
-- For the ADR: decide capability first (5 GB files, archives, NFR-5 latency for each engine), then cost. For a
-  reference run that stays near idle, (a) is the cheaper and simpler option; at the design load, (b) is.
+- ADR-0019 decided capability first (5 GB files, archives, NFR-5 latency for each engine), then cost. For a reference
+  run that stays near idle, (a) is the cheaper and simpler option; at the design load, (b) is. Staging measures
+  GuardDuty's time to result (section 8).
 
 ### 5.6 Download mechanism (open question 8)
 
@@ -543,7 +571,7 @@ account billed in Japan also pays 10 % consumption tax.
 
 | Service | Offer file published | Pricing page |
 |---|---|---|
-| EC2 instances (m8g.large, m8g.xlarge, m8g.2xlarge) | 2026-10-29 | [EC2 on-demand](https://aws.amazon.com/ec2/pricing/on-demand/) |
+| EC2 instances (m8g.medium, m8g.large, m8g.xlarge, m8g.2xlarge) | 2026-10-29 | [EC2 on-demand](https://aws.amazon.com/ec2/pricing/on-demand/) |
 | NAT gateway, EBS gp3 (EC2 offer) | rows effective 2026-10-01 | [VPC](https://aws.amazon.com/vpc/pricing/), [EBS](https://aws.amazon.com/ebs/pricing/) |
 | Interface endpoints, public IPv4 (VPC offer) | 2026-11-03 | [PrivateLink](https://aws.amazon.com/privatelink/pricing/), [VPC](https://aws.amazon.com/vpc/pricing/) |
 | EKS | 2026-10-27 | [EKS](https://aws.amazon.com/eks/pricing/) |
@@ -606,8 +634,8 @@ From ClamAV: the `clamd.conf.sample` shipped with ClamAV states the 2 GB limit u
   assumed to be under a year, so the totals use $1 per key; section 7.4 covers the case after teardown.
 - Which Cognito rate applies to federated members on the Plus plan: the price list has both the Plus rate ($0.02)
   and a federated rate ($0.015 after 50). The totals price every member at $0.02.
-- SES tenant management: the price list has rows for both regions, but #24 asks to confirm the feature in Tokyo and
-  Osaka before the email ADR.
+- SES tenant management: the price list has rows for both regions, but the feature itself is unconfirmed in Tokyo and
+  Osaka; the first staging build confirms it (ADR-0015).
 - GuardDuty's time to result for large objects, which no AWS page gives (section 3.3).
 - Security services and CloudWatch volumes are usage estimates (A19, A20, A33, A34), not price lookups.
 - Free tiers are ignored (for example 100 GB a month of internet egress, 1 TB a month from CloudFront, 1 M SQS
@@ -617,11 +645,11 @@ From ClamAV: the `clamd.conf.sample` shipped with ClamAV states the 2 GB limit u
 
 ### 7.1 Biggest cost drivers
 
-| Rank | (a) idle or demo, $3,036 | (b) design load, $12,065 |
+| Rank | (a) idle or demo, $3,233 | (b) design load, $12,262 |
 |---|---|---|
-| 1 | EKS worker nodes, both pools: $1,100 (36 %) | S3 replication to Osaka: $3,214 (27 %) |
-| 2 | Aurora, 3 × db.r8g.large: $728 (24 %) | Internet egress for downloads: $2,962 (25 %) |
-| 3 | NAT, interface endpoints and IPv4 in two regions: $686 (23 %) | EKS worker nodes, both pools: $1,354 (11 %) |
+| 1 | EKS nodes, both pools and the `system` group: $1,269 (39 %) | S3 replication to Osaka: $3,214 (26 %) |
+| 2 | Aurora, 3 × db.r8g.large: $728 (23 %) | Internet egress for downloads: $2,962 (24 %) |
+| 3 | NAT, interface endpoints and IPv4 in two regions: $686 (21 %) | EKS nodes, both pools and the `system` group: $1,523 (12 %) |
 
 The byte-driven costs (replication and egress, $6,176 together) come to about $0.10 for each GB that moves, whether
 it is replicated to Osaka or downloaded. Every uploaded GB is replicated once and, at design load, downloaded about
@@ -634,90 +662,103 @@ fixed infrastructure that exists for NFR-1, NFR-10 and NFR-11.
 |---|---|---|---|
 | Move file bytes at a sampled rate in load tests (PRD 6.1) | About $239 per day at the full byte rate ($114 egress, $105 replication, $12 GuardDuty share, $8 load balancer) | The byte path is not tested at full rate | Keep. One 4-hour full-byte window per load test costs about $40 (A42). |
 | Run byte-heavy load generators inside Tokyo | Regional transfer via public IPs is $0.01/GB each way, not $0.114/GB | Downloads stream through the load balancer (#24), so this applies; it doesn't exercise the internet path | Use for the full-byte window |
-| Tear down dev and staging when idle (NFR-20) | About $2,274 a month against running both 24×7 ($525 dev, $1,749 staging) | Rebuild time, bounded by NFR-19 (≤ 2 hours); rebuild and teardown hours bill too (A22) | Keep, as planned |
+| Tear down dev and staging when idle (NFR-20) | About $2,407 a month against running both 24×7 ($585 dev, $1,822 staging) | Rebuild time, bounded by NFR-19 (≤ 2 hours); rebuild and teardown hours bill too (A22) | Keep, as planned |
 | Osaka network in one AZ until failover (1 NAT gateway, endpoints in 1 AZ) | About $220 a month | Adds a Terraform step to the 55-minute failover budget (architecture section 7) | Decide in the compute ADR |
 | Drop the Tokyo Aurora reader | $243 a month | AZ failover becomes creating a new instance, which can miss NFR-11's 5 minutes | Don't |
 | Run the Osaka secondary without an instance (headless) | $242 a month | Failover must first add an instance | Not for prod; fine for staging outside drills |
 | Aurora Serverless v2 for the Osaka secondary (section 4.5) | $132 a month at idle, $78 at design load; staging about $29 at its expected hours | Promotion starts near 1 ACU with a cold cache; the ACUs are assumptions (A44) | Try in staging and measure in the first drill; the database ADR decides |
-| GuardDuty for every file instead of the hybrid (option (a), section 5.5) | About $443 a month at idle, net of GuardDuty's own $4, in whole nodes | About $2,904 a month more at design load | Decide on capability first, in the scan ADR |
-| Lower FR-2's file limit to 2 GB (option (c), section 5.5) | $360 a month at design load, nothing at idle | Changes a Must requirement | The PRD owner's call; input to the scan ADR |
+| GuardDuty for every file instead of the hybrid (option (a), section 5.5) | About $443 a month at idle, net of GuardDuty's own $4, in whole nodes | About $2,904 a month more at design load | ADR-0019 kept the hybrid, on capability first; revisit if traffic stays below the break-even |
+| Lower FR-2's file limit to 2 GB (option (c), section 5.5) | $360 a month at design load, nothing at idle | Changes a Must requirement | Not taken: ADR-0019 keeps FR-2's 5 GB |
 | Stay on EKS standard support | Extended support adds $365 a month per cluster ($730 for prod's two) | Upgrade at least yearly | Upgrade within standard support |
 | Shared KMS keys instead of one per tenant (open question 3) | About $1,000 a month for 500 per-tenant keys in two regions, up to $3,000 after two rotations | No cryptographic separation of file contents between tenants; names and messages still get per-tenant data keys | Chosen in #22 |
 | Downloads through CloudFront signed cookies instead of streaming through the API | About $243 a month of load balancer capacity at design load | Doesn't meet FR-14 and NFR-6 together, and needs a chunked-download engine (#24 5.1) | Rejected in #24 |
 | Filter WAF logs; keep EKS audit logs and log retention tight | Tens of dollars a month; logging every request at design load would add about $88 (1.5 KB per record, 155 M requests, $0.38/GB) | Less detail for forensics | Log blocked, challenged and counted requests (#24 3.4) |
-| Spot instances for dev nodes | A share of dev's $151 of EC2 at its expected 260 hours (Spot prices vary; not modelled) | Interruptions | dev only, not staging during drills |
+| Spot instances for dev nodes | A share of dev's $181 of EC2 at its expected 260 hours (Spot prices vary; not modelled) | Interruptions | dev only, not staging during drills |
 | Savings Plans or reserved instances | A discount for a 1- or 3-year commitment | Commits beyond a bounded operating period | Don't, unless the operating period runs a year or more |
 
 Interface endpoints cost more than the NAT traffic they save at this volume ($368 a month for both regions). They stay,
 because they keep traffic to AWS services off the internet (architecture 3.1); that is a security choice, not a
 saving.
 
-### 7.3 Recommended budget (open question 7)
+### 7.3 Budget (open question 7)
+
+Open question 7 is decided ([PRD](../prd.md) section 12): a cap of $6,000 a month during the operating period, with
+alarms at $3,000, $4,800 and $6,000, and about $800 a month for dev and staging during the build. The length of the
+operating period stays open. The other budgets below are this page's recommendation on the same rule.
 
 Each budget is set so that the expected month, load-test windows included, sits at or below about 70 % of it. The
 80 % alarm then fires only on unplanned spend, not every month.
 
 | Phase | What runs | Expected per month | Monthly budget | Alarms at 50 / 80 / 100 % | Expected share |
 |---|---|---:|---:|---|---:|
-| Build, before prod exists | dev for 260 billed hours ($292), the shared registry ($4), staging for up to 162 hours of rehearsals ($501) | $296–797 | $1,200 | $600 / $960 / $1,200 | 25–66 % |
-| Operating period | prod (a) $3,036, dev $292, staging $501, registry $4, load-test windows and a drill $248 (below) | $4,081 | **$6,000** | **$3,000 / $4,800 / $6,000** | 68 % |
-| After teardown (NFR-19) | The prod audit archive in both regions and its key (section 7.4) | about $2.10 | $5 | $2.50 / $4 / $5 | 42 % |
+| Build, before prod exists | dev for 260 billed hours ($324), the shared registry ($3–6), staging for up to 162 hours of rehearsals ($522) | $327–852 | $1,200 | $600 / $960 / $1,200 | 27–71 % |
+| Operating period | prod (a) $3,233, dev $324, staging $522, registry $6, load-test windows and a drill $248 (below) | $4,333 | **$6,000** | **$3,000 / $4,800 / $6,000** | 72 % |
+| After teardown (NFR-19) | The retained stack: the prod audit archive in both regions, its key, and the stack's own state, trail and alert topic (section 7.4) | about $2.20 | $7 | $3.50 / $5.60 / $7 | 31 % |
 
 **Load-test windows and drills (A42).** The operating-period line includes this headroom:
 
 | Item, above idle | First window in a month | Each later window |
 |---|---:|---:|
-| Extra nodes: 8 hours at 1× (2 main, 5 scan), 4 hours at 2× (5 main, 15 scan) | $20 | $20 |
+| Extra nodes: 8 hours at 1× (2 main, 5 scan), 4 hours at 2× (4 main, 15 scan) | $19 | $19 |
 | File bytes: 217 GB uploaded and downloaded (4 full-byte hours, 8 hours at 10 %): egress, replication, GuardDuty share, load balancer | $52 | $52 |
 | Test files kept about 10 days in both regions | $4 | $4 |
 | Load generators: 2 × m8g.2xlarge for 12 hours | $11 | $11 |
 | Requests and emails: WAF, Aurora I/O, SQS, SES (the mailbox simulator bills like real email), CloudTrail, logs | $21 | $21 |
 | 1,000 test members in Cognito, billed once a month | $20 | — |
-| **Total** | **$128** | **$108** |
+| **Total** | **$127** | **$107** |
 
-Two windows ($236) and one prod drill (Osaka's 4 main and 5 scan nodes for 8 hours, $12) make $248 a month.
+Two windows ($234) and one prod drill (Osaka's 2 `system`, 4 main and 5 scan nodes for 8 hours, $14) make $248 a month.
 
-- Without load tests the operating month is $3,833 (64 % of the budget); with them, $4,081 (68 %). The 80 % alarm at
-  $4,800 fires only after about $720 of unplanned spend: for example dev left running 24×7 for the whole month
-  (+$525) and two extra load-test windows. At a budget of $5,100 or less, the planned month itself would cross 80 %; a
-  reasonable range is **$5,500 to $6,500** a month.
-- The 50 % alarm watches actual spend and fires around day 22 to 24 of a planned month. It is a pacing check: if it
+- Without load tests the operating month is $4,085 (68 % of the budget); with them, $4,333 (72 %), a little above the
+  70 % rule because of the `system` node groups (ADR-0004). The 80 % alarm at $4,800 fires after about $470 of
+  unplanned spend: dev left running 24×7 for the whole month (+$585) is enough. At a budget of $5,400 or less, the
+  planned month itself would cross 80 %; the $6,000 cap stays inside the reasonable range of **$5,500 to $6,500**.
+- The 50 % alarm watches actual spend and fires around day 21 to 23 of a planned month. It is a pacing check: if it
   fires before day 15, spend is running ahead. The 80 % and 100 % alarms watch both actual and forecast spend.
-- The length of the operating period stays Rashid's call. Each extra month costs about $4,080; each extra day of prod
-  about $100.
-- AWS Budgets alarms are defined in Terraform (NFR-20). If each environment has its own account (open question 4),
+- The length of the operating period stays Rashid's call. Each extra month costs about $4,330; each extra day of prod
+  about $106.
+- AWS Budgets alarms are defined in Terraform (NFR-20). Each environment has its own account (open question 4), so
   each account gets a budget on the same rule:
 
 | Account | Expected per month | Budget | Alarms at 50 / 80 / 100 % | Expected share |
 |---|---:|---:|---|---:|
-| dev | $292 | $450 | $225 / $360 / $450 | 65 % |
-| staging | $501 | $800 | $400 / $640 / $800 | 63 % |
-| prod, with load-test windows and the drill | $3,284 | $4,700 | $2,350 / $3,760 / $4,700 | 70 % |
-| shared (registry) | $4 | $10 | $5 / $8 / $10 | 40 % |
-| audit archive, if it gets its own account (#22 8.4) | about $2.10 after teardown | $5 | $2.50 / $4 / $5 | 42 % |
+| dev | $324 | $450 | $225 / $360 / $450 | 72 % |
+| staging | $522 | $800 | $400 / $640 / $800 | 65 % |
+| prod, with load-test windows and the drill | $3,481 | $4,700 | $2,350 / $3,760 / $4,700 | 74 % |
+| shared (registry and its key) | $6 | $10 | $5 / $8 / $10 | 60 % |
+| prod after teardown: the retained stack, which stays in the prod account (#22 8.4, ADR-0006) | about $2.20 | $7 | $3.50 / $5.60 / $7 | 31 % |
 
-- A dev environment left running 24×7 ($817 a month, $27 a day) crosses its $360 alarm by day 14, and its forecast
+- The account budgets add up to $5,960, inside the $6,000 cap, so dev and prod run a little above 70 %; prod's 80 %
+  alarm leaves about $280 of headroom.
+- A dev environment left running 24×7 ($909 a month, $30 a day) crosses its $360 alarm by day 13, and its forecast
   alarm sooner.
-- A sustained month at the full design load ($12,065) is not planned. A full week of it would cost about $2,780.
+- A sustained month at the full design load ($12,262) is not planned. A full week of it would cost about $2,820.
 - Tag every resource with environment and component, so Cost Explorer can be compared line by line with section 5.
 
 ### 7.4 After teardown (NFR-19)
 
-NFR-19 lets only the prod audit archive and the key that encrypts it outlive prod, for at most $5 a month. #22 8.4
-keeps both in a retained stack and turns the audit key's rotation off at teardown, because no new records are written
-after it.
+NFR-19 lets only the retained stack outlive prod: the prod audit archive, the key that encrypts it, and the stack's own
+Terraform state, trail and alert topic that guard them, in the prod account, which stays open (ADR-0006), for at most
+$7 a month. #22 8.4 defines the stack. The audit
+key keeps its yearly rotation while prod runs, and the teardown apply turns rotation off, because no new records are
+written after it. AWS Config goes with the environment; EventBridge alerts in the retained stack replace its key rule.
 
 | Item | Planned: prod ran under a year, mostly idle | Worst case: a year or more at design load |
 |---|---:|---:|
 | Audit key: primary in Tokyo and replica in Osaka, rotation off from teardown (#22 8.4) | $2.00 (2 keys × $1) | $4.00 (2 keys × $2, after one rotation) |
 | Archive storage at teardown, S3 Standard in both regions ($0.025/GB-mo); it falls as retention ends | $0.05 (under 1 GB each) | $1.85 (37 GB each, section 3.4) |
-| What watches the archive: CloudTrail management events (first trail free), the Config rule `kms-cmk-not-scheduled-for-deletion`, EventBridge alerts | $0.05 (estimate) | $0.05 (estimate) |
-| **Total, against NFR-19's ≤ $5** | **about $2.10: inside** | **about $5.90: over** |
+| The retained trail, state bucket and alert topic: management events (the account's only trail after teardown, so free), S3 and KMS requests for log delivery, SNS within its free tier | about $0.15 (estimate) | about $0.15 (estimate) |
+| The shared account's log archive (the organization trail's bucket, 90-day Object Lock), for up to 90 days after the final teardown (ADR-0006) | a few cents | a few cents |
+| **Total, against NFR-19's ≤ $7** | **about $2.20: inside** | **about $6.00: inside** |
 
-Only an operating period of a year or more at design load breaks the cap. A colder storage class wouldn't help: most
-archive objects are single records of about 0.2 KB (A14), and the infrequent-access and Glacier Instant Retrieval
-classes bill at least 128 KB per object. If the operating period grows that long, #22 would need to set the audit
-key's rotation period beyond it, or NFR-19 would need an exception.
+- **Both cases fit with the yearly rotation kept.** A colder storage class wouldn't help anyway: most archive objects
+  are single records of about 0.2 KB (A14), and the infrequent-access and Glacier Instant Retrieval classes bill at
+  least 128 KB per object.
+- **Two years or more** add a second rotation, $3 a key. At idle that comes to about $6.20, still inside. At design
+  load it would be about $8.00, over the cap, but the operating budget rules that out: a month at design load costs
+  $12,262 against the $6,000 cap (section 7.3).
+- **While prod runs,** the retained stack's lines are inside prod's: the audit key in the KMS lines, the archive in
+  the S3 lines, its data events in the CloudTrail line (A37).
 
 ## 8. What to measure
 
