@@ -17,10 +17,10 @@ downloadable, every action is written to an audit log, and an admin can revoke a
 
 ## Status
 
-**Planning, phase 4 of 6** (decisions, [#34]; review fixes, [#41]). The ADRs are recorded and there is no product code
-yet. The two sample services from the
-[production repo template](https://github.com/codewithmuh/production-repo-template) stay in place, so every CI
-pipeline runs against real code until the first vertical slices replace them.
+**Building milestone M0** (foundation) of the [delivery plan](docs/delivery-plan.md). Planning phases 1–5 are done.
+The Python sample service from the
+[production repo template](https://github.com/codewithmuh/production-repo-template) stays in place, so every CI
+pipeline runs against real code, until M0 turns it into the API service.
 
 ## What v1 will do
 
@@ -45,7 +45,7 @@ Each phase produces documents in `docs/` through its own issue and pull request.
 | 2. Architecture and system design | [Architecture](docs/architecture.md): context and container diagrams, upload and download flows; data model, OpenAPI contract, multi-tenancy model, capacity estimates | [#16] |
 | 3. Security design | [STRIDE threat model](docs/threat-model.md), [encryption and key management](docs/security/encryption-and-keys.md), [authn/authz](docs/security/authn-authz.md), [abuse and rate limiting](docs/security/abuse-and-rate-limits.md) | [#25] |
 | 4. Decisions | [One ADR per significant choice](docs/adr/) | [#34] |
-| 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | — |
+| 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | [#43] |
 | 6. Operations | SLOs, dashboards, alerts, runbooks, backup/restore and DR drills with measured RTO/RPO | — |
 
 Stack, as the phase 4 ADRs decided ([architecture](docs/architecture.md) section 9): Python (FastAPI) only, Aurora
@@ -59,8 +59,8 @@ Issue first, one branch per issue, then a pull request with a Conventional Commi
 a code review and green CI before a squash merge into `main`. [CONTRIBUTING.md](CONTRIBUTING.md) has the details,
 including the `main` ruleset and its one temporary exception ([#6]).
 
-release-please keeps a Release PR open. Merging it tags the version. Signed images go to ECR in the shared account
-from M4 ([ADR-0007](docs/adr/0007-container-registry-ecr.md)).
+release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes a signed image with
+an SBOM to GHCR, until M4 moves images to ECR in the shared account ([ADR-0007](docs/adr/0007-container-registry-ecr.md)).
 
 ## Local development
 
@@ -115,3 +115,4 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 [#25]: https://github.com/codewithmuh/secure-file-transfer/issues/25
 [#34]: https://github.com/codewithmuh/secure-file-transfer/issues/34
 [#41]: https://github.com/codewithmuh/secure-file-transfer/issues/41
+[#43]: https://github.com/codewithmuh/secure-file-transfer/issues/43

@@ -76,6 +76,7 @@ jobs:
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
     strategy:
       fail-fast: false
+      # One image today; the matrix stays for the web app image in M3.
       matrix:
         include:
           - service: api-python
