@@ -33,3 +33,6 @@ coverage.out
 .DS_Store
 .idea/
 *.swp
+
+# Local-only notes and chat history: never pushed
+.private/

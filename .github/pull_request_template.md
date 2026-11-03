@@ -1,10 +1,16 @@
 ## What and why
 
-<!-- One or two sentences: what changes, and why it is needed. Link the issue. -->
+<!-- One or two sentences: what changes, and why it is needed. -->
+
+Closes #
 
 ## How it was tested
 
 <!-- Commands you ran, screenshots, or a link to the CI run. -->
+
+## Risks
+
+<!-- What could break, who is affected, and how to roll back. "None" is a valid answer if you say why. -->
 
 ## Checklist
 

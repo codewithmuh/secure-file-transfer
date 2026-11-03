@@ -17,13 +17,26 @@ make up      # run all services locally
 
 ## Workflow
 
-1. Create a short-lived branch from `main` (`feat/…`, `fix/…`).
-2. Keep pull requests small and focused; one logical change each.
-3. Write the PR title as a [Conventional Commit](https://www.conventionalcommits.org/) —
-   `feat: add order cancellation`, `fix: retry webhook on 429`, `docs: …`. With squash merges the PR title becomes
-   the commit message, and release-please uses it for the version bump and changelog
-   (`feat` → minor, `fix` → patch, `feat!` / `BREAKING CHANGE` → major).
-4. CI must be green and one code owner must approve.
+1. **Issue first.** Every change starts as a GitHub issue with the problem, the scope and acceptance criteria. Anything
+   bigger than a small fix gets a written plan (scope, design, risks) before code.
+2. **One branch per issue**, from an up-to-date `main`: `<type>/<issue#>-<short-slug>`, e.g. `feat/12-upload-api` or
+   `docs/2-prd`.
+3. **Pull request.** Keep it small and focused. The body closes the issue (`Closes #12`) and says what changed, how it
+   was tested and the risks; the PR template has the sections.
+4. **The PR title is the commit.** Write it as a [Conventional Commit](https://www.conventionalcommits.org/):
+   `feat: add share-link expiry`, `fix: reject expired upload links`, `docs: …`. `main` takes squash merges only, the
+   squash commit is the PR title with an empty body, and release-please reads it for the version bump and changelog
+   (`feat` → minor, `fix` → patch, `feat!` → major). Mark a breaking change with `!` in the title: a
+   `BREAKING CHANGE:` footer in a branch commit does not survive the squash.
+5. **Review and CI.** The PR gets a code review and findings are fixed on the same branch. The five CI checks must pass
+   and the branch must be up to date with `main`. No approval count is required: GitHub does not let authors approve
+   their own PRs, and this repo has one maintainer.
+6. **Merge.** The maintainer squash-merges; the branch is deleted automatically.
+
+The `protect-main` ruleset blocks direct pushes, force-pushes and deletion of `main`. Until
+[#6](https://github.com/codewithmuh/secure-file-transfer/issues/6) lands, the repository admin can bypass the rules
+when merging a pull request. That exists only for release-please's Release PRs, which get no CI run; don't use it for
+anything else.
 
 ## Standards
 

@@ -1,1 +1,1 @@
-"""Sample Python HTTP service for the production repo template."""
+"""Sample Python HTTP service, a placeholder until the API service replaces it."""

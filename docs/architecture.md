@@ -1,5 +1,8 @@
 # Architecture
 
+> **Placeholder from the template.** It describes the two sample services. Planning phase 2 replaces it with this
+> service's architecture.
+
 > Keep this page current: update it in the same pull request that changes the architecture.
 
 ## Context

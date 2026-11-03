@@ -1,5 +1,8 @@
 # Threat model
 
+> **Placeholder from the template.** It covers the two sample services. Planning phase 3 replaces it with this
+> service's STRIDE threat model.
+
 Lightweight [STRIDE](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats) review.
 Revisit it when you add an external integration, a data store, or a new trust boundary.
 
