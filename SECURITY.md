@@ -32,6 +32,6 @@ Verify a published image:
 
 ```bash
 cosign verify ghcr.io/codewithmuh/secure-file-transfer/api-go:<version> \
-  --certificate-identity-regexp 'https://github.com/codewithmuh/secure-file-transfer/' \
+  --certificate-identity 'https://github.com/codewithmuh/secure-file-transfer/.github/workflows/release.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

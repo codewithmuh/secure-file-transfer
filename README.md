@@ -27,9 +27,9 @@ pipeline runs against real code until the stack ADRs replace them.
 |---|---|
 | Send | Upload files and share them with external recipients by a link that expires |
 | Request | Send an upload link so someone outside the company can deliver files to you |
-| Verify | Recipients prove they own their email address with a one-time code before they download |
+| Verify | Recipients prove they own their email address before they download |
 | Protect | Files encrypted at rest with KMS keys and in transit with TLS; malware scan before any download |
-| Control | Admins revoke any link at any time; every action is audit-logged and exportable |
+| Control | Admins revoke any link at any time; every action is written to an audit log |
 
 The exact scope, non-goals and measurable targets will be in the PRD ([#2]).
 
@@ -52,13 +52,12 @@ workers, and one system of record.
 
 ## How changes flow
 
-1. Every change starts as a GitHub issue with its scope and acceptance criteria.
-2. One branch per issue, from an up-to-date `main`: `<type>/<issue#>-<short-slug>`, e.g. `feat/12-upload-api`.
-3. A pull request with a [Conventional Commit](https://www.conventionalcommits.org/) title closes the issue and says
-   what changed, how it was tested and what the risks are.
-4. The PR gets a code review and CI must be green. `main` only accepts squash merges from pull requests.
-5. release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes signed images with
-   SBOMs to GHCR.
+Issue first, one branch per issue, then a pull request with a Conventional Commit title that closes the issue. It needs
+a code review and green CI before a squash merge into `main`. [CONTRIBUTING.md](CONTRIBUTING.md) has the details,
+including the `main` ruleset and its one temporary exception ([#6]).
+
+release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes signed images with
+SBOMs to GHCR.
 
 ## Local development
 
@@ -80,7 +79,7 @@ Run `make` with no arguments to list every command.
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
-docs/                    requirements, architecture, threat model, ADRs, runbooks
+docs/                    planning docs, ADRs, runbooks (architecture + threat model: placeholders until phases 2–3)
 services/api-python/     FastAPI sample service (to be replaced by the API service)
 services/api-go/         Go sample service (stays only if an ADR gives Go a job)
 compose.yaml             local run with production-like hardening
@@ -110,3 +109,4 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 [MIT](LICENSE) © 2026 Muhammad Rashid ([CodeWithMuh](https://youtube.com/@codewithmuh))
 
 [#2]: https://github.com/codewithmuh/secure-file-transfer/issues/2
+[#6]: https://github.com/codewithmuh/secure-file-transfer/issues/6

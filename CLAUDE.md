@@ -16,8 +16,10 @@ https://github.com/codewithmuh/secure-file-transfer.
 
 ## How we work
 
-Follow the GitHub workflow in `~/.claude/CLAUDE.md`: plan → issue → branch → PR → code review → merge. No work without an
-issue. Rashid commits, pushes and merges; Claude writes code, opens issues and PRs with `gh`, and reviews.
+Follow the workflow in [CONTRIBUTING.md](CONTRIBUTING.md): plan → issue → branch → PR → code review → merge. No work
+without an issue. Rashid commits, pushes and merges; Claude writes code, opens issues and PRs with `gh`, and reviews.
+Claude never runs `git commit`, `git push` or a merge: when work is ready, give Rashid the commit message and the exact
+files to stage.
 
 Plan like a large company, in this order, each phase producing documents in `docs/` through its own issue and PR:
 
@@ -33,7 +35,7 @@ Plan like a large company, in this order, each phase producing documents in `doc
 ## Rules
 
 - Start from the template `codewithmuh/production-repo-template` (Rashid's P0 base for every project).
-- Candidate stack, to confirm with ADRs in phase 2: Python (FastAPI), PostgreSQL, S3 + KMS, Kubernetes (EKS) with
+- Candidate stack, to confirm with ADRs in phase 4: Python (FastAPI), PostgreSQL, S3 + KMS, Kubernetes (EKS) with
   Argo CD, Terraform, GitHub Actions with OIDC. Add Go only where it earns its place.
 - Keep the moving parts few: one API service plus workers, one system of record. Don't add services for keywords.
 - No secrets in git, ever: gitleaks in pre-commit and CI; secrets live in AWS Secrets Manager.

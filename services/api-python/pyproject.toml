@@ -1,7 +1,7 @@
 [project]
 name = "api"
 version = "0.1.0"
-description = "Sample Python HTTP service for the production repo template."
+description = "Sample Python HTTP service, a placeholder until the API service replaces it."
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
