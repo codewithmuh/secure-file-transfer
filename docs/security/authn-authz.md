@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed in phase 3; the phase 4 ADR records the identity provider choice |
+| Status | Phase 3 design, aligned with the phase 2 documents in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26); ADR-0016 records the identity provider choice |
 | Requirements | [PRD](../prd.md), especially FR-14, FR-15, FR-20, FR-22 to FR-27, FR-32, FR-34, FR-35, NFR-12 to NFR-15 |
 | Architecture | [architecture.md](../architecture.md), sections 4.2, 5.1, 5.2, 5.4 and 8 |
 | API | [openapi.yaml](../api/openapi.yaml) and its [README](../api/README.md) |
@@ -190,14 +190,14 @@ does.
   that an invitation email was sent. The conflict is recorded only in the platform audit log.
 - **SSO member.** No Cognito user is created. The email holds a one-time invitation link,
   `https://app.<domain>/invite#<token>`: 256 random bits, stored as a SHA-256 hash, valid for 7 days, carried in the
-  fragment like a link token (4.1). The web app posts the token to `startInvitationSignIn` (proposed, `public`), which
+  fragment like a link token (4.1). The web app posts the token to `startInvitationSignIn` (`public`), which
   checks it, puts the invited user and the tenant's connection in the pre-auth record, and sends the browser to that
   tenant's identity provider. On the callback the API binds the subject to the invited user, consumes the token and
   activates the user, in one transaction. A new invitation replaces the old token.
 - **Turning SSO on.** When a tenant's SSO connection becomes active, every existing member gets an invitation link to
   bind their SSO identity. Their local sign-in keeps working until the tenant requires SSO.
 
-**Lost factor.** A tenant admin resets the member's sign-in (`resetUserSignIn`, proposed, step-up). It acts on both
+**Lost factor.** A tenant admin resets the member's sign-in (`resetUserSignIn`, step-up). It acts on both
 pools, so old credentials can't come back with a failover or failback:
 
 1. In the API transaction that accepts the reset, every session of the member ends and their local identities in both
@@ -211,7 +211,7 @@ pools, so old credentials can't come back with a failover or failback:
 That is the same assurance as the first enrollment (ASVS 5.0 V6.4).
 
 **Operator-assisted recovery** covers a tenant's last admin who has lost their factor, and an SSO tenant whose identity
-provider is down with no fallback admin available. An operator calls `recoverTenantAdmin` (proposed, operator API) for
+provider is down with no fallback admin available. An operator calls `recoverTenantAdmin` (operator API) for
 a named admin of the tenant, only after confirming the request through the second contact recorded when the tenant
 was provisioned, and records how it was confirmed. For a local admin, it is the reset above. For an SSO tenant, it
 gives that admin a temporary local sign-in: the worker creates a Cognito user and identity for them as for a local
@@ -227,7 +227,7 @@ sign out users of the two pools. The internet-facing API role and the operator A
   with a DNS TXT record. A domain belongs to one tenant at most.
 - The CLI creates the SAML or OIDC provider in both pools with the operator's own AWS credentials, named after the
   tenant ID. It maps only email and subject, requires signed SAML assertions, and sets no identity provider
-  identifiers. It then records the configuration through the operator API (`configureTenantSso`, proposed), which
+  identifiers. It then records the configuration through the operator API (`configureTenantSso`), which
   writes the tenant's `idp_connections` row and proven domains. The API role never manages providers.
 - The tenant admin confirms that their identity provider enforces MFA, and the confirmation is audited. Cognito's MFA
   doesn't apply to federated users (section 9.1).
@@ -273,8 +273,8 @@ sign out users of the two pools. The internet-facing API role and the operator A
   When Osaka is supported, an ADR revisits this: members with passkeys and SSO members would then fail over without
   re-enrolling.
 - **After failback** the Tokyo pool is unchanged, so local members use their original credentials again, except those
-  reset or deactivated in the meantime (2.5). Identities are stored per pool connection (`user_identities`, section
-  10), so a member can hold one in each.
+  reset or deactivated in the meantime (2.5). Identities are stored per pool connection (`user_identities`, data
+  model 2.1), so a member can hold one in each.
 - Recipients, uploaders and API keys don't depend on Cognito. The synthetic probe (NFR-1) uses an API key and a
   recipient link, so it keeps measuring them during a failover.
 
@@ -332,14 +332,14 @@ oldest.
 **Step-up.** `inviteUser`, `updateUser`, `deactivateUser`, `updateTenantPolicy`, `createApiKey`, `resetUserSignIn` and
 `exportAuditEvents` need a sign-in within the last 15 minutes. `inviteUser` is on the list because an invitation can
 create an admin; since an invitation never changes an existing user's role (2.5), every way to grant the admin role
-needs step-up. Otherwise these operations return `401 reauthentication_required` (a new code, section 10). The web app
+needs step-up. Otherwise these operations return `401 reauthentication_required` (API contract). The web app
 runs sign-in again the same way in, which sends `prompt=login` to Cognito and on to the tenant's identity provider, and
 then retries. An API key may call only `exportAuditEvents` of these, within its own limits (5.3).
 
 **Admin rights need a passkey or SSO.** The API sets `auth_method` from the ID token's `amr` claim: `hwk` or `swk` (a
 passkey on a security key or a device) gives `passkey`; `pwd` with `otp` gives `password_totp`; a federated sign-in
 gives `sso`. A local admin's session acts with the admin role only when its `auth_method` is `passkey`. Otherwise it
-acts as a member, and an operation that needs the admin role answers `403 passkey_required` (a new code, section 10),
+acts as a member, and an operation that needs the admin role answers `403 passkey_required` (API contract),
 so the web app asks the admin to sign in with a passkey, or to register one first.
 
 - **Why.** TOTP can be phished in real time (threat model R-01), and an admin session can invite admins, create API
@@ -389,7 +389,7 @@ own.
 
 ### 3.5 Sign-out
 
-- `signOut` (proposed, `POST /v1/auth/sign-out`) revokes the session, clears the cookie and returns the logout URL of
+- `signOut` (`POST /v1/auth/sign-out`) revokes the session, clears the cookie and returns the logout URL of
   the pool that signed the member in; the web app goes there, so managed login's own cookie is cleared too. With
   `all_sessions: true` it ends every session of the member.
 - SSO members stay signed in at their own identity provider. SAML single logout is not in v1.
@@ -403,7 +403,7 @@ own.
   regions' archive before the response (as the contract says). An outbox message then disables the Cognito user in
   both pools and signs it out everywhere; that is defence in depth, because the callback already refuses a deactivated
   user. The next request from any of the user's browsers gets `401 session_expired`.
-- **`signOutUser`** (proposed): an admin ends every session of a member without deactivating them, for example after a
+- **`signOutUser`**: an admin ends every session of a member without deactivating them, for example after a
   lost laptop. It is a security-critical record too.
 - A member removed only at the tenant's identity provider keeps a session they already have until it times out (30
   minutes idle, 12 hours at most). Deactivating them in the web app takes effect at once. SCIM deprovisioning is later.
@@ -469,7 +469,7 @@ own.
 - **Revocation** of the transfer or request ends its sessions in the same transaction (data model 2.4), and every call
   compares the item's `expires_at` with the current time.
 - **Downloads.** A download grant belongs to the link session that created it (#24). The browser fetches the bytes by
-  navigation with `getSessionDownloadContent` (proposed in #24), and a navigation can't send `X-Link-Session`, so this
+  navigation with `getSessionDownloadContent` (#24), and a navigation can't send `X-Link-Session`, so this
   operation is exempt from the header. It is authorised by the grant ID in the path plus a cookie that holds the
   grant's session: without the cookie it gets `401`, and with a cookie that doesn't hold that session, such as another
   recipient's, `404`. A forwarded content URL grants nothing (FR-14). It is a safe GET with no CSRF header;
@@ -489,7 +489,7 @@ own.
   (`404 link_not_found`). Clearing the hash alone would rebuild the same token. Whoever caused the lockout with a
   leaked link is cut off; a recipient who mistyped just gets a new email.
 - Lockouts and unlocks are security-critical audit records.
-- **API keys can't unlock** (a change to the contract). A lockout signals a possible attack, so a person decides.
+- **API keys can't unlock** (API contract). A lockout signals a possible attack, so a person decides.
 
 ## 5. API keys
 
@@ -566,7 +566,7 @@ gitleaks rule in this repository matches the format, and the format suits GitHub
 
 ### 6.3 Permission table
 
-Every `x-permission` value in the API contract, then the values this design adds (marked proposed). **Own**: items the
+Every `x-permission` value in the API contract, including those this design added in #26. **Own**: items the
 caller created (for a key, items its owner created). **Tenant**: every item in the caller's tenant. Wherever the Admin
 column gives more than the Member column, a local admin needs a passkey sign-in (3.3), except for revocations. A dash
 means the caller is refused (`401` if it has no credential the operation accepts, `403` if it has).
@@ -580,20 +580,20 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `transfer.cancel` | `cancelTransfer` | Own | Own | `transfers:write`, own | — | — | — | |
 | `transfer.revoke` | `revokeTransfer` | Own | Tenant | `transfers:write`, tenant | — | — | — | FR-20 |
 | `transfer.extend` | `extendTransferExpiry` | Own | Own | `transfers:write`, own | — | — | — | FR-9 |
-| `recipient.unlock` | `unlockRecipient` | Own | Tenant | — (the contract allows `transfers:write`, 4.4) | — | — | — | Always issues a new link |
+| `recipient.unlock` | `unlockRecipient` | Own | Tenant | — (4.4) | — | — | — | Always issues a new link |
 | `file.upload` | `addTransferFile`, `requestUploadPartUrls`, `listUploadedParts`, `completeUpload` | Own | Own | `transfers:write`, own | — | — | — | The file belongs to a transfer, never to an upload request |
 | `file.read` | `getFile` | Own | Tenant | `transfers:read` for a transfer's file, `upload_requests:read` for a received file; tenant | — | — | — | The scope must match the file's parent, otherwise `404` |
 | `file.delete` | `deleteFile` | Own | Own | `transfers:write` or `upload_requests:write`, matching the parent; own | — | — | — | |
-| `file.download_received` | `createReceivedFileDownload`; `getReceivedFileDownloadContent` (proposed in #24) | Own | Own | — | — | — | — | Another member's request gets `403` for an admin. The content GET needs the member session that created the grant. |
+| `file.download_received` | `createReceivedFileDownload`, `getReceivedFileDownloadContent` | Own | Own | — | — | — | — | Another member's request gets `403` for an admin. The content GET needs the member session that created the grant. |
 | `upload_request.create` | `createUploadRequest` | Yes | Yes | `upload_requests:write` | — | — | — | |
 | `upload_request.read` | `listUploadRequests`, `getUploadRequest`, `listUploadRequestFiles` | Own | Tenant | `upload_requests:read`, tenant | — | — | — | As `transfer.read` |
 | `upload_request.revoke` | `revokeUploadRequest` | Own | Tenant | `upload_requests:write`, tenant | — | — | — | FR-20 |
-| `uploader.unlock` | `unlockUploader` | Own | Tenant | — (the contract allows `upload_requests:write`, 4.4) | — | — | — | Always issues a new link |
-| `public` | `resolveLink`, `requestVerificationCode`, `createLinkSession`; `startSignIn`, `completeSignIn`, `startInvitationSignIn` (proposed); `createOperatorToken` (proposed, operator API only) | Anyone | Anyone | Anyone | Anyone | Anyone | Anyone | Rate-limited (#24); reveals nothing about an item before verification |
+| `uploader.unlock` | `unlockUploader` | Own | Tenant | — (4.4) | — | — | — | Always issues a new link |
+| `public` | `resolveLink`, `requestVerificationCode`, `createLinkSession`; `startSignIn`, `completeSignIn`, `startInvitationSignIn`; `createOperatorToken` (operator API only) | Anyone | Anyone | Anyone | Anyone | Anyone | Anyone | Rate-limited (#24); reveals nothing about an item before verification |
 | `session.read` | `getLinkSession`, `listSessionFiles` | — | — | — | Own transfer | Own request | — | The session named by `X-Link-Session`, and its subject only |
 | `session.end` | `endLinkSession` | — | — | — | Yes | Yes | — | The session named by `X-Link-Session` |
 | `session.upload` | `addSessionUploadFile`, `requestSessionUploadPartUrls`, `listSessionUploadedParts`, `completeSessionUpload` | — | — | — | — (`403`) | Own request | — | The request is open and the file belongs to it |
-| `session.download` | `createSessionDownload`; `getSessionDownloadContent` (proposed in #24) | — | — | — | Own transfer | — (`403`) | — | The file is shareable and under the limit. The grant belongs to the session that created it; the content GET needs a cookie that holds that session, and no `X-Link-Session` (4.3). |
+| `session.download` | `createSessionDownload`, `getSessionDownloadContent` | — | — | — | Own transfer | — (`403`) | — | The file is shareable and under the limit. The grant belongs to the session that created it; the content GET needs a cookie that holds that session, and no `X-Link-Session` (4.3). |
 | `audit.search` | `searchAuditEvents` | — | Tenant | `audit:read` | — | — | — | |
 | `audit.export` | `exportAuditEvents` | — | Tenant, step-up | `audit:read`; 1 an hour, at most 100,000 events (5.3) | — | — | — | |
 | `user.invite` | `inviteUser` | — | Tenant, step-up | — | — | — | — | `409 user_exists` only within the tenant; never changes an existing user's role |
@@ -606,12 +606,12 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `api_key.read` | `listApiKeys` | — | Tenant | — | — | — | — | |
 | `api_key.revoke` | `revokeApiKey` | — | Tenant | — | — | — | — | Any key of the tenant |
 | `operator.tenant.create` | `createTenant` | — | — | — | — | — | Yes | Creates the tenant and invites its first admin; no tenant data returned |
-| `account.sign_out` (proposed) | `signOut` | Self | Self | — | — | — | — | |
-| `user.sign_out` (proposed) | `signOutUser` | — | Tenant | — | — | — | — | Security-critical record |
-| `user.reset_sign_in` (proposed) | `resetUserSignIn` | — | Tenant, step-up | — | — | — | — | Local members only; acts on both pools (2.5) |
-| `operator.tenant.sso.update` (proposed) | `configureTenantSso` | — | — | — | — | — | Yes | Records the connection and domains that the operator CLI set up in both pools |
-| `operator.tenant.admin_recovery` (proposed) | `recoverTenantAdmin` | — | — | — | — | — | Yes | Only after an out-of-band check with the tenant's second contact; security-critical; the tenant's admins are emailed (2.5) |
-| `operator.break_glass.record` (proposed) | `recordBreakGlassGrant` | — | — | — | — | — | Yes | Best effort: the Identity Center assignment and CloudTrail are the record, and a job fills any gap (8.3) |
+| `account.sign_out` | `signOut` | Self | Self | — | — | — | — | |
+| `user.sign_out` | `signOutUser` | — | Tenant | — | — | — | — | Security-critical record |
+| `user.reset_sign_in` | `resetUserSignIn` | — | Tenant, step-up | — | — | — | — | Local members only; acts on both pools (2.5) |
+| `operator.tenant.sso.update` | `configureTenantSso` | — | — | — | — | — | Yes | Records the connection and domains that the operator CLI set up in both pools |
+| `operator.tenant.admin_recovery` | `recoverTenantAdmin` | — | — | — | — | — | Yes | Only after an out-of-band check with the tenant's second contact; security-critical; the tenant's admins are emailed (2.5) |
+| `operator.break_glass.record` | `recordBreakGlassGrant` | — | — | — | — | — | Yes | Best effort: the Identity Center assignment and CloudTrail are the record, and a job fills any gap (8.3) |
 
 ### 6.4 Resource rules
 
@@ -781,26 +781,30 @@ context (#22). A scoping bug that slips past both layers above returns a row tha
 ### 8.1 Normal operator access
 
 - People reach AWS only through IAM Identity Center, with MFA by security key or passkey. There are no IAM users for
-  daily work and no long-lived access keys. Identity Center needs AWS Organizations (open question 4). Its home region
+  daily work and no long-lived access keys. Identity Center needs AWS Organizations, which open question 4 chose, with
+  one account per environment (ADR-0006). Its home region
   and replication decide whether operators can sign in while Tokyo is down; the accounts ADR confirms this, and 8.4
   covers an outage.
 - Deploys run from GitHub Actions through OIDC roles, never from a person's credentials (architecture 3.3).
 
 | Permission set | For | May | May not |
 |---|---|---|---|
-| `ReadOnly` | Dashboards, logs, alarms | Read metrics, logs and configuration | Read objects in the files or audit buckets, decrypt with the files key, read secrets, connect to the database |
-| `Operator` | Runbooks and the operator CLI | What `ReadOnly` may, plus: port-forward to the operator API in the `sft-operator` namespace; view and sync Argo CD applications, which applies what Git holds; manage SSO providers in the user pools; run the AWS steps of the failover runbooks | Exec, attach, port-forward, debug or add containers in application namespaces; create, patch, scale, restart or delete workloads anywhere (restarts and changes go through Git and Argo CD); override Argo CD parameters; read Kubernetes secrets; anything `ReadOnly` may not |
+| `ReadOnly` | Dashboards, logs, alarms | Read metrics, logs and configuration; port-forward to Grafana in its own namespace (ADR-0009) | Read objects in the files or audit buckets, decrypt with the files key, read secrets, connect to the database |
+| `Operator` | Runbooks and the operator CLI | What `ReadOnly` may, Grafana included, plus: port-forward to the operator API in the `sft-operator` namespace; view and sync Argo CD applications, which applies what Git holds; manage SSO providers in the user pools; run the AWS steps of the failover runbooks | Exec, attach, port-forward, debug or add containers in application namespaces; create, patch, scale, restart or delete workloads anywhere (restarts and changes go through Git and Argo CD); override Argo CD parameters; read Kubernetes secrets; anything `ReadOnly` may not |
 | `BreakGlassApprover` | A second operator | Assign `BreakGlass` to another operator for one hour (8.3) | Use `BreakGlass` itself |
 | `BreakGlass` | Emergencies only | See 8.3 | See 8.3 |
 
 - **No shell or tunnel into application pods.** A shell in an API pod carries the pod's IAM and database roles, which
   can read files and unwrap tenant data keys, and a port-forward reaches its internal ports.
   An EKS access entry maps `Operator` to a Kubernetes group whose RBAC allows `pods/portforward` only in
-  `sft-operator`, which runs nothing but the operator API. Taking these away is what makes "operators can't read file
-  contents" true in normal operation.
-- **Contents are protected by policy, not procedure.** The files bucket allows reads only by the API, scan worker and
-  lifecycle roles and `BreakGlass`; the files key allows decryption only by the same (#22); infected objects are denied
-  to every principal by their tag (FR-17). A normal operator holds none of these roles and, without exec, can't borrow
+  `sft-operator`, which runs nothing but the operator API, and in Grafana's namespace, which runs nothing but Grafana
+  and holds no role that can read files (ADR-0009). `ReadOnly` gets the Grafana port-forward only. Taking these away
+  is what makes "operators can't read file contents" true in normal operation.
+- **Contents are protected by policy, not procedure.** The files buckets allow reads only by the API role (scan-tagged
+  objects only), the scan worker, the S3 replication role, the GuardDuty Malware Protection role (the large-file bucket
+  only) and `BreakGlass`; the files key allows decryption only by the same, plus EBS for the scan nodes' volumes (#22
+  4.3). The lifecycle jobs delete without reading. Infected objects are denied to every principal by their tag
+  (FR-17). A normal operator holds none of these roles and, without exec, can't borrow
   one.
 
 ### 8.2 Operator API authentication
@@ -809,7 +813,7 @@ context (#22). A scoping bug that slips past both layers above returns a row tha
   own IAM role (`sft-{env}-operator`) and its own database role (`sft_operator`, 7.3). No load balancer or ingress
   routes to it. Operators reach it with `kubectl port-forward` to that namespace, which only `Operator` may do. It
   never returns file names, messages or contents, and its database role can't read those columns.
-- **Token exchange** (`createOperatorToken`, proposed). The operator CLI signs an STS `GetCallerIdentity` request with
+- **Token exchange** (`createOperatorToken`). The operator CLI signs an STS `GetCallerIdentity` request with
   the operator's Identity Center credentials, including a signed `X-SFT-Audience: operator-api-<env>` header, and
   sends the signed request, not the credentials. The operator API:
   1. accepts only a `GetCallerIdentity` request, signed for STS in its own Region, whose signed headers include the
@@ -824,8 +828,8 @@ context (#22). A scoping bug that slips past both layers above returns a row tha
   5. issues a 15-minute operator token, stored as a SHA-256 hash in `operator_sessions` with the account and the
      operator's Identity Center user name (the role session name).
 
-  If one AWS account ever hosts more than one environment (open question 4), each environment gets its own `Operator`
-  permission set, so the role still tells environments apart.
+  Each environment has its own AWS account (open question 4, ADR-0006). If one account ever hosted more than one, each
+  environment would get its own `Operator` permission set, so the role would still tell environments apart.
 - Every operator call is audited with actor type `operator` and the operator's Identity Center user name, as a platform
   event and, when it acts on a tenant, in that tenant's audit log.
 
@@ -846,12 +850,12 @@ flowchart LR
 |---|---|
 | Request | The operator gives the incident, the reason, the tenants and resources concerned, and the time needed (at most 1 hour) to the break-glass tool. The tool writes them into the one-time removal schedule: its name carries the incident ID, its description the reason and tenants. |
 | Approval | A second operator with `BreakGlassApprover` approves: under the approver's credentials, the tool assigns `BreakGlass` to the requester and creates the EventBridge Scheduler schedule that removes the assignment after 1 hour. **The record of the grant is the Identity Center assignment plus CloudTrail**, kept in the organization trail's Object Lock bucket, so break-glass works when the API or the database is down, which is often exactly when it is needed. |
-| Record in the service | The tool then calls `recordBreakGlassGrant` (proposed): a security-critical platform audit record, plus a record in each affected tenant's audit log, where its admins can see it (UC-4). This is best effort. Every 15 minutes a job in `sft-operator` compares the `BreakGlass` assignments in CloudTrail with `break_glass_grants`, writes any missing record (marked as reconciled), and alerts if one is still missing an hour after the grant. |
+| Record in the service | The tool then calls `recordBreakGlassGrant`: a security-critical platform audit record, plus a record in each affected tenant's audit log, where its admins can see it (UC-4). This is best effort. Every 15 minutes a job in `sft-operator` compares the `BreakGlass` assignments in CloudTrail with `break_glass_grants`, writes any missing record (marked as reconciled), and alerts if one is still missing an hour after the grant. |
 | Use | The requester signs in with MFA; the session lasts at most 1 hour, so access ends at most 2 hours after approval. Nobody holds a standing `BreakGlass` assignment, and a daily check alerts if one exists. |
 | Allows | Reading file objects and decrypting them with the files key; reading the database master password and connecting as the master user; administering the Kubernetes cluster. Cluster administration includes exec into application pods, and through a pod the operator acts with that workload's IAM and database roles: through an API pod they can unwrap tenant data keys and read file names and messages, although `BreakGlass` itself has no decrypt on the fields key (#22). It can also change object tags, so the tag that denies infected files to every principal (FR-17) doesn't stop it. |
 | Can't, through an SCP or Object Lock | Changing KMS key policies, or disabling or deleting keys: a service control policy denies these to everyone except the Terraform deploy role. Changing or deleting audit archive objects: Object Lock in compliance mode in prod. Stopping or changing CloudTrail, AWS Config, EKS control-plane audit logging or the alerting rules, and changing IAM: the same SCP. |
 | Alerts | EventBridge rules on the assignment, every sign-in with `BreakGlass`, every call by its role, every read of the master password, and every decryption with the files key by a person's role; and, from the Kubernetes audit log, every exec, attach or port-forward into an application pod. On-call is paged and every operator emailed within 5 minutes. Self-approval, and an assignment without a service record after an hour, raise their own alerts. |
-| Evidence | An organization CloudTrail trail, with S3 data events on the files bucket and KMS events, delivered to an Object Lock bucket; pgaudit logs every statement of the master user; the Kubernetes audit log records each exec session, though not what is typed inside it |
+| Evidence | The organization trail (ADR-0006), with management events, KMS calls included, delivered to the shared account's log archive under Object Lock; S3 data events on the files buckets, from the environment's trail (#22 3.1), in the prod account's CloudTrail bucket, which has no Object Lock so that it can be torn down; pgaudit logs every statement of the master user; the Kubernetes audit log records each exec session, though not what is typed inside it |
 | Afterwards | The master password is rotated (#22). An after-action review within 2 business days compares what was read (CloudTrail data events) with the approved scope, says whether the access was needed, and opens an issue to make it unnecessary next time. Uses are counted; the target is zero. |
 
 Break-glass is meant to be able to repair anything, so it can also read anything the workloads can. What limits it is
@@ -903,7 +907,7 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 | CSRF | Missing or wrong token; a token from another session, including another link session in the same browser; the token from `GET /me` still works after a page load and changes with the session; the previous key works for 24 hours after a rotation, then fails; missing or foreign `Origin`; cookie plus bearer refused; non-JSON body refused | Every pull request |
 | Link access | After an end-to-end run, no link token appears in load balancer, CDN, WAF or application logs. `resolveLink` reveals nothing; a code works only for its own subject; a superseded code fails; 5 attempts per code; lockout at 20; unlocking clears both `link_token_hash` and `link_issued_at`, issues a new link, and the old one fails; another transfer's file IDs get `404`; an uploader can't download and a recipient can't upload; revocation ends sessions within 5 seconds (NFR-6). One browser holds 10 link sessions, each picked by `X-Link-Session`, verifying a second link leaves the first working, and an 11th ends the oldest. The content GET works with the grant's session in the cookie and no `X-Link-Session`, gets `401` without the cookie and `404` with another session. | Every pull request; staging end to end |
 | API keys | The checksum rejects typos; only the hash is stored; scopes hold; a download gets `403`; a key can't create keys or unlock; every call, reads included, writes its own audit record; a second export within the hour and an export of more than 100,000 events are refused; a revoked or expired key gets `401` on the next call; deactivating the owner revokes their keys | Every pull request |
-| Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator`, and can't exec, attach, port-forward, patch or restart in application namespaces. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
+| Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator` and Grafana's namespace, and can't exec, attach, port-forward, patch or restart in application namespaces. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
 | Break-glass | A drill: request, approval, alerts within 5 minutes (including one for an exec into an API pod), assignment removed after 1 hour, the service record written, or filled in by reconciliation when the drill stops the API first, review written | Staging, in every disaster recovery drill |
 | User pool configuration | Static checks on the Terraform: MFA required, Plus plan, threat protection enforced, admin-only sign-up, implicit grant off, no provider identifiers, the app client can't write `email` or `custom:tenant_id`, both triggers attached in both pools. Once deployed, a daily drift check. | Every pull request; daily |
 
@@ -919,62 +923,37 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 
 The threat model (#21) holds the full ASVS checklist.
 
-## 10. Changes this design asks for
+## 10. Changes asked of other documents: status
 
-These go to the phase 2 owners through [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26).
+Everything this design asked of the phase 2 documents was applied in
+[#26](https://github.com/codewithmuh/secure-file-transfer/issues/26):
 
-**API contract** ([#14](https://github.com/codewithmuh/secure-file-transfer/issues/14)):
+- **API contract, done.** The sign-in, sign-out, sign-in reset and operator operations with the permissions in 6.3;
+  the content operations, exempt from `X-Link-Session`; `401 reauthentication_required` on the step-up operations,
+  `inviteUser` and `exportAuditEvents` included, and `403 passkey_required`; `409 user_exists` within the tenant only;
+  the API key export limits (`422 export_too_large` past 100,000 events); `sso_fallback` on `UserUpdate`; unlocks
+  without API keys, always issuing a new link; the operator token exchange and the operator API reached by
+  port-forward; the `ApiKeyCreated.secret` format; derived CSRF tokens and `SameSite=Strict`.
+- **Data model, done.** `member_sessions` as in 3.2; `link_sessions.last_seen_at`; the invitation and `sso_fallback`
+  columns on `users`; the SSO columns on `tenants`, with proven domains in `sso_domains`; the two writers of
+  `user_identities`; `operator_sessions` and `break_glass_grants`; row-level security as in section 7 (ADR-0020).
+- **Architecture, done.** The operator API as its own Deployment in `sft-operator`; the sign-in triggers' events
+  through an SQS queue to the notification worker.
+- **PRD, done.** NFR-11 states that members without SSO re-enroll after a regional failover; FR-22 says that an address
+  holds a local sign-in for one tenant only.
 
-- Add sign-in: `startSignIn` (`GET /auth/sign-in`, with the way in and an optional `sso_domain`), `completeSignIn`
-  (`GET /auth/callback`) and `startInvitationSignIn` (`POST /auth/invitations`, token in the body), all `public`, and
-  `signOut` (`POST /auth/sign-out`, `account.sign_out`).
-- Add `signOutUser` (`POST /users/{user_id}/sign-out`, `user.sign_out`) and `resetUserSignIn`
-  (`POST /users/{user_id}/reset-sign-in`, `user.reset_sign_in`).
-- Add to the operator API: `createOperatorToken` (`POST /operator/token`, `public`), `configureTenantSso`
-  (`PUT /operator/tenants/{tenant_id}/sso`, `operator.tenant.sso.update`), `recoverTenantAdmin`
-  (`POST /operator/tenants/{tenant_id}/admin-recovery`, `operator.tenant.admin_recovery`) and `recordBreakGlassGrant`
-  (`POST /operator/break-glass-grants`, `operator.break_glass.record`, best effort).
-- New error codes: `reauthentication_required` (401) on the step-up operations (3.3), now including `inviteUser` and
-  `exportAuditEvents`; `passkey_required` (403) on operations that need the admin role.
-- `inviteUser`: `409 user_exists` only for a user of this tenant; an invitation never changes an existing user's role.
-- `exportAuditEvents`: for API keys, 1 export an hour per key and at most 100,000 events per export (5.3).
-- `UserUpdate`: `sso_fallback`, for at most two admins of an SSO tenant (2.5).
-- `unlockRecipient` and `unlockUploader`: remove `tenantApiKey`, and say that unlocking always issues a new link.
-- `operatorToken`: describe the exchange (8.2), and that the operator API is its own workload, reached only by
-  port-forward.
-- `ApiKeyCreated.secret`: document the format (5.1).
-- The download content operations proposed in #24 take `session.download` and `file.download_received`, and are exempt
-  from `X-Link-Session` (4.3).
-
-**Data model** ([#13](https://github.com/codewithmuh/secure-file-transfer/issues/13)):
-
-- `member_sessions` as in 3.2, with no CSRF column.
-- `link_sessions`: add `last_seen_at`. CSRF tokens are derived, so there is no CSRF column.
-- `users`: `invitation_token_hash` (unique) and `invitation_expires_at` for SSO binding (2.5), and `sso_fallback`.
-- `tenants`: `sso_required`, `sso_mfa_confirmed_by` and `sso_mfa_confirmed_at`; proven SSO domains, each unique across
-  tenants. The protocol and provider name are already in `idp_connections`.
-- `user_identities` rows are written only by the notification worker (local, from Cognito's `sub`) and by the
-  invitation flow (SSO), as in 2.4.
-- Platform tables without row-level security: `operator_sessions` (token hash, account, Identity Center user name,
-  unique exchange signature hash, expiry), and `break_glass_grants` (requester, approver, reason, incident, tenants,
-  starts and ends, how it was recorded: by the tool or by reconciliation, review due, review link).
-- Section 4.2's row-level security item becomes section 7 here: a scope setting next to the tenant, and per-role
-  policies.
-
-**Architecture:** the operator API is its own Deployment in the `sft-operator` namespace, not a second port of the API
-pods (8.2), and the Cognito sign-in triggers send events through an SQS queue to the notification worker (2.4).
-
-**PRD:** NFR-11 should say how sign-in for local members recovers after a regional failover (2.6). FR-22 should say
-that an address can hold a local sign-in for one tenant only (2.5).
+Left for later, on purpose: the admin passkey rule waits for the staging test that both pools issue `amr` (3.3); SCIM
+deprovisioning and SAML single logout come after v1 (3.5, 3.6); Cognito's replication is revisited by an ADR once it
+supports Osaka (2.6).
 
 ## 11. Open points for review
 
 | Point | Proposal |
 |---|---|
-| Local members after a regional failover (NFR-11) | Re-enroll them as a runbook step, so sign-in meets the 1-hour RTO, at the cost of mailbox-only assurance during the failover (2.6). The alternative is to wait for Tokyo, which breaks NFR-11 for them. Cognito's replication can't help until it supports Osaka. |
+| Local members after a regional failover (NFR-11) | Decided: they re-enroll as a runbook step, so sign-in meets the 1-hour RTO, at the cost of mailbox-only assurance during the failover (2.6). NFR-11 says so. Cognito's replication can't help until it supports Osaka. |
 | Passkeys for admins | On once both pools issue the `amr` claim (3.3); otherwise an ADR records running without the rule |
 | One local sign-in per address | Accept for v1 (2.5). Revisit if people who work for several tenants under one address become common. |
 | Two-person break-glass with one maintainer | Allow self-approval in the reference run, with its own alert and a note in the review (8.3) |
 | Cognito Plus plan | Needed for the breached-password check (ASVS 5.0 V6.2); about $400–500 a month at design load, under a dollar in the reference run |
 | API keys bound to their owner | Deactivating or demoting the owner revokes their keys (5.2). Tenant-owned service keys would survive staff changes but leave credentials with no person behind them. |
-| Contract and data model changes in section 10 | For the phase 2 owners to apply, through #26 |
+| Contract and data model changes in section 10 | Applied in #26 |

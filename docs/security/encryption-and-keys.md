@@ -43,15 +43,15 @@ Decisions on this page:
 | Class | Meaning | Rules |
 |---|---|---|
 | Restricted | File contents, the reason the service exists | Only in the files buckets, on a scan worker's scratch volume while its scan runs, inside GuardDuty Malware Protection while it scans a file over 2 GB (decision 15), and in API memory while a download streams. Never in PostgreSQL, queues, caches, logs, traces or email. |
-| Confidential | Personal and business data about transfers: file names, messages, email addresses, IP addresses, audit records, tenant settings | Only in the stores listed below. File names and messages are also field-encrypted (3.2). Never in object keys, queue messages, metrics or log lines. |
+| Confidential | Personal and business data about transfers: file names, messages, email addresses, IP addresses, audit records, tenant settings | Only in the stores listed below. File names and messages are also field-encrypted (3.2). Never in object keys, work queue messages, metrics or log lines. |
 | Secret | Credentials: link tokens, session tokens, CSRF tokens, API keys, invitation tokens, verification codes, HMAC keys, client secrets, the database master password | Plain text exists only in transit, in memory, or once at creation (the emailed link, the cookie, the API key response). At rest only as a hash, an HMAC, or inside Secrets Manager. Link and CSRF tokens are derived (6.2), so they are never stored. |
 | Internal | Operational data with no customer content: application logs, metrics, traces, queue messages, container images, infrastructure state | Identifiers only: `tenant_id`, `request_id`, an HMAC of an email address. Application logs may also hold IP addresses. |
 | Public | The web app bundle and the published OpenAPI document | TLS in transit; no encryption requirement at rest. |
 
 | Data | Class | Where it lives | Encrypted with |
 |---|---|---|---|
-| File contents | Restricted | S3 files buckets (Tokyo, Osaka replica), always under `tenants/{tenant_id}/`, large files included; scan worker scratch volumes, deleted after each scan; GuardDuty Malware Protection, which reads files over 2 GB in the bucket's Region (decision 15); API memory while streaming | files key |
-| File names, transfer and upload request messages | Confidential | PostgreSQL `files.display_name`, `transfers.message`, `upload_requests.message`; the browser after verification (FR-14) | Per-tenant data key under the fields key (3.2), inside storage encrypted with the database key |
+| File contents | Restricted | S3 files buckets (Tokyo, Osaka replica): one pair for files up to 2 GB and one for larger files, always under `tenants/{tenant_id}/` (ADR-0012); scan worker scratch volumes, deleted after each scan; GuardDuty Malware Protection, which reads the large-file bucket in its Region (decision 15); API memory while streaming | files key |
+| File names, transfer and upload request messages | Confidential | PostgreSQL `files.display_name_ct`, `transfers.message_ct`, `upload_requests.message_ct`, ciphertext only; the browser after verification (FR-14) | Per-tenant data key under the fields key (3.2), inside storage encrypted with the database key |
 | Email addresses of members, recipients and uploaders | Confidential, personal data | PostgreSQL, in plain text because we send mail to them and search by them (UC-4); Cognito for members; SES while sending. Logs, rate-limit counters and the suppression list hold only an HMAC (6.2). | database key; email HMAC keyring |
 | Source IP addresses and user agents | Confidential, personal data | Audit records; CloudFront, WAF and load balancer logs; rate-limit counters (at most 25 hours) | database, audit, logs and platform keys |
 | Tenant settings, users and roles | Confidential | PostgreSQL | database key |
@@ -64,7 +64,7 @@ Decisions on this page:
 | Application logs and traces | Internal (may hold IP addresses) | Log and trace stores in Tokyo (architecture 5.5) | logs key |
 | CloudFront, WAF and load balancer logs, CloudTrail, VPC flow logs | Confidential (IP addresses) | S3 log buckets and CloudWatch Logs in Tokyo (NFR-21) | logs key; the retained stack's trail uses the audit key (8.4); load balancer access logs are the exception in 3.1 |
 | Metrics | Internal | Prometheus volumes; no personal data in labels | platform key |
-| Queue messages | Internal | SQS; IDs only (architecture 5.3) | platform key |
+| Queue messages | Internal for the work queues; Confidential for the intake queues | SQS. Work queues carry IDs only (architecture 5.3). Intake queues carry what their source sends: sign-in events add the source IP and user agent, SES events the recipient's address. | platform key |
 | Container images | Internal | ECR in the shared registry stack, replicated to Osaka (capacity 5.4) | registry key |
 | Terraform state | Internal, sensitive | One state bucket per environment, holding no live secret value (6.4); the retained stack's own state bucket (8.4) | tfstate key; audit key for the retained stack |
 | Web app bundle | Public | S3 behind CloudFront | SSE-S3 (3.1) |
@@ -124,7 +124,7 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 
 | Store | Encryption | Key | Notes |
 |---|---|---|---|
-| S3 files, Tokyo and Osaka | SSE-KMS with S3 Bucket Keys, as the bucket default | files | The bucket policy denies any upload that names another KMS key, and any SSE-C request, so no object can be stored under a key we don't control. Versioning is on, because replication needs it. No Object Lock, because NFR-8 must be able to delete. Never in an AWS Backup plan. GuardDuty Malware Protection's role reads files over 2 GB through S3 (4.4). |
+| S3 files, Tokyo and Osaka: two bucket pairs, one for files up to 2 GB and one for larger files (ADR-0012) | SSE-KMS with S3 Bucket Keys, as the bucket default | files | Both pairs have the same settings and key. The bucket policy denies any upload that names another KMS key, and any SSE-C request, so no object can be stored under a key we don't control. Versioning is on, because replication needs it. No Object Lock, because NFR-8 must be able to delete. Never in an AWS Backup plan. GuardDuty Malware Protection covers the whole large-file bucket, and its role reads only that bucket (4.4). |
 | S3 audit archive, Tokyo and Osaka | SSE-KMS with S3 Bucket Keys | audit | Object Lock in compliance mode with 365-day retention in prod. Governance mode with 1-day retention in dev and staging, so they can be torn down (NFR-15). Object Lock protects the objects, not their key, so the key has its own guards (8.4). |
 | S3 log buckets: CloudTrail, CloudFront, WAF, VPC flow logs, log and trace stores | SSE-KMS with S3 Bucket Keys | logs | The log delivery services write through key policy statements limited by `aws:SourceAccount` and `aws:SourceArn`. |
 | S3 load balancer access logs | SSE-S3 | — | **Exception to NFR-13:** load balancer access logs support only SSE-S3. They hold IP addresses, paths with opaque IDs and user agents. Link tokens never reach them, because they travel in the URL fragment (architecture 4.2). Only the log reader role can read the bucket. |
@@ -134,7 +134,7 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 | Aurora PostgreSQL: Tokyo cluster, Osaka secondary, automated backups (14-day point-in-time recovery), snapshots, Performance Insights | Aurora storage encryption, set at creation | database | Each Region's cluster uses that Region's copy of the key. An unencrypted cluster can't be encrypted in place, so CI rejects a plan that would create one (section 9). |
 | File names and messages inside PostgreSQL | AES-256-GCM with per-tenant data keys | fields | Section 3.2 |
 | Aurora PostgreSQL logs | CloudWatch Logs | logs | The parameter group keeps values out of the log: `log_parameter_max_length = 0` and `log_parameter_max_length_on_error = 0` (no bound values), `log_error_verbosity = terse` (no `DETAIL` lines, which print the conflicting key of a unique violation, such as an email address, or the failing row of a check constraint), `pgaudit.log_parameter = off`, and `log_statement = none` (pgaudit decides what is audited). The application sends parameterized statements, so statement text holds `$1` placeholders, not values. What can still get through, a residual risk (9.1): text a person types under break-glass, which pgaudit records on purpose, and the primary message of an input-syntax error, which quotes the bad value. A CloudWatch Logs data protection policy with the email address identifier masks any address that does get through. |
-| SQS work queues and dead-letter queues | SSE-KMS, data key reused for 5 minutes | platform | Messages hold IDs only. The SES events topic and the EventBridge rules (GuardDuty scan results, SES tenant pauses) deliver into queues through the statements in 4.4. |
+| SQS work queues, intake queues and dead-letter queues | SSE-KMS, data key reused for 5 minutes | platform | Work queue messages hold IDs only; intake messages are classified in section 1. Only the outbox relay sends to the work queues. Each intake queue has one sender: the sign-in triggers' role for sign-in events, the SES events topic for sending events, and the EventBridge delivery role for GuardDuty scan results and SES tenant pauses, through the statements in 4.4. |
 | ElastiCache Serverless (Valkey) | Encryption at rest, always on | platform | Rate-limit counters and sign-in state |
 | EBS: node root volumes, observability volumes | EBS encryption by default, set for the account in each Region | platform | The node provisioner (Karpenter and the EC2 Fleet service-linked role) uses the key for each volume it launches (4.4). |
 | EBS: scan worker volumes | Encrypted | files | The scratch disk holds file contents during a scan, so the scan workers run in their own node pool whose volumes use the files key. The worker deletes each scratch file when its scan ends. The separate pool also keeps hostile files off the API's nodes. |
@@ -156,7 +156,10 @@ leaked database credential, or a break-glass database session. Field encryption 
 
 1. **One data key per tenant.** Each tenant has a 256-bit data key, generated by KMS `GenerateDataKey` on the fields
    key with encryption context `{"purpose": "field-dek", "tenant_id": "<tenant>"}`. Only the wrapped key is stored, in
-   a new table `tenant_data_keys (tenant_id, version, wrapped_key, created_at, retired_at)`.
+   `tenant_data_keys (tenant_id, key_version, wrapped_key, created_at, retired_at)` (data model).
+   The ciphertext columns are `files.display_name_ct`, `transfers.message_ct` and `upload_requests.message_ct`; each
+   table records `data_key_version`, a foreign key to the tenant's key version, so a version can't be deleted while a
+   row uses it. There are no plaintext columns for these values.
 2. **Authenticated encryption.** Each value is encrypted with AES-256-GCM, a random 96-bit nonce, and additional
    authenticated data made of `tenant_id`, table, column, row ID and key version. The stored value carries a format
    version, the key version, the nonce and the ciphertext with its tag.
@@ -257,7 +260,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 |---|---|---|---|---|---|---|---|---|
 | API service | E D | E D | — | E, both Regions | — | D, own secrets | — | — |
 | Operator API (decision 12) | — | — | — | E, both Regions | — | — | — | — |
-| Scan worker | D | — | — | — | — | — | D, scan queues | — |
+| Scan worker | D, files up to 2 GB only | — | — | — | — | — | D, scan queues | — |
 | Notification worker | — | — | — | — | — | D, own secrets | D, its queues | — |
 | Outbox relay | — | — | — | — | — | — | E D, queues | — |
 | Sign-in triggers (Cognito pre- and post-authentication) | — | — | — | — | — | — | E D, sign-in events queue | — |
@@ -269,7 +272,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Migrations job | — | — | — | — | — | — | — | — |
 | External Secrets (platform) | — | — | — | — | — | D, platform component secrets | — | — |
 | S3 replication role | D Tokyo, E D Osaka | — | — | D Tokyo, E D Osaka (in prod, the retained stack's own role) | — | — | — | D Tokyo, E D Osaka |
-| GuardDuty Malware Protection role (decision 15) | E D, through S3 | — | — | — | — | — | — | — |
+| GuardDuty Malware Protection role (decision 15) | E D, through S3, large-file buckets only | — | — | — | — | — | — | — |
 | EventBridge delivery role | — | — | — | — | — | — | E D, named queues and topics | — |
 | Node provisioner: Karpenter controller and the EC2 Fleet service-linked role | V, scan node pool | — | — | — | — | — | V, root volumes | — |
 | Log and trace stores | — | — | — | — | E D | — | — | — |
@@ -315,7 +318,7 @@ Every key policy follows these rules:
    principal except the deploy roles, BreakGlass included. Each key policy repeats the denial of `DisableKey` and
    `ScheduleKeyDeletion` (sketch below), so it holds even if the SCP changes. In prod any deletion must use the
    longest waiting period, 30 days. In dev and staging the deploy role may use 7 days, so teardown works. SCPs need
-   AWS Organizations, which IAM Identity Center needs anyway (open question 4).
+   AWS Organizations, which IAM Identity Center needs anyway; open question 4 chose it (ADR-0006).
 6. **BreakGlass recovers, it doesn't administer.** It may describe a key, list and revoke grants, enable a disabled
    key and cancel a pending deletion. The key policy also names it for `PutKeyPolicy`, so a key whose deploy role was
    deleted can still be repaired, but the SCP denies that call until someone with the organization's management
@@ -372,20 +375,33 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
       "Condition": {
         "StringEquals": {
           "kms:ViaService": "s3.ap-northeast-1.amazonaws.com",
-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<files bucket, Tokyo>"
+          "kms:EncryptionContext:aws:s3:arn": ["arn:aws:s3:::<files bucket, Tokyo>", "arn:aws:s3:::<large-file bucket, Tokyo>"]
         }
       }
     },
     {
-      "Sid": "ScanWorkerAndReplicationReadThroughS3",
+      "Sid": "ScanWorkerReadsSmallFilesThroughS3",
       "Effect": "Allow",
-      "Principal": {"AWS": ["arn:aws:iam::<prod>:role/sft-prod-scan", "arn:aws:iam::<prod>:role/sft-prod-s3-replication"]},
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-prod-scan"},
       "Action": "kms:Decrypt",
       "Resource": "*",
       "Condition": {
         "StringEquals": {
           "kms:ViaService": "s3.ap-northeast-1.amazonaws.com",
           "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<files bucket, Tokyo>"
+        }
+      }
+    },
+    {
+      "Sid": "ReplicationReadsThroughS3",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-prod-s3-replication"},
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.ap-northeast-1.amazonaws.com",
+          "kms:EncryptionContext:aws:s3:arn": ["arn:aws:s3:::<files bucket, Tokyo>", "arn:aws:s3:::<large-file bucket, Tokyo>"]
         }
       }
     },
@@ -398,7 +414,7 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
       "Condition": {
         "StringEquals": {
           "kms:ViaService": "s3.ap-northeast-1.amazonaws.com",
-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<files bucket, Tokyo>"
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<large-file bucket, Tokyo>"
         }
       }
     },
@@ -411,7 +427,7 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
       "Condition": {
         "StringEquals": {
           "kms:ViaService": "s3.ap-northeast-1.amazonaws.com",
-          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<files bucket, Tokyo>"
+          "kms:EncryptionContext:aws:s3:arn": ["arn:aws:s3:::<files bucket, Tokyo>", "arn:aws:s3:::<large-file bucket, Tokyo>"]
         }
       }
     },
@@ -557,7 +573,7 @@ Aurora storage stays under one shared key in every option, because a cluster has
 |---|---|---|---|---|---|
 | 1. Shared key per data class (the floor) | Encryption at rest, a key policy per workload, CloudTrail per key. No cryptographic separation between tenants. | Lowest: eight keys per environment, all in Terraform. | About 3 M a month with Bucket Keys (capacity A21), about $9 | 16 keys: $16 a month, up to $48 after two yearly rotations | None |
 | **2. Option 1 plus per-tenant data keys for file names and messages** (recommended) | Adds per-tenant binding for the most sensitive metadata. A scoping bug, SQL injection or a database-only reader can't read another tenant's names and messages. File contents stay under the shared key. | One small crypto module, one table, a key cache and tests (3.2). | Option 1 plus at most about 6 M a month for unwrapping, about $18 more | Same as option 1 | Negligible: well below the 20,000 requests a second shared quota in Tokyo and 10,000 in Osaka |
-| 3. A KMS key per tenant for files and fields, every tenant | The benefits in the list above, for every tenant. | A key per tenant in both Regions at provisioning, so either the operator API gets `CreateKey`, `PutKeyPolicy` and `ReplicateKey` (a privileged path inside a running service), or provisioning a tenant becomes a Terraform change. S3 replication needs one rule per tenant, because the replica key is set per rule. The bucket default can name only one key, so every upload must name its tenant's key, and a bucket policy can't check the match for 500 tenants. | More, because each tenant key needs its own Bucket Keys, but never more than the rate without Bucket Keys: at most about 12 M a month, about $35 | 500 tenants × 2 Regions = 1,000 keys: about $1,000 a month, $2,000 after the first rotation, $3,000 after the second. Prod idle costs $2,926 a month (capacity section 1). | 1,000 of the 100,000 keys allowed per Region. A replication configuration holds at most 1,000 rules, which caps a bucket pair at about 1,000 tenants. |
+| 3. A KMS key per tenant for files and fields, every tenant | The benefits in the list above, for every tenant. | A key per tenant in both Regions at provisioning, so either the operator API gets `CreateKey`, `PutKeyPolicy` and `ReplicateKey` (a privileged path inside a running service), or provisioning a tenant becomes a Terraform change. S3 replication needs one rule per tenant, because the replica key is set per rule. The bucket default can name only one key, so every upload must name its tenant's key, and a bucket policy can't check the match for 500 tenants. | More, because each tenant key needs its own Bucket Keys, but never more than the rate without Bucket Keys: at most about 12 M a month, about $35 | 500 tenants × 2 Regions = 1,000 keys: about $1,000 a month, $2,000 after the first rotation, $3,000 after the second. Prod idle costs $3,041 a month (capacity section 1). | 1,000 of the 100,000 keys allowed per Region. A replication configuration holds at most 1,000 rules, which caps a bucket pair at about 1,000 tenants. |
 | 4. Dedicated key per tenant, opt-in (later): a key we hold, or one in the tenant's own AWS account | Option 3 for the tenants that ask. A key held by the customer lets them cut off the service's access to their data. | Option 3's mechanics for a few tenants: a Terraform change and one replication rule per tenant. | Small | $2 a month per tenant, up to $6 after two rotations | Negligible |
 
 **Recommendation: option 2 for v1, with option 4 as the path for tenants that need a dedicated key.**
@@ -614,10 +630,11 @@ What is deliberately not a secret here:
 
 - **Verification codes:** `code_hmac = HMAC-SHA-256(key, "code/v1/" + code_id + "/" + code)`. Including the row ID
   means an HMAC can only match its own row, and the prefix keeps each key to one purpose. The row records which key was
-  used. A copy of the database alone can't be used to brute-force codes (data model section 1).
+  used, in `verification_codes.hmac_key_id`. A copy of the database alone can't be used to brute-force codes (data
+  model section 1).
 - **Email pseudonyms:** `"e" + key_id + ":" + base64url(HMAC-SHA-256(key, "email/v1/" + email_normalized))`, truncated
   to 128 bits. This is pseudonymization, not anonymization: anyone holding the key can test guesses, so it is treated as
-  a secret like any other. Each `email_suppressions` row records the key ID it was made with (6.5).
+  a secret like any other. Each `email_suppressions` row records the key ID it was made with, in `hmac_key_id` (6.5).
 - **Link tokens:** `HMAC-SHA-256(K_link, "link/v1/" + subject_id + "/" + link_issued_at)` (decision 10). The row
   records the key version in `link_key_id` and stores only the SHA-256 of the token. A copy of the database alone can't
   produce a token; with `K_link` as well it could produce every live link (6.5).
@@ -800,9 +817,9 @@ at once, and backups age out within 14 days.
 ### 8.4 What survives teardown, and how it is protected
 
 NFR-19 keeps the prod audit archive (both Regions) and the key that encrypts it (primary and replica) until the
-archive's retention ends, in an AWS account that stays open. They live in a separate **retained stack**: its own
-Terraform root module, which no environment `destroy` touches, and which depends on nothing that teardown removes
-(decision 19). From the day prod is created it holds:
+archive's retention ends, in the prod account, which stays open (ADR-0006). They live in a separate **retained
+stack**: its own Terraform root module, which no environment `destroy` touches, and which depends on nothing that
+teardown removes (decision 19). From the day prod is created it holds:
 
 | Resource | Why it is in the retained stack |
 |---|---|
@@ -810,9 +827,9 @@ Terraform root module, which no environment `destroy` touches, and which depends
 | The audit key, primary and replica, and its policy | It encrypts the records and everything below |
 | Its own Terraform state bucket, encrypted with the audit key | The environment's state bucket and the tfstate key are destroyed at teardown. The stack starts with local state, creates the key and the bucket, then moves its state into the bucket. |
 | Its own deploy role and the OIDC trust it uses | The environment's deploy role is destroyed too, and a key whose only administrator is gone can't be changed or scheduled for deletion. |
-| A trail for management events and the archive buckets' data events, writing to a small bucket under the audit key | EventBridge sees CloudTrail events only while a trail is logging, and the environment's trail goes away. If the accounts ADR adds an organization trail that covers this account, that trail replaces this one. |
+| A trail for the archive buckets' data events and, from teardown, management events, writing to a small bucket under the audit key | EventBridge sees CloudTrail events only while a trail is logging. While prod runs, the organization trail (ADR-0006) logs the account's management events, the free copy, and EventBridge sees them from it; this trail adds management events at teardown, so it doesn't bill a second copy while prod runs (capacity A37). It is needed because the organization trail ends with the shared account. |
 | EventBridge rules in both Regions, an alert topic encrypted with the audit key, and the delivery role between them | The alerts below keep working after teardown |
-| The NFR-19 budget alarm at $5, emailing directly | Needs no topic or key |
+| The NFR-19 budget alarm at $7, emailing directly | Needs no topic or key |
 
 | Guard | What it stops |
 |---|---|
@@ -821,7 +838,7 @@ Terraform root module, which no environment `destroy` touches, and which depends
 | Object Lock in compliance mode, 365 days | Deleting or overwriting records, even by the root user; a bucket that still holds objects can't be deleted either |
 | SCP and key policy (decision 13): `PutKeyPolicy`, `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait | Disabling or deleting the key, which would make the locked objects unreadable |
 | Multi-Region key: replica first, then primary | Destroying the key takes at least 60 days; a deleted replica can be re-created from the primary |
-| SCP: changes to the archive buckets' policy, lifecycle rules and Object Lock settings only by the retained stack's deploy role. If the accounts ADR (open question 4) gives the archive its own account, the stack moves there. | BreakGlass and every other role in the workload account |
+| SCP, on the prod OU (ADR-0006): changes to the archive buckets' policy, lifecycle rules and Object Lock settings only by the retained stack's deploy role | BreakGlass and every other role in the prod account |
 | EventBridge alerts on those calls against the retained resources, and on any SCP change | A change nobody notices |
 
 Teardown, in order:
@@ -829,7 +846,8 @@ Teardown, in order:
 1. Apply the retained stack with the environment's principals removed from the audit key policy and the bucket
    policies. KMS refuses a key policy that names a role that no longer exists, so leaving them in would block every
    later change to the key. The same apply turns the audit key's rotation off (`DisableKeyRotation`): no new records
-   are written, so rotating would add cost without protecting anything new.
+   are written, so rotating would add cost without protecting anything new. It also turns on management events in
+   the retained trail, before the organization trail can end with the shared account.
 2. Destroy the environment, then its bootstrap stack.
 3. Check the next bill (NFR-19).
 
@@ -840,12 +858,12 @@ After teardown:
 | Audit key: primary in Tokyo and replica in Osaka, rotation off from teardown | $2.00 (2 keys × $1) | $4.00 (2 keys × $2, after one rotation) |
 | Archive storage at teardown, S3 Standard in both Regions; it falls as retention ends | $0.05 (under 1 GB each) | $1.85 (37 GB each, capacity section 3.4) |
 | The retained trail, state bucket and alert topic: management events (the first copy is free), S3 and KMS requests for log delivery, SNS within its free tier | about $0.15 (estimate) | about $0.15 (estimate) |
-| **Total, against NFR-19's ≤ $5** | **about $2.20: inside** | **about $6.00: over** |
+| The shared account's log archive (the organization trail's bucket, 90-day Object Lock), for up to 90 days after the final teardown (ADR-0006) | a few cents | a few cents |
+| **Total, against NFR-19's ≤ $7** | **about $2.20: inside** | **about $6.00: inside** |
 
-- **Over the cap only in the worst case.** Only a year or more at design load with a rotated key exceeds $5. If prod
-  is going to run that long, the deploy role raises the audit key's rotation period (KMS allows up to 2,560 days)
-  before its first rotation. That is a recorded exception to 7.1, acceptable for a key whose data is write-once and
-  under Object Lock.
+- **Both cases fit with the yearly rotation kept**, so 7.1 needs no exception for the audit key. Two years or more
+  add a second rotation ($3 a key): about $6.20 at idle, still inside. At design load that would be about $8.00, but
+  the operating budget rules it out (capacity 7.4).
 - **AWS Config doesn't run after teardown.** It belongs to the environment; the EventBridge alerts above replace its
   `kms-cmk-not-scheduled-for-deletion` rule.
 - **Reading the archive** needs the audit reader permission set, through IAM Identity Center with MFA. Permission sets
@@ -867,7 +885,7 @@ so they tear down completely.
 | BreakGlass can reach file names and messages through an API pod | It has no Decrypt on the fields key and can't add it, but exec into an API pod acts as the pod's role, which unwraps data keys | The exec raises an alert from the Kubernetes audit log (decision 13); the after-action review compares what was done with the approved scope. Accepted. |
 | AWS runs the HSMs, and S3 decrypts on our behalf | No external key store; end-to-end encryption is a non-goal (PRD section 8) | Accepted |
 | Plain text in memory: file bytes while streaming and scanning, data keys, HMAC keys | Processing needs plain text | Graviton memory encryption against physical access; non-root, read-only filesystem, minimal image; scan workers on their own nodes; data keys cached at most 15 minutes |
-| GuardDuty Malware Protection reads files over 2 GB | ClamAV can't scan them (decision 15) | An AWS service in the bucket's Region, reading through its own role limited to the files bucket; it keeps no copy. The scan ADR confirms it. |
+| GuardDuty Malware Protection reads files over 2 GB | ClamAV can't scan them (decision 15) | An AWS service in the bucket's Region, reading through its own role limited to the large-file bucket; it keeps no copy. ADR-0019 records it. |
 | Load balancer access logs use SSE-S3, an exception to NFR-13 | The load balancer supports only SSE-S3 for access logs | Recorded exception; only the log reader role can read the bucket; no tokens or names in the logs |
 | No per-object KMS check on S3 | S3 Bucket Keys authorize per bucket-level key (decision 4) | Tenant scoping for objects comes from the key prefix, IAM and the service layer; every object read is logged by CloudTrail data events |
 | Aurora logs can still hold a value | pgaudit records what a person types under break-glass, by design; an input-syntax error message quotes the bad value | Terse error verbosity and no parameter logging (3.1); the API validates input before it reaches SQL; data protection masking of email addresses on the log groups; the logs key and access control. Low. |
@@ -878,7 +896,7 @@ so they tear down completely.
 | No tenant crypto-shredding | Keys are shared | Deletion jobs and backup ageing (8.2); dedicated keys as an opt-in later (section 5) |
 | Links and codes sit in recipients' mailboxes | Mail providers store messages | SES TLS policy `Require`; codes expire within 10 minutes; a link alone grants nothing (FR-14). Mail servers without TLS receive nothing, a deliverability cost we accept. |
 | A bug in field encryption makes names unreadable | New code | Property tests, a read-back check on write, and no wrapped key or KMS key is deleted while rows use it |
-| The audit archive depends on one AWS account staying open and paid (NFR-19) | A reference service with one maintainer | A $5 budget alarm in the retained stack; the retained stack plans without any other stack (8.4); the teardown runbook |
+| The audit archive depends on one AWS account staying open and paid (NFR-19) | A reference service with one maintainer | A $7 budget alarm in the retained stack; the retained stack plans without any other stack (8.4); the teardown runbook |
 
 ### 9.2 Checks
 
@@ -902,27 +920,32 @@ apply. CI checks run on the Terraform plan as policy-as-code; the tool is chosen
 | Retained resources | `kms-cmk-not-scheduled-for-deletion`, while the environment runs | No environment plan changes a resource tagged `retention = audit-archive`; the retained stack plans with no environment or bootstrap stack present, and its state bucket, trail and alert topic name the audit key. The teardown drill (NFR-19) checks that the audit reader can still read an archived record, that a test change to the archive raises the alert, and that the next bill shows only the retained stack. |
 | Residency | — | Keys replicate only to Osaka; the Region guard in NFR-21 covers KMS |
 
-## 10. Follow-ups in other documents
+## 10. Follow-ups in other documents: status
 
-Phase 2 documents, collected in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26):
+Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) unless marked otherwise:
 
-| Document | Change |
-|---|---|
-| Data model ([#13](https://github.com/codewithmuh/secure-file-transfer/issues/13)) | Ciphertext columns for `files.display_name`, `transfers.message` and `upload_requests.message`; a new `tenant_data_keys` table; the key ID stored with `code_hmac`; `email_suppressions` (proposed by the abuse design) records the HMAC key ID of each row (6.5). Closes the open item on per-tenant encryption. |
-| Capacity and cost ([#15](https://github.com/codewithmuh/secure-file-transfer/issues/15)) | 8 keys per Region instead of 6 (+$2 a month per Region); the registry key in the shared stack (+$1 a month in Tokyo, +$1 once it replicates to Osaka; 5.4); up to 6 M more KMS requests a month for field data keys (about $18); CloudTrail S3 data events on the files and audit buckets (about 15 M events a month at design load, about $15); the after-teardown cost in 8.4, which now includes the retained stack's own trail, state and alert topic and no AWS Config rule (about $2.20 planned, about $6.00 worst case). |
-| Architecture | Load balancer to pods over HTTPS; the scan workers' own node pool; no custom encryption context on S3 objects; the retained stack's contents and the teardown order (8.4); the shared registry's own key; EventBridge rules delivering through an execution role. |
-| PRD | Record the load balancer access log exception to NFR-13. |
+- **Data model, done.** Ciphertext columns `files.display_name_ct`, `transfers.message_ct` and
+  `upload_requests.message_ct`, each table with `data_key_version`, and `tenant_data_keys`; `hmac_key_id` on
+  `verification_codes` and `email_suppressions`.
+- **Capacity and cost, done.** 8 keys per Region; the registry key in the shared stack (capacity 5.4); up to 6 M more
+  KMS requests a month for field data keys; CloudTrail S3 data events; the after-teardown cost in 8.4 (capacity 7.4).
+- **Architecture, done.** Load balancer to pods over HTTPS; the scan workers' own node pool; no custom encryption
+  context on S3 objects; the retained stack and the teardown order; the registry key; EventBridge delivering through an
+  execution role; the large-file bucket pair (ADR-0012, ADR-0019).
+- **PRD, done.** NFR-13 records the load balancer access log exception; NFR-19 allows the retained stack at ≤ $7 a
+  month with the audit key's yearly rotation kept (8.4).
+- **Threat model, done** in the phase 3 review (#27–#30): T-36, T-73 and T-61 say what this page says.
+- **Authentication and authorization, done.** The names this page uses agree: API key prefixes `sft_dev_`, `sft_stg_`
+  and `sft_prd_`; `csrf-hmac` and `link-hmac`; one client secret per user pool; `sft-{env}-operator`; BreakGlass
+  reaching names only through an alerted exec into an API pod. Its 8.1 list of who may read with the files key now
+  includes the S3 replication and GuardDuty roles.
+- **Abuse and rate limits, done.** Per-address counters count both pseudonyms for 25 hours after an email-hmac
+  switch, and suppression lookups check every key that still has rows (6.5). A scan over its tenant's cap is re-sent
+  as a new message through the outbox (decision 16), so the relay stays the only sender to the work queues; the
+  intake queues each have one named sender (threat model T-50).
+- **Phase 4 ADRs.** ADR-0017 records open question 3 (section 5); ADR-0019 confirms GuardDuty Malware Protection for
+  files over 2 GB and its role; ADR-0006 confirms AWS Organizations, on which the SCP in 4.4 depends, and keeps the
+  retained stack in the prod account.
 
-Phase 3 sibling documents:
-
-| Document | Change |
-|---|---|
-| Threat model ([#21](https://github.com/codewithmuh/secure-file-transfer/issues/21)) | T-36 should not say the KMS encryption context includes `tenant_id` for objects: S3 objects carry none (decision 4); cross-tenant protection for files is the data-access scope, IAM prefix conditions and tests. T-73 should not cite Aurora's managed master password, which Aurora doesn't support for global database clusters; the master password is written with Terraform write-only arguments (6.3). T-61: the SCP leaves `PutKeyPolicy`, `DisableKey` and `ScheduleKeyDeletion` to the deploy roles only, not to break-glass (decision 13). |
-| Authentication and authorization ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)) | Agreed with this page: API key prefixes `sft_dev_`, `sft_stg_` and `sft_prd_`; `csrf-hmac` and `link-hmac` as in 6.1; one client secret per user pool; the operator API's own role `sft-{env}-operator`; BreakGlass reaching names only through an alerted exec into an API pod. Its 8.1 list of who may decrypt with the files key also needs the S3 replication role and the GuardDuty Malware Protection role. |
-| Abuse and rate limits ([#24](https://github.com/codewithmuh/secure-file-transfer/issues/24)) | Per-address counters count both pseudonyms for 25 hours after an email-hmac switch, and suppression lookups check every key that still has rows (6.5). A scan over its tenant's cap is re-sent as a new message (decision 16) through the outbox: the outbox relay sends it with a delay, so the relay stays the only role that sends to the queues and the scan worker only decrypts. |
-
-Phase 4:
-
-| Document | Change |
-|---|---|
-| ADRs | One for the open question 3 decision (section 5). The scan ADR confirms GuardDuty Malware Protection for files over 2 GB (decision 15) and its role. The accounts ADR (open question 4) confirms AWS Organizations, on which the SCP in 4.4 depends, and where the retained stack lives. |
+Left for later: every check in 9.2 that needs an AWS account waits for the AWS profile, and the on-demand rotation
+rehearsal (7.1) runs in the first staging build.

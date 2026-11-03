@@ -14,9 +14,10 @@ PRD open question 8, the download mechanism. The other phase 3 documents cover t
 ([#22](https://github.com/codewithmuh/secure-file-transfer/issues/22)) and authentication and authorization
 ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)). Where this page relies on them, it says so.
 
-Every number here is a starting value: configuration promoted dev → staging → prod like code, which an operator can
-override for one tenant (audited), tuned by the first load test and the first weeks in prod. NFR-14 lets phase 3
-tighten its numbers; this page adds daily code caps (section 2) and the upload and download limits NFR-14 left open.
+Every number here is a starting value: configuration promoted dev → staging → prod like code, tuned by the first load
+test and the first weeks in prod. Overriding one for a single tenant (audited) needs the per-tenant overrides that are
+still open (section 10). NFR-14 lets phase 3 tighten its numbers; this page adds daily code caps (section 2) and the
+upload and download limits NFR-14 left open.
 
 **Decisions in short**
 
@@ -35,7 +36,7 @@ tighten its numbers; this page adds daily code caps (section 2) and the upload a
 
 | ID | Abuse case | Who | Main controls |
 |---|---|---|---|
-| AB-1 | Link token brute force and enumeration | Anyone on the internet | 128-bit tokens, per-IP limits, a block on repeated `link_not_found` |
+| AB-1 | Link token brute force and enumeration | Anyone on the internet | 256-bit tokens, per-IP limits, a block on repeated `link_not_found` |
 | AB-2 | Verification code guessing | Someone holding a forwarded or leaked link | 5 attempts per code, lockout after 20 failures, per-IP failure limit |
 | AB-3 | Code flooding and email bombing of a victim | Leaked-link holder, or a member or API key | Per-link and per-address code caps, per-address and per-sender email caps, coalesced notices |
 | AB-4 | Sending spam or phishing through the service | A malicious or compromised tenant or member | Fixed templates, no sender text in emails, caps, per-tenant SES reputation |
@@ -51,7 +52,7 @@ tighten its numbers; this page adds daily code caps (section 2) and the upload a
 
 | | |
 |---|---|
-| Prevention | Link tokens carry at least 128 bits from the OS random generator (NFR-14; format in #23). They are stored as SHA-256, found by hash, and travel only in the URL fragment and in request bodies (architecture 4.2). `resolveLink` returns only the link kind, access state and locale (FR-14). Per IP: 60 link-step requests a minute in the app (NFR-14) and 100 a minute at the WAF. An IP that loads the recipient or uploader page more than 30 times in 5 minutes gets a WAF challenge on that navigation (section 3.2); a script that calls the API directly never sees the page and meets the per-IP limits instead. After 20 `link_not_found` answers in an hour, that IP gets `429` on every link step for the rest of the hour. With about 10^5 live links and 10^6 guesses a second, the expected time to hit any link is longer than 10^19 years. |
+| Prevention | Link tokens are 256-bit HMAC-SHA-256 outputs under the 256-bit keyring `K_link`, so guessing one is as hard as guessing the key (#23 4.1, #22 6.2); NFR-14 asks for at least 128 bits. They are stored as SHA-256, found by hash, and travel only in the URL fragment and in request bodies (architecture 4.2). `resolveLink` returns only the link kind, access state and locale (FR-14). Per IP: 60 link-step requests a minute in the app (NFR-14) and 100 a minute at the WAF. An IP that loads the recipient or uploader page more than 30 times in 5 minutes gets a WAF challenge on that navigation (section 3.2); a script that calls the API directly never sees the page and meets the per-IP limits instead. After 20 `link_not_found` answers in an hour, that IP gets `429` on every link step for the rest of the hour. Even at 128 bits, with about 10^5 live links and 10^6 guesses a second, the expected time to hit any link is longer than 10^19 years. |
 | Detection | `link_lookups_total{result}` (found, not_found, revoked, expired), IPs caught by the not-found rule, and the WAF rule that counts link-step requests per ASN. |
 | Response | Runbook `link-enumeration`: add the IPs or ASNs to the WAF block list and turn on the attack-mode rule (section 3.2). |
 
@@ -277,13 +278,13 @@ can't stop an admin from revoking a leaked transfer. The per-member limit still 
 |---|---|---|---|
 | Tenant | 60 searches a minute | App | `429` |
 | Tenant | 10 exports an hour, 1 at a time | App | `429` |
-| API key | 1 export an hour, each at most 100,000 events | App | `429`; a larger range gets `422 validation_failed` |
+| API key | 1 export an hour, each at most 100,000 events | App | `429`; a larger range gets `422 export_too_large` |
 
 **J. Key and tenant administration:** `createApiKey`, `createTenant`.
 
 | Key | Limit | Enforced by | Over the limit |
 |---|---|---|---|
-| Tenant | 20 new API keys a day; at most 50 active keys | App; PostgreSQL | `429`; `422 validation_failed` |
+| Tenant | 20 new API keys a day; at most 25 active keys (#23 5.2) | App; PostgreSQL | `429`; `422 validation_failed` |
 | Operator | 30 new tenants an hour | App | `429` |
 
 ### 2.3 NFR-14 coverage
@@ -299,14 +300,14 @@ can't stop an admin from revoking a leaked transfer. The per-member limit still 
 | Codes have at least 6 digits | — | 6 digits | Notification worker; the contract's pattern |
 | Lockout after 20 failed attempts until the member unlocks; the member and admins are told | Subject | 20 | PostgreSQL; a notice through the outbox |
 | A verified session lasts ≤ 24 hours | Link session | 24 hours | `link_sessions.expires_at`, checked on every call |
-| Link tokens carry ≥ 128 bits of randomness | — | ≥ 128 bits | Notification worker (#23 sets the format) |
+| Link tokens carry ≥ 128 bits of randomness | — | 256 bits, derived with `K_link` (#23 4.1) | Notification worker |
 
 **Why sign-in needs a trigger.** After 5 failed passwords, Cognito locks the user out for 2^(n−5) seconds, capped at
 about 15 minutes, so failures 6 to 14 can come at 1, 3, 7, 15, 31, 63, 127, 255 and 511 seconds: 14 in the first 15
 minutes. A pre-authentication trigger counts each attempt per account in the counter store over a sliding 15
 minutes, and the post-authentication trigger clears the count. The trigger denies the 11th attempt, and denies
-sign-in when it can't reach the store. It is a small function in the VPC, deployed by Terraform; the alternative is
-to amend NFR-14 to Cognito's curve (section 10).
+sign-in when it can't reach the store. It is a small function in the VPC, deployed by Terraform. NFR-14 keeps its 10
+and names the trigger, rather than moving to Cognito's curve.
 
 ### 2.4 How limits behave
 
@@ -428,8 +429,8 @@ address or failed attempt. It keeps floods off the pods; the application enforce
   investigations; the runbooks hold them.
 
 **Cost.** Per region in prod, the API web ACL has 11 rules and the sign-in web ACL 6; the CloudFront web ACL has 5.
-Challenges now come only from page loads. The capacity page prices 12, 3 and 4 rules (A29); the difference is about
-$5 a month (section 10).
+Challenges come only from page loads. The capacity page prices these counts (A29): about $130 a month in Tokyo and
+$27 in Osaka at design load.
 
 ## 4. Counter store
 
@@ -511,7 +512,7 @@ Existing sessions keep working; `RateLimitStoreUnavailable` pages (section 8), b
 | NFR-4: first byte p95 ≤ 1 s | About 0.3 s: the grant call, then the first bytes from S3 in the same region | Similar, plus the CDN hop | Fastest |
 | NFR-21: no file contents stored outside Japan | Bytes go only from Tokyo or Osaka to the client | Edges outside Japan pass the bytes through with caching off; NFR-21 allows this, but a cache policy must guarantee it | Direct from S3 |
 | NFR-22: latest two versions of four browsers | The browser's own download manager, in every browser | Chunked downloads in JavaScript need the File System Access API, which Firefox and Safari don't offer for saving files, or a service-worker workaround that is fragile for files of several GB | The browser's download manager |
-| Cost at design load | About $243 a month of load balancer capacity plus about 0.4 vCPU (capacity 5.5) | A few dollars a month of requests | None extra |
+| Cost at design load | About $243 a month of load balancer capacity plus about 0.4 vCPU (capacity 5.6) | A few dollars a month of requests | None extra |
 | Operations | Pods carry file bytes; a deploy cuts long downloads, which resume (5.7) | A second distribution, a key group whose private key must be rotated, origin access with a KMS key policy that lets CloudFront decrypt file objects (#22), origin failover to Osaka, and a chunked-download engine in the web app | Simplest |
 | Verdict | **Chosen** | Rejected | Rejected; the PRD doesn't accept a bearer URL |
 
@@ -565,9 +566,10 @@ sequenceDiagram
 
 ### 5.4 Download grants
 
-A new table, `download_grants` (data model, section 10): `id`, `tenant_id`, `file_id`, `recipient_id` and
-`link_session_id`, or `user_id` and `member_session_id`, `s3_version_id`, `created_at`, `expires_at`, `byte_budget`,
-`bytes_served`, `request_count`, `active_stream_id`, `last_stream_at`.
+The `download_grants` table (data model): `id`, `tenant_id`, `file_id`, `s3_version_id`, either `recipient_id` and
+`link_session_id` or `user_id` and `member_session_id`, `byte_budget`, `bytes_served`, `request_count`, `expires_at`,
+`active_stream_id` and `active_stream_until` (the stream lease, renewed at each 30-second re-check), `archived_at`
+(when both regions' archive confirmed the grant record) and `created_at`.
 
 | Rule | Value | Why |
 |---|---|---|
@@ -624,7 +626,7 @@ be up to 5 minutes behind (NFR-10), which can only allow a few extra bytes, neve
 
 ### 5.8 Cost
 
-From the capacity estimate (section 5.5): about 42 load balancer capacity units an hour at design load, about $243 a
+From the capacity estimate (section 5.6): about 42 load balancer capacity units an hour at design load, about $243 a
 month, and about 0.4 vCPU; almost nothing at idle. CloudFront would have saved the $243 at the price of the drawbacks
 in 5.1. Internet egress is the same either way.
 
@@ -681,9 +683,11 @@ is already past `uploading` returns it unchanged.
 
 ### 6.4 Scan limits and zip bombs
 
-ClamAV can't scan files over 2 GB, so the capacity baseline is a hybrid: ClamAV up to 2 GB, GuardDuty Malware
-Protection for S3 above (capacity 3.3); the scan ADR (open question 2) decides. GuardDuty's role needs decrypt on the
-files key (#22), and large files stay under `tenants/{tenant_id}/`. Results map to file states like this:
+ClamAV can't scan files over 2 GB, so scanning is a hybrid: ClamAV up to 2 GB, GuardDuty Malware Protection for S3
+above (capacity 3.3, ADR-0019). A protection plan can't select by size, so files declared over 2 GB go to a second
+files bucket pair, chosen at upload start, with the same settings, keys and `tenants/{tenant_id}/` key layout, and
+the plan covers that whole bucket. GuardDuty's role may decrypt with the files key, through S3, for that bucket only
+(#22). Results map to file states like this:
 
 | Engine result | ClamAV, files up to 2 GB | GuardDuty, files over 2 GB | File state |
 |---|---|---|---|
@@ -700,7 +704,10 @@ files key (#22), and large files stay under `tenants/{tenant_id}/`. Results map 
 - **Scan workers.** clamd requests 4 GiB, and each pod has up to 2 GB of scratch disk, enough for its largest file
   (capacity 4.1). A file's timeout scales with its size (a scan takes about 1 s plus 0.058 s per MB, 2 minutes for
   2 GB; capacity 3.3), and running out of time counts as a failed attempt. The engine container has a read-only root
-  file system and no network access except to its signature mirror.
+  file system, no service account token and no AWS credentials, and scans over a local socket. It shares the pod's
+  network namespace, so its network isolation is the pod's network policy: no ingress, and egress only to the
+  signature mirror and the AWS endpoints the worker needs. The engine can reach what the worker reaches, though it
+  holds nothing to authenticate with (ADR-0019).
 - **Fair scanning.** Scan queues are SQS fair queues keyed by tenant, and each tenant may run at most 4 small-file
   and 2 large-file ClamAV scans at once, counted with leases in the counter store. A worker that receives a message
   over its tenant's cap writes a new scan message to the outbox, which the relay sends with a 30-second delay, and
@@ -753,8 +760,9 @@ The caps are in section 2.2, groups A and G. Three design points:
   (SES tenants are regional) with the shared domain identity and configuration set, and every send names it. An SES
   pause reaches the notification worker as an EventBridge event; the worker holds that tenant's emails and an operator
   is paged. The account alarms stay, because the account's reputation sums every tenant. It costs about $10 a month
-  at design load ($0.005 per tenant a month plus $0.005 per 1,000 emails); its availability in Tokyo and Osaka must be
-  confirmed before the email ADR.
+  at design load ($0.005 per tenant a month plus $0.005 per 1,000 emails). Tenant management and tenant-level
+  suppression are still unconfirmed in Tokyo and Osaka; the first staging build confirms them, and a region without
+  them relies on our own pause and suppression table (ADR-0015).
 - **Our own automatic pause.** The notification worker rates each tenant over its most recent 1,000 emails, none
   older than 30 days (a tenant with fewer isn't rated), and pauses its sending when hard bounces reach 5 % and at
   least 50, or complaints reach 0.3 % and at least 3. Smaller samples prove nothing: one complaint in 200 emails is
@@ -772,11 +780,15 @@ The caps are in section 2.2, groups A and G. Three design points:
 
 ### 7.4 Suppression list
 
-- The SES account-level suppression list is on for bounces and complaints, as a backstop. Our own
-  `email_suppressions` table (address HMAC, `hmac_key_id`, scope, reason, created, expiry) decides what we send; a
-  lookup checks the address under every key that still has rows and re-keys an old match (#22).
-- A hard bounce suppresses the address everywhere; a complaint, only for the tenant that sent the email. An operator
-  can remove an entry once the person confirms the address works.
+- **A hard bounce suppresses the address everywhere; a complaint, only for the tenant that sent the email.** An
+  operator can remove an entry once the person confirms the address works.
+- **Our own `email_suppressions` table decides what we send:** `tenant_id` (empty for a hard bounce, which applies to
+  every tenant; set for a complaint, which applies to that tenant only), `email_hmac`, `hmac_key_id`, `reason`,
+  `created_at` and `expires_at` (data model). A lookup checks the address under every key that still has rows and
+  re-keys an old match (#22).
+- **SES's own lists back it up on the same rule.** The account-level suppression list is on for hard bounces only,
+  because a complaint there would block the address for every tenant. Complaints go to the SES tenant's own
+  suppression list (tenant-level suppression), so they stay per tenant (ADR-0015).
 - `createTransfer` and `createUploadRequest` refuse a suppressed recipient with `422 recipient_undeliverable`, shown
   in the recipient's status (FR-7). A code request for a suppressed address sends nothing, and the recipient page
   says the code couldn't be sent and to contact the sender.
@@ -891,51 +903,38 @@ verification funnel, streams and email reputation.
 | Email caps and coalescing | The 21st link to one address in a day from one tenant gets `429`; the cross-tenant cap delays and doesn't refuse, and the recipient shows `queued`; 50 uploads give one files-arrived email | CI |
 | Alerts have runbooks (NFR-17) | The test that fails if an alert has no runbook | CI |
 
-## 10. Changes this design asks of other documents
+## 10. Changes asked of other documents: status
 
-Each change lands through its own issue and pull request.
+Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) unless marked otherwise:
 
-**API contract** ([#14](https://github.com/codewithmuh/secure-file-transfer/issues/14)):
-
-1. `DownloadMethod` keeps only `stream`; `signed_cookie` and `refresh_after` go.
-2. Add `getSessionDownloadContent` (`GET /session/downloads/{grant_id}/content`), authorised by the grant ID and a
-   `__Host-sft_link` cookie holding the grant's session and exempt from `X-Link-Session`, and
-   `getReceivedFileDownloadContent` (`GET /files/{file_id}/downloads/{grant_id}/content`, `memberSession`). Both are
-   safe methods with no CSRF header (#23), support Range and `If-Range`, and return `200`, `206`, `401`, `403`, `404`,
-   `410`, `416`, `429` and `503` with the headers in 5.6. `resume_grant_id` works only in the grant's session.
-3. New error codes `403 download_grant_exhausted`, `413 storage_quota_exceeded`, `416 range_not_satisfiable` and
-   `422 recipient_undeliverable`; a `RecipientStatus` delivery state whose `queued` covers every delay (7.2).
-4. README section 6: this page's upload, download and email limits; the WAF `429` with its CORS headers; `503` for
-   the sign-in routes when the counters are unavailable.
-5. Recommended, for the maintainer to decide: operator operations to suspend and resume a tenant and to set
-   per-tenant limit overrides; optional source address ranges on an API key; a public operation behind the "report
-   this email" link; a cap on expiry extensions, for example no later than 90 days after the transfer was sent.
-
-**PRD:** mark open question 8 decided (stream through the API) and point FR-6, FR-14 and the pre-signed URL risk row
-to this page. In NFR-14, add the upload and download starting limits and the daily code caps (20 per link, 50 per
-address). In NFR-1, exempt the probe mailbox's addresses from the per-address link-email caps too. Keep "≤ 10 failed
-sign-ins per account per 15 minutes", met by the trigger; the alternative is to amend it to Cognito's curve (up to
-14 in the first 15 minutes, then about one per 15 minutes), a reasonable trade with mandatory MFA and threat
-protection, but a change to a measured target.
-
-**Architecture** ([#12](https://github.com/codewithmuh/secure-file-transfer/issues/12)): section 2, the counter
-store, its failure modes and the sign-in trigger; 4.1, the completion order (lock and re-check, complete, check the
-size) and the deferred-scan re-send through the outbox; 4.2, the download decision in place of the candidates table;
-8, the 120-second stream drain; 9, rows for the download mechanism and the counter store.
-
-**Data model** ([#13](https://github.com/codewithmuh/secure-file-transfer/issues/13)): add `download_grants` with its
-session columns, `files.s3_version_id`, `tenant_usage`, `email_suppressions` with `hmac_key_id`, the recipient's
-delivery state, and per-tenant limit overrides.
-
-**Capacity** ([#15](https://github.com/codewithmuh/secure-file-transfer/issues/15)): confirm the streaming load
-balancer line (about $243 a month at design load); set A29's rules to 11 (API), 6 (sign-in) and 5 (CloudFront), with
-challenges only on page loads (about $5 a month more); keep SES tenant management (about $10 a month at design load)
-and the sign-in trigger (a few dollars).
+- **API contract, done.** `DownloadMethod` keeps only `stream`; `getSessionDownloadContent` and
+  `getReceivedFileDownloadContent` as in 5.3 and 5.6, the first exempt from `X-Link-Session`; `403
+  download_grant_exhausted`, `413 storage_quota_exceeded`, `416 range_not_satisfiable` and `422
+  recipient_undeliverable`; the `queued` delivery state; README section 6 with this page's limits, the WAF `429` and
+  its CORS headers, and `503` for the sign-in routes; `422 export_too_large` for an API key's export past 100,000
+  events.
+- **PRD, done.** Open question 8 decided; FR-6, FR-14 and the pre-signed URL risk point here; NFR-14 has the upload
+  and download limits, the daily code caps (20 per link, 50 per address) and the trigger for failed sign-ins; NFR-1
+  exempts the probe mailbox from the per-address link-email caps too.
+- **Architecture, done.** Section 2, the counter store, its failure modes and the sign-in trigger; 4.1, the completion
+  order and the deferred-scan re-send through the outbox; 4.2, the download decision; 8, the 120-second stream drain;
+  9, rows for the download mechanism and the counter store.
+- **Data model, done.** `download_grants` with its session columns, `files.s3_version_id`, `tenant_usage`,
+  `email_suppressions` with `hmac_key_id`, and the recipient's `delivery_state`.
+- **Capacity, done.** The streaming load balancer line (about $243 a month at design load, capacity 5.6); A29 at 11,
+  6 and 5 rules, with challenges only on page loads; SES tenant management and the sign-in triggers.
+- **Left for the maintainer:** operator operations to suspend and resume a tenant, per-tenant limit overrides (and
+  their `tenant_limit_overrides` table), source address ranges on an API key, a public "report this email" operation,
+  and a cap on expiry extensions. The API README and the data model list them as open. Until they exist, a limit
+  changes only through deploy config for every tenant, and the runbooks that raise a tenant's quota or suspend a tenant
+  (AB-4, AB-5, 8.3) have no operator operation to call.
 
 **Open points for the maintainer:**
 
 - The grant's budget (3 × size, 20 requests, 24 hours, one session) and the 120-second stream drain.
 - The default quotas (2 TB stored, 200 GB uploaded and 500 GB granted a day per tenant; 25 GB a day per recipient)
   and the sign-in sizing assumptions (30 % of sign-ins in the busiest hour, a 1,000-member tenant behind one address).
-- IPv4-only load balancer in v1; the trigger or an amended NFR-14 for failed sign-ins; whether recipients and
-  uploaders stay outside the tenant's 1,000-a-minute budget, as this page proposes.
+- IPv4-only load balancer in v1, and whether recipients and uploaders stay outside the tenant's 1,000-a-minute budget,
+  as this page proposes.
+- SES tenant management and tenant-level suppression are still unconfirmed in Tokyo and Osaka. The first staging build
+  confirms them; a region without them relies on our own pause and suppression table (7.3, 7.4, ADR-0015).
