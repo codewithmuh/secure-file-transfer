@@ -29,6 +29,12 @@ jobs:
         uses: docker://rhysd/actionlint:1.7.12
         with:
           args: -color
+      - name: Lint the OpenAPI contract (rules in redocly.yaml)
+        uses: docker://redocly/cli:2.64.1
+        env:
+          REDOCLY_TELEMETRY: "off"
+        with:
+          args: lint docs/api/openapi.yaml
       - name: Scan for secrets
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:

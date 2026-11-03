@@ -1,0 +1,22 @@
+# Lint rules for the API contract, docs/api/openapi.yaml (CI: the repo-checks job).
+# The linter's recommended rules, plus two rules from ADR-0002 that fail the build.
+extends:
+  - recommended
+
+rules:
+  rule/operation-declares-permission:
+    subject:
+      type: Operation
+      property: x-permission
+    assertions:
+      defined: true
+    message: Every operation declares x-permission, a permission name or `public` (ADR-0002).
+    severity: error
+  rule/operation-declares-429:
+    subject:
+      type: Responses
+    assertions:
+      required:
+        - '429'
+    message: Every operation declares a 429 response with Retry-After (ADR-0002, NFR-14).
+    severity: error

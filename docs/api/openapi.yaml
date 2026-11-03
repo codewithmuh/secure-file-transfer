@@ -1,0 +1,3574 @@
+openapi: 3.1.0
+info:
+  title: secure-file-transfer API
+  version: 1.0.0-draft
+  summary: Send and request confidential files through expiring links that only a verified email address can open.
+  description: |
+    The public, versioned REST API of secure-file-transfer (FR-31). The web app (FR-30) and tenant automation (FR-32)
+    use it; nothing the web app does bypasses it.
+
+    This is the design-first contract from planning phase 2 (issue #14). Once code exists, the document generated from
+    the code replaces this file and CI fails if the two differ (ADR-0002). See `docs/api/README.md` for the
+    conventions: authentication, errors, pagination, idempotency and rate limits.
+
+    Parts marked **provisional** wait for a phase 3 decision: member sign-in (PRD open question 1) and the download
+    mechanism (PRD open question 8).
+  license:
+    name: MIT
+    identifier: MIT
+  contact:
+    name: secure-file-transfer maintainers
+    url: https://github.com/codewithmuh/secure-file-transfer
+
+servers:
+  - url: /v1
+    description: Relative to the API origin. The domain waits for PRD open question 5.
+
+tags:
+  - name: Account
+    description: The signed-in member or admin.
+  - name: Transfers
+    description: Sending files to external recipients (UC-1, FR-1 to FR-9).
+  - name: Files
+    description: Uploading files to a transfer, file state, and files received through upload requests (FR-2, FR-12, FR-13, FR-16).
+  - name: Upload requests
+    description: Asking an external person to deliver files (UC-2, FR-10 to FR-13).
+  - name: Links and verification
+    description: Public steps a recipient or uploader takes before verification. The link token travels in the request body, never in a URL (FR-14).
+  - name: Recipient session
+    description: What a recipient or uploader can do after verifying their email address, within one link session (FR-15).
+  - name: Audit
+    description: Searching and exporting the audit log (UC-4, FR-27 to FR-29).
+  - name: Tenant admin
+    description: Members, roles and tenant policy (UC-5, FR-22 to FR-24).
+  - name: API keys
+    description: Tenant-scoped API keys for automation (FR-32).
+  - name: Operator
+    description: Platform operator actions (UC-6, FR-34).
+
+paths:
+  /me:
+    get:
+      tags: [Account]
+      operationId: getCurrentMember
+      summary: Get the signed-in member
+      description: |
+        Returns the signed-in member or admin and their tenant. The web app uses it to decide what to show.
+        Signing in and out is provisional: those operations are added once PRD open question 1 decides how members
+        sign in with MFA.
+
+        Requirements: FR-22, FR-25, FR-30.
+      x-permission: account.read
+      security:
+        - memberSession: []
+      responses:
+        '200':
+          description: The signed-in member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentMember'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers:
+    post:
+      tags: [Transfers]
+      operationId: createTransfer
+      summary: Create a transfer
+      description: |
+        Creates a transfer in the `draft` state with its recipients, expiry, optional message and optional download
+        limit. Add files with `addTransferFile`, then call `sendTransfer`. A draft with no activity for 7 days is
+        cancelled.
+
+        `expires_at` must be between 1 hour and 30 days from now, and within the tenant's `max_expiry`. When it is left
+        out, the expiry is 7 days, or the tenant's maximum if that is shorter. Each recipient's domain is checked
+        against the tenant's allowed and blocked domains.
+
+        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `409 idempotency_conflict`.
+
+        Requirements: FR-1, FR-3, FR-4, FR-8, FR-24, FR-33.
+      x-permission: transfer.create
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferCreate'
+      responses:
+        '201':
+          description: The transfer was created as a draft.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Transfers]
+      operationId: listTransfers
+      summary: List transfers
+      description: |
+        Lists transfers, newest first. `scope=own` (the default) returns the caller's own transfers. `scope=tenant`
+        returns every transfer in the tenant and needs the admin role or an API key. Admins see metadata only.
+
+        Requirements: FR-1, FR-7, FR-20.
+      x-permission: transfer.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - $ref: '#/components/parameters/TransferStateFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of transfers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    get:
+      tags: [Transfers]
+      operationId: getTransfer
+      summary: Get a transfer
+      description: |
+        Returns a transfer with its files and recipients. Each file shows its state, so for a `held` transfer the
+        member sees which file isn't shareable and why (UC-1). A transfer past `expires_at` is shown as `expired` even
+        before the lifecycle job records it.
+
+        Requirements: FR-1, FR-5, FR-16, FR-21.
+      x-permission: transfer.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+      responses:
+        '200':
+          description: The transfer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/send:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Transfers]
+      operationId: sendTransfer
+      summary: Send a transfer
+      description: |
+        Moves a `draft` transfer to `submitted`. Every file must have finished uploading. The service then runs the
+        locked evaluation (architecture 4.1): when every file is shareable the transfer becomes `sent` and each
+        recipient is emailed a link; when any file isn't shareable it becomes `held` and no recipient is notified.
+
+        Calling it again on a transfer that is already `submitted`, `held` or `sent` returns the current transfer, so
+        a retry is safe.
+
+        Errors: `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state` (cancelled), `409 transfer_revoked`,
+        `409 transfer_expired`.
+
+        Requirements: FR-1, FR-5.
+      x-permission: transfer.send
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The transfer, now `submitted`, `sent` or `held`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Transfers]
+      operationId: cancelTransfer
+      summary: Cancel a draft or held transfer
+      description: |
+        Cancels a `draft` or `held` transfer. No recipient is notified, and its files are deleted on the PRD data
+        lifecycle schedule. Cancelling a transfer that is already `cancelled` returns it unchanged. A transfer that was
+        sent is revoked instead (`revokeTransfer`).
+
+        Errors: `409 invalid_state`.
+
+        Requirements: FR-5, FR-21.
+      x-permission: transfer.cancel
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The cancelled transfer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Transfers]
+      operationId: revokeTransfer
+      summary: Revoke a transfer
+      description: |
+        Revokes a `submitted`, `held` or `sent` transfer. The member who created it can revoke it, and so can any
+        tenant admin. In the same transaction every link session of the transfer ends. No new download can start
+        within 5 seconds, and a download in progress stops within 60 seconds (NFR-6). Recipients then see that the
+        link was revoked (`link_revoked`).
+
+        The response comes only after the revocation record is in the audit archive in both regions (NFR-10). If that
+        write fails the call returns `503` and can be retried. Revoking a transfer that is already `revoked` returns it
+        unchanged.
+
+        Errors: `409 invalid_state` (draft or cancelled), `409 transfer_expired`, `503 service_unavailable`.
+
+        Requirements: FR-20, NFR-6, NFR-10.
+      x-permission: transfer.revoke
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The revoked transfer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /transfers/{transfer_id}/extend:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Transfers]
+      operationId: extendTransferExpiry
+      summary: Extend a transfer's expiry
+      description: |
+        Moves `expires_at` later for a transfer that hasn't ended (`draft`, `submitted`, `held` or `sent`). The new
+        time must be later than the current one. The limits apply to the transfer's whole lifetime, counted from
+        `sent_at` (or from creation while it is a draft): at most 30 days, and at most the tenant's `max_expiry`.
+        Repeated extensions can't keep a transfer alive beyond that.
+
+        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `422 expiry_out_of_range`.
+
+        Requirements: FR-9, FR-3.
+      x-permission: transfer.extend
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExpiryExtension'
+      responses:
+        '200':
+          description: The transfer with its new expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/recipients:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    get:
+      tags: [Transfers]
+      operationId: listTransferRecipients
+      summary: Get per-recipient status
+      description: |
+        For each recipient: whether they were notified, when they verified, whether they are locked out, and which
+        files they downloaded and when. A transfer has at most 50 recipients, so the list isn't paginated.
+
+        Requirements: FR-7, NFR-14.
+      x-permission: transfer.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+      responses:
+        '200':
+          description: Every recipient of the transfer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientStatusList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/recipients/{recipient_id}/unlock:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+      - $ref: '#/components/parameters/RecipientId'
+    post:
+      tags: [Transfers]
+      operationId: unlockRecipient
+      summary: Unlock a locked-out recipient
+      description: |
+        A recipient is locked out after 20 failed verification attempts on this transfer (NFR-14). The member who
+        created the transfer, or a tenant admin, unlocks them; the count of failed attempts starts again from zero.
+        Unlocking a recipient who isn't locked returns their status unchanged. The lockout and the unlock are
+        security-critical audit records.
+
+        Errors: `409 transfer_revoked`, `409 transfer_expired`.
+
+        Requirements: NFR-14, FR-7, FR-27.
+      x-permission: recipient.unlock
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The recipient's status after the unlock.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipientStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/files:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Files]
+      operationId: addTransferFile
+      summary: Add a file to a draft transfer
+      description: |
+        Declares a file's name, type and size, and starts its multipart upload. The response carries the upload plan
+        (`part_size`, `part_count`); request part URLs with `requestUploadPartUrls`. Files can be added only while the
+        transfer is a `draft`.
+
+        Limits (FR-1, FR-2): 50 files per transfer, 5 GB (5,000,000,000 bytes) per file, 20 GB per transfer, counted
+        from the declared sizes.
+
+        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `413 file_too_large`,
+        `413 total_too_large`, `422 too_many_files`, `409 idempotency_conflict`.
+
+        Requirements: FR-1, FR-2.
+      x-permission: file.upload
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileCreate'
+      responses:
+        '201':
+          description: The file, in the `uploading` state, with its upload plan.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /files/{file_id}:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      tags: [Files]
+      operationId: getFile
+      summary: Get a file
+      description: |
+        Returns a file of one of the caller's transfers or upload requests, with its state: `uploading`, `scanning`,
+        `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`. `shareable` says whether it can be
+        downloaded under the current tenant policy. The web app polls this while a file is scanning.
+
+        Requirements: FR-16, FR-18, FR-19.
+      x-permission: file.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+        - tenantApiKey: ['upload_requests:read']
+      responses:
+        '200':
+          description: The file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [Files]
+      operationId: deleteFile
+      summary: Remove or delete a file
+      description: |
+        For a file of a transfer: removes it while the transfer is a `draft` or `held`. Removing the blocked file of a
+        `held` transfer moves it back to `submitted` and runs the evaluation again, so the remaining files can be sent
+        (UC-1). Removing the last file of a `held` transfer is refused; cancel the transfer instead.
+
+        For a file received through an upload request: deletes it before its retention ends (FR-13).
+
+        The file's contents are deleted on the PRD data lifecycle schedule. Only the member who owns the transfer or
+        request can do this.
+
+        Errors: `409 invalid_state`, `409 transfer_empty`, `409 transfer_revoked`, `409 transfer_expired`.
+
+        Requirements: FR-5, FR-13, FR-21.
+      x-permission: file.delete
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+        - tenantApiKey: ['upload_requests:write']
+      responses:
+        '204':
+          description: The file was removed. Its contents are deleted on the data lifecycle schedule.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /files/{file_id}/parts:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Files]
+      operationId: requestUploadPartUrls
+      summary: Get upload URLs for parts of a file
+      description: |
+        Returns a pre-signed URL for each requested part, up to 100 per call. Each URL allows one `PUT` of exactly
+        that part's size to object storage, for at most 15 minutes, and allows nothing else. Ask again for parts whose
+        URL expired. URLs are issued only while the file is `uploading` and its transfer is a `draft`.
+
+        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `422 validation_failed` (a part
+        number beyond `part_count`).
+
+        Requirements: FR-2, NFR-3, NFR-6.
+      x-permission: file.upload
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartUrlRequest'
+      responses:
+        '200':
+          description: One upload URL per requested part.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PartUrlList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Files]
+      operationId: listUploadedParts
+      summary: List the parts already uploaded
+      description: |
+        Lists the parts object storage already holds for a file that is still `uploading`, so an interrupted upload
+        sends only the missing parts. A file has at most 1,000 parts, so the list isn't paginated.
+
+        Errors: `409 invalid_state`.
+
+        Requirements: FR-2, NFR-3.
+      x-permission: file.upload
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The parts received so far.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadedParts'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /files/{file_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Files]
+      operationId: completeUpload
+      summary: Complete a file upload
+      description: |
+        Assembles the uploaded parts into one object, checks its real size against the declared size and the limits,
+        and re-checks the transfer under a row lock, so a revocation that lands meanwhile wins (NFR-6). On success the
+        file moves to `scanning`. If a check fails, the object is deleted and the file becomes `rejected`.
+
+        Completing a file that is already past `uploading` returns it unchanged, so a retry is safe.
+
+        Errors: `409 upload_incomplete` (parts missing), `409 transfer_revoked`, `409 transfer_expired`,
+        `422 upload_size_mismatch`.
+
+        Requirements: FR-2, FR-16, NFR-6.
+      x-permission: file.upload
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['transfers:write']
+      responses:
+        '200':
+          description: The file, now `scanning`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /files/{file_id}/downloads:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Files]
+      operationId: createReceivedFileDownload
+      summary: Download a received file
+      description: |
+        Grants the member who created an upload request access to one shareable file received through it (FR-12).
+        Tenant admins see metadata only and can't download, and API keys can't download file contents.
+
+        Every call is checked and audited; the audit record is committed before access is returned, and if it can't
+        be written the call fails with `503` (NFR-15). An `unscannable` file allowed by policy carries a warning
+        (FR-18). This operation never replays a stored response, so it takes no `Idempotency-Key`.
+
+        **Provisional:** the shape of `DownloadAccess` waits for PRD open question 8.
+
+        Errors: `403 permission_denied`, `409 file_not_shareable`, `503 service_unavailable`.
+
+        Requirements: FR-12, FR-16, FR-17, FR-18, NFR-15.
+      x-permission: file.download_received
+      security:
+        - memberSession: []
+          csrfToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadRequest'
+      responses:
+        '200':
+          description: How to fetch the file's bytes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /upload-requests:
+    post:
+      tags: [Upload requests]
+      operationId: createUploadRequest
+      summary: Create an upload request
+      description: |
+        Creates an `open` upload request for one external email address and emails them an upload link. The expiry
+        follows the same rules as a transfer (FR-3), and the address is checked against the tenant's allowed and
+        blocked domains.
+
+        Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `409 idempotency_conflict`.
+
+        Requirements: FR-10, FR-3, FR-24, FR-33.
+      x-permission: upload_request.create
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['upload_requests:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadRequestCreate'
+      responses:
+        '201':
+          description: The upload request was created and the link is being emailed.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Upload requests]
+      operationId: listUploadRequests
+      summary: List upload requests
+      description: |
+        Lists upload requests, newest first. `scope=own` (the default) returns the caller's own requests; `scope=tenant`
+        returns every request in the tenant and needs the admin role or an API key.
+
+        Requirements: FR-10, FR-20.
+      x-permission: upload_request.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['upload_requests:read']
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - $ref: '#/components/parameters/UploadRequestStateFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of upload requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadRequestPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /upload-requests/{upload_request_id}:
+    parameters:
+      - $ref: '#/components/parameters/UploadRequestId'
+    get:
+      tags: [Upload requests]
+      operationId: getUploadRequest
+      summary: Get an upload request
+      description: |
+        Returns an upload request, including whether the uploader has verified or is locked out.
+
+        Requirements: FR-10, FR-12, NFR-14.
+      x-permission: upload_request.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['upload_requests:read']
+      responses:
+        '200':
+          description: The upload request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /upload-requests/{upload_request_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/UploadRequestId'
+    post:
+      tags: [Upload requests]
+      operationId: revokeUploadRequest
+      summary: Revoke an upload request
+      description: |
+        Revokes an `open` upload request: its link sessions end and no new upload can start or complete (NFR-6).
+        Files already received stay available until their own retention ends (FR-13). The member who created it, or a
+        tenant admin, can revoke it.
+
+        As with `revokeTransfer`, the response comes only after the revocation record is in the audit archive in both
+        regions, and `503` means it can be retried. Revoking a request that is already `revoked` returns it unchanged.
+
+        Errors: `409 upload_request_expired`, `503 service_unavailable`.
+
+        Requirements: FR-20, NFR-6, NFR-10.
+      x-permission: upload_request.revoke
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['upload_requests:write']
+      responses:
+        '200':
+          description: The revoked upload request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /upload-requests/{upload_request_id}/unlock:
+    parameters:
+      - $ref: '#/components/parameters/UploadRequestId'
+    post:
+      tags: [Upload requests]
+      operationId: unlockUploader
+      summary: Unlock a locked-out uploader
+      description: |
+        Unlocks the uploader after 20 failed verification attempts on this request (NFR-14), the same way as
+        `unlockRecipient`. Unlocking an uploader who isn't locked returns the request unchanged.
+
+        Errors: `409 upload_request_revoked`, `409 upload_request_expired`.
+
+        Requirements: NFR-14, FR-27.
+      x-permission: uploader.unlock
+      security:
+        - memberSession: []
+          csrfToken: []
+        - tenantApiKey: ['upload_requests:write']
+      responses:
+        '200':
+          description: The upload request after the unlock.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /upload-requests/{upload_request_id}/files:
+    parameters:
+      - $ref: '#/components/parameters/UploadRequestId'
+    get:
+      tags: [Upload requests]
+      operationId: listUploadRequestFiles
+      summary: List files received through an upload request
+      description: |
+        Lists every file the uploader sent, with its state and `retention_until`. Shareable files can be downloaded
+        with `createReceivedFileDownload`; blocked files show why. A request receives at most 50 files, so the list
+        isn't paginated.
+
+        Requirements: FR-12, FR-13, FR-16.
+      x-permission: upload_request.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['upload_requests:read']
+      responses:
+        '200':
+          description: The files of the upload request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /links/resolve:
+    post:
+      tags: [Links and verification]
+      operationId: resolveLink
+      summary: Resolve a link token
+      description: |
+        The web app reads the token from the URL fragment of the emailed link and posts it here. The response says
+        only what kind of link it is and whether verification is needed. It reveals no file name, message, sender or
+        content (FR-14).
+
+        Public. Rate limit: 60 link-page requests per IP address per minute (NFR-14).
+
+        Errors: `404 link_not_found`, `410 link_revoked`, `410 link_expired`.
+
+        Requirements: FR-14, FR-21, NFR-14.
+      x-permission: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkTokenRequest'
+      responses:
+        '200':
+          description: The link is valid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkResolution'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /links/codes:
+    post:
+      tags: [Links and verification]
+      operationId: requestVerificationCode
+      summary: Email a verification code
+      description: |
+        Emails a one-time code to the address the link was sent to. The code has at least 6 digits, is valid for at
+        most 10 minutes and allows at most 5 attempts. Requesting a new code replaces every earlier code for that
+        recipient or uploader.
+
+        Public. Every call is checked and audited and never replays a stored response, so it takes no
+        `Idempotency-Key`. Rate limits (NFR-14): 5 codes per email address per hour, and the per-IP link limit. If the
+        rate-limit counters are unavailable, the call fails closed with `503`.
+
+        Errors: `403 recipient_locked`, `404 link_not_found`, `410 link_revoked`, `410 link_expired`,
+        `429 rate_limited`, `503 service_unavailable`.
+
+        Requirements: FR-14, NFR-7, NFR-14.
+      x-permission: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkTokenRequest'
+      responses:
+        '202':
+          description: A code is on its way to the invited address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerificationCodeRequested'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /links/sessions:
+    post:
+      tags: [Links and verification]
+      operationId: createLinkSession
+      summary: Verify a code and start a link session
+      description: |
+        Checks the code against the newest code for this recipient or uploader. Attempts are counted atomically. On
+        success the response sets the link session cookie, bound to this browser and to this one transfer or upload
+        request, valid for at most 24 hours (FR-15).
+
+        A wrong code returns `422 code_invalid` with `attempts_remaining`. After 5 wrong attempts the code is used up
+        (`422 code_attempts_exhausted`); after 20 failed attempts in total the recipient or uploader is locked out
+        until the member unlocks them (`403 recipient_locked`), and the member and tenant admins are told.
+
+        Public. Every attempt is audited and never replays a stored response, so it takes no `Idempotency-Key`. Rate
+        limits as for `requestVerificationCode`; fails closed with `503`.
+
+        Errors: `403 recipient_locked`, `404 link_not_found`, `410 link_revoked`, `410 link_expired`,
+        `422 code_invalid`, `422 code_expired`, `422 code_attempts_exhausted`, `429 rate_limited`,
+        `503 service_unavailable`.
+
+        Requirements: FR-14, FR-15, FR-27, NFR-14.
+      x-permission: public
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LinkSessionCreate'
+      responses:
+        '201':
+          description: Verified. The link session has started.
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/SetLinkSessionCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /session:
+    get:
+      tags: [Recipient session]
+      operationId: getLinkSession
+      summary: Get the current link session
+      description: |
+        Returns what the verified recipient or uploader may now see: the message, the sender, the expiry and, for an
+        upload request, the limits and what has been received so far.
+
+        Errors: `401 session_expired`, `410 link_revoked`, `410 link_expired`.
+
+        Requirements: FR-14, FR-15, FR-11.
+      x-permission: session.read
+      security:
+        - linkSession: []
+      responses:
+        '200':
+          description: The current link session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkSession'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [Recipient session]
+      operationId: endLinkSession
+      summary: End the current link session
+      description: |
+        Ends the link session and clears its cookie. Opening the link again needs a new verification.
+
+        Requirements: FR-15.
+      x-permission: session.end
+      security:
+        - linkSession: []
+          csrfToken: []
+      responses:
+        '204':
+          description: The session has ended.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /session/files:
+    get:
+      tags: [Recipient session]
+      operationId: listSessionFiles
+      summary: List the files of the session
+      description: |
+        For a recipient: the shareable files of the transfer, each with its download count and limit, and a warning on
+        unscannable files allowed by policy (FR-18). Files that aren't shareable are never listed.
+
+        For an uploader: the files they uploaded to the request, with their state, so blocked files are reported to
+        them (FR-12).
+
+        At most 50 files, so the list isn't paginated.
+
+        Errors: `401 session_expired`, `410 link_revoked`, `410 link_expired`.
+
+        Requirements: FR-6, FR-12, FR-16, FR-18.
+      x-permission: session.read
+      security:
+        - linkSession: []
+      responses:
+        '200':
+          description: The files of the session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionFileList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags: [Recipient session]
+      operationId: addSessionUploadFile
+      summary: Add a file to an upload request
+      description: |
+        For an uploader: declares a file and starts its multipart upload, as `addTransferFile` does for a member. The
+        same limits apply: 50 files, 5 GB per file, 20 GB in total (FR-11). Not allowed for a recipient session.
+
+        Errors: `403 permission_denied`, `410 link_revoked`, `410 link_expired`, `413 file_too_large`,
+        `413 total_too_large`, `422 too_many_files`, `409 idempotency_conflict`.
+
+        Requirements: FR-11, FR-2.
+      x-permission: session.upload
+      security:
+        - linkSession: []
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileCreate'
+      responses:
+        '201':
+          description: The file, in the `uploading` state, with its upload plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionFile'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /session/files/{file_id}/parts:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Recipient session]
+      operationId: requestSessionUploadPartUrls
+      summary: Get upload URLs for parts of an uploader's file
+      description: |
+        For an uploader: the same as `requestUploadPartUrls`, for a file of this upload request.
+
+        Errors: `403 permission_denied`, `409 invalid_state`, `410 link_revoked`, `410 link_expired`,
+        `422 validation_failed`.
+
+        Requirements: FR-11, NFR-3, NFR-6.
+      x-permission: session.upload
+      security:
+        - linkSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartUrlRequest'
+      responses:
+        '200':
+          description: One upload URL per requested part.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PartUrlList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Recipient session]
+      operationId: listSessionUploadedParts
+      summary: List the parts of an uploader's file already uploaded
+      description: |
+        For an uploader: the same as `listUploadedParts`, so an interrupted upload resumes.
+
+        Errors: `403 permission_denied`, `409 invalid_state`, `410 link_revoked`, `410 link_expired`.
+
+        Requirements: FR-11, NFR-3.
+      x-permission: session.upload
+      security:
+        - linkSession: []
+      responses:
+        '200':
+          description: The parts received so far.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadedParts'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /session/files/{file_id}/complete:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Recipient session]
+      operationId: completeSessionUpload
+      summary: Complete an uploader's file upload
+      description: |
+        For an uploader: the same checks as `completeUpload`, against the upload request under a row lock. A request
+        revoked or expired meanwhile never accepts the file (NFR-6). When the scan finishes, a shareable file becomes
+        available to the member, who is notified; a blocked file is reported to both sides (FR-12).
+
+        Errors: `403 permission_denied`, `409 upload_incomplete`, `410 link_revoked`, `410 link_expired`,
+        `422 upload_size_mismatch`.
+
+        Requirements: FR-11, FR-12, FR-16, NFR-6.
+      x-permission: session.upload
+      security:
+        - linkSession: []
+          csrfToken: []
+      responses:
+        '200':
+          description: The file, now `scanning`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionFile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /session/files/{file_id}/downloads:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    post:
+      tags: [Recipient session]
+      operationId: createSessionDownload
+      summary: Download a file of the transfer
+      description: |
+        For a recipient: grants access to one shareable file of the transfer. There is no download of several files
+        at once (FR-6). The call checks revocation and expiry, then counts the download with one conditional update
+        in the same transaction as the audit record, so parallel requests can't exceed the limit (FR-4). The audit
+        record is committed, and the grant written to both regions' audit archive, before access is returned; if
+        either write fails the call returns `503` (NFR-15, NFR-10).
+
+        Resuming an interrupted download passes `resume_grant_id` and doesn't count again (FR-6). Every call is
+        checked and audited and never replays a stored response, so it takes no `Idempotency-Key`. Rate limits:
+        per IP address, per tenant and per recipient (NFR-14).
+
+        **Provisional:** how the bytes are delivered, and how resuming is bounded so it can't get around the limit,
+        wait for PRD open question 8.
+
+        Errors: `403 download_limit_reached`, `403 permission_denied` (an uploader session), `409 file_not_shareable`,
+        `410 link_revoked`, `410 link_expired`, `503 service_unavailable`.
+
+        Requirements: FR-4, FR-6, FR-14, FR-17, FR-18, NFR-6, NFR-15.
+      x-permission: session.download
+      security:
+        - linkSession: []
+          csrfToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadRequest'
+      responses:
+        '200':
+          description: How to fetch the file's bytes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadAccess'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /audit/events/search:
+    post:
+      tags: [Audit]
+      operationId: searchAuditEvents
+      summary: Search the audit log
+      description: |
+        Searches the tenant's audit log, newest first, by actor, email address, target, action, source IP address and
+        time range (UC-4). Filters travel in the request body, not the query string, so email addresses and IP
+        addresses never appear in URLs or access logs. The search itself is recorded in the audit log (FR-27).
+
+        Needs the admin role or an API key with `audit:read`.
+
+        Errors: `400 invalid_cursor`, `422 validation_failed`.
+
+        Requirements: FR-28, FR-27.
+      x-permission: audit.search
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+        - tenantApiKey: ['audit:read']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditSearchRequest'
+      responses:
+        '200':
+          description: One page of audit events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /audit/exports:
+    post:
+      tags: [Audit]
+      operationId: exportAuditEvents
+      summary: Export audit log results
+      description: |
+        Streams every event that matches the filter as CSV or JSON, newest first, with the same filters as
+        `searchAuditEvents`. At most 1,000,000 events per export; narrow the time range beyond that. The export is
+        recorded in the audit log (FR-27).
+
+        Needs the admin role or an API key with `audit:read`.
+
+        Errors: `422 export_too_large`, `422 validation_failed`.
+
+        Requirements: FR-29, FR-27.
+      x-permission: audit.export
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+        - tenantApiKey: ['audit:read']
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditExportRequest'
+      responses:
+        '200':
+          description: The matching events, in the requested format.
+          headers:
+            Content-Disposition:
+              $ref: '#/components/headers/ContentDisposition'
+          content:
+            text/csv:
+              schema:
+                type: string
+                description: One header row, then one row per event, with the columns of `AuditEvent`.
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEvent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /users:
+    post:
+      tags: [Tenant admin]
+      operationId: inviteUser
+      summary: Invite a member or admin
+      description: |
+        Invites a person to the tenant with the `member` or `admin` role and emails them an invitation. They are
+        `invited` until they first sign in.
+
+        Errors: `409 user_exists`, `409 idempotency_conflict`.
+
+        Requirements: FR-22.
+      x-permission: user.invite
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserInvite'
+      responses:
+        '201':
+          description: The user was invited.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [Tenant admin]
+      operationId: listUsers
+      summary: List members and admins
+      description: |
+        Lists the tenant's users, optionally filtered by role and status.
+
+        Requirements: FR-22.
+      x-permission: user.read
+      security:
+        - memberSession: [admin]
+      parameters:
+        - $ref: '#/components/parameters/UserRoleFilter'
+        - $ref: '#/components/parameters/UserStatusFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Tenant admin]
+      operationId: getUser
+      summary: Get a member or admin
+      description: |
+        Returns one user of the tenant.
+
+        Requirements: FR-22.
+      x-permission: user.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [Tenant admin]
+      operationId: updateUser
+      summary: Change a user's role
+      description: |
+        Assigns the `admin` or `member` role. The tenant always keeps at least one active admin. Role changes are
+        audited (FR-27).
+
+        Errors: `409 last_admin`, `409 invalid_state` (deactivated user).
+
+        Requirements: FR-22.
+      x-permission: user.update_role
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /users/{user_id}/deactivate:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Tenant admin]
+      operationId: deactivateUser
+      summary: Deactivate a user
+      description: |
+        Deactivates a member or admin: their sessions end at once and they can no longer sign in. Their transfers and
+        upload requests are unchanged; an admin can revoke them. The tenant always keeps at least one active admin.
+
+        A deactivation is a security-critical record: the response comes only after it is in the audit archive in both
+        regions (NFR-10), and `503` means it can be retried. Deactivating a user who is already deactivated returns
+        them unchanged.
+
+        Errors: `409 last_admin`, `503 service_unavailable`.
+
+        Requirements: FR-22, NFR-10.
+      x-permission: user.deactivate
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '200':
+          description: The deactivated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tenant/policy:
+    get:
+      tags: [Tenant admin]
+      operationId: getTenantPolicy
+      summary: Get the tenant policy
+      description: |
+        Returns the tenant policy. Every member can read it, so the web app can show the longest allowed expiry and
+        the domain rules before a transfer is created.
+
+        Requirements: FR-23, FR-24, FR-3.
+      x-permission: tenant_policy.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+        - tenantApiKey: ['upload_requests:read']
+      responses:
+        '200':
+          description: The tenant policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantPolicy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [Tenant admin]
+      operationId: updateTenantPolicy
+      summary: Update the tenant policy
+      description: |
+        Changes the fields sent; fields left out are unchanged. A shorter `max_expiry` applies to new transfers and
+        extensions, not to existing ones. A new `received_file_retention_days` applies to files received from then on
+        (FR-13). Policy changes are audited (FR-27).
+
+        Errors: `422 validation_failed`.
+
+        Requirements: FR-23, FR-24, FR-18, FR-13.
+      x-permission: tenant_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantPolicyUpdate'
+      responses:
+        '200':
+          description: The updated tenant policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api-keys:
+    post:
+      tags: [API keys]
+      operationId: createApiKey
+      summary: Create an API key
+      description: |
+        Creates a tenant API key with the given scopes. The full key appears once, in this response; the service
+        stores only its hash and `key_prefix`. Only a tenant admin signed in to the web app can create keys; a key
+        can't create another key.
+
+        This operation takes no `Idempotency-Key`: a stored response would hold the key in plain text. If the
+        response is lost, revoke the key by its prefix and create another.
+
+        Requirements: FR-32, FR-27.
+      x-permission: api_key.create
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreate'
+      responses:
+        '201':
+          description: The key was created. `secret` is shown only now.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    get:
+      tags: [API keys]
+      operationId: listApiKeys
+      summary: List API keys
+      description: |
+        Lists the tenant's API keys with their prefix, scopes and last use. The full key is never returned again.
+
+        Requirements: FR-32.
+      x-permission: api_key.read
+      security:
+        - memberSession: [admin]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of API keys.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api-keys/{api_key_id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/ApiKeyId'
+    post:
+      tags: [API keys]
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: |
+        Revokes a key at once; later calls with it get `401`. Revoking a key that is already revoked returns it
+        unchanged.
+
+        Requirements: FR-32, FR-27.
+      x-permission: api_key.revoke
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '200':
+          description: The revoked key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /operator/tenants:
+    post:
+      tags: [Operator]
+      operationId: createTenant
+      summary: Provision a tenant and its first admin
+      description: |
+        Creates a tenant with the default policy and invites its first admin. There is no self-service sign-up.
+        Operators never get access to file contents through this API (FR-35).
+
+        Errors: `409 idempotency_conflict`.
+
+        Requirements: FR-34, FR-35.
+      x-permission: operator.tenant.create
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TenantCreate'
+      responses:
+        '201':
+          description: The tenant and its first admin were created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+components:
+  securitySchemes:
+    memberSession:
+      type: apiKey
+      in: cookie
+      name: __Host-sft_session
+      description: |
+        Web app session of a member or admin: HttpOnly, Secure, SameSite=Lax. **Provisional:** how it is issued waits
+        for PRD open question 1 (sign-in with MFA, FR-25). Where a requirement lists `admin`, the member needs the
+        admin role. Unsafe methods also need `csrfToken`.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: |
+        CSRF token for cookie sessions. The service sets a readable `__Host-sft_csrf` cookie with each session; the web
+        app copies its value into this header on every POST, PATCH and DELETE. The service also checks `Origin` on
+        every unsafe request. Phase 3 (security design) confirms the pattern.
+    tenantApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque tenant API key
+      description: |
+        Tenant API key for automation (FR-32), sent as `Authorization: Bearer <key>`. A key acts for the tenant with
+        the rights of a tenant admin, limited to the scopes listed in each requirement (`ApiKeyScope`). What a key
+        creates is owned by the admin who created the key, and the audit log names the key as the actor. Keys never
+        download file contents.
+    linkSession:
+      type: apiKey
+      in: cookie
+      name: __Host-sft_link
+      description: |
+        Link session of a verified recipient or uploader (FR-15): HttpOnly, Secure, SameSite=Strict, bound to one
+        transfer recipient or one upload request, valid for at most 24 hours. Set by `createLinkSession`. Unsafe
+        methods also need `csrfToken`.
+    operatorToken:
+      type: http
+      scheme: bearer
+      bearerFormat: short-lived operator token
+      description: |
+        Short-lived token of a platform operator, used by the operator CLI. How operators obtain it, and whether the
+        operator API is also restricted by network, is decided in phase 3 (security design).
+
+  parameters:
+    TransferId:
+      name: transfer_id
+      in: path
+      required: true
+      description: ID of the transfer.
+      schema:
+        $ref: '#/components/schemas/Id'
+    RecipientId:
+      name: recipient_id
+      in: path
+      required: true
+      description: ID of the transfer recipient.
+      schema:
+        $ref: '#/components/schemas/Id'
+    FileId:
+      name: file_id
+      in: path
+      required: true
+      description: ID of the file.
+      schema:
+        $ref: '#/components/schemas/Id'
+    UploadRequestId:
+      name: upload_request_id
+      in: path
+      required: true
+      description: ID of the upload request.
+      schema:
+        $ref: '#/components/schemas/Id'
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: ID of the user.
+      schema:
+        $ref: '#/components/schemas/Id'
+    ApiKeyId:
+      name: api_key_id
+      in: path
+      required: true
+      description: ID of the API key.
+      schema:
+        $ref: '#/components/schemas/Id'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque cursor from `next_cursor` of the previous page. Leave it out for the first page. An invalid or
+        expired cursor returns `400 invalid_cursor`.
+      schema:
+        type: string
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Largest number of items to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    Scope:
+      name: scope
+      in: query
+      required: false
+      description: |
+        `own` returns the caller's own items. `tenant` returns every item in the tenant and needs the admin role or an
+        API key.
+      schema:
+        type: string
+        enum: [own, tenant]
+        default: own
+    TransferStateFilter:
+      name: state
+      in: query
+      required: false
+      description: Return only transfers in these states. Repeat the parameter for several states.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 7
+        uniqueItems: true
+        items:
+          $ref: '#/components/schemas/TransferState'
+    UploadRequestStateFilter:
+      name: state
+      in: query
+      required: false
+      description: Return only upload requests in these states. Repeat the parameter for several states.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 3
+        uniqueItems: true
+        items:
+          $ref: '#/components/schemas/UploadRequestState'
+    UserRoleFilter:
+      name: role
+      in: query
+      required: false
+      description: Return only users with this role.
+      schema:
+        $ref: '#/components/schemas/Role'
+    UserStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Return only users with this status.
+      schema:
+        $ref: '#/components/schemas/UserStatus'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        A unique key per logical request, such as a UUID, so a retry can't create a second item. The key is scoped to
+        the caller and kept with a fingerprint of the request body for 24 hours. A retry with the same key and body
+        gets the stored response; the same key with a different body gets `409 idempotency_conflict`, and a retry
+        while the first request is still running gets `409 idempotency_in_progress` (architecture 5.4).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[\x21-\x7E]+$'
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 1
+    Location:
+      description: URL of the item that was created.
+      schema:
+        type: string
+        format: uri-reference
+    WWWAuthenticate:
+      description: Sent to bearer-token callers (API keys and operator tokens), as in RFC 6750.
+      schema:
+        type: string
+    SetLinkSessionCookie:
+      description: |
+        Sets `__Host-sft_link`, the link session (HttpOnly, Secure, SameSite=Strict, Path=/, at most 24 hours), and
+        `__Host-sft_csrf`, the CSRF token the web app copies into `X-CSRF-Token`.
+      schema:
+        type: string
+    ContentDisposition:
+      description: '`attachment` with a file name such as `audit-export.csv`.'
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: |
+        The request can't be parsed: the body isn't valid JSON, a header is malformed, or the cursor is invalid.
+        Codes: `malformed_request`, `invalid_cursor`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: |
+        No valid credentials: the session or link session is missing or has expired, or the API key or operator token
+        is invalid, expired or revoked. Codes: `authentication_required`, `session_expired`, `credentials_invalid`.
+      headers:
+        WWW-Authenticate:
+          $ref: '#/components/headers/WWWAuthenticate'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        The caller is known but may not do this: the role, scope or session kind doesn't allow it, the CSRF check
+        failed, the recipient or uploader is locked out, or the download limit is used up. Codes: `permission_denied`,
+        `csrf_failed`, `recipient_locked`, `download_limit_reached`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            recipientLocked:
+              summary: Locked out after 20 failed attempts
+              value:
+                type: https://secure-file-transfer.example/problems/recipient_locked
+                title: Locked out
+                status: 403
+                code: recipient_locked
+                detail: Too many failed attempts. Ask the sender to unlock your access.
+                request_id: req_7f3c2a91
+    NotFound:
+      description: |
+        Nothing with this ID or token is visible to the caller. Items of another tenant, or owned by another member,
+        return this too, so their existence is never revealed (NFR-12). Codes: `not_found`, `link_not_found`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: |
+        The request conflicts with the current state of the item or with an earlier request. Codes:
+        `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`,
+        `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`,
+        `file_not_shareable`, `user_exists`, `last_admin`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            transferRevoked:
+              summary: The transfer was revoked while a file was uploading
+              value:
+                type: https://secure-file-transfer.example/problems/transfer_revoked
+                title: Transfer revoked
+                status: 409
+                code: transfer_revoked
+                detail: The transfer was revoked, so this file was not accepted.
+                request_id: req_51d0e8b4
+                current_state: revoked
+    Gone:
+      description: |
+        The link or link session belongs to a transfer or upload request that was revoked or has expired (FR-21,
+        UC-3). Codes: `link_revoked`, `link_expired`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            linkExpired:
+              summary: The link has expired
+              value:
+                type: https://secure-file-transfer.example/problems/link_expired
+                title: Link expired
+                status: 410
+                code: link_expired
+                detail: This link has expired. Ask the sender for a new one.
+                request_id: req_0b9a64cc
+    ContentTooLarge:
+      description: |
+        A declared file size, or the total for the transfer or upload request, is over the limit (FR-2, FR-11), or the
+        request body is too large. Codes: `file_too_large`, `total_too_large`, `request_too_large`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableContent:
+      description: |
+        The request is well formed but breaks a rule. `validation_failed` lists each problem in `errors`. Codes:
+        `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `too_many_files`,
+        `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          examples:
+            codeInvalid:
+              summary: A wrong verification code
+              value:
+                type: https://secure-file-transfer.example/problems/code_invalid
+                title: Code not accepted
+                status: 422
+                code: code_invalid
+                detail: That code is not correct.
+                request_id: req_c4e1f702
+                attempts_remaining: 3
+    TooManyRequests:
+      description: |
+        A rate limit was reached (NFR-14). Retry after the number of seconds in `Retry-After`. Code: `rate_limited`.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        A dependency the call must not proceed without is unavailable, so the call failed closed: the audit write
+        before a download (NFR-15), the two-region record of a revocation or deactivation (NFR-10), or the rate-limit
+        counters for verification (NFR-14). Nothing changed; retry after `Retry-After`. Code: `service_unavailable`.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Id:
+      type: string
+      format: uuid
+      description: A UUIDv7 generated by the service.
+
+    Timestamp:
+      type: string
+      format: date-time
+      description: A time in UTC, RFC 3339.
+
+    EmailAddress:
+      type: string
+      format: email
+      maxLength: 254
+
+    Locale:
+      type: string
+      enum: [en, ja]
+      description: Language of emails and of the recipient or uploader pages (FR-33).
+
+    TransferState:
+      type: string
+      enum: [draft, submitted, sent, held, revoked, expired, cancelled]
+      description: State of a transfer (data model section 3.2).
+
+    FileState:
+      type: string
+      enum: [uploading, scanning, clean, infected, unscannable, scan_failed, rejected, deleted]
+      description: State of a file (data model section 3.1, FR-16).
+
+    UploadRequestState:
+      type: string
+      enum: [open, revoked, expired]
+      description: State of an upload request (data model section 3.3).
+
+    AccessState:
+      type: string
+      enum: [invited, verified, locked]
+      description: |
+        Where a recipient or uploader stands (data model section 3.4): `invited` (link emailed, no active session),
+        `verified` (an active link session), `locked` (20 failed attempts, until the member unlocks them).
+
+    Role:
+      type: string
+      enum: [admin, member]
+
+    UserStatus:
+      type: string
+      enum: [invited, active, deactivated]
+
+    ApiKeyScope:
+      type: string
+      enum: ['transfers:read', 'transfers:write', 'upload_requests:read', 'upload_requests:write', 'audit:read']
+      description: |
+        What an API key may do. `transfers:write` includes uploading files to the key's transfers. No scope allows
+        downloading file contents.
+
+    ActorType:
+      type: string
+      enum: [member, admin, recipient, uploader, api_key, operator, system]
+
+    UnscannablePolicy:
+      type: string
+      enum: [block, allow_with_warning]
+      description: What happens to files the scanner can't inspect (FR-18). Never applies to `scan_failed` (FR-19).
+
+    Problem:
+      type: object
+      description: |
+        An error, as RFC 9457 problem details (`application/problem+json`). Clients branch on `code`, not on `title`
+        or `detail`, which are for people and may change.
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: |
+            Stable URI of the problem type, `https://secure-file-transfer.example/problems/{code}`. The host changes to
+            the service's domain once PRD open question 5 is decided, before v1 is released.
+          examples:
+            - https://secure-file-transfer.example/problems/link_expired
+        title:
+          type: string
+          description: Short summary of the problem type.
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          description: The HTTP status code.
+        detail:
+          type: string
+          description: Explanation of this occurrence, safe to show to the caller.
+        instance:
+          type: string
+          format: uri-reference
+          description: URI of this occurrence, when there is one.
+        code:
+          $ref: '#/components/schemas/ProblemCode'
+        request_id:
+          type: string
+          description: ID of the request, also in the service's logs and traces. Quote it when reporting a problem.
+        errors:
+          type: array
+          description: For `validation_failed`, one entry per problem.
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+        attempts_remaining:
+          type: integer
+          minimum: 0
+          description: For `code_invalid`, how many attempts this code still allows.
+        current_state:
+          type: string
+          description: For state conflicts, the item's current state.
+
+    ProblemCode:
+      type: string
+      description: |
+        Stable, machine-readable error code. The README lists each code with its status. A new code can be added
+        without a new API version, so clients treat an unknown code by its HTTP status.
+      enum:
+        - malformed_request
+        - invalid_cursor
+        - authentication_required
+        - session_expired
+        - credentials_invalid
+        - permission_denied
+        - csrf_failed
+        - recipient_locked
+        - download_limit_reached
+        - not_found
+        - link_not_found
+        - idempotency_conflict
+        - idempotency_in_progress
+        - invalid_state
+        - transfer_revoked
+        - transfer_expired
+        - upload_request_revoked
+        - upload_request_expired
+        - transfer_empty
+        - upload_incomplete
+        - file_not_shareable
+        - user_exists
+        - last_admin
+        - link_revoked
+        - link_expired
+        - file_too_large
+        - total_too_large
+        - request_too_large
+        - validation_failed
+        - expiry_out_of_range
+        - recipient_domain_not_allowed
+        - too_many_files
+        - upload_size_mismatch
+        - code_invalid
+        - code_expired
+        - code_attempts_exhausted
+        - export_too_large
+        - rate_limited
+        - service_unavailable
+
+    ValidationIssue:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: What is wrong.
+        pointer:
+          type: string
+          description: JSON Pointer to the field in the request body, such as `#/recipients/3/email`.
+        parameter:
+          type: string
+          description: Name of the query or path parameter.
+        header:
+          type: string
+          description: Name of the header.
+
+    # Transfers
+
+    RecipientInput:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: Defaults to the tenant's `default_locale`.
+
+    TransferCreate:
+      type: object
+      additionalProperties: false
+      required: [recipients]
+      properties:
+        recipients:
+          type: array
+          minItems: 1
+          maxItems: 50
+          description: 1 to 50 recipients, with no address twice (FR-1).
+          items:
+            $ref: '#/components/schemas/RecipientInput'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Between 1 hour and 30 days from now, within the tenant's `max_expiry` (FR-3). Defaults to 7 days, or the tenant's maximum if shorter.
+        message:
+          type: string
+          maxLength: 2000
+          description: Optional message, shown to recipients only after they verify (FR-14).
+        download_limit:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 100
+          default: null
+          description: Downloads allowed per recipient per file (FR-4). `null` means no limit.
+        notify_on_first_download:
+          type: boolean
+          default: false
+          description: Email the member on the first download of the transfer (FR-8).
+
+    TransferRecipient:
+      type: object
+      required: [id, email, locale, access_state]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        locale:
+          $ref: '#/components/schemas/Locale'
+        access_state:
+          $ref: '#/components/schemas/AccessState'
+
+    Transfer:
+      type: object
+      required:
+        - id
+        - state
+        - created_by
+        - created_at
+        - expires_at
+        - message
+        - download_limit
+        - notify_on_first_download
+        - submitted_at
+        - sent_at
+        - revoked_at
+        - revoked_by
+        - total_size
+        - files
+        - recipients
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/TransferState'
+        created_by:
+          $ref: '#/components/schemas/Id'
+          description: ID of the member who owns the transfer.
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        message:
+          type: [string, 'null']
+        download_limit:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 100
+        notify_on_first_download:
+          type: boolean
+        submitted_at:
+          type: [string, 'null']
+          format: date-time
+        sent_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_by:
+          type: [string, 'null']
+          format: uuid
+        total_size:
+          type: integer
+          minimum: 0
+          description: Sum of the declared sizes of the files, in bytes.
+        files:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/File'
+        recipients:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/TransferRecipient'
+
+    TransferSummary:
+      type: object
+      required: [id, state, created_by, created_at, expires_at, sent_at, revoked_at, file_count, recipient_count, total_size]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/TransferState'
+        created_by:
+          $ref: '#/components/schemas/Id'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        sent_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        file_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+        recipient_count:
+          type: integer
+          minimum: 1
+          maximum: 50
+        total_size:
+          type: integer
+          minimum: 0
+
+    TransferPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferSummary'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    ExpiryExtension:
+      type: object
+      additionalProperties: false
+      required: [expires_at]
+      properties:
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: The new expiry, later than the current one.
+
+    RecipientDownload:
+      type: object
+      required: [file_id, count, first_downloaded_at, last_downloaded_at]
+      properties:
+        file_id:
+          $ref: '#/components/schemas/Id'
+        count:
+          type: integer
+          minimum: 1
+          description: Counted downloads of this file. Resumes don't count again (FR-6).
+        first_downloaded_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_downloaded_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    RecipientStatus:
+      type: object
+      required: [id, email, locale, access_state, notified_at, first_verified_at, last_verified_at, failed_attempts, locked_at, downloads]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        locale:
+          $ref: '#/components/schemas/Locale'
+        access_state:
+          $ref: '#/components/schemas/AccessState'
+        notified_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the link email was handed to the email provider.
+        first_verified_at:
+          type: [string, 'null']
+          format: date-time
+        last_verified_at:
+          type: [string, 'null']
+          format: date-time
+        failed_attempts:
+          type: integer
+          minimum: 0
+          maximum: 20
+          description: Failed verification attempts since the link was issued or last unlocked.
+        locked_at:
+          type: [string, 'null']
+          format: date-time
+        downloads:
+          type: array
+          description: One entry per file this recipient downloaded.
+          items:
+            $ref: '#/components/schemas/RecipientDownload'
+
+    RecipientStatusList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/RecipientStatus'
+
+    # Files and uploads
+
+    FileCreate:
+      type: object
+      additionalProperties: false
+      required: [display_name, size]
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: File name shown to recipients. Path separators and control characters are rejected.
+        content_type:
+          type: string
+          maxLength: 255
+          default: application/octet-stream
+          description: Media type as declared by the sender. It is never trusted for scanning.
+        size:
+          type: integer
+          minimum: 1
+          maximum: 5000000000
+          description: Size in bytes, at most 5 GB (FR-2). Stored as `declared_size` and checked when the upload completes.
+
+    UploadPlan:
+      type: object
+      required: [part_size, part_count]
+      description: How to split the file. Every part but the last is exactly `part_size` bytes.
+      properties:
+        part_size:
+          type: integer
+          minimum: 5242880
+          description: Size of each part in bytes, chosen by the service so that a file has at most 1,000 parts.
+        part_count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+
+    File:
+      type: object
+      required: [id, transfer_id, upload_request_id, display_name, content_type, declared_size, actual_size, state, shareable, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        transfer_id:
+          type: [string, 'null']
+          format: uuid
+          description: Set for a file of a transfer. Exactly one of `transfer_id` and `upload_request_id` is set.
+        upload_request_id:
+          type: [string, 'null']
+          format: uuid
+          description: Set for a file received through an upload request.
+        display_name:
+          type: string
+        content_type:
+          type: string
+        declared_size:
+          type: integer
+          minimum: 1
+          maximum: 5000000000
+        actual_size:
+          type: [integer, 'null']
+          minimum: 1
+          description: Real size after the upload completed.
+        sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 of the contents, once known.
+        state:
+          $ref: '#/components/schemas/FileState'
+        shareable:
+          type: boolean
+          description: True when the file is `clean`, or `unscannable` and the tenant policy allows it (FR-16).
+        scanned_at:
+          type: [string, 'null']
+          format: date-time
+        retention_until:
+          type: [string, 'null']
+          format: date-time
+          description: For received files, when the file is deleted (FR-13).
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        upload:
+          $ref: '#/components/schemas/UploadPlan'
+          description: Present only while the file is `uploading`.
+
+    FileList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/File'
+
+    PartUrlRequest:
+      type: object
+      additionalProperties: false
+      required: [part_numbers]
+      properties:
+        part_numbers:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 1000
+
+    PartUrl:
+      type: object
+      required: [part_number, size, method, url, expires_at]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        size:
+          type: integer
+          minimum: 1
+          description: Exact size of this part in bytes. The URL is signed for this length only.
+        method:
+          type: string
+          enum: [PUT]
+        url:
+          type: string
+          format: uri
+          description: |
+            Pre-signed object storage URL for this one part. It allows only this upload, for at most 15 minutes, and
+            never allows reading. It is the only credential-carrying URL in the API.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: Extra headers to send with the upload, if any.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    PartUrlList:
+      type: object
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartUrl'
+
+    UploadedPart:
+      type: object
+      required: [part_number, size]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        size:
+          type: integer
+          minimum: 1
+
+    UploadedParts:
+      type: object
+      required: [part_size, part_count, parts]
+      properties:
+        part_size:
+          type: integer
+          minimum: 5242880
+        part_count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        parts:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/UploadedPart'
+
+    # Downloads (provisional, PRD open question 8)
+
+    DownloadRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        resume_grant_id:
+          $ref: '#/components/schemas/Id'
+          description: |
+            **Provisional.** The grant of an interrupted download to resume. Resuming within a valid grant isn't
+            counted again (FR-6). Phase 3 decides how a grant is bounded so resuming can't get around the limit.
+
+    DownloadMethod:
+      type: string
+      enum: [stream, signed_cookie]
+      description: |
+        **Provisional (PRD open question 8).** `stream`: the browser fetches `url` from the API with its session
+        cookie, using HTTP Range requests to resume. `signed_cookie`: this response sets short-lived CDN cookies for
+        this one file, the browser fetches `url` from the CDN, and asks again before `refresh_after`. Phase 3 picks
+        one; the other is removed before v1.
+
+    DownloadAccess:
+      type: object
+      description: |
+        **Provisional (PRD open question 8).** One audited, counted grant to fetch one file's bytes. `url` never
+        carries a credential: access works only together with the verified session or the cookies set on this
+        response, so a forwarded URL grants nothing (FR-14), and a revocation stops new requests at once (NFR-6).
+      required: [grant_id, method, url, expires_at, file]
+      properties:
+        grant_id:
+          $ref: '#/components/schemas/Id'
+        method:
+          $ref: '#/components/schemas/DownloadMethod'
+        url:
+          type: string
+          format: uri-reference
+          description: Where the browser fetches the bytes.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: No new request can start under this grant after this time.
+        refresh_after:
+          type: [string, 'null']
+          format: date-time
+          description: For `signed_cookie`, when to call again with `resume_grant_id` to refresh the cookies.
+        file:
+          $ref: '#/components/schemas/DownloadFile'
+        warning:
+          type: string
+          enum: [unscannable]
+          description: Present when the file couldn't be scanned and the tenant policy allows it (FR-18). The web app must show a warning.
+        downloads_remaining:
+          type: [integer, 'null']
+          minimum: 0
+          description: For a recipient, downloads of this file left after this one. `null` when there is no limit.
+
+    DownloadFile:
+      type: object
+      required: [id, display_name, content_type, size]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        display_name:
+          type: string
+        content_type:
+          type: string
+        size:
+          type: integer
+          minimum: 1
+        sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+
+    # Upload requests
+
+    UploadRequestCreate:
+      type: object
+      additionalProperties: false
+      required: [uploader_email]
+      properties:
+        uploader_email:
+          $ref: '#/components/schemas/EmailAddress'
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: Defaults to the tenant's `default_locale`.
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Same range and default as a transfer (FR-3).
+        message:
+          type: string
+          maxLength: 2000
+          description: Optional message, shown to the uploader only after they verify.
+
+    UploadRequest:
+      type: object
+      required:
+        - id
+        - state
+        - created_by
+        - created_at
+        - uploader_email
+        - locale
+        - message
+        - expires_at
+        - revoked_at
+        - revoked_by
+        - uploader_access_state
+        - failed_attempts
+        - locked_at
+        - file_count
+        - total_size
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/UploadRequestState'
+        created_by:
+          $ref: '#/components/schemas/Id'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        uploader_email:
+          $ref: '#/components/schemas/EmailAddress'
+        locale:
+          $ref: '#/components/schemas/Locale'
+        message:
+          type: [string, 'null']
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_by:
+          type: [string, 'null']
+          format: uuid
+        uploader_access_state:
+          $ref: '#/components/schemas/AccessState'
+        failed_attempts:
+          type: integer
+          minimum: 0
+          maximum: 20
+        locked_at:
+          type: [string, 'null']
+          format: date-time
+        file_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+        total_size:
+          type: integer
+          minimum: 0
+
+    UploadRequestPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/UploadRequest'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # Links and verification
+
+    LinkToken:
+      type: string
+      minLength: 22
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: |
+        The link token from the URL fragment of the emailed link, base64url, with at least 128 bits of randomness
+        (NFR-14). It is sent only in request bodies, never in a path or query string.
+
+    VerificationCode:
+      type: string
+      pattern: '^[0-9]{6,10}$'
+      description: The one-time code from the email, at least 6 digits (NFR-14).
+
+    LinkKind:
+      type: string
+      enum: [transfer, upload_request]
+
+    LinkTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          $ref: '#/components/schemas/LinkToken'
+
+    LinkResolution:
+      type: object
+      required: [kind, access_state, locale]
+      description: What a token alone reveals. Nothing about the transfer or request itself (FR-14).
+      properties:
+        kind:
+          $ref: '#/components/schemas/LinkKind'
+        access_state:
+          type: string
+          enum: [verification_required, verified, locked]
+          description: '`verified` when this browser already has a valid link session for this link.'
+        locale:
+          $ref: '#/components/schemas/Locale'
+
+    VerificationCodeRequested:
+      type: object
+      required: [code_valid_for_seconds, max_attempts]
+      properties:
+        code_valid_for_seconds:
+          type: integer
+          minimum: 1
+          maximum: 600
+          description: How long the code is valid once it is sent.
+        max_attempts:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: Attempts the code allows.
+
+    LinkSessionCreate:
+      type: object
+      additionalProperties: false
+      required: [token, code]
+      properties:
+        token:
+          $ref: '#/components/schemas/LinkToken'
+        code:
+          $ref: '#/components/schemas/VerificationCode'
+
+    LinkSession:
+      type: object
+      required: [kind, email, locale, expires_at]
+      description: A verified link session. Exactly one of `transfer` and `upload_request` is present, matching `kind`.
+      properties:
+        kind:
+          $ref: '#/components/schemas/LinkKind'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+          description: The verified address.
+        locale:
+          $ref: '#/components/schemas/Locale'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: When the session ends, at most 24 hours after verification (NFR-14).
+        transfer:
+          $ref: '#/components/schemas/LinkSessionTransfer'
+        upload_request:
+          $ref: '#/components/schemas/LinkSessionUploadRequest'
+
+    LinkSessionTransfer:
+      type: object
+      required: [tenant_name, sender_email, message, expires_at, download_limit]
+      properties:
+        tenant_name:
+          type: string
+        sender_email:
+          $ref: '#/components/schemas/EmailAddress'
+        message:
+          type: [string, 'null']
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        download_limit:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 100
+
+    LinkSessionUploadRequest:
+      type: object
+      required: [tenant_name, requester_email, message, expires_at, max_files, max_file_size, max_total_size, files_received, bytes_received]
+      properties:
+        tenant_name:
+          type: string
+        requester_email:
+          $ref: '#/components/schemas/EmailAddress'
+        message:
+          type: [string, 'null']
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        max_files:
+          type: integer
+          minimum: 1
+          maximum: 50
+        max_file_size:
+          type: integer
+          minimum: 1
+          maximum: 5000000000
+        max_total_size:
+          type: integer
+          minimum: 1
+          maximum: 20000000000
+        files_received:
+          type: integer
+          minimum: 0
+          maximum: 50
+        bytes_received:
+          type: integer
+          minimum: 0
+
+    SessionFile:
+      type: object
+      required: [id, display_name, content_type, size, state]
+      description: A file as a recipient or uploader sees it.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        display_name:
+          type: string
+        content_type:
+          type: string
+        size:
+          type: integer
+          minimum: 1
+          maximum: 5000000000
+        state:
+          $ref: '#/components/schemas/FileState'
+        warning:
+          type: string
+          enum: [unscannable]
+          description: For a recipient, present when the file couldn't be scanned and the tenant policy allows it (FR-18).
+        download_limit:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 100
+          description: For a recipient. `null` means no limit.
+        downloads_used:
+          type: integer
+          minimum: 0
+          description: For a recipient, counted downloads of this file so far.
+        upload:
+          $ref: '#/components/schemas/UploadPlan'
+          description: For an uploader, present only while the file is `uploading`.
+
+    SessionFileList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/SessionFile'
+
+    # Audit
+
+    AuditFilter:
+      type: object
+      additionalProperties: false
+      description: All filters are optional and combine with AND.
+      properties:
+        occurred_after:
+          $ref: '#/components/schemas/Timestamp'
+        occurred_before:
+          $ref: '#/components/schemas/Timestamp'
+        actor_type:
+          $ref: '#/components/schemas/ActorType'
+        actor_id:
+          $ref: '#/components/schemas/Id'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+          description: Events whose actor or target is this email address, such as a member, recipient or uploader.
+        actions:
+          type: array
+          maxItems: 20
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z_]+\.[a-z_]+$'
+          examples:
+            - [file.downloaded, transfer.revoked]
+        target_type:
+          type: string
+          maxLength: 64
+          examples:
+            - transfer
+        target_id:
+          $ref: '#/components/schemas/Id'
+        source_ip:
+          type: string
+          maxLength: 45
+          description: An IPv4 or IPv6 address.
+
+    AuditSearchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        filter:
+          $ref: '#/components/schemas/AuditFilter'
+        cursor:
+          type: string
+          maxLength: 512
+          description: '`next_cursor` from the previous page. Leave it out for the first page.'
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 25
+
+    AuditExportRequest:
+      type: object
+      additionalProperties: false
+      required: [format]
+      properties:
+        filter:
+          $ref: '#/components/schemas/AuditFilter'
+        format:
+          type: string
+          enum: [csv, json]
+          description: '`csv` returns `text/csv`; `json` returns `application/json`.'
+
+    AuditEvent:
+      type: object
+      required: [id, occurred_at, actor_type, actor_id, actor_email, action, target_type, target_id, source_ip, user_agent, request_id, security_critical, details]
+      description: One audit record (FR-27). `details` holds IDs and enums, never file names or message text.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        occurred_at:
+          $ref: '#/components/schemas/Timestamp'
+        actor_type:
+          $ref: '#/components/schemas/ActorType'
+        actor_id:
+          type: [string, 'null']
+          format: uuid
+          description: '`null` for `system`.'
+        actor_email:
+          type: [string, 'null']
+          format: email
+          description: The actor's email address, when the actor is a person and still known.
+        action:
+          type: string
+          pattern: '^[a-z_]+\.[a-z_]+$'
+          examples:
+            - file.downloaded
+        target_type:
+          type: [string, 'null']
+          examples:
+            - file
+        target_id:
+          type: [string, 'null']
+          format: uuid
+        source_ip:
+          type: [string, 'null']
+        user_agent:
+          type: [string, 'null']
+        request_id:
+          type: [string, 'null']
+        security_critical:
+          type: boolean
+          description: True for records also written straight to both regions' audit archive.
+        details:
+          type: object
+          additionalProperties: true
+
+    AuditEventPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # Tenant administration
+
+    Tenant:
+      type: object
+      required: [id, name, status, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+        status:
+          type: string
+          enum: [active, suspended]
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    User:
+      type: object
+      required: [id, email, role, status, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        role:
+          $ref: '#/components/schemas/Role'
+        status:
+          $ref: '#/components/schemas/UserStatus'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    CurrentMember:
+      type: object
+      required: [user, tenant]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        tenant:
+          $ref: '#/components/schemas/Tenant'
+
+    UserInvite:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        role:
+          $ref: '#/components/schemas/Role'
+          default: member
+
+    UserUpdate:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+
+    UserPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    TenantPolicy:
+      type: object
+      required: [max_expiry, unscannable_policy, received_file_retention_days, allowed_domains, blocked_domains, default_locale, updated_at]
+      properties:
+        max_expiry:
+          type: string
+          format: duration
+          description: Longest allowed expiry, an ISO 8601 duration between `PT1H` and `P30D` (FR-3, FR-23).
+          examples:
+            - P30D
+        unscannable_policy:
+          $ref: '#/components/schemas/UnscannablePolicy'
+        received_file_retention_days:
+          type: integer
+          minimum: 1
+          maximum: 90
+          description: How long received files are kept, counted from each file's upload (FR-13).
+        allowed_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: If not empty, recipients and uploaders must be in one of these domains (FR-24).
+          items:
+            type: string
+            format: hostname
+        blocked_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: Recipients and uploaders can't be in these domains (FR-24).
+          items:
+            type: string
+            format: hostname
+        default_locale:
+          $ref: '#/components/schemas/Locale'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    TenantPolicyUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Only the fields sent are changed.
+      properties:
+        max_expiry:
+          type: string
+          format: duration
+          description: Between `PT1H` and `P30D`.
+        unscannable_policy:
+          $ref: '#/components/schemas/UnscannablePolicy'
+        received_file_retention_days:
+          type: integer
+          minimum: 1
+          maximum: 90
+        allowed_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items:
+            type: string
+            format: hostname
+        blocked_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items:
+            type: string
+            format: hostname
+        default_locale:
+          $ref: '#/components/schemas/Locale'
+
+    # API keys
+
+    ApiKeyCreate:
+      type: object
+      additionalProperties: false
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: A label to recognise the key, such as the system that uses it.
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ApiKeyScope'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: At most 365 days from now. Defaults to 90 days.
+
+    ApiKey:
+      type: object
+      required: [id, name, key_prefix, scopes, created_by, created_at, expires_at, last_used_at, revoked_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        name:
+          type: string
+        key_prefix:
+          type: string
+          description: The first characters of the key, so an admin can recognise it without seeing it.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiKeyScope'
+        created_by:
+          $ref: '#/components/schemas/Id'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+
+    ApiKeyCreated:
+      description: A new key, with its full value. The value is never returned again.
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: |
+                The full API key, sent as an `Authorization` bearer token. Store it in a secret manager.
+
+    ApiKeyPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiKey'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    # Operator
+
+    TenantCreate:
+      type: object
+      additionalProperties: false
+      required: [name, first_admin_email]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        first_admin_email:
+          $ref: '#/components/schemas/EmailAddress'
+        default_locale:
+          $ref: '#/components/schemas/Locale'
+          default: en
+
+    TenantCreated:
+      type: object
+      required: [tenant, first_admin]
+      properties:
+        tenant:
+          $ref: '#/components/schemas/Tenant'
+        first_admin:
+          $ref: '#/components/schemas/User'
+
+    # Pagination
+
+    NextCursor:
+      type: [string, 'null']
+      description: Cursor for the next page, or `null` on the last page.
