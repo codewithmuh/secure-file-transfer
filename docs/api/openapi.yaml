@@ -53,7 +53,9 @@ paths:
       operationId: getCurrentMember
       summary: Get the signed-in member
       description: |
-        Returns the signed-in member or admin and their tenant. The web app uses it to decide what to show.
+        Returns the signed-in member or admin, their tenant and the session's CSRF token (`csrf_token`, see the
+        `csrfToken` scheme). The web app calls it after sign-in and after every page load, uses it to decide what to
+        show, and keeps the token in memory for unsafe requests. The response is sent with `Cache-Control: no-store`.
         Signing in and out is provisional: those operations are added once PRD open question 1 decides how members
         sign in with MFA.
 
@@ -81,13 +83,15 @@ paths:
       operationId: createTransfer
       summary: Create a transfer
       description: |
-        Creates a transfer in the `draft` state with its recipients, expiry, optional message and optional download
-        limit. Add files with `addTransferFile`, then call `sendTransfer`. A draft with no activity for 7 days is
-        cancelled.
+        Creates a transfer in the `draft` state with its recipients, how long it stays open, an optional message and
+        an optional download limit. Add files with `addTransferFile`, then call `sendTransfer`. A draft with no
+        activity for 7 days is cancelled.
 
-        `expires_at` must be between 1 hour and 30 days from now, and within the tenant's `max_expiry`. When it is left
-        out, the expiry is 7 days, or the tenant's maximum if that is shorter. Each recipient's domain is checked
-        against the tenant's allowed and blocked domains.
+        `expires_in` is how long the transfer stays open once it is submitted: between 1 hour and 30 days, and within
+        the tenant's `max_expiry`. When it is left out, it is 7 days, or the tenant's maximum if that is shorter. A
+        draft has no `expires_at`: `sendTransfer` sets it to `submitted_at` plus `expires_in`, so time spent as a
+        draft never shortens the transfer. Each recipient's domain is checked against the tenant's allowed and blocked
+        domains.
 
         Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `409 idempotency_conflict`.
 
@@ -173,7 +177,10 @@ paths:
         member sees which file isn't shareable and why (UC-1). A transfer past `expires_at` is shown as `expired` even
         before the lifecycle job records it.
 
-        Requirements: FR-1, FR-5, FR-16, FR-21.
+        A member sees their own transfers. A tenant admin, or an API key with `transfers:read`, sees every transfer in
+        the tenant, as metadata only (UC-3). Another member's transfer returns `404` to a member who isn't an admin.
+
+        Requirements: FR-1, FR-5, FR-16, FR-20, FR-21.
       x-permission: transfer.read
       security:
         - memberSession: []
@@ -202,15 +209,17 @@ paths:
       operationId: sendTransfer
       summary: Send a transfer
       description: |
-        Moves a `draft` transfer to `submitted`. Every file must have finished uploading. The service then runs the
-        locked evaluation (architecture 4.1): when every file is shareable the transfer becomes `sent` and each
-        recipient is emailed a link; when any file isn't shareable it becomes `held` and no recipient is notified.
+        Moves a `draft` transfer to `submitted` and sets `submitted_at`, and `expires_at` to `submitted_at` plus
+        `expires_in`. Every file must have finished uploading. The service then runs the locked evaluation
+        (architecture 4.1): when every file is shareable the transfer becomes `sent` and each recipient is emailed a
+        link; when any file isn't shareable it becomes `held` and no recipient is notified.
 
         Calling it again on a transfer that is already `submitted`, `held` or `sent` returns the current transfer, so
-        a retry is safe.
+        a retry is safe. Only the transfer's owner can send it; a tenant admin gets `403 permission_denied` on another
+        member's transfer.
 
-        Errors: `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state` (cancelled), `409 transfer_revoked`,
-        `409 transfer_expired`.
+        Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
+        (cancelled), `409 transfer_revoked`, `409 transfer_expired`.
 
         Requirements: FR-1, FR-5.
       x-permission: transfer.send
@@ -246,9 +255,13 @@ paths:
       description: |
         Cancels a `draft` or `held` transfer. No recipient is notified, and its files are deleted on the PRD data
         lifecycle schedule. Cancelling a transfer that is already `cancelled` returns it unchanged. A transfer that was
-        sent is revoked instead (`revokeTransfer`).
+        sent is revoked instead (`revokeTransfer`). Only the transfer's owner can cancel it; a tenant admin gets
+        `403 permission_denied` on another member's transfer and revokes it instead.
 
-        Errors: `409 invalid_state`.
+        Cancelling a draft while one of its files is uploading wins over the upload: that file becomes `rejected`, and
+        the upload's next call gets `409 invalid_state`.
+
+        Errors: `403 permission_denied`, `409 invalid_state`.
 
         Requirements: FR-5, FR-21.
       x-permission: transfer.cancel
@@ -283,13 +296,14 @@ paths:
       summary: Revoke a transfer
       description: |
         Revokes a `submitted`, `held` or `sent` transfer. The member who created it can revoke it, and so can any
-        tenant admin. In the same transaction every link session of the transfer ends. No new download can start
-        within 5 seconds, and a download in progress stops within 60 seconds (NFR-6). Recipients then see that the
-        link was revoked (`link_revoked`).
+        tenant admin. In one transaction the transfer becomes `revoked`, every link session of the transfer ends and
+        the audit record is written. No new download can start within 5 seconds, and a download in progress stops
+        within 60 seconds (NFR-6). Recipients then see that the link was revoked (`link_revoked`).
 
-        The response comes only after the revocation record is in the audit archive in both regions (NFR-10). If that
-        write fails the call returns `503` and can be retried. Revoking a transfer that is already `revoked` returns it
-        unchanged.
+        A revocation is a security-critical record (README section 5): the `200` comes only after the record is in
+        the audit archive in both regions (NFR-10). If that write fails, the revocation has still taken effect and the
+        call returns `503`; retry it. Revoking a transfer that is already `revoked` writes the archive record if it is
+        still missing and returns `200` with the transfer, so a retry is always safe.
 
         Errors: `409 invalid_state` (draft or cancelled), `409 transfer_expired`, `503 service_unavailable`.
 
@@ -327,12 +341,20 @@ paths:
       operationId: extendTransferExpiry
       summary: Extend a transfer's expiry
       description: |
-        Moves `expires_at` later for a transfer that hasn't ended (`draft`, `submitted`, `held` or `sent`). The new
-        time must be later than the current one. The limits apply to the transfer's whole lifetime, counted from
-        `sent_at` (or from creation while it is a draft): at most 30 days, and at most the tenant's `max_expiry`.
+        Moves `expires_at` later for a transfer that was submitted and hasn't ended (`submitted`, `held` or `sent`).
+        A draft has no `expires_at` yet: its time starts when it is submitted, so there is nothing to extend
+        (`409 invalid_state`).
+
+        The limits apply to the transfer's whole lifetime, counted from `submitted_at`, when `expires_at` was first
+        set: the new time can be at most 30 days after `submitted_at`, and at most the tenant's `max_expiry` after it.
         Repeated extensions can't keep a transfer alive beyond that.
 
-        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `422 expiry_out_of_range`.
+        Asking for the current `expires_at` returns the transfer unchanged, so a retry of a successful extension is
+        safe; an earlier time gets `422 expiry_out_of_range`. The call also accepts an `Idempotency-Key`. Only the
+        transfer's owner can extend it; a tenant admin gets `403 permission_denied` on another member's transfer.
+
+        Errors: `403 permission_denied`, `409 invalid_state` (draft or cancelled), `409 transfer_revoked`,
+        `409 transfer_expired`, `409 idempotency_conflict`, `422 expiry_out_of_range`.
 
         Requirements: FR-9, FR-3.
       x-permission: transfer.extend
@@ -340,6 +362,8 @@ paths:
         - memberSession: []
           csrfToken: []
         - tenantApiKey: ['transfers:write']
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -379,7 +403,10 @@ paths:
         For each recipient: whether they were notified, when they verified, whether they are locked out, and which
         files they downloaded and when. A transfer has at most 50 recipients, so the list isn't paginated.
 
-        Requirements: FR-7, NFR-14.
+        The same people see it as with `getTransfer`: the owner, and every tenant admin and API key with
+        `transfers:read` for any transfer in the tenant, so an admin can find and unlock a locked-out recipient.
+
+        Requirements: FR-7, FR-20, NFR-14.
       x-permission: transfer.read
       security:
         - memberSession: []
@@ -450,13 +477,15 @@ paths:
       description: |
         Declares a file's name, type and size, and starts its multipart upload. The response carries the upload plan
         (`part_size`, `part_count`); request part URLs with `requestUploadPartUrls`. Files can be added only while the
-        transfer is a `draft`.
+        transfer is a `draft`, and only by its owner; a tenant admin gets `403 permission_denied` on another member's
+        transfer.
 
         Limits (FR-1, FR-2): 50 files per transfer, 5 GB (5,000,000,000 bytes) per file, 20 GB per transfer, counted
-        from the declared sizes.
+        from the declared sizes. `completeUpload` counts them again under a lock.
 
-        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `413 file_too_large`,
-        `413 total_too_large`, `422 too_many_files`, `409 idempotency_conflict`.
+        Errors: `403 permission_denied`, `409 invalid_state` (the transfer isn't a draft; `current_state` says what it
+        is, for example `cancelled`), `413 file_too_large`, `413 total_too_large`, `422 too_many_files`,
+        `409 idempotency_conflict`.
 
         Requirements: FR-1, FR-2.
       x-permission: file.upload
@@ -507,9 +536,17 @@ paths:
       operationId: getFile
       summary: Get a file
       description: |
-        Returns a file of one of the caller's transfers or upload requests, with its state: `uploading`, `scanning`,
+        Returns a file of a transfer or upload request the caller can see, with its state: `uploading`, `scanning`,
         `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`. `shareable` says whether it can be
         downloaded under the current tenant policy. The web app polls this while a file is scanning.
+
+        A member sees the files of their own transfers and upload requests; a tenant admin sees every file's metadata
+        in the tenant.
+
+        **API key scope follows the file's owner.** A key needs `transfers:read` for a file of a transfer and
+        `upload_requests:read` for a file received through an upload request. The `security` list names both because
+        OpenAPI can't make the choice depend on the file; the service loads the file and checks the scope that matches
+        its owner kind, so a key with only the other scope gets `404`, as if the file didn't exist.
 
         Requirements: FR-16, FR-18, FR-19.
       x-permission: file.read
@@ -537,16 +574,23 @@ paths:
       operationId: deleteFile
       summary: Remove or delete a file
       description: |
-        For a file of a transfer: removes it while the transfer is a `draft` or `held`. Removing the blocked file of a
-        `held` transfer moves it back to `submitted` and runs the evaluation again, so the remaining files can be sent
-        (UC-1). Removing the last file of a `held` transfer is refused; cancel the transfer instead.
+        For a file of a transfer: removes it while the transfer is a `draft`, `submitted` or `held`. When files remain,
+        removing one from a `submitted` or `held` transfer runs the evaluation again (a `held` transfer moves back to
+        `submitted` first), so removing the blocked file lets the remaining files be sent (UC-1). Removing the last
+        file moves the transfer back to `draft` (data model 3.2): no recipient was ever notified, `submitted_at` and
+        `expires_at` are cleared, and the member can add files and send it again, or cancel it.
 
         For a file received through an upload request: deletes it before its retention ends (FR-13).
 
         The file's contents are deleted on the PRD data lifecycle schedule. Only the member who owns the transfer or
-        request can do this.
+        request can do this; a tenant admin gets `403 permission_denied` on another member's item.
 
-        Errors: `409 invalid_state`, `409 transfer_empty`, `409 transfer_revoked`, `409 transfer_expired`.
+        **API key scope follows the file's owner,** as for `getFile`: `transfers:write` for a file of a transfer,
+        `upload_requests:write` for a received file, checked by the service; a key with only the other scope gets
+        `404`.
+
+        Errors: `403 permission_denied`, `409 invalid_state` (the transfer was sent or cancelled),
+        `409 transfer_revoked`, `409 transfer_expired`.
 
         Requirements: FR-5, FR-13, FR-21.
       x-permission: file.delete
@@ -579,10 +623,11 @@ paths:
       description: |
         Returns a pre-signed URL for each requested part, up to 100 per call. Each URL allows one `PUT` of exactly
         that part's size to object storage, for at most 15 minutes, and allows nothing else. Ask again for parts whose
-        URL expired. URLs are issued only while the file is `uploading` and its transfer is a `draft`.
+        URL expired. URLs are issued only while the file is `uploading` and its transfer is a `draft`, and only to the
+        transfer's owner.
 
-        Errors: `409 invalid_state`, `409 transfer_revoked`, `409 transfer_expired`, `422 validation_failed` (a part
-        number beyond `part_count`).
+        Errors: `403 permission_denied`, `409 invalid_state` (the file is past `uploading`, or the draft was cancelled
+        by its owner or after 7 days without activity), `422 validation_failed` (a part number beyond `part_count`).
 
         Requirements: FR-2, NFR-3, NFR-6.
       x-permission: file.upload
@@ -623,9 +668,11 @@ paths:
       summary: List the parts already uploaded
       description: |
         Lists the parts object storage already holds for a file that is still `uploading`, so an interrupted upload
-        sends only the missing parts. A file has at most 1,000 parts, so the list isn't paginated.
+        sends only the missing parts. A file has at most 1,000 parts, so the list isn't paginated. Only the transfer's
+        owner can call it.
 
-        Errors: `409 invalid_state`.
+        Errors: `403 permission_denied`, `409 invalid_state` (the file is past `uploading`, for example because the
+        draft was cancelled).
 
         Requirements: FR-2, NFR-3.
       x-permission: file.upload
@@ -658,16 +705,19 @@ paths:
       operationId: completeUpload
       summary: Complete a file upload
       description: |
-        Assembles the uploaded parts into one object, checks its real size against the declared size and the limits,
-        and re-checks the transfer under a row lock, so a revocation that lands meanwhile wins (NFR-6). On success the
-        file moves to `scanning`. If a check fails, the object is deleted and the file becomes `rejected`.
+        Assembles the uploaded parts into one object, checks its real size against the declared size, and re-checks
+        the transfer under a row lock, so a cancellation of the draft that lands meanwhile wins: a cancelled draft
+        never accepts the file. Under the same lock it counts the transfer's files and their total size again, so
+        uploads added in parallel can't exceed 50 files or 20 GB (FR-1, FR-2). On success the file moves to
+        `scanning`. If a check fails, the object is deleted and the file becomes `rejected`.
 
-        Completing a file that is already past `uploading` returns it unchanged, so a retry is safe.
+        Completing a file that is already past `uploading` returns it unchanged, so a retry is safe. Only the
+        transfer's owner can call it.
 
-        Errors: `409 upload_incomplete` (parts missing), `409 transfer_revoked`, `409 transfer_expired`,
-        `422 upload_size_mismatch`.
+        Errors: `403 permission_denied`, `409 upload_incomplete` (parts missing), `409 invalid_state` (the draft was
+        cancelled meanwhile), `413 total_too_large`, `422 too_many_files`, `422 upload_size_mismatch`.
 
-        Requirements: FR-2, FR-16, NFR-6.
+        Requirements: FR-1, FR-2, FR-16.
       x-permission: file.upload
       security:
         - memberSession: []
@@ -688,6 +738,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
         '422':
           $ref: '#/components/responses/UnprocessableContent'
         '429':
@@ -837,7 +889,11 @@ paths:
       description: |
         Returns an upload request, including whether the uploader has verified or is locked out.
 
-        Requirements: FR-10, FR-12, NFR-14.
+        A member sees their own upload requests. A tenant admin, or an API key with `upload_requests:read`, sees every
+        upload request in the tenant, as metadata only (UC-3). Another member's request returns `404` to a member who
+        isn't an admin.
+
+        Requirements: FR-10, FR-12, FR-20, NFR-14.
       x-permission: upload_request.read
       security:
         - memberSession: []
@@ -870,8 +926,9 @@ paths:
         Files already received stay available until their own retention ends (FR-13). The member who created it, or a
         tenant admin, can revoke it.
 
-        As with `revokeTransfer`, the response comes only after the revocation record is in the audit archive in both
-        regions, and `503` means it can be retried. Revoking a request that is already `revoked` returns it unchanged.
+        As with `revokeTransfer`, the `200` comes only after the revocation record is in the audit archive in both
+        regions. A `503` means the revocation has taken effect but its record isn't confirmed yet; retry it. Revoking
+        a request that is already `revoked` writes the archive record if it is still missing and returns `200`.
 
         Errors: `409 upload_request_expired`, `503 service_unavailable`.
 
@@ -947,8 +1004,9 @@ paths:
       summary: List files received through an upload request
       description: |
         Lists every file the uploader sent, with its state and `retention_until`. Shareable files can be downloaded
-        with `createReceivedFileDownload`; blocked files show why. A request receives at most 50 files, so the list
-        isn't paginated.
+        with `createReceivedFileDownload` by the request's owner; blocked files show why. A request receives at most
+        50 files, so the list isn't paginated. The same people see it as with `getUploadRequest`; a tenant admin sees
+        the files' metadata only.
 
         Requirements: FR-12, FR-13, FR-16.
       x-permission: upload_request.read
@@ -979,7 +1037,8 @@ paths:
       description: |
         The web app reads the token from the URL fragment of the emailed link and posts it here. The response says
         only what kind of link it is and whether verification is needed. It reveals no file name, message, sender or
-        content (FR-14).
+        content (FR-14). When this browser already holds a live link session for this link, `access_state` is
+        `verified` and `link_session_id` names that session, so the web app carries on without a new code.
 
         Public. Rate limit: 60 link-page requests per IP address per minute (NFR-14).
 
@@ -1067,8 +1126,15 @@ paths:
       summary: Verify a code and start a link session
       description: |
         Checks the code against the newest code for this recipient or uploader. Attempts are counted atomically. On
-        success the response sets the link session cookie, bound to this browser and to this one transfer or upload
-        request, valid for at most 24 hours (FR-15).
+        success a new link session starts, bound to this browser and to this one transfer recipient or upload request,
+        valid for at most 24 hours (FR-15). The response body carries the session's `id`, which every `/session` call
+        sends in `X-Link-Session`, and its own `csrf_token`. It is sent with `Cache-Control: no-store`.
+
+        A browser can hold several link sessions at once, one per transfer recipient or upload request, so verifying a
+        second link never ends the first. The response sets a new `__Host-sft_link` value, and the browser's other
+        live link sessions move to it, so a value from before verification never carries into a session. A browser
+        holds at most 10 link sessions; verifying an 11th ends the oldest. Verifying again for a subject that already
+        has a session in this browser replaces that session.
 
         A wrong code returns `422 code_invalid` with `attempts_remaining`. After 5 wrong attempts the code is used up
         (`422 code_attempts_exhausted`); after 20 failed attempts in total the recipient or uploader is locked out
@@ -1116,15 +1182,20 @@ paths:
           $ref: '#/components/responses/ServiceUnavailable'
 
   /session:
+    parameters:
+      - $ref: '#/components/parameters/LinkSessionId'
     get:
       tags: [Recipient session]
       operationId: getLinkSession
       summary: Get the current link session
       description: |
-        Returns what the verified recipient or uploader may now see: the message, the sender, the expiry and, for an
-        upload request, the limits and what has been received so far.
+        Returns what the verified recipient or uploader may now see, in the link session named by `X-Link-Session`:
+        the message, the sender, the expiry and, for an upload request, the limits and what has been received so far.
+        It also returns the session's `csrf_token`, so the web app gets it back after a page load; the response is
+        sent with `Cache-Control: no-store`.
 
-        Errors: `401 session_expired`, `410 link_revoked`, `410 link_expired`.
+        Errors: `401 authentication_required` (no `X-Link-Session`, or one this browser doesn't hold),
+        `401 session_expired`, `410 link_revoked`, `410 link_expired`.
 
         Requirements: FR-14, FR-15, FR-11.
       x-permission: session.read
@@ -1150,7 +1221,8 @@ paths:
       operationId: endLinkSession
       summary: End the current link session
       description: |
-        Ends the link session and clears its cookie. Opening the link again needs a new verification.
+        Ends the link session named by `X-Link-Session`. The browser's other link sessions carry on; the
+        `__Host-sft_link` cookie is cleared once none is left. Opening the link again needs a new verification.
 
         Requirements: FR-15.
       x-permission: session.end
@@ -1168,6 +1240,8 @@ paths:
           $ref: '#/components/responses/TooManyRequests'
 
   /session/files:
+    parameters:
+      - $ref: '#/components/parameters/LinkSessionId'
     get:
       tags: [Recipient session]
       operationId: listSessionFiles
@@ -1253,6 +1327,7 @@ paths:
   /session/files/{file_id}/parts:
     parameters:
       - $ref: '#/components/parameters/FileId'
+      - $ref: '#/components/parameters/LinkSessionId'
     post:
       tags: [Recipient session]
       operationId: requestSessionUploadPartUrls
@@ -1333,17 +1408,20 @@ paths:
   /session/files/{file_id}/complete:
     parameters:
       - $ref: '#/components/parameters/FileId'
+      - $ref: '#/components/parameters/LinkSessionId'
     post:
       tags: [Recipient session]
       operationId: completeSessionUpload
       summary: Complete an uploader's file upload
       description: |
         For an uploader: the same checks as `completeUpload`, against the upload request under a row lock. A request
-        revoked or expired meanwhile never accepts the file (NFR-6). When the scan finishes, a shareable file becomes
-        available to the member, who is notified; a blocked file is reported to both sides (FR-12).
+        revoked or expired meanwhile never accepts the file (NFR-6). Under the same lock the request's files and their
+        total size are counted again, so uploads added in parallel can't exceed 50 files or 20 GB (FR-11). When the
+        scan finishes, a shareable file becomes available to the member, who is notified; a blocked file is reported
+        to both sides (FR-12).
 
         Errors: `403 permission_denied`, `409 upload_incomplete`, `410 link_revoked`, `410 link_expired`,
-        `422 upload_size_mismatch`.
+        `413 total_too_large`, `422 too_many_files`, `422 upload_size_mismatch`.
 
         Requirements: FR-11, FR-12, FR-16, NFR-6.
       x-permission: session.upload
@@ -1367,6 +1445,8 @@ paths:
           $ref: '#/components/responses/Conflict'
         '410':
           $ref: '#/components/responses/Gone'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
         '422':
           $ref: '#/components/responses/UnprocessableContent'
         '429':
@@ -1375,16 +1455,27 @@ paths:
   /session/files/{file_id}/downloads:
     parameters:
       - $ref: '#/components/parameters/FileId'
+      - $ref: '#/components/parameters/LinkSessionId'
     post:
       tags: [Recipient session]
       operationId: createSessionDownload
       summary: Download a file of the transfer
       description: |
         For a recipient: grants access to one shareable file of the transfer. There is no download of several files
-        at once (FR-6). The call checks revocation and expiry, then counts the download with one conditional update
-        in the same transaction as the audit record, so parallel requests can't exceed the limit (FR-4). The audit
-        record is committed, and the grant written to both regions' audit archive, before access is returned; if
-        either write fails the call returns `503` (NFR-15, NFR-10).
+        at once (FR-6). A new download runs in this order, so that a `503` always means nothing was counted:
+
+        1. Check the session, revocation, expiry, that the file is shareable and that the limit isn't used up.
+        2. Generate the grant's ID, and write the grant record under that ID to the audit archive in both regions
+           (NFR-10).
+        3. In one transaction: count the download with one conditional update, so parallel requests can't exceed
+           the limit (FR-4); create the grant under that ID; write the audit record (NFR-15). Commit.
+        4. Return the grant.
+
+        If the archive write or the commit fails, the call returns `503`, nothing was counted, and it can be
+        retried. If a parallel request took the last download between steps 1 and 3, the call returns
+        `403 download_limit_reached`. Either way the archive may hold a record for a grant that was never issued: it
+        gave no access, and re-applying it after a failover or restore can count one download too many, never one
+        too few.
 
         Resuming an interrupted download passes `resume_grant_id` and doesn't count again (FR-6). Every call is
         checked and audited and never replays a stored response, so it takes no `Idempotency-Key`. Rate limits:
@@ -1485,6 +1576,11 @@ paths:
         `searchAuditEvents`. At most 1,000,000 events per export; narrow the time range beyond that. The export is
         recorded in the audit log (FR-27).
 
+        **CSV formula neutralisation.** Fields such as `actor_email`, `user_agent` and `details` hold text an outsider
+        chose, which a spreadsheet could run as a formula (CWE-1236). So every CSV cell that starts with `=`, `+`, `-`,
+        `@`, a tab or a carriage return is prefixed with a single quote (`'`), and every cell is quoted as in RFC 4180.
+        The JSON format is unchanged, because it is never opened as a spreadsheet.
+
         Needs the admin role or an API key with `audit:read`.
 
         Errors: `422 export_too_large`, `422 validation_failed`.
@@ -1511,7 +1607,10 @@ paths:
             text/csv:
               schema:
                 type: string
-                description: One header row, then one row per event, with the columns of `AuditEvent`.
+                description: |
+                  RFC 4180 CSV: one header row, then one row per event, with the columns of `AuditEvent` and `details`
+                  as one JSON cell. Every cell is quoted, and a cell that starts with `=`, `+`, `-`, `@`, a tab or a
+                  carriage return is prefixed with a single quote, so a spreadsheet never runs it as a formula.
             application/json:
               schema:
                 type: array
@@ -1641,11 +1740,18 @@ paths:
       summary: Change a user's role
       description: |
         Assigns the `admin` or `member` role. The tenant always keeps at least one active admin. Role changes are
-        audited (FR-27).
+        audited (FR-27). Setting the role a user already has returns them unchanged.
 
-        Errors: `409 last_admin`, `409 invalid_state` (deactivated user).
+        **Demoting an admin to `member` revokes every API key they own,** in the same transaction as the role change,
+        because a key acts as the admin who created it (FR-32). Before the demotion the web app shows the keys the
+        admin owns (`listApiKeys`, by `created_by`), so automation can move to another admin's key first. A demotion
+        is a security-critical record, like a deactivation (README section 5): the `200` comes only after it is in
+        the audit archive in both regions. If that write fails, the demotion and the key revocations have still taken
+        effect and the call returns `503`; retry it, and the retry writes the record if it is still missing.
 
-        Requirements: FR-22.
+        Errors: `409 last_admin`, `409 invalid_state` (deactivated user), `503 service_unavailable`.
+
+        Requirements: FR-22, FR-32, NFR-10.
       x-permission: user.update_role
       security:
         - memberSession: [admin]
@@ -1677,6 +1783,8 @@ paths:
           $ref: '#/components/responses/UnprocessableContent'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /users/{user_id}/deactivate:
     parameters:
@@ -1686,16 +1794,20 @@ paths:
       operationId: deactivateUser
       summary: Deactivate a user
       description: |
-        Deactivates a member or admin: their sessions end at once and they can no longer sign in. Their transfers and
+        Deactivates a member or admin. In one transaction the user becomes `deactivated`, every session of theirs
+        ends, every API key they own is revoked, and the audit record is written; they can no longer sign in, and the
+        next call with any of their keys gets `401`. Before deactivating an admin, the web app shows the keys they own
+        (`listApiKeys`, by `created_by`), so automation can move to another admin's key first. Their transfers and
         upload requests are unchanged; an admin can revoke them. The tenant always keeps at least one active admin.
 
-        A deactivation is a security-critical record: the response comes only after it is in the audit archive in both
-        regions (NFR-10), and `503` means it can be retried. Deactivating a user who is already deactivated returns
-        them unchanged.
+        A deactivation is a security-critical record (README section 5): the `200` comes only after it is in the
+        audit archive in both regions (NFR-10). If that write fails, the deactivation has still taken effect and the
+        call returns `503`; retry it. Deactivating a user who is already deactivated writes the archive record if it
+        is still missing and returns `200` with the user, so a retry is always safe.
 
         Errors: `409 last_admin`, `503 service_unavailable`.
 
-        Requirements: FR-22, NFR-10.
+        Requirements: FR-22, FR-32, NFR-10.
       x-permission: user.deactivate
       security:
         - memberSession: [admin]
@@ -1947,34 +2059,51 @@ components:
       in: cookie
       name: __Host-sft_session
       description: |
-        Web app session of a member or admin: HttpOnly, Secure, SameSite=Lax. **Provisional:** how it is issued waits
-        for PRD open question 1 (sign-in with MFA, FR-25). Where a requirement lists `admin`, the member needs the
-        admin role. Unsafe methods also need `csrfToken`.
+        Web app session of a member or admin: HttpOnly, Secure, SameSite=Strict, host-only. **Provisional:** how it is
+        issued waits for PRD open question 1 (sign-in with MFA, FR-25). Where a requirement lists `admin`, the member
+        needs the admin role. Unsafe methods also need `csrfToken`, with the token `getCurrentMember` returns.
     csrfToken:
       type: apiKey
       in: header
       name: X-CSRF-Token
       description: |
-        CSRF token for cookie sessions. The service sets a readable `__Host-sft_csrf` cookie with each session; the web
-        app copies its value into this header on every POST, PATCH and DELETE. The service also checks `Origin` on
-        every unsafe request. Phase 3 (security design) confirms the pattern.
+        Synchronizer CSRF token for cookie sessions. **Each member session and each link session has its own token**,
+        returned in response bodies: `csrf_token` in `getCurrentMember` for a member session, and in
+        `createLinkSession` and `getLinkSession` for a link session. Those responses are sent with
+        `Cache-Control: no-store`. The web app keeps the token in memory only and sends it in this header on every
+        POST, PATCH and DELETE.
+
+        The service checks the token against the session the request uses: the member session on member routes, and
+        the link session named by `X-Link-Session` on `/session` routes. Starting a link session therefore never
+        changes a member's token, and two link sessions in one browser have independent tokens. A token changes
+        whenever its session does. The service also checks that `Origin` is the web app's origin on every unsafe
+        request. A missing or wrong token, or a foreign `Origin`, gets `403 csrf_failed`.
+
+        There is no readable CSRF cookie: the web app and the API are separate origins, so the web app couldn't read a
+        cookie of the API host.
     tenantApiKey:
       type: http
       scheme: bearer
       bearerFormat: opaque tenant API key
       description: |
-        Tenant API key for automation (FR-32), sent as `Authorization: Bearer <key>`. A key acts for the tenant with
-        the rights of a tenant admin, limited to the scopes listed in each requirement (`ApiKeyScope`). What a key
-        creates is owned by the admin who created the key, and the audit log names the key as the actor. Keys never
-        download file contents.
+        Tenant API key for automation (FR-32), sent as `Authorization: Bearer <key>`. A key acts as the tenant admin
+        who created it, limited to the scopes listed in each requirement (`ApiKeyScope`). What a key creates is owned
+        by that admin, and the audit log names the key as the actor. Keys never download file contents.
+
+        A key is valid only while its owner is an active admin: deactivating the owner (`deactivateUser`) or demoting
+        them to `member` (`updateUser`) revokes every key they own in the same transaction, and the next call with
+        such a key gets `401`.
     linkSession:
       type: apiKey
       in: cookie
       name: __Host-sft_link
       description: |
-        Link session of a verified recipient or uploader (FR-15): HttpOnly, Secure, SameSite=Strict, bound to one
-        transfer recipient or one upload request, valid for at most 24 hours. Set by `createLinkSession`. Unsafe
-        methods also need `csrfToken`.
+        Link sessions of a verified recipient or uploader (FR-15). The cookie is HttpOnly, Secure, SameSite=Strict and
+        host-only, and identifies the browser. A browser can hold several link sessions at once, one per transfer
+        recipient or upload request, each with its own ID, expiry (at most 24 hours) and CSRF token, so verifying a
+        second link never ends the first. Every `/session` call names the session it acts in with the
+        `X-Link-Session` header and gets only that session's transfer or request. Set by `createLinkSession`. Unsafe
+        methods also need `csrfToken`, with that session's token.
     operatorToken:
       type: http
       scheme: bearer
@@ -2102,15 +2231,30 @@ components:
       in: header
       required: false
       description: |
-        A unique key per logical request, such as a UUID, so a retry can't create a second item. The key is scoped to
-        the caller and kept with a fingerprint of the request body for 24 hours. A retry with the same key and body
-        gets the stored response; the same key with a different body gets `409 idempotency_conflict`, and a retry
-        while the first request is still running gets `409 idempotency_in_progress` (architecture 5.4).
+        A unique key per logical request, such as a UUID, so a retry can't apply a change twice. The key is scoped to
+        the caller and kept for 24 hours with a fingerprint of the method, the path with its resource IDs filled in
+        (such as `POST /v1/transfers/{id}/files` for one transfer) and the body. A retry with the same key, method,
+        path and body gets the stored response. The same key with any of them different gets
+        `409 idempotency_conflict`, so a key reused on another resource is refused rather than answered with the first
+        resource's response. A retry while the first request is still running gets `409 idempotency_in_progress`
+        (architecture 5.4).
       schema:
         type: string
         minLength: 1
         maxLength: 255
         pattern: '^[\x21-\x7E]+$'
+    LinkSessionId:
+      name: X-Link-Session
+      in: header
+      required: true
+      description: |
+        ID of the link session this call acts in (`LinkSession.id`, from `createLinkSession` or `resolveLink`). A
+        browser can hold several link sessions at once under its `__Host-sft_link` cookie, one per transfer recipient
+        or upload request; this header picks one, and the call sees only that session's transfer or request. The ID
+        is not a credential: it works only with the cookie of the browser that verified it, so the web app may keep it
+        across a page reload. A missing ID, or one this browser doesn't hold, gets `401`.
+      schema:
+        $ref: '#/components/schemas/Id'
 
   headers:
     RetryAfter:
@@ -2129,8 +2273,9 @@ components:
         type: string
     SetLinkSessionCookie:
       description: |
-        Sets `__Host-sft_link`, the link session (HttpOnly, Secure, SameSite=Strict, Path=/, at most 24 hours), and
-        `__Host-sft_csrf`, the CSRF token the web app copies into `X-CSRF-Token`.
+        Sets a new value of `__Host-sft_link` (HttpOnly, Secure, SameSite=Strict, Path=/, no Domain), which carries
+        this browser's link sessions, the new one and any it already held. No CSRF cookie is set: the CSRF token is in
+        the response body.
       schema:
         type: string
     ContentDisposition:
@@ -2179,8 +2324,10 @@ components:
                 request_id: req_7f3c2a91
     NotFound:
       description: |
-        Nothing with this ID or token is visible to the caller. Items of another tenant, or owned by another member,
-        return this too, so their existence is never revealed (NFR-12). Codes: `not_found`, `link_not_found`.
+        Nothing with this ID or token is visible to the caller. An item of another tenant returns this too, and so
+        does another member's item for a caller who isn't a tenant admin, so their existence is never revealed
+        (NFR-12). Tenant admins, and API keys with the matching read scope, see every transfer and upload request in
+        their tenant. Codes: `not_found`, `link_not_found`.
       content:
         application/problem+json:
           schema:
@@ -2196,15 +2343,25 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
           examples:
+            draftCancelled:
+              summary: The draft was cancelled while a file was uploading
+              value:
+                type: https://secure-file-transfer.example/problems/invalid_state
+                title: Not allowed in this state
+                status: 409
+                code: invalid_state
+                detail: The transfer was cancelled, so this file was not accepted.
+                request_id: req_51d0e8b4
+                current_state: cancelled
             transferRevoked:
-              summary: The transfer was revoked while a file was uploading
+              summary: The member extends a transfer that was revoked
               value:
                 type: https://secure-file-transfer.example/problems/transfer_revoked
                 title: Transfer revoked
                 status: 409
                 code: transfer_revoked
-                detail: The transfer was revoked, so this file was not accepted.
-                request_id: req_51d0e8b4
+                detail: The transfer was revoked, so its expiry can't change.
+                request_id: req_9a27c3e0
                 current_state: revoked
     Gone:
       description: |
@@ -2264,9 +2421,16 @@ components:
             $ref: '#/components/schemas/Problem'
     ServiceUnavailable:
       description: |
-        A dependency the call must not proceed without is unavailable, so the call failed closed: the audit write
-        before a download (NFR-15), the two-region record of a revocation or deactivation (NFR-10), or the rate-limit
-        counters for verification (NFR-14). Nothing changed; retry after `Retry-After`. Code: `service_unavailable`.
+        A dependency the call must not do without is unavailable. Retry after `Retry-After`. What the `503` means
+        depends on the call (README section 5):
+
+        - **Download grants** (NFR-15) and **verification** (the rate-limit counters, NFR-14) fail closed: nothing
+          changed, and no download was counted.
+        - **Security-critical changes** (a revocation, deactivation or demotion, NFR-10) have taken effect, but their
+          record isn't yet confirmed in both regions' audit archive. A retry finds the change already made, writes the
+          record if it is still missing, and returns success.
+
+        Code: `service_unavailable`.
       headers:
         Retry-After:
           $ref: '#/components/headers/RetryAfter'
@@ -2330,8 +2494,9 @@ components:
       type: string
       enum: ['transfers:read', 'transfers:write', 'upload_requests:read', 'upload_requests:write', 'audit:read']
       description: |
-        What an API key may do. `transfers:write` includes uploading files to the key's transfers. No scope allows
-        downloading file contents.
+        What an API key may do. `transfers:write` includes uploading files to the key's transfers. For a file
+        (`getFile`, `deleteFile`), the scope that applies follows the file's owner: `transfers:*` for a file of a
+        transfer, `upload_requests:*` for a received file. No scope allows downloading file contents.
 
     ActorType:
       type: string
@@ -2478,9 +2643,15 @@ components:
           description: 1 to 50 recipients, with no address twice (FR-1).
           items:
             $ref: '#/components/schemas/RecipientInput'
-        expires_at:
-          $ref: '#/components/schemas/Timestamp'
-          description: Between 1 hour and 30 days from now, within the tenant's `max_expiry` (FR-3). Defaults to 7 days, or the tenant's maximum if shorter.
+        expires_in:
+          type: string
+          format: duration
+          description: |
+            How long the transfer stays open once it is submitted, an ISO 8601 duration between `PT1H` and `P30D`,
+            within the tenant's `max_expiry` (FR-3). Defaults to `P7D`, or the tenant's maximum if shorter.
+            `sendTransfer` sets `expires_at` to `submitted_at` plus this duration.
+          examples:
+            - P7D
         message:
           type: string
           maxLength: 2000
@@ -2516,6 +2687,7 @@ components:
         - state
         - created_by
         - created_at
+        - expires_in
         - expires_at
         - message
         - download_limit
@@ -2537,8 +2709,17 @@ components:
           description: ID of the member who owns the transfer.
         created_at:
           $ref: '#/components/schemas/Timestamp'
+        expires_in:
+          type: string
+          format: duration
+          description: How long the transfer stays open once it is submitted, as chosen at creation.
         expires_at:
-          $ref: '#/components/schemas/Timestamp'
+          type: [string, 'null']
+          format: date-time
+          description: |
+            `null` while the transfer is a draft. Set when it is submitted, to `submitted_at` plus `expires_in`, and
+            moved later only by `extendTransferExpiry`, never to more than 30 days, or the tenant's `max_expiry` if
+            that is shorter, after `submitted_at`. Cleared if the transfer goes back to `draft` (`deleteFile`).
         message:
           type: [string, 'null']
         download_limit:
@@ -2550,6 +2731,7 @@ components:
         submitted_at:
           type: [string, 'null']
           format: date-time
+          description: When the transfer was submitted. Its lifetime, and every extension, is counted from here.
         sent_at:
           type: [string, 'null']
           format: date-time
@@ -2587,7 +2769,9 @@ components:
         created_at:
           $ref: '#/components/schemas/Timestamp'
         expires_at:
-          $ref: '#/components/schemas/Timestamp'
+          type: [string, 'null']
+          format: date-time
+          description: '`null` while the transfer is a draft.'
         sent_at:
           type: [string, 'null']
           format: date-time
@@ -2624,7 +2808,9 @@ components:
       properties:
         expires_at:
           $ref: '#/components/schemas/Timestamp'
-          description: The new expiry, later than the current one.
+          description: |
+            The new expiry: no earlier than the current one, and no more than 30 days, or the tenant's `max_expiry` if
+            that is shorter, after `submitted_at`. The current expiry itself returns the transfer unchanged.
 
     RecipientDownload:
       type: object
@@ -2950,7 +3136,10 @@ components:
           description: Defaults to the tenant's `default_locale`.
         expires_at:
           $ref: '#/components/schemas/Timestamp'
-          description: Same range and default as a transfer (FR-3).
+          description: |
+            Between 1 hour and 30 days from now, within the tenant's `max_expiry` (FR-3). Defaults to 7 days from now,
+            or the tenant's maximum if shorter. A request is open from creation, so its expiry is a time, not a
+            duration.
         message:
           type: string
           maxLength: 2000
@@ -3064,6 +3253,9 @@ components:
           type: string
           enum: [verification_required, verified, locked]
           description: '`verified` when this browser already has a valid link session for this link.'
+        link_session_id:
+          $ref: '#/components/schemas/Id'
+          description: Present when `access_state` is `verified`, the ID to send in `X-Link-Session`.
         locale:
           $ref: '#/components/schemas/Locale'
 
@@ -3094,9 +3286,14 @@ components:
 
     LinkSession:
       type: object
-      required: [kind, email, locale, expires_at]
+      required: [id, csrf_token, kind, email, locale, expires_at]
       description: A verified link session. Exactly one of `transfer` and `upload_request` is present, matching `kind`.
       properties:
+        id:
+          $ref: '#/components/schemas/Id'
+          description: ID of the session, sent in `X-Link-Session` on every `/session` call. Not a credential.
+        csrf_token:
+          $ref: '#/components/schemas/CsrfToken'
         kind:
           $ref: '#/components/schemas/LinkKind'
         email:
@@ -3360,12 +3557,24 @@ components:
 
     CurrentMember:
       type: object
-      required: [user, tenant]
+      required: [user, tenant, csrf_token]
       properties:
         user:
           $ref: '#/components/schemas/User'
         tenant:
           $ref: '#/components/schemas/Tenant'
+        csrf_token:
+          $ref: '#/components/schemas/CsrfToken'
+
+    CsrfToken:
+      type: string
+      minLength: 43
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: |
+        The CSRF token of this one session (member or link), base64url with 256 random bits. Send it in
+        `X-CSRF-Token` on every POST, PATCH and DELETE of this session. Keep it in memory only; never put it in a URL,
+        storage or a log.
 
     UserInvite:
       type: object
