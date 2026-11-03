@@ -198,7 +198,7 @@ sequenceDiagram
         API->>DB: file to scanning, outbox scan message, audit, in the same transaction
     end
     M->>API: POST /v1/transfers/{id}/send
-    API->>DB: lock the transfer row, mark submitted, evaluate
+    API->>DB: lock the transfer row, mark submitted, set expires_at, evaluate
     SW->>Q: receive scan message
     SW->>S3: read the object
     SW->>DB: file to clean, infected, unscannable or scan-failed, with audit
@@ -209,9 +209,9 @@ sequenceDiagram
         NW->>DB: create each recipient's link token, store its hash
         NW->>E: one email per recipient, with its link
         NW->>DB: audit email sent
-    else submitted and a file is not shareable
+    else submitted and a file is blocked
         Note over SW,DB: evaluate moves the transfer to held, with an outbox message to the member
-    else files still scanning, or not yet submitted
+    else files still uploading or scanning, or not yet submitted
         Note over SW,DB: evaluate changes nothing
     end
 ```
@@ -222,11 +222,15 @@ sequenceDiagram
   re-checks the transfer under a row lock, so a revocation that lands meanwhile wins (NFR-6). If either check fails,
   the object is deleted and the file is rejected.
 - Resuming an upload: the web app asks the API which parts S3 already has, and sends only the missing ones (NFR-3).
-- **One evaluation, under a lock.** The send call and every scan result lock the transfer row and run the same
-  evaluation: sent if submitted and every file is shareable, held if submitted and any file isn't, otherwise nothing.
-  Whichever happens last triggers the notification, and two scans finishing together can't both miss it (FR-5).
+- **One evaluation, under a lock.** The send call, every scan result, and every file removal or rejection lock the
+  transfer row and run the same evaluation ([data model](design/data-model.md) 3.2). For a submitted or held transfer:
+  held if any file is blocked; otherwise no change while any file is still uploading or scanning; sent once every file
+  is shareable; and back to draft, with a notice to the member, if no files remain. Whichever happens last triggers the
+  notification, and two scans finishing together can't both miss it (FR-5).
 - A scan that keeps failing ends in `scan-failed`, not stuck in `scanning`: the last retry records that state before
-  the message goes to the dead-letter queue, and the transfer is held (FR-19).
+  the message goes to the dead-letter queue, and the transfer is held (FR-19). If a worker dies without recording a
+  result, for example out of memory on a zip bomb, reconciliation moves the file to `scan-failed` once its scan
+  deadline passes.
 - Every message to a worker goes through the outbox (section 5.3), so a crash between the database write and the queue
   send loses nothing.
 - Secrets never travel through the outbox or SQS: the notification worker creates each link token, stores only its
@@ -403,10 +407,12 @@ skip anything already done.
 
 ### 5.4 Idempotent API requests
 
-Every `POST` that creates something accepts an `Idempotency-Key` header. The key is scoped to the caller (member, API
-key or link session) and stored with a fingerprint of the request body for 24 hours. A retry with the same key and body
-gets the stored response; the same key with a different body is rejected with 409. Calls that grant access (download
-access, code requests, sessions) never replay a stored response: they are checked and audited every time.
+Every `POST` that creates something accepts an `Idempotency-Key` header, except API key creation, whose response holds
+the key in plain text. The key is scoped to the caller (member, API key or link session) and stored for 24 hours with
+a fingerprint of the request body, the response status and the ID of what was created, never the response body. A
+retry with the same key and body gets the same status, with the response rebuilt from the resource; the same key with
+a different body is rejected with 409. Calls that grant access (download access, code requests, sessions) never replay
+a response: they are checked and audited every time.
 
 ### 5.5 Observability
 
@@ -428,7 +434,7 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 | Outbox rows after they are sent | 7 days (re-publishing after a failover looks back 24 hours) |
 | Processed-message records | 14 days, as long as a message can stay in a dead-letter queue |
 | SQS messages | 4 days in a work queue, 14 days in a dead-letter queue |
-| Stored idempotency responses | 24 hours |
+| Idempotency records (status and resource ID) | 24 hours |
 
 ## 6. Failure handling
 
@@ -444,7 +450,7 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 | Rate-limit counters unavailable | Errors from the store | Sign-in and verification fail closed; phase 3 decides for other calls. | NFR-14 |
 | File replication lagging | Replication latency metrics | An alert fires; Tokyo is unaffected. | NFR-10 |
 | Bad deploy | Error-rate and latency burn alerts | Revert the version change in the deploy config; Argo CD syncs the previous version. The web app bundle rolls back the same way. | NFR-18: ≤ 10 min |
-| Bad migration or data corruption | Errors, reconciliation report | Point-in-time restore to a new database, then re-apply security-critical changes from the audit archive. | NFR-11: ≤ 2 h |
+| Bad migration or data corruption | Errors, reconciliation report | Point-in-time restore to a new database, start a new audit archive generation (data model 2.5), then re-apply security-critical changes from the audit archive. | NFR-11: ≤ 2 h |
 
 ## 7. Disaster recovery outline
 
@@ -454,7 +460,7 @@ drill, not measurements.
 | Step | Budget |
 |---|---|
 | Confirm the regional failure and decide to fail over | 10 min |
-| Promote the Osaka PostgreSQL replica to primary | 5 min |
+| Promote the Osaka PostgreSQL replica to primary, and start a new audit archive generation (data model 2.5) | 5 min |
 | Add worker nodes in Osaka; Argo CD deploys the current versions with every worker scaled to zero | 20 min |
 | Re-apply security-critical changes from the Osaka audit archive | 5 min |
 | Re-publish unprocessed outbox messages from the last 24 hours, then scale the workers up | 5 min |
@@ -483,6 +489,7 @@ them as unavailable (NFR-10).
 | Area | Candidate | Main alternative | Decided by |
 |---|---|---|---|
 | API framework | FastAPI, SQLAlchemy 2.0, Alembic | Django + Django Ninja | [ADR-0002](adr/0002-api-framework.md), accepted |
+| Multi-tenancy | Shared schema with `tenant_id` on every row | Schema or database per tenant | [ADR-0003](adr/0003-multi-tenancy-shared-schema.md), accepted |
 | Compute | EKS with Argo CD | ECS on Fargate | ADR pending |
 | Database | Aurora PostgreSQL with a global database in Osaka | RDS PostgreSQL Multi-AZ with a cross-region replica | ADR pending |
 | Object storage | S3 with versioning and replication with RTC to Osaka | — | ADR pending |
