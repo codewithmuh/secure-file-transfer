@@ -30,8 +30,9 @@ pipeline runs against real code until the stack ADRs replace them.
 | Verify | Recipients prove they own their email address before they download |
 | Protect | Files encrypted at rest with KMS keys and in transit with TLS; malware scan before any download |
 | Control | Admins revoke any link at any time; every action is written to an audit log |
+| Web app | React + TypeScript app for senders and admins, plus the recipient and uploader pages |
 
-The exact scope, non-goals and measurable targets will be in the PRD ([#2]).
+The exact scope, non-goals and measurable targets are in the [PRD](docs/prd.md).
 
 ## Planning roadmap
 
@@ -39,7 +40,7 @@ Each phase produces documents in `docs/` through its own issue and pull request.
 
 | Phase | Output | Tracking |
 |---|---|---|
-| 1. Requirements | PRD: users, use cases, non-goals, measurable non-functional requirements | [#2] |
+| 1. Requirements | [PRD](docs/prd.md): users, use cases, non-goals, measurable non-functional requirements | [#2] |
 | 2. Architecture and system design | Context and container diagrams, upload and download flows, data model, OpenAPI contract, multi-tenancy model, capacity estimates | — |
 | 3. Security design | STRIDE threat model, encryption and key management, authn/authz, abuse and rate limiting | — |
 | 4. Decisions | One ADR per significant choice in `docs/adr/` | — |
