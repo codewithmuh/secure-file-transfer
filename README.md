@@ -59,19 +59,18 @@ Issue first, one branch per issue, then a pull request with a Conventional Commi
 a code review and green CI before a squash merge into `main`. [CONTRIBUTING.md](CONTRIBUTING.md) has the details,
 including the `main` ruleset and its one temporary exception ([#6]).
 
-release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes signed images with
-SBOMs to GHCR.
+release-please keeps a Release PR open. Merging it tags the version. Signed images go to ECR in the shared account
+from M4 ([ADR-0007](docs/adr/0007-container-registry-ecr.md)).
 
 ## Local development
 
-Requirements: [uv](https://docs.astral.sh/uv/), [Go 1.27](https://go.dev/dl/),
-[golangci-lint](https://golangci-lint.run/), [pre-commit](https://pre-commit.com/) and Docker, or just open the
+Requirements: [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.com/) and Docker, or just open the
 **Dev Container**.
 
 ```bash
 make setup    # install dependencies and the git hooks (gitleaks runs on every commit)
 make check    # lint, type-check and test everything (same as CI)
-make up       # run the services: python on :8000, go on :8080
+make up       # run the API on :8000
 make down
 ```
 
@@ -84,7 +83,6 @@ Run `make` with no arguments to list every command.
 .devcontainer/           reproducible dev environment
 docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api-python/     FastAPI sample service (to be replaced by the API service)
-services/api-go/         Go sample service (to be removed: ADR-0010 keeps v1 Python only)
 compose.yaml             local run with production-like hardening
 Makefile                 every command you need
 ```

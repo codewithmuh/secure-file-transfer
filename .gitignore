@@ -19,10 +19,6 @@ coverage.xml
 htmlcov/
 dist/
 
-# Go
-coverage.out
-/bin/
-
 # Terraform
 .terraform/
 *.tfstate

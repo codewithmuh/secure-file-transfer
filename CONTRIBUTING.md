@@ -6,8 +6,7 @@ Thanks for helping! This guide gets you from clone to merged pull request.
 
 Option A — **Dev Container** (VS Code / Codespaces): open the repo and choose *Reopen in Container*. Everything is installed.
 
-Option B — local: install [uv](https://docs.astral.sh/uv/), [Go 1.27](https://go.dev/dl/),
-[golangci-lint](https://golangci-lint.run/), [pre-commit](https://pre-commit.com/) and Docker, then:
+Option B — local: install [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.com/) and Docker, then:
 
 ```bash
 make setup   # dependencies + git hooks

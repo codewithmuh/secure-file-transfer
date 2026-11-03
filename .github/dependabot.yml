@@ -13,14 +13,8 @@ updates:
     groups:
       python: { patterns: ["*"] }
 
-  - package-ecosystem: gomod
-    directory: /services/api-go
-    schedule: { interval: weekly }
-    groups:
-      go: { patterns: ["*"] }
-
   - package-ecosystem: docker
-    directories: [/services/api-python, /services/api-go]
+    directories: [/services/api-python]
     schedule: { interval: weekly }
     groups:
       base-images: { patterns: ["*"] }
