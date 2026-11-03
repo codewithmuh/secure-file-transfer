@@ -1,131 +1,112 @@
-# Production Repo Template
+# secure-file-transfer
 
 <p align="center">
-  <a href="https://github.com/codewithmuh/production-repo-template/releases"><img src="https://img.shields.io/github/v/release/codewithmuh/production-repo-template?color=blue&label=version&style=flat-square" alt="GitHub Release"></a>
-  <a href="https://github.com/codewithmuh/production-repo-template/actions/workflows/ci.yml"><img src="https://github.com/codewithmuh/production-repo-template/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/codewithmuh/production-repo-template/actions/workflows/release.yml"><img src="https://github.com/codewithmuh/production-repo-template/actions/workflows/release.yml/badge.svg" alt="Release"></a>
-  <a href="https://github.com/codewithmuh/production-repo-template/stargazers"><img src="https://img.shields.io/github/stars/codewithmuh/production-repo-template?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/codewithmuh/production-repo-template/network/members"><img src="https://img.shields.io/github/forks/codewithmuh/production-repo-template?style=flat-square" alt="Forks"></a>
+  <a href="https://github.com/codewithmuh/secure-file-transfer/actions/workflows/ci.yml"><img src="https://github.com/codewithmuh/secure-file-transfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License: MIT"></a>
-  <br>
-  <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
-  <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/Security-Trivy%20%7C%20Gitleaks-critical?style=flat-square" alt="Security">
 </p>
 
-A GitHub template that makes every new repository **production-grade from the first commit**: CI on every pull
-request, secret and vulnerability scanning, signed container images with SBOMs, automated releases and changelog,
-docs and runbooks, and a one-command local setup. It ships with two small sample services — one in **Python
-(FastAPI)** and one in **Go** — so every pipeline runs against real code.
+A secure file transfer service on AWS. A company sends confidential files to outside recipients through a link that
+expires, or sends an upload link so someone outside the company can deliver files to it. Recipients verify their email
+address before they can download. Every file is encrypted with AWS KMS and scanned for malware before it becomes
+downloadable, every action is written to an audit log, and an admin can revoke any link at any time.
 
-> Start a new project: click **Use this template** on GitHub, then follow [After creating a repo](#after-creating-a-repo-from-this-template).
+> [!NOTE]
+> **This is a reference service, not a production business.** It is built to the standard of a real B2B SaaS team
+> (requirements, system design, threat model, ADRs, tests, SLOs, runbooks and measured DR drills), but it has no
+> customers, no support and no uptime commitment. Do not use it to move real confidential data.
 
----
+## Status
 
-## What you get
+**Planning, phase 1 of 6.** There is no product code yet. The two sample services from the
+[production repo template](https://github.com/codewithmuh/production-repo-template) stay in place, so every CI
+pipeline runs against real code until the stack ADRs replace them.
 
-| Area | What is set up | Where |
+## What v1 will do
+
+| Capability | Summary |
+|---|---|
+| Send | Upload files and share them with external recipients by a link that expires |
+| Request | Send an upload link so someone outside the company can deliver files to you |
+| Verify | Recipients prove they own their email address with a one-time code before they download |
+| Protect | Files encrypted at rest with KMS keys and in transit with TLS; malware scan before any download |
+| Control | Admins revoke any link at any time; every action is audit-logged and exportable |
+
+The exact scope, non-goals and measurable targets will be in the PRD ([#2]).
+
+## Planning roadmap
+
+Each phase produces documents in `docs/` through its own issue and pull request.
+
+| Phase | Output | Tracking |
 |---|---|---|
-| Code quality | ruff (lint + format), mypy strict, golangci-lint v2, pre-commit hooks | `pyproject.toml`, `.golangci.yml`, `.pre-commit-config.yaml` |
-| Tests | pytest and Go tests with the race detector; **80 % coverage gate**; container smoke test | `tests/`, `*_test.go`, `ci.yml` |
-| CI | Lint → test → build → scan → smoke test on every PR; workflows linted with actionlint | `.github/workflows/ci.yml` |
-| Security | gitleaks, Trivy (repo + images), Actions pinned to SHAs, least-privilege tokens, non-root read-only containers | `ci.yml`, `Dockerfile`s, `SECURITY.md` |
-| Supply chain | Images signed with cosign (keyless), SBOM (SPDX) on every release, build provenance | `release.yml` |
-| Releases | Conventional Commits → release-please PR → tag, changelog, GHCR images | `release.yml`, `CHANGELOG.md` |
-| Dependencies | Weekly grouped Dependabot PRs for Actions, uv, Go modules and base images | `.github/dependabot.yml` |
-| Observability | JSON logs with request IDs, Prometheus metrics, liveness/readiness probes | `services/*` |
-| Reliability | Graceful shutdown on SIGTERM, server timeouts, health checks in images | `services/*`, `compose.yaml` |
-| Docs | Architecture, threat model, ADRs, runbooks, contributing, security policy, issue/PR templates | `docs/`, `.github/` |
-| Developer experience | `make` targets, Dev Container, Docker Compose, `.env.example` | `Makefile`, `.devcontainer/` |
+| 1. Requirements | PRD: users, use cases, non-goals, measurable non-functional requirements | [#2] |
+| 2. Architecture and system design | Context and container diagrams, upload and download flows, data model, OpenAPI contract, multi-tenancy model, capacity estimates | — |
+| 3. Security design | STRIDE threat model, encryption and key management, authn/authz, abuse and rate limiting | — |
+| 4. Decisions | One ADR per significant choice in `docs/adr/` | — |
+| 5. Delivery plan | GitHub milestones and issues, built in thin vertical slices | — |
+| 6. Operations | SLOs, dashboards, alerts, runbooks, backup/restore and DR drills with measured RTO/RPO | — |
 
-## Quick start
+Candidate stack, to be confirmed or replaced by ADRs: Python (FastAPI), PostgreSQL, Amazon S3 + KMS, Kubernetes (EKS)
+with Argo CD, Terraform, and GitHub Actions with OIDC. The design keeps the moving parts few: one API service plus
+workers, and one system of record.
+
+## How changes flow
+
+1. Every change starts as a GitHub issue with its scope and acceptance criteria.
+2. One branch per issue, from an up-to-date `main`: `<type>/<issue#>-<short-slug>`, e.g. `feat/12-upload-api`.
+3. A pull request with a [Conventional Commit](https://www.conventionalcommits.org/) title closes the issue and says
+   what changed, how it was tested and what the risks are.
+4. The PR gets a code review and CI must be green. `main` only accepts squash merges from pull requests.
+5. release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes signed images with
+   SBOMs to GHCR.
+
+## Local development
 
 Requirements: [uv](https://docs.astral.sh/uv/), [Go 1.27](https://go.dev/dl/),
-[golangci-lint](https://golangci-lint.run/), [pre-commit](https://pre-commit.com/), Docker — or just open the
+[golangci-lint](https://golangci-lint.run/), [pre-commit](https://pre-commit.com/) and Docker, or just open the
 **Dev Container**.
 
 ```bash
-make setup    # install dependencies and git hooks
+make setup    # install dependencies and the git hooks (gitleaks runs on every commit)
 make check    # lint, type-check and test everything (same as CI)
-make up       # run both services: python on :8000, go on :8080
-
-curl localhost:8000/v1/hello?name=Tokyo   # {"message":"Hello, Tokyo!"}
-curl localhost:8080/metrics | head
-
+make up       # run the services: python on :8000, go on :8080
 make down
 ```
 
 Run `make` with no arguments to list every command.
-
-## How changes flow
-
-```mermaid
-flowchart LR
-    dev[Branch + PR] --> ci{ci.yml<br/>lint · test · scan<br/>build · smoke test}
-    ci -- green + review --> main[(main)]
-    main --> rp[release-please<br/>opens Release PR]
-    rp -- merge --> tag[Tag + GitHub release<br/>CHANGELOG]
-    tag --> pub[Publish to GHCR<br/>sign · SBOM · provenance]
-```
-
-1. Open a pull request with a [Conventional Commit](https://www.conventionalcommits.org/) title.
-2. `ci.yml` must pass and a code owner approves; squash-merge into `main`.
-3. release-please keeps a Release PR open with the next version and changelog.
-4. Merging the Release PR tags the version; `release.yml` publishes signed images to GHCR and attaches SBOMs.
 
 ## Repository layout
 
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
-docs/                    architecture, threat model, ADRs, runbooks
-services/api-python/     FastAPI sample: src/, tests/, Dockerfile, pyproject.toml, uv.lock
-services/api-go/         Go sample: cmd/, internal/, Dockerfile, go.mod
+docs/                    requirements, architecture, threat model, ADRs, runbooks
+services/api-python/     FastAPI sample service (to be replaced by the API service)
+services/api-go/         Go sample service (stays only if an ADR gives Go a job)
 compose.yaml             local run with production-like hardening
 Makefile                 every command you need
 ```
 
-## Every service follows the same contract
+## Service contract
+
+Every service keeps this runtime contract:
 
 | Endpoint / behaviour | Meaning |
 |---|---|
-| `GET /healthz` | Liveness — the process is up (never checks dependencies) |
-| `GET /readyz` | Readiness — 503 until started and while shutting down |
+| `GET /healthz` | Liveness: the process is up (never checks dependencies) |
+| `GET /readyz` | Readiness: 503 until started and while shutting down |
 | `GET /metrics` | Prometheus metrics: request count and latency by route and status |
 | Logs | JSON on stdout, one line per request, with `request_id` (taken from `X-Request-Id` or generated) |
 | `SIGTERM` | Fail readiness → finish in-flight requests (≤ 20 s) → exit |
 | Image | Non-root user, read-only filesystem, built-in `HEALTHCHECK` |
 
-## After creating a repo from this template
+## Security
 
-1. Replace `codewithmuh/production-repo-template` in `README.md`, `SECURITY.md`, `.github/CODEOWNERS` and
-   `services/api-go/go.mod` with your repository.
-2. Rename, replace or delete the sample services — keep the runtime contract above.
-3. Protect `main` (Settings → Branches): require pull requests, one approval, and these status checks:
-   `Repo checks (workflows, secrets, misconfigurations)`, `Python (lint, types, tests)`, `Go (lint, tests)`,
-   and both `Image … (build, scan, smoke test)` jobs.
-4. Settings → Actions → General: allow GitHub Actions to create pull requests (needed by release-please).
-5. Settings → Code security: enable Dependabot alerts and private vulnerability reporting.
-6. Use **squash merge** only, so each PR title becomes one Conventional Commit.
-7. Fill in `docs/architecture.md` and write your first real ADR.
-
-## Production-grade checklist
-
-Use this before announcing a project built from the template.
-
-- [ ] Code quality — linters, formatters, type checks and pre-commit pass
-- [ ] Tests — unit + integration, ≥ 80 % coverage, a smoke test and a load test with published numbers
-- [ ] CI — every PR runs lint, tests, build and scans; `main` is protected
-- [ ] Security — no secrets in git, least privilege, scanned images, SBOM, signed images, threat model
-- [ ] Infrastructure as code — remote state, `make up` / `make down`, cost estimate, clean teardown
-- [ ] Releases — semantic versions, changelog, images in a registry
-- [ ] Observability — logs, metrics, traces, dashboards as code, alerts linked to runbooks
-- [ ] Reliability — probes, graceful shutdown, timeouts/retries/idempotency, tested backups, written SLOs
-- [ ] Docs — README with quick start, architecture, ADRs, runbooks, contributing, license
-- [ ] Developer experience — one-command setup, Dev Container or Compose, seed data
-- [ ] Demo — screenshots, short demo video, write-up
+No secrets in git: gitleaks runs in pre-commit and in CI, and runtime secrets will live in AWS Secrets Manager. To
+report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
 [MIT](LICENSE) © 2026 Muhammad Rashid ([CodeWithMuh](https://youtube.com/@codewithmuh))
+
+[#2]: https://github.com/codewithmuh/secure-file-transfer/issues/2

@@ -1,4 +1,4 @@
-module github.com/codewithmuh/production-repo-template/services/api-go
+module github.com/codewithmuh/secure-file-transfer/services/api-go
 
 go 1.27.0
 
