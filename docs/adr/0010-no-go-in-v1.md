@@ -44,9 +44,10 @@ milestone (phase 5), in the same change that adds the ECR push ([ADR-0007](0007-
   matrix and `go` in its `needs`; the `api-go` entry in `release.yml`'s publish matrix; the `GO` variable and its steps
   in the `Makefile`; the `api-go` service in `compose.yaml`; the `gomod` entry and the Go directory of the Docker
   entry in `.github/dependabot.yml`; the Go feature and extension in `.devcontainer/devcontainer.json`; the
-  `cosign verify` example for the GHCR `api-go` image in `SECURITY.md`, replaced by the ECR one (ADR-0007); the Go
-  globs in `.editorconfig` (`*.go` and `go.mod`; the `Makefile` keeps its tabs); the Go block in `.gitignore`
-  (`coverage.out`, `/bin/`); and Go in the requirements and layout of `README.md` and `CONTRIBUTING.md`.
+  `cosign verify` example for the GHCR `api-go` image in `SECURITY.md`, leaving the `api-python` one, which M4 changes
+  to the ECR image (ADR-0007); the Go globs in `.editorconfig` (`*.go` and `go.mod`; the `Makefile` keeps its tabs);
+  the Go block in `.gitignore` (`coverage.out`, `/bin/`); and Go in the requirements and layout of `README.md` and
+  `CONTRIBUTING.md`.
 - **Required checks.** The `protect-main` ruleset requires five checks, two of them Go's. They have to come off the
   ruleset, because a required check that never runs blocks every later merge. While the repo is private on GitHub
   Free the ruleset isn't enforced and can't be edited, so the change is tracked in
