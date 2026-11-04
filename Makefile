@@ -37,10 +37,14 @@ check: lint test web-check ## Everything CI runs before building images
 
 # The web app's CI job, run the same way (needs Node, the version in web/.nvmrc).
 .PHONY: web-check
-web-check: ## Web app: clean install, type check, lint, tests and build (same as CI)
+web-check: ## Web app: clean install, type check, lint, tests, build and generated API client (same as CI)
 	@want="v$$(cat web/.nvmrc)"; have="$$(node --version)"; \
 	  [[ "$$have" == "$$want" ]] || echo "warning: CI uses Node $$want (web/.nvmrc), this is $$have" >&2
 	cd web && npm ci --ignore-scripts && npm run check && npm run build
+	@before="$$(mktemp)"; trap 'rm -f "$$before"' EXIT; cp web/src/api/schema.ts "$$before"; \
+	  (cd web && npm run --silent gen:api >/dev/null); \
+	  cmp -s "$$before" web/src/api/schema.ts || { echo "error: web/src/api/schema.ts was out of date with" \
+	    "docs/api/openapi.yaml; it is regenerated now: review it and commit it with the contract" >&2; exit 1; }
 
 # The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
 # The breaking-change check compares the working tree's contract with the one at the merge base of
