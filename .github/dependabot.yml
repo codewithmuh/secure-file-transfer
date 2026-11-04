@@ -31,6 +31,15 @@ updates:
     groups:
       python: { patterns: ["*"] }
 
+  # Minor and patch updates in one weekly pull request; each major update gets its own, since it may need code changes.
+  # The Node version in web/.nvmrc isn't covered: bump it by hand to the current LTS release.
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
+    groups:
+      web: { patterns: ["*"], update-types: [minor, patch] }
+
   - package-ecosystem: docker
     directories: [/services/api]
     schedule: { interval: weekly }

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useCallback } from 'react';
 import { cn } from '@/lib/cn';
 import { CheckCircle, AlertCircle, XCircle, X, Info } from 'lucide-react';
 import { create } from 'zustand';
@@ -68,11 +68,6 @@ function ToastItem({ toast: t, onDismiss }: { toast: Toast; onDismiss: () => voi
 
 export function ToastContainer() {
   const { toasts, removeToast } = useToastStore();
-  const [_mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
 
   const handleDismiss = useCallback(
     (id: string) => () => removeToast(id),
