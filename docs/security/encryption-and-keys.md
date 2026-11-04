@@ -5,7 +5,7 @@
 | Requirements | [PRD](../prd.md), especially NFR-8, NFR-9, NFR-10, NFR-13, NFR-15, NFR-19, NFR-21 and open question 3 |
 | Architecture | [architecture.md](../architecture.md), sections 2, 3, 5 and 7 |
 | Related | [Data model](../design/data-model.md), [capacity and cost](../design/capacity-and-cost.md), [ADR-0003](../adr/0003-multi-tenancy-shared-schema.md); threat model ([#21](https://github.com/codewithmuh/secure-file-transfer/issues/21)), authentication and authorization ([#23](https://github.com/codewithmuh/secure-file-transfer/issues/23)), abuse and rate limits ([#24](https://github.com/codewithmuh/secure-file-transfer/issues/24)) |
-| Tracking | [#22](https://github.com/codewithmuh/secure-file-transfer/issues/22), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)) |
+| Tracking | [#22](https://github.com/codewithmuh/secure-file-transfer/issues/22), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)); DLP data keys in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64) |
 
 This page decides how data is encrypted in transit and at rest, which KMS keys exist and who may use them, how keys and
 application secrets rotate, how deletion and teardown interact with keys, and PRD open question 3 (per-tenant keys).
@@ -24,6 +24,9 @@ Decisions on this page:
   (section 4).
 - **Open question 3:** shared keys per data class, plus per-tenant data keys for file names and messages, bound to the
   caller's `tenant_id`. Dedicated per-tenant KMS keys become an opt-in for tenants that require one (section 5).
+- **DLP data keys:** a second per-tenant data key under the fields key, with its own encryption context, protects DLP
+  finding details and the tenant's keyword lists and patterns. The scan worker may unwrap it, and only it; no new KMS
+  key (section 3.3).
 - **S3 objects carry no custom encryption context** (decision 4). With S3 Bucket Keys, KMS checks the bucket, not the
   object, so a `tenant_id` pair would not be enforced. `tenant_id` is used as encryption context where the service
   calls KMS itself (section 3.2).
@@ -44,7 +47,7 @@ Decisions on this page:
 
 | Class | Meaning | Rules |
 |---|---|---|
-| Restricted | File contents, the reason the service exists | Only in the files buckets, in a scan worker's memory as it streams a file to clamd and on the clamd pod's scratch volume while its scan runs, inside GuardDuty Malware Protection while it scans a file over 2 GB (decision 15), and in API memory while a download streams. Never in PostgreSQL, queues, caches, logs, traces or email. |
+| Restricted | File contents, the reason the service exists, and the text the DLP inspector extracts from them | Only in the files buckets, in a scan worker's memory as it streams a file to clamd and the DLP inspector, on the clamd and inspector pods' memory and scratch volumes while the scan runs, inside GuardDuty Malware Protection while it scans a file over 2 GB (decision 15), and in API memory while a download streams. Never in PostgreSQL, queues, caches, logs, traces or email. |
 | Confidential | Personal and business data about transfers: file names, messages, email addresses, IP addresses, audit records, tenant settings | Only in the stores listed below. File names and messages are also field-encrypted (3.2). Never in object keys, work queue messages, metrics or log lines. |
 | Secret | Credentials: link tokens, session tokens, CSRF tokens, API keys, invitation tokens, verification codes, HMAC keys, client secrets, the database master password | Plain text exists only in transit, in memory, or once at creation (the emailed link, the cookie, the API key response). At rest only as a hash, an HMAC, or inside Secrets Manager. Link and CSRF tokens are derived (6.2), so they are never stored. |
 | Internal | Operational data with no customer content: application logs, metrics, traces, queue messages, container images, infrastructure state | Identifiers only: `tenant_id`, `request_id`, an HMAC of an email address. Application logs may also hold IP addresses. |
@@ -53,6 +56,9 @@ Decisions on this page:
 | Data | Class | Where it lives | Encrypted with |
 |---|---|---|---|
 | File contents | Restricted | S3 files buckets (Tokyo, Osaka replica): one pair for files up to 2 GB and one for larger files, always under `tenants/{tenant_id}/` (ADR-0012); clamd scratch volumes (4 GiB per pod, ADR-0019), deleted after each scan, and scan worker memory while a file streams to clamd; GuardDuty Malware Protection, which reads the large-file bucket in its Region (decision 15); API memory while streaming | files key |
+| Text the DLP inspector extracts, and the values its detectors match | Restricted | Only in the inspector's child process and its scratch volume while it inspects one file (ADR-0022); never stored, logged or returned. Findings keep counts, location hints and masked previews instead. | files key (scratch volume) |
+| DLP finding details (location hints, masked previews), tenant keyword lists and patterns | Confidential | PostgreSQL `dlp_findings.detail_ct` and `dlp_detectors.definition_ct`, ciphertext only; the scan worker's and the API's memory | Per-tenant DLP data key under the fields key (3.3), inside storage encrypted with the database key |
+| DLP justifications and approvers' comments | Confidential | PostgreSQL `dlp_confirmations.justification_ct`, `dlp_approval_decisions.comment_ct` | Per-tenant field data key (3.2) |
 | File names, transfer and upload request messages | Confidential | PostgreSQL `files.display_name_ct`, `transfers.message_ct`, `upload_requests.message_ct`, ciphertext only; the browser after verification (FR-14) | Per-tenant data key under the fields key (3.2), inside storage encrypted with the database key |
 | Email addresses of members, recipients and uploaders | Confidential, personal data | PostgreSQL, in plain text because we send mail to them and search by them (UC-4); Cognito for members; SES while sending. Logs, rate-limit counters and the suppression list hold only an HMAC (6.2). | database key; email HMAC keyring |
 | Source IP addresses and user agents | Confidential, personal data | Audit records; CloudFront, WAF and load balancer logs; rate-limit counters (at most 25 hours) | database, audit, logs and platform keys |
@@ -105,6 +111,7 @@ record lets only Amazon's certificate authority issue certificates for the domai
 | Pods to Valkey (rate-limit counters, sign-in state) | ElastiCache Serverless always uses TLS; clients verify the server certificate. |
 | Pod to pod (metrics scrapes, traces) | Plain HTTP inside the cluster. Between m8g nodes in one VPC the Nitro hardware encrypts it, and AWS encrypts all traffic between Availability Zones. No file contents, names, messages or secrets travel pod to pod, with the one exception below, and network policies limit the paths. A service mesh would add mutual TLS; it is a moving part this design doesn't need yet. |
 | Scan worker to clamd | Pod to pod inside the scan node pool: the worker streams the file's bytes to clamd with INSTREAM over plain TCP (ADR-0019). Between m8g nodes the Nitro hardware encrypts it, and the pair usually shares a node. Network policies allow ingress to clamd only from the scan workers, and both run only on the scan pool, never on the API's nodes. |
+| Scan worker to DLP inspector | The same: the file's bytes, with the tenant's decrypted keyword lists and patterns, over plain TCP to the inspector beside the worker, and the findings with masked previews back (ADR-0022). The inspector accepts connections only from the scan workers and has no egress. |
 
 Downloads stream from S3 through the API (abuse and download design, #24): S3 decrypts the object, the bytes reach
 the pod over TLS through the S3 endpoint, and leave over TLS through the load balancer. The API never writes them to
@@ -185,6 +192,29 @@ The cost: names and messages can't be searched or sorted in SQL. The web app sor
 itself, and audit search doesn't use them (UC-4). The module uses a standard AEAD implementation, never its own
 cryptography, and a write is read back and checked before it commits.
 
+### 3.3 DLP data keys
+
+DLP finding details and a tenant's own detectors are as revealing as file names: a sheet called "Layoffs 2027", the
+last digits of a card, a keyword list of deal names. They are encrypted like file names (3.2), with one difference:
+the scan worker writes findings and reads detectors, so it needs a key it may unwrap, and it must not unwrap the field
+data key.
+
+1. **A second data key per tenant**, generated on the fields key with encryption context
+   `{"purpose": "dlp-dek", "tenant_id": "<tenant>"}` and stored wrapped in `tenant_dlp_keys` (data model 2.7). The API
+   or the scan worker, whichever needs it first, creates the first version.
+2. **Values**: `dlp_findings.detail_ct` (location hints and masked previews) and `dlp_detectors.definition_ct`
+   (keyword lists, patterns and their context keywords), AES-256-GCM with the same format and additional
+   authenticated data as 3.2, and the version in `dlp_key_version`.
+3. **Who unwraps.** The API, for both purposes. The scan worker for `dlp-dek` only: the key policy names it with the
+   condition `kms:EncryptionContext:purpose = dlp-dek` (4.4), so it can never unwrap a field data key, and file names
+   and messages stay readable only by the API. The worker decrypts detectors to send them to the inspector and
+   encrypts details to store them; its database role can't select `detail_ct` (data model 4.2), so it can't read
+   details back. Justifications and comments are written only by the API, under the field data key.
+4. **Caller's tenant.** As in 3.2: the data key of the tenant in the caller's scope (for the worker, the message's
+   tenant), never the tenant on the row.
+5. **Deletion.** `detail_ct` is cleared when the file's contents are deleted (NFR-8), and a key version is deleted once
+   no row uses it.
+
 ## 4. Key hierarchy and multi-Region keys
 
 ### 4.1 The keys
@@ -199,7 +229,7 @@ protects no data: the shared account's DNSSEC key-signing key, an asymmetric key
 | Key | Alias in prod | Protects | Created by |
 |---|---|---|---|
 | files | `alias/sft/prod/files` | S3 files buckets; scan worker volumes | Environment stack |
-| fields | `alias/sft/prod/fields` | Per-tenant data keys for file names and messages | Environment stack |
+| fields | `alias/sft/prod/fields` | Per-tenant data keys for file names and messages, and per-tenant DLP data keys (3.3) | Environment stack |
 | database | `alias/sft/prod/database` | Aurora clusters, backups, snapshots, Performance Insights | Environment stack |
 | audit | `alias/sft/prod/audit` | Audit archive buckets; the retained stack's state, trail and alert topic | Retained stack (8.4) |
 | logs | `alias/sft/prod/logs` | Log buckets, CloudWatch Logs, log and trace stores | Environment stack |
@@ -226,6 +256,8 @@ flowchart TB
     odk --> files[("File contents")]
     kfields --> dek["Data key per tenant<br/>stored wrapped in PostgreSQL"]
     dek --> fv[("File names and messages")]
+    kfields --> dlpdek["DLP data key per tenant<br/>stored wrapped in PostgreSQL"]
+    dlpdek --> dlpv[("DLP finding details,<br/>keyword lists and patterns")]
     kdb --> aurora[("Aurora storage, backups, snapshots")]
     kaudit --> abk["S3 Bucket Key"]
     abk --> arch[("Audit archive objects")]
@@ -266,7 +298,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 |---|---|---|---|---|---|---|---|---|
 | API service | E D | E D | — | E, both Regions | — | D, own secrets | — | — |
 | Operator API (decision 12) | — | — | — | E, both Regions | — | — | — | — |
-| Scan worker | D, files up to 2 GB only | — | — | — | — | — | D, scan queues | — |
+| Scan worker | D, files up to 2 GB only | E D, `dlp-dek` only (3.3) | — | — | — | — | D, scan queues | — |
 | Notification worker | — | — | — | — | — | D, own secrets | D, its queues | — |
 | Outbox relay | — | — | — | — | — | — | E D, queues | — |
 | Sign-in triggers (Cognito pre- and post-authentication) | — | — | — | — | — | — | E D, sign-in events queue | — |
@@ -301,7 +333,8 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 - **Narrow conditions.** Each workload statement is limited by `kms:ViaService` (S3, SQS, SNS, EC2 or Secrets Manager
   in the right Region) and by encryption context: the bucket ARN for S3 (`kms:EncryptionContext:aws:s3:arn`; with
   Bucket Keys it is the bucket, not the object), `SecretARN` for Secrets Manager, `aws:sqs:arn` for queues, the trail
-  ARN for CloudTrail log files, and for the fields key `purpose = field-dek` with `tenant_id` present.
+  ARN for CloudTrail log files, and for the fields key `purpose = field-dek` or `dlp-dek` with `tenant_id` present;
+  the scan worker's statement allows only `dlp-dek`.
 - **Role names** follow the authentication and authorization design: IAM roles `sft-{env}-api`, `sft-{env}-scan`,
   `sft-{env}-notify`, `sft-{env}-relay`, `sft-{env}-jobs`, `sft-{env}-archive`, `sft-{env}-migrate` and
   `sft-{env}-operator` match the PostgreSQL login roles `sft_api` to `sft_operator`. This page adds
@@ -570,7 +603,7 @@ How the other keys differ:
 
 | Key | Differences from the files key |
 |---|---|
-| fields | One user, the API, calling KMS directly (no `kms:ViaService`). The condition requires `kms:EncryptionContext:purpose` = `field-dek` and a `tenant_id` key in the context (`kms:EncryptionContextKeys`). BreakGlass gets no Decrypt here and can't add it, because the SCP stops it changing the key policy. It could still reach names and messages by exec into an API pod, whose role can unwrap data keys; that exec raises an alert from the Kubernetes audit log (decision 13, 9.1). |
+| fields | Two users calling KMS directly (no `kms:ViaService`). The API's statement requires `kms:EncryptionContext:purpose` to be `field-dek` or `dlp-dek`; the scan worker's statement allows `kms:GenerateDataKey` and `kms:Decrypt` only with `dlp-dek` (3.3). Both require a `tenant_id` key in the context (`kms:EncryptionContextKeys`). BreakGlass gets no Decrypt here and can't add it, because the SCP stops it changing the key policy. It could still reach names and messages by exec into an API pod, whose role can unwrap data keys; that exec raises an alert from the Kubernetes audit log (decision 13, 9.1). |
 | database | No workload principals. RDS uses the key through grants that the deploy role creates for the cluster (`kms:ViaService` = RDS, `kms:GrantIsForAWSResource`). |
 | audit | Writers (archive job, API, operator API) get `kms:GenerateDataKey` only; readers (recovery job, audit reader, BreakGlass) get `kms:Decrypt`. All through S3, limited to the archive bucket ARN. In prod the key and its policy live in the retained stack and are administered by that stack's own deploy role (8.4). The same key protects the retained stack's state bucket (its deploy role, through S3, that bucket only), its trail (`cloudtrail.amazonaws.com` with `aws:SourceArn` = that trail and the `aws:cloudtrail:arn` context) and its alert topic (its own EventBridge delivery role, through SNS). |
 | logs | Service principals (`logs.<region>.amazonaws.com`, `cloudtrail.amazonaws.com`, `delivery.logs.amazonaws.com`), each limited by `aws:SourceAccount` and its own encryption context (`aws:logs:arn`, `aws:cloudtrail:arn`), plus the log and trace store roles through S3, and the lifecycle jobs role (Decrypt through S3 for CloudTrail log files only, 4.3). |
@@ -785,6 +818,7 @@ or a key policy we no longer trust. What replacing means per store:
 | Item | Rotation | Notes |
 |---|---|---|
 | Per-tenant field data keys | A new version per tenant every year; new writes use it. Older versions decrypt until the purge job has removed every row that uses them. | On suspected exposure: a new version and a job that re-encrypts that tenant's rows. |
+| Per-tenant DLP data keys | The same, yearly | Finding details live only until their file is deleted, so old versions empty out within 97 days; detector definitions are re-encrypted with the next revision |
 | HMAC keyrings (code, email, link, CSRF), identity provider client secrets | Section 6.5 | |
 | Database master password | After every use and every 90 days | A reviewed change raises the write-only version (6.3) |
 | Workload database tokens | Every 15 minutes, automatically | IAM database authentication |
@@ -912,6 +946,7 @@ so they tear down completely.
 | The deploy roles can rewrite key policies | Whoever may call `PutKeyPolicy` can grant themselves use | Only the deploy roles may (reviewed Terraform from `main`, prod behind an environment approval), plus the key-admin role, which only BreakGlass may assume and whose every use pages (4.4); the SCP denies everyone else, BreakGlass included (decision 13); an alert on any other attempt; CI checks every key policy. Someone with the management account can lift the SCP; with one maintainer that is the same person, which decision 13 accepts. |
 | BreakGlass can reach file names and messages through an API pod | It has no Decrypt on the fields key and can't add it, but exec into an API pod acts as the pod's role, which unwraps data keys | The exec raises an alert from the Kubernetes audit log (decision 13); the after-action review compares what was done with the approved scope. Accepted. |
 | AWS runs the HSMs, and S3 decrypts on our behalf | No external key store; end-to-end encryption is a non-goal (PRD section 8) | Accepted |
+| The scan worker can unwrap every tenant's DLP data key | It writes findings and reads the detectors of any tenant whose files it scans | Only for `dlp-dek`, never the field data key; no column grant to read finding details back; it already sees the files it scans. Accepted. |
 | Plain text in memory: file bytes while streaming and scanning, data keys, HMAC keys | Processing needs plain text | Graviton memory encryption against physical access; non-root, read-only filesystem, minimal image; scan workers on their own nodes; data keys cached at most 15 minutes |
 | GuardDuty Malware Protection reads files over 2 GB | ClamAV can't scan them (decision 15) | An AWS service in the bucket's Region, reading through its own role limited to the large-file bucket; it keeps no copy. ADR-0019 records it. |
 | Load balancer access logs use SSE-S3, an exception to NFR-13 | The load balancer supports only SSE-S3 for access logs | Recorded exception; only the log reader role can read the bucket; no tokens or names in the logs |
@@ -944,7 +979,7 @@ apply. CI checks run on the Terraform plan as policy-as-code; the tool is chosen
 | CloudTrail | `multi-region-cloudtrail-enabled`, `cloud-trail-encryption-enabled`, `cloud-trail-log-file-validation-enabled`, `cloudtrail-s3-dataevents-enabled` | Data events on for the files and audit buckets; the lifecycle jobs role can decrypt CloudTrail log files and not application logs |
 | Secrets | `secretsmanager-using-cmk`, `secretsmanager-secret-unused` | An alarm when a keyring's active key is older than its period plus 7 days; no IAM policy outside 6.4 allows `PutSecretValue`. Tests: codes issued before a rotation verify during the overlap and fail after it; a notify message retried after a link-hmac switch rebuilds the same link; a CSRF token from before a csrf-hmac rotation works during the overlap and fails after it; an email-hmac rotation resets no per-address limit and drops no suppression. |
 | TLS at the edge | `elbv2-predefined-security-policy-ssl-check` (with the policy name), `elb-tls-https-listeners-only`, `elbv2-targetgroup-protocol-encrypted`, `cloudfront-viewer-policy-https`, `cloudfront-security-policy-check`, `cloudfront-no-deprecated-ssl-protocols`, `cloudfront-traffic-to-origin-encrypted`, `cloudfront-s3-origin-access-control-enabled`, `acm-certificate-expiration-check` | The synthetic probe (NFR-1) also checks that TLS 1.0 and 1.1 are refused and that certificates have more than 30 days left |
-| Field encryption bound to the caller's tenant | — | The isolation suite (NFR-12) injects another tenant's row into a result and expects a decrypt failure and the alert. The failover drill reads names in Osaka with Tokyo KMS blocked, and signs a member in through the Osaka pool's client. |
+| Field encryption bound to the caller's tenant | — | The isolation suite (NFR-12) injects another tenant's row into a result and expects a decrypt failure and the alert; the same for DLP finding details and detectors. In staging, the scan worker's role is denied a `field-dek` decrypt and allowed a `dlp-dek` one. The failover drill reads names in Osaka with Tokyo KMS blocked, and signs a member in through the Osaka pool's client. |
 | Retained resources | `kms-cmk-not-scheduled-for-deletion`, while the environment runs | No environment plan changes a resource tagged `retention = audit-archive`; the retained stack plans with no environment or bootstrap stack present, and its state bucket, trail and alert topic name the audit key. The teardown drill (NFR-19) checks that the audit reader can still read an archived record, that a test change to the archive raises the alert, and that the next bill shows only the retained stack. |
 | Residency | — | Keys replicate only to Osaka; the Region guard in NFR-21 covers KMS |
 
@@ -978,6 +1013,11 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
 - **Phase 4 review fixes** ([#41](https://github.com/codewithmuh/secure-file-transfer/issues/41)): egress through VPC
   endpoints and the proxy (2.2, 2.3, ADR-0021); clamd in its own pods (2.2, ADR-0019); the key-admin role (4.4,
   ADR-0017); data events in the shared log archive (3.1); the retained budget created at teardown (8.4).
+
+- **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** Per-tenant DLP data keys under the
+  fields key (3.3), the scan worker's `dlp-dek` statement (4.3, 4.4), the inspector hop (2.2) and the classification
+  rows (section 1). The data model has `tenant_dlp_keys` and the ciphertext columns (2.7); capacity A30 counts the
+  extra KMS requests.
 
 Left for later: every check in 9.2 that needs an AWS account waits for the AWS profile, and the on-demand rotation
 rehearsal (7.1) runs in the first staging build.

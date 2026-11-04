@@ -30,6 +30,7 @@ settings, probes, metrics, logs and graceful shutdown are in place, and it serve
 | Request | Send an upload link so someone outside the company can deliver files to you |
 | Verify | Recipients prove they own their email address before they download |
 | Protect | Files encrypted at rest with KMS keys and in transit with TLS; malware scan before any download |
+| Prevent data loss | Files inspected for personal data and secrets, such as My Numbers and card numbers; the company's rules warn the sender, hold the transfer for an approver, or block it before anything leaves |
 | Control | Admins revoke any link at any time; every action is written to an audit log |
 | Web app | React + TypeScript app for senders and admins, plus the recipient and uploader pages |
 
