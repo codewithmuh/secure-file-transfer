@@ -1,0 +1,92 @@
+[project]
+name = "sft"
+version = "0.1.0"
+description = "The secure-file-transfer backend: the API service now, and the workers later, from one codebase (ADR-0002)."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+dependencies = [
+  "fastapi>=0.143",
+  "uvicorn>=0.54",
+  "prometheus-client>=0.23",
+  "pydantic-settings>=2.16",
+]
+
+[dependency-groups]
+dev = [
+  "httpx2>=2.13",
+  "import-linter>=2.15",
+  "mypy>=1.18",
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "ruff>=0.17",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sft"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F",   # pycodestyle + pyflakes
+  "I",             # import sorting
+  "B",             # bugbear
+  "UP",            # pyupgrade
+  "SIM",           # simplify
+  "S",             # bandit (security)
+  "N",             # naming
+  "PT",            # pytest style
+  "ASYNC",         # async pitfalls
+  "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # asserts are how pytest works
+
+[tool.mypy]
+strict = true
+mypy_path = "src"
+packages = ["sft"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=sft --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+branch = true
+# Also measure the server started as a real process by the signal tests.
+patch = ["subprocess"]
+
+# The layers of ADR-0002, checked by `lint-imports` (make lint, CI). A layer may import the layers below it, never
+# the ones above. `workers` is optional until the first worker exists; it sits beside `api`, and neither imports the
+# other. `exhaustive` fails the check when a new subpackage of `sft` isn't placed in a layer.
+[tool.importlinter]
+root_package = "sft"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layers: api | workers -> service -> data -> core"
+type = "layers"
+containers = ["sft"]
+layers = [
+  "api | (workers)",
+  "service",
+  "data",
+  "core",
+]
+exhaustive = true
+broken_contract_guidance = "Move the shared code down to the lowest layer that needs it (ADR-0002)."
+
+[[tool.importlinter.contracts]]
+name = "Only the api layer knows about HTTP"
+type = "forbidden"
+source_modules = ["sft.service", "sft.data", "sft.core"]
+forbidden_modules = ["fastapi", "starlette", "uvicorn"]

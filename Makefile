@@ -2,7 +2,7 @@ SHELL := bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
-PY := services/api-python
+PY := services/api
 
 .PHONY: help setup fmt lint test check scan build up down logs clean
 
@@ -16,8 +16,8 @@ setup: ## Install dependencies and the git hooks (needs uv and pre-commit)
 fmt: ## Format all code
 	cd $(PY) && uv run ruff format . && uv run ruff check --fix .
 
-lint: ## Lint and type-check everything (same as CI)
-	cd $(PY) && uv run ruff format --check . && uv run ruff check . && uv run mypy
+lint: ## Lint, type-check and check the import layers (same as CI)
+	cd $(PY) && uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run lint-imports
 
 test: ## Run all tests with the coverage gates (same as CI)
 	cd $(PY) && uv run pytest

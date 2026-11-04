@@ -743,11 +743,12 @@ original Tokyo sign-in again.
 
 | Concern | How |
 |---|---|
+| Ports | The API on its public port; the probes and `/metrics` only on a second, internal port that no load balancer listener routes, so a routing mistake can't expose them |
 | Liveness | `GET /healthz`: the process is up; never checks dependencies |
 | Readiness | `GET /readyz`: 503 until started and during shutdown. The load balancer's target health check uses it on a port that the public listener doesn't route to. There is no public health endpoint: Route 53's two health checks probe a fixed response that each region's load balancer answers itself, so Osaka's passes during the pilot light (ADR-0021). |
 | Metrics | `GET /metrics` in Prometheus format, not exposed through the public load balancer |
 | Logs | One JSON line per event on stdout, with `request_id` and `trace_id` |
-| Shutdown | On SIGTERM: fail readiness, drain in-flight requests (≤ 20 s), exit 0. The API's download streams get up to 120 s, then close, and the browser resumes them under the same grant. API pods have a 150 s termination grace period, and the target group's deregistration delay exceeds the stream drain ([ABUSE] 5.7). |
+| Shutdown | On SIGTERM: fail readiness, drain in-flight requests (≤ 20 s), exit 0. The server stops accepting the moment SIGTERM arrives, so a `preStop` sleep hook holds SIGTERM back until the pod has left its Service endpoints and the load balancer has stopped sending it new requests. The API's download streams get up to 120 s, then close, and the browser resumes them under the same grant. API pods have a 150 s termination grace period, and the target group's deregistration delay exceeds the stream drain ([ABUSE] 5.7). |
 | Config | Environment variables only; secrets from AWS Secrets Manager |
 | Security | Non-root user, read-only filesystem, no capabilities, minimal base image |
 

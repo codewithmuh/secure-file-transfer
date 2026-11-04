@@ -9,14 +9,14 @@ updates:
       actions: { patterns: ["*"] }
 
   - package-ecosystem: uv
-    directory: /services/api-python
+    directory: /services/api
     schedule: { interval: weekly }
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:
       python: { patterns: ["*"] }
 
   - package-ecosystem: docker
-    directories: [/services/api-python]
+    directories: [/services/api]
     schedule: { interval: weekly }
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:

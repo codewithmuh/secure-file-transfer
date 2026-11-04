@@ -10,11 +10,12 @@ x-hardening: &hardening
   restart: unless-stopped
 
 services:
-  api-python:
+  api:
     <<: *hardening
     build:
-      context: ./services/api-python
+      context: ./services/api
       args: { APP_VERSION: local }
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
-    ports: ["127.0.0.1:8000:8000"]
+    # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
+    ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
