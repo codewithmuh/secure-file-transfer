@@ -29,6 +29,17 @@ variable "github_environment" {
   }
 }
 
+variable "network_regions" {
+  description = "Regions where this account has network stacks (#56): the roles get that layer's permissions there. Empty for none."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for r in var.network_regions : contains(["ap-northeast-1", "ap-northeast-3"], r)])
+    error_message = "network_regions may hold only ap-northeast-1 and ap-northeast-3 (NFR-21)."
+  }
+}
+
 variable "create_oidc_provider" {
   description = "Create the GitHub OIDC provider. False only if another stack owns it: an account has one per issuer."
   type        = bool

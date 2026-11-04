@@ -28,7 +28,9 @@
 
 ## Decision
 
-- **VPCs.** One per account and region, IPv4 only, each its own /16 (prod: 10.30.0.0/16 Tokyo, 10.31.0.0/16 Osaka).
+- **VPCs.** One per account and region, IPv4 only, each its own /16, 10.ER.0.0/16 with E = 1 for dev, 2 staging,
+  3 prod and R = 0 Tokyo, 1 Osaka: dev 10.10.0.0/16, staging 10.20.0.0/16 and 10.21.0.0/16, prod 10.30.0.0/16 and
+  10.31.0.0/16.
   Three AZs by ID (apne1-az1, -az2, -az4; apne3-az1 to -az3); dev uses two, with one NAT gateway and endpoints in one
   AZ (capacity 5.3). Per AZ: a public /24 (load balancer, NAT gateway), a private /19 (nodes, pods, Cognito trigger
   functions), an endpoint /26 that holds only the interface endpoints and the cluster API's network interfaces, and an
@@ -40,6 +42,7 @@
   ap-northeast-3, which serve the EKS add-ons, the pause image and Bottlerocket's host containers (ADR-0004,
   [ADR-0007](0007-container-registry-ecr.md)). The S3 gateway's policy allows our buckets and the AWS-owned bucket that
   serves ECR image layers, for our registry and those registries alike; the cross-region one only our buckets there.
+  The EC2 endpoint also lets our principals launch from AWS-owned AMIs, which Bottlerocket's are (Karpenter).
 - **Egress: an allowlisting proxy, not Network Firewall.** Envoy as an HTTPS `CONNECT` proxy on the `system` nodes:
   two replicas in different AZs in each Tokyo cluster and one in an Osaka pilot light (two after a failover), each
   requesting 0.1 vCPU and 0.25 GiB, which ADR-0004 sizes the `system` group for. One listener and allowlist per

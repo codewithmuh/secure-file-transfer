@@ -7,3 +7,9 @@ variable "account_id" {
     error_message = "account_id must be a 12-digit AWS account ID."
   }
 }
+
+variable "flow_log_destination_arn" {
+  description = "The environment's log bucket ARN, optionally with /prefix/, for the VPC flow log. Null until data creates it."
+  type        = string
+  default     = null
+}

@@ -12,3 +12,21 @@ misconfigurations:
       under Object Lock, where a read or write by anyone but the Terraform roles stands out (T-73, T-75). Server access
       logs would need a log bucket in every account and Region, before the state bucket exists, that is itself a
       bucket without logging.
+  - id: AVD-AWS-0104 # security group egress to 0.0.0.0/0
+    paths:
+      - "**/modules/network/security-groups.tf"
+    statement: >-
+      Only the system node group's security group, and only TCP 443: the egress proxy and the Systems Manager agent
+      reach the internet through NAT there, which is the design (ADR-0021). Every other outbound connection goes
+      through the proxy, whose per-workload allowlists name each destination; network policies keep every other pod
+      on system nodes off NAT, DNS Firewall answers only allowed names, and main and scan nodes may leave the VPC only
+      for S3's prefix list (T-53, residual R-15).
+  - id: AVD-AWS-0178 # VPC flow logs
+    paths:
+      - "**/modules/network/main.tf"
+    statement: >-
+      The module has a flow log for all traffic (aws_flow_log.this), created once the root sets
+      flow_log_destination_arn. Its destination is the environment's S3 log bucket under the logs key (capacity A19,
+      encryption 3.1), which the data layer creates after the network, so a fresh build applies the network a second
+      time with it (infra/README.md, "Apply order"). Trivy sees the default, null. Flow logs are part of T-53's
+      detection, with the proxy's byte logs and GuardDuty.

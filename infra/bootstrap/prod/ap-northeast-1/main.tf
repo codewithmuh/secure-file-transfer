@@ -57,6 +57,9 @@ module "terraform_roles" {
   iam_path           = module.conventions.bootstrap_iam_path
   plan_role_name     = module.conventions.bootstrap_role_names.terraform_plan
   deploy_role_name   = module.conventions.bootstrap_role_names.terraform_deploy
+
+  # The network layer's permissions (#56), in the Regions where this account has network stacks.
+  network_regions = ["ap-northeast-1", "ap-northeast-3"]
 }
 
 module "key_admin" {
