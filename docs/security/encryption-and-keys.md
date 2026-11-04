@@ -320,6 +320,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Terraform plan role (ADR-0005) | — | — | — | — | — | — | — | D and `GenerateDataKey`, through S3, its state bucket only, for the lock files it writes |
 | Audit reader (investigations, time-limited) | — | — | — | D | D | — | — | — |
 | BreakGlass permission set | R, D | R | R | R, D | R, D | R, D (master password) | R | R |
+| Emergency IAM user (authn-authz 8.4), staging and prod | — | — | — | — | — | — | — | A, and E D through S3 for the Osaka state bucket only, on the Osaka replica: it stands in for the bootstrap `Admin` role there when a Tokyo outage takes Identity Center (#81) |
 | Operators in normal operation | — | — | — | — | — | — | — | — |
 
 - **Deletion needs no key.** Deleting object versions and aborting multipart uploads need no KMS permission, so the
@@ -360,7 +361,8 @@ Every key policy follows these rules:
 5. **Only the deploy roles change or destroy keys (decision 13).** A service control policy denies
    `kms:PutKeyPolicy`, `kms:DisableKey`, `kms:ScheduleKeyDeletion` and `kms:DeleteImportedKeyMaterial` to every
    principal except the deploy roles (the retained stack's included), the bootstrap `Admin` role for the tfstate keys
-   its stack creates, and the key-admin role of rule 6, which may only put a key policy; BreakGlass and every other
+   its stack creates, the staging and prod emergency users for Osaka's tfstate key, the only key policy that names
+   them (#81), and the key-admin role of rule 6, which may only put a key policy; BreakGlass and every other
    role are denied. Each key policy repeats the denial of `DisableKey` and
    `ScheduleKeyDeletion` (sketch below), so it holds even if the SCP changes. In prod any deletion must use the
    longest waiting period, 30 days. In dev and staging the deploy role may use 7 days, so teardown works. SCPs need
@@ -609,7 +611,7 @@ How the other keys differ:
 | logs | Service principals (`logs.<region>.amazonaws.com`, `cloudtrail.amazonaws.com`, `delivery.logs.amazonaws.com`), each limited by `aws:SourceAccount` and its own encryption context (`aws:logs:arn`, `aws:cloudtrail:arn`), plus the log and trace store roles through S3, and the lifecycle jobs role (Decrypt through S3 for CloudTrail log files only, 4.3). |
 | secrets | Each workload may Decrypt only through Secrets Manager and only for its own secrets (`kms:EncryptionContext:SecretARN`). The writers in 6.4: the key rotation job encrypts and decrypts for the keyrings and the identity provider client secrets; the deploy role encrypts (`GenerateDataKey`) for the master password and the platform component secrets, and may decrypt only Secrets Manager's key-access check (`kms:EncryptionContext:SecretVersionId` = `RequestToValidateKeyAccess`), which runs when a secret is created. EKS uses the key for etcd through a grant the deploy role creates. |
 | platform | Producers and consumers through SQS (`aws:sqs:arn`): the relay, the workers, the sign-in triggers and the EventBridge delivery role. The service statements above for SNS. The node provisioner for EBS root volumes, as in the files key. ElastiCache through grants. |
-| tfstate | The deploy role encrypts and decrypts through S3 for the state bucket only; the plan role decrypts and generates data keys the same way, for its lock files; the bootstrap `Admin` role administers the key and uses it for the bootstrap stack's own state; the replication role as for the files key. AWS Config's service-linked role may `DescribeKey` and `GetKeyRotationStatus` for its rules (9.2), matched by `aws:PrincipalArn` through the account principal, because the role doesn't exist yet when the bootstrap creates the key. The other keys need the same statement once Config runs. |
+| tfstate | The deploy role encrypts and decrypts through S3 for the state bucket only; the plan role decrypts and generates data keys the same way, for its lock files; the bootstrap `Admin` role administers the key and uses it for the bootstrap stack's own state, and on Osaka's replica so does the account's emergency user, by its exact ARN (authn-authz 8.4, #81); the replication role as for the files key. AWS Config's service-linked role may `DescribeKey` and `GetKeyRotationStatus` for its rules (9.2), matched by `aws:PrincipalArn` through the account principal, because the role doesn't exist yet when the bootstrap creates the key. The other keys need the same statement once Config runs. |
 | registry (shared stack) | Administered by the shared stack's deploy role, which also creates the repositories (`CreateGrant` for AWS resources and `DescribeKey`; `RetireGrant` in its IAM policy for deletions). ECR encrypts pushed layers and decrypts pulled ones through the grants it creates for each repository. The environments' node roles may only `kms:Decrypt` through ECR (`kms:ViaService` = ECR, `kms:EncryptionContext:aws:ecr:arn` = our repositories), so no environment can encrypt with or administer the key. The key lives until the shared stack is destroyed after the last environment (capacity 5.4), with the 30-day wait. |
 
 ## 5. Open question 3: per-tenant keys
