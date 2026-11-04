@@ -4,11 +4,12 @@ import { Key, Plus, Trash2 } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import { Button, Card, Badge, Table, TableHead, TableBody, TableRow, TableHeader, TableCell, Dialog, Input, EmptyState } from '@/components/ui';
 import { formatDate } from '@/lib/formatters';
-import type { ApiKey } from '@/types';
+import type { ApiKey } from '@/api';
 
+// Mock data in the contract's shape; replaced by TanStack Query when the API exists.
 const mockKeys: ApiKey[] = [
-  { id: '1', prefix: 'sft_k1_', name: 'CI Pipeline', scopes: ['transfers:write', 'transfers:read'], expires_at: '2027-02-01T00:00:00Z', last_used_at: '2026-11-04T04:00:00Z', created_at: '2026-10-01T00:00:00Z' },
-  { id: '2', prefix: 'sft_k2_', name: 'Audit Export', scopes: ['audit:read', 'audit:export'], expires_at: '2027-01-01T00:00:00Z', last_used_at: null, created_at: '2026-11-01T00:00:00Z' },
+  { id: '1', name: 'CI Pipeline', key_prefix: 'sft_k1_', scopes: ['transfers:write', 'transfers:read'], created_by: 'u1', created_at: '2026-10-01T00:00:00Z', expires_at: '2027-02-01T00:00:00Z', last_used_at: '2026-11-04T04:00:00Z', revoked_at: null },
+  { id: '2', name: 'Audit Export', key_prefix: 'sft_k2_', scopes: ['audit:read'], created_by: 'u1', created_at: '2026-11-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z', last_used_at: null, revoked_at: null },
 ];
 
 export function ApiKeysPage() {
@@ -40,7 +41,7 @@ export function ApiKeysPage() {
               {mockKeys.map((key) => (
                 <TableRow key={key.id}>
                   <TableCell><span className="font-medium text-gray-900">{key.name}</span></TableCell>
-                  <TableCell><code className="text-xs">{key.prefix}…</code></TableCell>
+                  <TableCell><code className="text-xs">{key.key_prefix}…</code></TableCell>
                   <TableCell>
                     <div className="flex flex-wrap gap-1">
                       {key.scopes.map((scope) => (<Badge key={scope} variant="info">{scope}</Badge>))}

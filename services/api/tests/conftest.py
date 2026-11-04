@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 import pytest
 from sqlalchemy import URL
 
+from isolation import Mode, World, world_database
 from pg import ADMIN_URL_VARIABLE, ScratchDatabase, fresh_database
 from sft.core.logs import JsonFormatter
 from sft.data.database import Database, psycopg_url
@@ -79,3 +80,15 @@ async def operator_db(migrated_db: ScratchDatabase) -> AsyncIterator[Database]:
     database = Database.connect(migrated_db.url(OPERATOR), pool_size=1)
     yield database
     await database.dispose()
+
+
+@pytest.fixture(scope="session")
+def isolation_world(admin_url: URL) -> Iterator[World]:
+    """The isolation suite's databases: one as built, one with row-level security off."""
+    with (
+        world_database(admin_url, rls=True) as as_built,
+        world_database(admin_url, rls=False) as data_layer_alone,
+    ):
+        world = World({Mode.AS_BUILT: as_built, Mode.DATA_LAYER_ALONE: data_layer_alone})
+        yield world
+        world.close()

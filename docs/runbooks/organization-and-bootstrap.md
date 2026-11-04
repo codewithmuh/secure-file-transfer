@@ -19,7 +19,6 @@ create the member accounts, guardrails and budgets (`infra/organization`, #55), 
   `you+sft-dev@example.com`. **An account's email can never be reused once the account is closed**, so pick ones you
   will keep.
 - `make infra-check` passing on `main`.
-- The GitHub CLI signed in as a repository admin (`gh auth status`), for step 0.
 - The personal account emptied of workloads. SCPs never apply to the management account, so anything left there runs
   without guardrails (ADR-0006).
 
@@ -34,7 +33,6 @@ git-ignored `.tfvars` file.
 | `sft-management-approver` | `BreakGlassApprover` in the management account | Assigning and removing `Admin` and `BreakGlass` |
 | `sft-management-admin` | `Admin` in the management account, for at most an hour | Later applies of the organization stack and the management bootstrap |
 | `sft-<account>-admin` | `Admin` in shared, dev, staging or prod, for at most an hour | That account's bootstrap stacks |
-| `sft-<account>-emergency` | The account's emergency IAM user, through `aws login` | Only when Identity Center can't be reached ("If something goes wrong") |
 
 Every Identity Center profile shares one `sso-session` in `~/.aws/config`:
 
@@ -186,7 +184,7 @@ IAM Identity Center → **Enable** → for the organization. Then, under **Setti
 3. **Authentication → Session settings**: an access portal session of 4 hours, so a security key touch is needed at
    least that often.
 
-There is no API for these settings, so Terraform can't enforce them; step 12 checks them.
+There is no API for these settings, so Terraform can't enforce them; step 11 checks them.
 
 ### 7. Create your Identity Center user (console)
 
@@ -247,28 +245,17 @@ M4 needs shared and dev; staging and prod follow in M7. For each account, in thi
 2. Apply `infra/bootstrap/<account>/ap-northeast-1` as [infra/README.md](../../infra/README.md#bootstrap-an-account)
    says, with `TF_VAR_account_id` from `terraform output account_ids` in step 5. The admin pattern comes from the
    code; no `TF_VAR_admin_principal_arn_patterns`.
-3. Set up the emergency user the Tokyo stack created (authn-authz 8.4), in the console, still as `Admin`: IAM →
-   Users → `sft-<account>-emergency` → **Security credentials**. **Enable console access** with a custom password of
-   at least 32 random characters, written down and kept offline (not in a synced password manager), with no reset
-   at first sign-in. **Assign MFA device** → security key, both of your keys. Never create access keys; SCP 4 denies
-   them anyway. Sign in once at `https://<account id>.signin.aws.amazon.com/console` as that user to prove the
-   password and keys work, then sign out.
-4. Staging and prod only: apply `infra/bootstrap/<account>/ap-northeast-3` with `TF_VAR_tfstate_primary_key_arn` from
-   the Tokyo stack's `tfstate_key_arn` output. Its bucket and key policies name the emergency user by its ARN.
-5. Remove your `Admin` assignment.
+3. Staging and prod only: apply `infra/bootstrap/<account>/ap-northeast-3` with `TF_VAR_tfstate_primary_key_arn` from
+   the Tokyo stack's `tfstate_key_arn` output.
+4. Remove your `Admin` assignment.
 
 Then check, in that account:
 
 - With `ReadOnly`: `aws ec2 describe-instances --region us-west-2` fails with an explicit deny in a service control
   policy (the region guard). `aws ec2 describe-instances --region ap-northeast-1` works.
 - With `BreakGlass` assigned for a few minutes: `aws iam update-assume-role-policy` on
-  `sft-<account>-terraform-deploy` fails with an explicit deny (SCP 4), and so does
-  `aws s3api put-bucket-versioning --bucket sft-<account>-apne1-tfstate-<account id> --versioning-configuration
-  Status=Enabled` (the state bucket policy and SCP 3, #81; versioning is already on, so the call would change nothing
-  if it got through, but then stop and find out why). Remove the assignment.
-- IAM → Roles: `sft-<account>-terraform-plan`, `-terraform-deploy` and `-keyadmin` under `/sft-bootstrap/`; IAM →
-  Users: `sft-<account>-emergency` under `/sft-emergency/`, with console access, two security keys and no access
-  keys, and no other user.
+  `sft-<account>-terraform-deploy` fails with an explicit deny (SCP 4). Remove the assignment.
+- IAM → Roles: `sft-<account>-terraform-plan`, `-terraform-deploy` and `-keyadmin` under `/sft-bootstrap/`.
 
 ### 12. Check Identity Center (console)
 
@@ -320,11 +307,7 @@ Reading the outputs needs the organization stack's state, so run those `terrafor
 - **A member account's bucket or queue policy locks everyone out.** From the management account, IAM → Root access
   management → **Take privileged action** on that account (a 15-minute root session; SCP 3 lets it through).
 - **Identity Center is unreachable** (a Tokyo outage): authn-authz 8.4. The management account's root user, with its
-  security key, still signs in, because IAM is global. In a member account, sign in as `sft-<account>-emergency` with
-  its offline password and a security key, and for the CLI run `aws login --profile sft-<account>-emergency` as in
-  step 3. In staging and prod it is a bootstrap admin of the Osaka state bucket and tfstate key, so
-  `infra/bootstrap/<account>/ap-northeast-3` can be planned and applied with it; Osaka's other stacks keep applying
-  from CI, whose roles don't depend on Identity Center. Every sign-in alerts. Afterwards, change its password.
+  security key, still signs in, because IAM is global.
 - **Step 5 fails with `TagKeysNotFoundException`:** `TF_VAR_activate_cost_allocation_tags=false` wasn't set.
 - **Step 8 fails with "No IAM Identity Center instance":** it was enabled in a Region other than Tokyo. Delete that
   instance and enable it again in Tokyo (step 6).

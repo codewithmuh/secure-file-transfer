@@ -7,6 +7,9 @@ never import this module: each migration keeps the schema of its own time.
 Conventions (data model 1): IDs are UUIDv7 made by the application, times are `timestamptz`,
 states are `text` with a `CHECK` constraint. Constraint and index names follow PostgreSQL's own
 pattern, so names in migrations, errors and the catalog agree.
+
+Every tenant-owned model mixes in `TenantOwned` (`sft.data.access`), which names its tenant column
+and what a link session's subject reaches, so `in_scope` can filter it.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 from sqlalchemy import (
     ARRAY,
     CheckConstraint,
+    ColumnElement,
     DateTime,
     Index,
     MetaData,
@@ -27,11 +31,15 @@ from sqlalchemy import (
     Text,
     func,
     text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB
 from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import UserDefinedType
+
+from sft.data.access import TenantOwned
+from sft.data.scope import Subject
 
 NAMING_CONVENTION = {
     "pk": "%(table_name)s_pkey",
@@ -47,13 +55,14 @@ class Base(DeclarativeBase):
     type_annotation_map = {datetime: DateTime(timezone=True)}  # noqa: RUF012
 
 
-class Tenant(Base):
+class Tenant(TenantOwned, Base):
     """A customer company (data model 2.1). Every tenant-owned row refers to one.
 
     The columns for recovery and SSO arrive with their features (M1, M6), each in its own migration.
     """
 
     __tablename__ = "tenants"
+    __tenant_key__ = "id"
     __table_args__ = (CheckConstraint("status IN ('active', 'suspended')", name="status"),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -61,6 +70,12 @@ class Tenant(Base):
     status: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A link session reads its own tenant's row: the sender's company name, and its status,
+        # so a suspended tenant's links stop working. The tenant condition in_scope adds is enough.
+        return true()
 
 
 class SchemaCompatibility(Base):
