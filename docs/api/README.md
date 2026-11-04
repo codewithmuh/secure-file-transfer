@@ -132,7 +132,7 @@ Every error is an RFC 9457 problem (`application/problem+json`) with these field
 | `status` | The HTTP status. |
 | `code` | Stable, machine-readable code. Clients branch on this. |
 | `request_id` | Also in logs and traces; quote it when reporting a problem. |
-| `errors` | For `validation_failed` and `recipient_undeliverable`, one entry per problem with a JSON Pointer. |
+| `errors` | For `validation_failed` and `recipient_undeliverable`, one entry per problem with a JSON Pointer; for a `malformed_request` caused by a parameter, one entry per parameter or header. |
 | `attempts_remaining`, `current_state` | For `code_invalid` and for state conflicts. |
 
 | Status | Codes |
@@ -141,18 +141,43 @@ Every error is an RFC 9457 problem (`application/problem+json`) with these field
 | 401 | `authentication_required`, `session_expired`, `credentials_invalid`, `reauthentication_required` |
 | 403 | `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted`, `self_approval_forbidden` |
 | 404 | `not_found`, `link_not_found` |
+| 405 | `method_not_allowed`, with `Allow` |
 | 409 | `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`, `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`, `file_not_shareable`, `user_exists`, `last_admin`, `dlp_decision_changed`, `dlp_policy_conflict`, `detector_in_use`, `no_eligible_approver`, `approval_limit_reached` |
 | 410 | `link_revoked`, `link_expired` |
 | 413 | `file_too_large`, `total_too_large`, `storage_quota_exceeded`, `request_too_large` |
+| 415 | `unsupported_media_type` |
 | 416 | `range_not_satisfiable` |
 | 422 | `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`, `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large`, `justification_required`, `approvers_insufficient` |
 | 429 | `rate_limited` |
+| 500 | `internal_error`: nothing about the cause; the logs have it under the `request_id` |
 | 503 | `service_unavailable`: a call couldn't reach the audit archive, the rate-limit counters or the sign-in state store, or an API pod is full of download streams. A download grant, a verification or a sign-in changed nothing; a security-critical change took effect and a retry completes its record (section 5). |
 
 Members see `transfer_revoked` or `transfer_expired` (409) when they act on a transfer that was revoked or has expired;
 recipients see `link_revoked` or `link_expired` (410). Operations that apply only to drafts, such as adding
 and uploading files, answer `409 invalid_state` with `current_state` instead, because a draft is never revoked or
 expired: it is cancelled. Each operation's description lists the codes it can return.
+
+Every problem carries the `request_id` that the `X-Request-Id` header and the logs carry. `405`, `415` and `500` can
+come from any operation, so operations don't declare them: `405` from a method the path doesn't take, `415` from a body
+that isn't `application/json`, and `500` from a fault in the service.
+
+### 3.1 Requests that don't validate
+
+A request that doesn't match its operation's parameters or body schema gets the first of these that applies
+(`sft.api.errors`):
+
+| What is wrong | Answer |
+|---|---|
+| A path parameter, such as an ID that isn't a UUID | `404 not_found`: an ID that can't exist is as unknown as one that doesn't (NFR-12) |
+| A query, header or cookie parameter | `400 malformed_request`, with one `errors` entry per `parameter` or `header` |
+| The body isn't valid JSON | `400 malformed_request` |
+| The body is sent as another media type | `415 unsupported_media_type` |
+| The body breaks its schema, or a required body is missing | `422 validation_failed`, with a JSON Pointer per field, such as `#/recipients/3/email` |
+
+The `detail` of each entry is the validator's message. The value sent is never echoed, because it could be a secret or
+an address. An operation whose contract answers a parameter differently, such as a `Range` header that doesn't match
+(`416`) or an `X-Link-Session` that names no session (`401`), takes that parameter as a plain string and raises the
+contract's error itself.
 
 `completeSignIn` is a browser navigation from Cognito, so it never answers with a problem document for a refused
 sign-in: it redirects to the web app's sign-in page with `error=sign_in_failed`, and the audit log records why.
@@ -423,13 +448,15 @@ Later, not in v1 (each needs its own issue; none is required by the security des
 
 ## 11. Checking the contract
 
-Three checks keep this file and the code in step. `make contract` runs the last two locally, as CI does.
+Four checks keep this file and the code in step. `make contract` runs the second and third locally, as CI does, and
+`make web-check` runs the last.
 
 | Check | CI job | Fails when |
 |---|---|---|
 | Lint | `ci.yml`, `repo-checks` | The spec breaks the linter's recommended rules, or an operation lacks `x-permission` or a `429` response (the rules in [`redocly.yaml`](../../redocly.yaml)) |
 | Generated spec | `contract.yml`, `Contract (generated spec)`; also `make check` | An operation the code implements isn't in this file, or differs from it (11.1) |
 | Breaking changes | `contract.yml`, `Contract (breaking changes)` | The pull request changes this file in a way that breaks clients, and doesn't carry the `breaking` label (11.2) |
+| Web app client | `ci.yml`, `web` | The web app's generated client, `web/src/api/schema.ts`, differs from what this file generates, or the web app no longer type-checks against it (11.3) |
 
 To lint locally, with the image `ci.yml` pins:
 
@@ -450,8 +477,17 @@ and compares each operation in it with this file:
   mount), because it can't be checked. Add the operation to this file first, in the same pull request.
 - **An operation that is here must match it** in method, path, operation ID, parameters (name, location, required,
   style and schema), request body (required, media types and schema), success responses (every 2xx and 3xx status,
-  with its media types and schemas) and `deprecated`. Each app is checked against its own server's operations, so an
-  operator operation on the public app fails too.
+  with its media types and schemas), error responses (every 4xx and 5xx status, range and `default`, with its media
+  types and schemas) and `deprecated`. Each app is checked against its own server's operations, so an operator
+  operation on the public app fails too.
+- **Error responses are compared both ways.** A route that declares an error status this file doesn't declare for
+  the operation fails, and so does a route that leaves one out. A route declares its errors with
+  `responses=problem_responses(401, 403, 404, 429)` (`sft.api.errors`), which writes each as a `Problem` in
+  `application/problem+json`. FastAPI adds a `422` of its own to every route with parameters or a body; the app's
+  document replaces it with the `Problem` one when the route has a body, which can fail validation with `422`, and
+  drops it otherwise, because a bad parameter answers `400` or `404` (section 3.1). An app built without
+  `register_error_handlers` still shows FastAPI's `422`, and fails. `405`, `415` and `500` aren't declared per
+  operation (section 3), so a route doesn't declare them either.
 - **Operations not implemented yet are allowed.** The check prints how many remain.
 
 Schemas are compared after both sides are normalised, so two spellings of one schema compare equal. `$ref`s are
@@ -466,7 +502,6 @@ What the check doesn't compare, and what covers it instead:
 | Not compared | Why | Covered by |
 |---|---|---|
 | `title`, `description`, `summary`, examples, `tags` and `x-` extensions | Documentation; FastAPI fills some of them from Python names | Review |
-| Error responses (4xx, 5xx and `default`) | FastAPI adds its own `422` until M1's first issue answers with the problems of section 3 | Each route's tests, then M1's error handler |
 | `security` | FastAPI writes each security dependency as a separate requirement, so it can't express "a session and a CSRF token" | The authorization matrix test (authn-authz 9.2) |
 | `x-permission` | An extension FastAPI doesn't generate | The CI test of the permission registry against every `x-permission` value and the [permission table](../security/authn-authz.md#63-permission-table) (authn-authz 6.5), from M1 |
 | Response headers, such as `Location`, `Set-Cookie` and `Retry-After` | Declared by hand in FastAPI, outside the response model | Each route's tests |
@@ -507,3 +542,12 @@ optional field rather than a required one, keep a field rather than remove it, a
 less, and return no less than before in a response. If the break is deliberate and one of the two cases above, add the
 label. `make contract` runs the same comparison against the merge base with `origin/main`; set `CONTRACT_BASE` to
 compare with another branch.
+
+### 11.3 Web app client
+
+The web app's types come from this file (FR-31). `npm run gen:api` in `web/` runs
+[openapi-typescript](https://openapi-ts.dev) on it and writes `web/src/api/schema.ts`, which is committed; the web
+app calls the API through a typed layer over it (see [web/README.md](../../web/README.md#api-client)). The `web` job in
+`ci.yml` runs whenever this file changes, regenerates the client and fails if the committed one differs. So a pull
+request that changes this file regenerates the client in the same pull request, and the web app's type check shows
+whatever the change breaks there.

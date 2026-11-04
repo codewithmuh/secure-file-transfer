@@ -7,10 +7,14 @@ behind it (ADR-0020).
 - `database`: the pool, and `Database.transaction(scope)`, the only way to open a transaction. It
   sets `app.scope` and `app.tenant_id` for that transaction alone.
 - `scope`: `Scope`, the database half of a scope: its kind and, for tenant and resource scopes,
-  the tenant.
+  the tenant; a resource scope also names its subject.
+- `access`: the rules on top: which role opens which scope, `in_scope` for every query, and
+  `TenantOwned` for every tenant-owned model.
+- `tenants`, and one module per table or aggregate after it: the data-access functions.
 - `models`: the tables, for queries; a test keeps them in step with the migrations.
 - `roles`: the PostgreSQL roles. `bootstrap` creates them (`python -m sft.data.bootstrap`).
-- `rls`: generates the grants and policies a migration pastes in as literal SQL.
+- `rls`: generates the grants, policies, tenant keys and lookup functions a migration pastes in
+  as literal SQL.
 - `audit`: `audit.record(session, ...)` writes an audit event in the transaction of the change it
   describes (FR-27); partition upkeep for the lifecycle job.
 - `audit_required`: generates the fail-closed trigger a migration pastes in, `require_audit_sql`:

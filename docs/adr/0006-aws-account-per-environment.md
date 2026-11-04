@@ -66,8 +66,7 @@ protections. The retained stack stays in the prod account, which stays open afte
      S3 endpoint needs (ADR-0021).
   2. **Keys (decision 13).** Deny `kms:PutKeyPolicy`, `kms:DisableKey`, `kms:ScheduleKeyDeletion` and
      `kms:DeleteImportedKeyMaterial` to every principal except the deploy roles, the bootstrap `Admin` role for the
-     tfstate keys its stack creates, the staging and prod emergency users for Osaka's tfstate key (authn-authz 8.4,
-     #81), and the `sft-{env}-keyadmin` role of
+     tfstate keys its stack creates, and the `sft-{env}-keyadmin` role of
      [ADR-0017](0017-kms-keys-per-data-class.md), which `BreakGlass` uses only to recover a key policy and which may
      only put key policies.
   3. **Accounts and logging.** Deny leaving the organization, the root user in member accounts, turning off S3 Block
@@ -75,10 +74,7 @@ protections. The retained stack stays in the prod account, which stays open afte
      deleting CloudTrail, Config, GuardDuty, EKS control-plane logging and the alert rules to everyone but the deploy
      roles, and the bootstrap `Admin` role for what its stack creates, so an apply or a teardown can create and destroy
      them and nobody else can, `BreakGlass` included (T-60, T-74, T-75). EKS logging is set by
-     `eks:UpdateClusterConfig`, which also sets endpoint access, so that call stays with the apply roles too. Deny
-     changing a Terraform state bucket's policy, versioning, lifecycle, encryption, replication, inventory, Object
-     Lock, ownership or public access settings, or deleting it, to everyone but `Admin`, the staging and prod
-     emergency users and assumed-root sessions (T-73, #81); the state bucket policies repeat it.
+     `eks:UpdateClusterConfig`, which also sets endpoint access, so that call stays with the apply roles too.
   4. **IAM.** Deny creating, changing or deleting IAM roles, their trust and permission policies, and OIDC providers to
      everyone except the deploy roles, `BreakGlass` and `Admin` included. The roles the bootstrap applies create (the
      plan, apply and key-administration roles, the retained stack's deploy role and the OIDC provider, under the
@@ -88,8 +84,8 @@ protections. The retained stack stays in the prod account, which stays open afte
      and Object Lock settings (encryption 8.4), and the bootstrap `Admin` role, which runs the retained stack's first
      apply from local state (ADR-0005).
   The code added what the threat model asks of the same guards: SCP 4 also denies IAM access keys to everyone and IAM
-  users, their passwords, policies and MFA devices to all but `Admin` (T-71, T-74, #81), and SCP 1 denies KMS
-  replicas outside Osaka (encryption 4.4) and VPC endpoints to services outside Japan.
+  users to all but `Admin` (T-71, T-74), and SCP 1 denies KMS replicas outside Osaka (encryption 4.4) and VPC endpoints
+  to services outside Japan.
 - **Root users.** Centralized root access is on: member accounts have no root credentials, and a privileged root task
   runs from the management account through `sts:AssumeRoot`, which SCP 3 lets through. Only the management account's
   root user has a password and security keys.
