@@ -18,6 +18,8 @@ from sft.data.roles import API, JOBS, LOGIN_ROLES, LOOKUP, MIGRATE, OWNER, RECOV
 # Each test session makes its own databases there and drops them afterwards. The roles are
 # cluster-wide, so they stay, with the password below.
 ADMIN_URL_VARIABLE = "TEST_DATABASE_URL"
+# local/postgres/passwords.sql gives the local stack's roles the same value, so `make test` against
+# the stack leaves the API's login working. Change both together.
 TEST_PASSWORD = "test-only-password"  # noqa: S105 - local and CI test servers only
 
 
