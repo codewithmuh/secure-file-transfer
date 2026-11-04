@@ -42,8 +42,9 @@ from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.logs import request_id_var, trace_id_var
+from sft.data.access import require_scope
 from sft.data.models import ActorType, AuditEvent, Outcome
-from sft.data.scope import Scope, ScopeKind
+from sft.data.scope import ScopeKind
 
 USER_AGENT_MAX: Final = 512
 """Longer user agents are cut to this many characters; only the first part says anything."""
@@ -71,7 +72,7 @@ __all__ = [
 ]
 
 # Tenant and resource scopes write their tenant's events; platform scope, events with no tenant.
-_WRITES_EVENTS = frozenset({ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.PLATFORM})
+_WRITES_EVENTS = (ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.PLATFORM)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,11 +161,9 @@ async def record(
     _action(action)
     if not isinstance(actor, Actor):
         raise TypeError("actor must be an Actor")
-    scope = session.info.get("scope")
-    if not isinstance(scope, Scope) or scope.kind not in _WRITES_EVENTS:
-        # System scope finds work and acts on each item in that item's tenant scope (data model
-        # 4.2); lookup and recovery scopes write no events through this function.
-        raise ValueError("audit events are written in a tenant, resource or platform scope")
+    # System scope finds work and acts on each item in that item's tenant scope (data model 4.2);
+    # lookup and recovery scopes write no events through this function.
+    scope = require_scope(session, *_WRITES_EVENTS)
     origin = origin or Origin()
     event_id = uuid7()
     await session.execute(

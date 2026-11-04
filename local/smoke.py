@@ -43,7 +43,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENV = {
-    "DATABASE_URL": "postgresql+psycopg://sft:sft-local-only@127.0.0.1:5432/sft",
+    # The superuser, not DATABASE_URL: the API's own role has no password until #79.
+    "LOCAL_POSTGRES_URL": "postgresql://sft:sft-local-only@127.0.0.1:5432/sft",
     "AWS_REGION": "ap-northeast-1",
     "AWS_ACCESS_KEY_ID": "local-only",
     "AWS_SECRET_ACCESS_KEY": "local-only",
@@ -97,7 +98,7 @@ def aws(service: str):
 
 
 def check_postgres() -> str:
-    url = cfg["DATABASE_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
+    url = cfg["LOCAL_POSTGRES_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
     with psycopg.connect(url, connect_timeout=5) as conn:
         one = conn.execute("SELECT 1").fetchone()
         version = conn.execute("SHOW server_version").fetchone()

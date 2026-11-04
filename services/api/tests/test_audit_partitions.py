@@ -163,7 +163,8 @@ async def test_only_the_lifecycle_job_runs_partition_upkeep(own_db: ScratchDatab
     try:
         for call in (audit.partition_status, audit.create_partitions):
             with pytest.raises(DBAPIError) as refused:
-                async with api.transaction(Scope.system()) as session:
+                # sft_api never opens system scope; in a scope it may open, the grant refuses it.
+                async with api.transaction(Scope.platform()) as session:
                     await call(session)
             assert getattr(refused.value.orig, "sqlstate", None) == "42501"
     finally:
