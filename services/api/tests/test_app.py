@@ -53,7 +53,9 @@ def test_the_lifespan_opens_the_pool_and_closes_it(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(Database, "dispose", record_dispose)
     settings = Settings(
-        database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"), database_pool_size=3
+        database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"),
+        database_pool_size=3,
+        valkey_url=SecretStr("redis://u:p@127.0.0.1:1/0"),
     )
     app = app_with_database_route(settings)
     with TestClient(app) as client:

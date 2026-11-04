@@ -160,7 +160,7 @@ There are four ways to make the service email someone, and each one is capped:
 
 | Key | Value used | Notes |
 |---|---|---|
-| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. Dual-stack needs the limiter to group IPv6 addresses by /64 first, because WAF rate rules key each IPv6 address separately. |
+| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. The limiter already counts an IPv6 address per /64 (#97); the WAF rate rules still key each IPv6 address separately, so dual-stack needs a WAF change too. |
 | Account | The member's user ID; for sign-in, the Cognito user | |
 | Tenant | `tenant_id` from the member session or API key | Recipients and uploaders don't count against their tenant's request budget (2.2, H) |
 | Invited email | HMAC-SHA-256 of the normalized address (data model section 1) | Never the address itself. For 25 hours after an HMAC key rotation, each per-address limit adds the old pseudonym's count, so a rotation never resets a cap (#22). |
@@ -510,11 +510,16 @@ PostgreSQL holding the security state. The phase 4 ADR confirms it.
   first, 2.4) and stop at the first refusal, so a flood refused per IP or per key never uses up a tenant's budget or a
   victim's code cap. That costs up to four 1 ms round trips; one script over all keys would need one hash slot, which
   cluster mode denies.
-- **Key names** look like `rl:{group}:{key type}:{value}`, where the value is an ID, an HMAC or an IPv4 address.
+- **Key names** look like `rl:{group}.{limit}:{key type}:{value}`, for example `rl:A.ip_requests:ip:203.0.113.7`,
+  where the value is an ID, an HMAC, an IPv4 address or an IPv6 /64. The limit's name keeps two limits on one key
+  type apart; a key holds no braces, so no hash tag, and each script touches its one key (#97).
   Access is by IAM authentication from the roles of the API, the sign-in triggers, the scan worker and the
   notification worker, over TLS, through a security group open only to them (ADR-0014).
 - **Timeouts.** 50 ms per call. After 5 errors in a row, the API stops calling the store for 10 seconds and applies
-  each group's failure mode, so a sick cache doesn't add latency to every request.
+  each group's failure mode, so a sick cache doesn't add latency to every request. After the rest, one failed call
+  starts the next rest at once; one success ends it.
+- **Retry-After.** After the first refusal the wider limits are only read, never counted, so the answer can still
+  give the largest wait (2.4) without spending a tenant's budget.
 
 ### 4.5 Failure modes
 
@@ -957,7 +962,7 @@ verification funnel, streams and email reputation.
 | Closing the browser ends the link cookie, so finishing a download after verifying again counts a new download | Grants are bound to their session | Accepted; resumes within the session are free |
 | Deploys cut downloads still running after 120 s, and browsers differ in whether they resume a cut download with a `Strict` cookie | Streaming through pods | Measured; otherwise a restart within the same grant |
 | Files clean at upload aren't re-scanned when signatures update | Files live at most 90 days | Possible later: re-scan on download when the scan is older than a set age |
-| IPv6 clients would each get their own limits | WAF and our limiter key single addresses | The load balancer stays IPv4-only until the limiter groups IPv6 by /64 |
+| IPv6 clients would each get their own WAF limits | The WAF keys single addresses; our limiter counts per /64 | The load balancer stays IPv4-only until the WAF rules are revisited |
 | A botnet spreads code guesses over many IPs and leaked links | Per-IP limits don't see it | The per-code and per-recipient limits are in PostgreSQL and hold whatever the IP; the odds stay ≤ 2 × 10^-5 per recipient |
 
 ### 9.2 Tests
@@ -1019,6 +1024,11 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
 - **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** AB-12, group K, the inspection
   limits (6.5), the DLP emails (7.1, 7.2), signals and alerts (8.1, 8.2), and `rejectTransfer` among the safety
   actions. The API README lists group K.
+
+- **Rate limiting, [#97](https://github.com/codewithmuh/secure-file-transfer/issues/97).** Groups A, B, G
+  (`inviteUser`), H and J are data in `services/api/src/sft/service/rate_limits/limits.py`, with each operation's
+  bundle; the key names (4.4), IPv6 per /64 (2.1) and the read-only check of wider limits after a refusal (4.4).
+  Groups C to F, I and K, the stream leases and the byte budgets join with their routes.
 
 **Open points for the maintainer:**
 

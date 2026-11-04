@@ -5,11 +5,12 @@ from sft.core.settings import BootstrapSettings, Settings, setting_errors
 
 # DATABASE_URL is required; give it, so each test sees only the error it causes.
 DATABASE_URL = SecretStr("postgresql://sft_api@127.0.0.1:1/sft")
+VALKEY_URL = SecretStr("redis://u:p@127.0.0.1:1/0")
 
 
 def errors_for(**values: object) -> list[dict[str, str]]:
     with pytest.raises(ValidationError) as caught:
-        Settings(database_url=DATABASE_URL, **values)  # type: ignore[arg-type]
+        Settings(database_url=DATABASE_URL, valkey_url=VALKEY_URL, **values)  # type: ignore[arg-type]
     return setting_errors(caught.value, Settings)
 
 
@@ -32,6 +33,7 @@ def test_never_includes_the_value() -> None:
 
 def test_names_a_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("VALKEY_URL", VALKEY_URL.get_secret_value())
     with pytest.raises(ValidationError) as caught:
         Settings()  # type: ignore[call-arg]
     assert setting_errors(caught.value, Settings) == [

@@ -15,6 +15,8 @@ dependencies = [
   # The binary wheel bundles libpq, so the slim image needs no system packages.
   "psycopg[binary]>=3.3.6",
   "alembic>=1.20.1",
+  # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
+  "valkey>=6.2.0",
 ]
 
 [dependency-groups]

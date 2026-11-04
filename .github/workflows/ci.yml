@@ -95,8 +95,19 @@ jobs:
         options: >-
           --health-cmd "pg_isready --username postgres --host 127.0.0.1"
           --health-interval 2s --health-timeout 5s --health-retries 30
+      # Real Valkey for the rate-limit counters (ADR-0014), at the local stack's version. A
+      # password per run as above; the image's entrypoint appends VALKEY_EXTRA_FLAGS.
+      valkey:
+        image: valkey/valkey:9.0.7-alpine
+        env:
+          VALKEY_EXTRA_FLAGS: --save '' --appendonly no --requirepass vk-${{ github.run_id }}-${{ github.run_attempt }}
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli -a vk-${{ github.run_id }}-${{ github.run_attempt }} --no-auth-warning ping"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
+      TEST_VALKEY_URL: redis://:vk-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

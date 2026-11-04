@@ -22,6 +22,9 @@ services:
       # the API connects only when a request needs the database. The `postgres` service comes with
       # the local stack (#52); running the bootstrap and migration jobs in it is a follow-up issue.
       DATABASE_URL: ${DATABASE_URL:-postgresql://sft_api@postgres:5432/sft}
+      # The rate-limit counters (ADR-0014), as the stack's local ACL user. Required; connected on
+      # first use, so the API starts without it, and limits that fail open then count per pod.
+      VALKEY_URL: ${VALKEY_URL:-redis://sft-local:local-only-valkey-password@valkey:6379/0}
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
