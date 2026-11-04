@@ -44,6 +44,34 @@ provider "aws" {
   }
 }
 
+# What a read-only plan of the organization stack reads (#55): Organizations, Identity Center and its identity store,
+# Budgets, the cost allocation tags and the root access settings. Read and list actions only; the stack's state comes
+# through the bucket and key policies.
+data "aws_iam_policy_document" "plan_organization" {
+  statement {
+    sid       = "ReadTheOrganization"
+    actions   = ["organizations:Describe*", "organizations:List*", "iam:ListOrganizationsFeatures"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "ReadIdentityCenter"
+    actions = [
+      "identitystore:DescribeGroup", "identitystore:DescribeGroupMembership", "identitystore:DescribeUser",
+      "identitystore:GetUserId",
+      "sso:DescribePermissionSet", "sso:GetInlinePolicyForPermissionSet", "sso:ListAccountAssignments",
+      "sso:ListInstances", "sso:ListManagedPoliciesInPermissionSet", "sso:ListTagsForResource",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "ReadBudgetsAndCostAllocationTags"
+    actions   = ["budgets:ListTagsForResource", "budgets:ViewBudget", "ce:ListCostAllocationTags"]
+    resources = ["*"]
+  }
+}
+
 module "terraform_roles" {
   source = "../../../modules/terraform-oidc-roles"
 
@@ -53,6 +81,7 @@ module "terraform_roles" {
   iam_path           = module.conventions.bootstrap_iam_path
   plan_role_name     = module.conventions.bootstrap_role_names.terraform_plan
   deploy_role_name   = module.conventions.bootstrap_role_names.terraform_deploy
+  plan_policy_json   = data.aws_iam_policy_document.plan_organization.json
 }
 
 module "state" {

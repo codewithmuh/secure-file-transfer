@@ -60,3 +60,14 @@ variable "deploy_max_session_seconds" {
     error_message = "deploy_max_session_seconds must be between 3600 and 43200."
   }
 }
+
+variable "plan_policy_json" {
+  description = "Identity policy for the plan role, as JSON, replacing the placeholder. Null keeps the placeholder."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.plan_policy_json == null || can(jsondecode(var.plan_policy_json))
+    error_message = "plan_policy_json must be a JSON policy document."
+  }
+}

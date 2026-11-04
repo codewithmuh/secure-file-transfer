@@ -69,8 +69,9 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 ## Apply order
 
 1. `bootstrap/management/ap-northeast-1`, before anything else exists.
-2. `organization`: creates the member accounts, Identity Center, the `Admin` and `BreakGlass` permission sets and the
-   SCPs.
+2. `organization`: the budgets first, then the organization, OUs and member accounts, the SCPs, and, once Identity
+   Center is enabled in the console, the permission sets and groups. Two console steps and a few flags make it more
+   than one apply: follow [the runbook](../docs/runbooks/organization-and-bootstrap.md), which covers steps 1 to 3.
 3. For each member account (shared, dev, staging, prod): `bootstrap/<account>/ap-northeast-1`, then, for staging and
    prod, `bootstrap/<account>/ap-northeast-3`, which needs the Tokyo stack's `tfstate_key_arn` output and its roles.
 4. `shared`.
@@ -130,13 +131,56 @@ sets anything else.
 | `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
 
-All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). Both trusts pin
+All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
+retained stack's own deploy role, which must be named `sft-prod-retained-terraform-deploy`: the SCPs treat every
+`sft-*-terraform-deploy` under that path as a deploy role, and SCP 5 names this one. Both trusts pin
 the audience and the exact subject with `StringEquals`; the module's variables reject wildcards. Each GitHub
 environment must accept deployments from `main` only, which is set in the repository settings, not here. The
 management account has a plan role only.
 
 The plan and deploy roles' permissions beyond state are a **placeholder** in `modules/terraform-oidc-roles`: each
-issue that builds a layer adds what that layer needs.
+issue that builds a layer adds what that layer needs. The management account's plan role is the first to have real
+ones: read access to Organizations, Identity Center, Budgets and the cost allocation tags, for read-only plans of the
+organization stack, passed in as `plan_policy_json`.
+
+## Organization and guardrails
+
+`organization` holds everything that binds the accounts from above ([ADR-0006](../docs/adr/0006-aws-account-per-environment.md)).
+SCPs never bind the management account, so it holds nothing else and is applied only by the maintainer with MFA.
+
+| | |
+|---|---|
+| OUs and accounts | `prod` (prod), `nonprod` (dev, staging), `shared` (shared). Accounts are named `sft-<env>`; their emails come in as `TF_VAR_account_emails`. `prevent_destroy` and `close_on_deletion = false`: nothing here closes an account. |
+| Root access | Centralized root access: member accounts have no root credentials. A privileged root task runs from the management account through `sts:AssumeRoot`. |
+| Trusted access | Identity Center, IAM (root access) and CloudTrail. The shared account is CloudTrail's delegated administrator: the shared stack creates the organization trail next to its log archive, and that trail must log S3 data events on every `sft-*-tfstate-*` bucket (`.trivyignore.yaml`). GuardDuty and Config belong to each environment, so neither is delegated. |
+| Budgets | $6,500 in total and per account: shared $20, dev $500, staging $800, prod $5,180 (capacity 7.3). Alarms by email at 50 % actual, 80 % and 100 % actual and forecast (NFR-20). The $7 NFR-19 budget is the retained stack's. |
+| Cost allocation tags | `environment`, `component`, `stack` |
+
+**SCPs.** Deny statements only; `FullAWSAccess` stays the allow. "Apply roles" are the deploy roles
+(`/sft-bootstrap/sft-*-terraform-deploy`, the retained stack's included) and the `Admin` permission set.
+
+| SCP | Attached to | Denies |
+|---|---|---|
+| 1 `region-guard` | Root | Everything outside Tokyo and Osaka, except global services (IAM, STS, Route 53, CloudFront, Organizations, account, billing, Budgets, Cost Explorer, Support, Health) and, in us-east-1 only, ACM, WAF, CloudWatch, SNS, CloudWatch Logs delivery and KMS (NFR-21). Also log groups in us-east-1, KMS replicas outside Osaka, and VPC endpoints to services outside Japan; `vpce:AllowMultiRegion` passes (ADR-0021). |
+| 2 `keys` | Root | Disabling or deleting KMS keys, or deleting imported key material, to all but apply roles; putting key policies to all but apply roles and `sft-<env>-keyadmin` |
+| 3 `accounts-and-logging` | Root | Leaving the organization; the root user's own credentials; sharing EBS or RDS snapshots; turning off account-wide S3 Block Public Access or EBS default encryption, and changing CloudTrail, Config, GuardDuty, EKS logging, `sft-*` EventBridge rules and alarms or `/aws/eks/*` log groups, to all but apply roles |
+| 4 `iam` | Root | Changing roles, policies and OIDC or SAML providers to all but deploy roles; changing what is under `/sft-bootstrap/`, the GitHub OIDC provider and `OrganizationAccountAccessRole` to all but `Admin`; access keys and service-specific credentials to everyone; IAM users to all but `Admin` |
+| 5 `audit-archive` | `prod` OU | Changing the policy, lifecycle, Object Lock, replication, versioning, encryption or public access settings of `sft-prod-apne?-audit-archive-*` and `sft-prod-apne?-retained-*` buckets to all but the retained stack's deploy role and `Admin` |
+
+**Permission sets.** Group assignments only; nobody holds `Admin` or `BreakGlass` standing.
+
+| Permission set | Session | Policies | Assigned |
+|---|---|---|---|
+| `Admin` | 1 hour | `AdministratorAccess` | By a `BreakGlassApprover`, one person, at most an hour, any account |
+| `BreakGlass` | 1 hour | `AdministratorAccess`, bound by the SCPs and the bucket and key policies | By a `BreakGlassApprover`, one person, at most an hour |
+| `BreakGlassApprover` | 1 hour | Create and delete assignments of `Admin` and `BreakGlass`; read people and assignments | `sft-breakglass-approvers`, management account |
+| `ReadOnly` | 4 hours | `ViewOnlyAccess`, `CloudWatchReadOnlyAccess`, EKS describe | `sft-readonly`, every member account |
+| `Operator` | 2 hours | `ReadOnly`'s, plus SSO providers in the user pools | `sft-operators`, dev, staging, prod |
+| `AuditReader` | 1 hour | Read `sft-*-audit-archive-*` and `sft-shared-*-log-archive-*`, decrypt through S3 | `sft-audit-readers`, every member account |
+
+Still to add here, by the issues that bring what they need: Systems Manager port forwarding for `ReadOnly` and
+`Operator` (cluster layer), the failover steps for `Operator` (M7), and the break-glass tool's EventBridge Scheduler
+removal and alerts (FR-35, M6).
 
 ## Conventions
 
@@ -147,6 +191,7 @@ issue that builds a layer adds what that layer needs.
 | Regional resource | `sft-<env>-<region-short>-<thing>` | `sft-prod-apne1-vpc` |
 | Global resource (IAM role, CloudFront) | `sft-<env>-<thing>` | `sft-prod-api`, `sft-prod-keyadmin` |
 | S3 bucket (globally unique) | `sft-<env>-<region-short>-<thing>-<account-id>` | `sft-dev-apne1-tfstate-<account-id>` |
+| Names the SCPs and permission sets rely on | Audit archive `sft-<env>-<region-short>-audit-archive-<account-id>`; the retained stack's other buckets `sft-prod-apne1-retained-<thing>-<account-id>`; the log archive `sft-shared-apne1-log-archive-<account-id>`; alert rules and alarms `sft-*` | `sft-prod-apne3-audit-archive-<account-id>` |
 | KMS alias | `alias/sft/<env>/<class>` | `alias/sft/prod/files` |
 | Secret | `sft/<env>/<name>` | `sft/prod/db/master` |
 
@@ -170,8 +215,8 @@ Every provider sets `default_tags` from the `conventions` module, so every resou
 | `repository` | `codewithmuh/secure-file-transfer` | Where the code lives |
 | `retention` | `audit-archive`, on the retained stack only | The CI guard and the NFR-19 budget filter (encryption 8.4) |
 
-Cost Explorer can use `environment`, `component` and `stack` once they are activated as cost allocation tags in the
-management account (#55).
+The organization stack activates `environment`, `component` and `stack` as cost allocation tags in the management
+account, so Cost Explorer can split cost by them (capacity 7.3).
 
 ### Account IDs and variables
 

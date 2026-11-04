@@ -8,7 +8,7 @@ misconfigurations:
       - "**/modules/tfstate-backend/main.tf"
     statement: >-
       The Terraform state buckets record access through CloudTrail S3 data events, not S3 server access logs. The
-      organization trail (#55) logs data events on every sft-*-tfstate-* bucket into the shared account's log archive
-      under Object Lock, where a read or write by anyone but the Terraform roles stands out (T-73, T-75). Server access
+      organization trail, which the shared stack creates as CloudTrail's delegated administrator (#55), logs data
+      events on every sft-*-tfstate-* bucket into the shared account's log archive under Object Lock, where a read or write by anyone but the Terraform roles stands out (T-73, T-75). Server access
       logs would need a log bucket in every account and Region, before the state bucket exists, that is itself a
       bucket without logging.

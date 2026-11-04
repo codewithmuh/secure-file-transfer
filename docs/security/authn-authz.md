@@ -820,6 +820,11 @@ context (#22). A scoping bug that slips past both layers above returns a row tha
 | `BreakGlassApprover` | A second operator | Assign `BreakGlass` to another operator for one hour (8.3) | Use `BreakGlass` itself |
 | `BreakGlass` | Emergencies only | See 8.3 | See 8.3 |
 
+Sessions last one hour for `BreakGlass`, `BreakGlassApprover`, `Admin` and `AuditReader`, two hours for `Operator`
+and four for `ReadOnly`; the access portal asks for the security key again after four hours. `BreakGlassApprover` is
+assigned in the management account, where Identity Center lives, and may assign `BreakGlass` and `Admin` only
+(infra/README, "Organization and guardrails").
+
 - **No shell or tunnel into application pods.** A shell in an API pod carries the pod's IAM and database roles, which
   can read files and unwrap tenant data keys, and a port-forward reaches its internal ports. An EKS access entry maps
   `Operator` to a Kubernetes group whose RBAC allows `pods/portforward` only in `sft-operator`, which runs nothing but
@@ -894,7 +899,9 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 - Each AWS account has one emergency IAM user with a hardware security key, console access only and no access keys. Its
   password is kept offline. Any sign-in alerts. It is used only when Identity Center can't be reached, for example in
   a regional outage that also takes down Identity Center's home region.
-- The root user has a hardware security key, is never used, and any sign-in alerts.
+- Member accounts have no root user credentials: centralized root access is on, and a privileged root task runs from
+  the management account through `sts:AssumeRoot` for at most 15 minutes (ADR-0006). The management account's root
+  user has a hardware security key, is never used, and any sign-in alerts.
 
 ## 9. Residual risks and tests
 
