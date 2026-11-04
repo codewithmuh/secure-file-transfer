@@ -30,8 +30,16 @@ fmt: ## Format all code
 lint: ## Lint, type-check and check the import layers (same as CI)
 	cd $(PY) && uv run ruff format --check . && uv run ruff check . && uv run mypy && uv run lint-imports
 
-test: ## Run all tests with the coverage gates (same as CI)
-	cd $(PY) && uv run pytest
+# While the local stack runs, the database tests default to its superuser; they make and drop their
+# own databases there (services/api/README.md). Set TEST_DATABASE_URL to use another server.
+LOCAL_TEST_DATABASE_URL := postgresql://sft:sft-local-only@127.0.0.1:5432/postgres
+
+test: ## Run all tests with the coverage gates (same as CI); uses the local stack's PostgreSQL if it runs
+	@url="$${TEST_DATABASE_URL:-}"; \
+	if [[ -z "$$url" ]] && docker compose ps --status running --quiet postgres 2>/dev/null | grep -q .; then \
+	  url="$(LOCAL_TEST_DATABASE_URL)"; echo "TEST_DATABASE_URL: the local stack's PostgreSQL"; \
+	fi; \
+	cd $(PY) && TEST_DATABASE_URL="$$url" uv run pytest
 
 check: lint test web-check ## Everything CI runs before building images
 
@@ -82,7 +90,7 @@ down: ## Stop and remove local containers (keeps the local data)
 reset: ## Stop everything and delete the local data (database, S3 objects)
 	docker compose down --volumes --remove-orphans
 
-smoke: ## One round trip to every local stack service (after make up)
+smoke: ## One round trip to every local stack service, and sft_api's row-level security (after make up)
 	uv run --script local/smoke.py
 
 logs: ## Follow logs of all services

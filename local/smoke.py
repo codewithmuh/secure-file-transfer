@@ -43,7 +43,8 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ENV = {
-    # The superuser, not DATABASE_URL: the API's own role has no password until #79.
+    # The API's own role, which row-level security applies to, and the server's superuser.
+    "DATABASE_URL": "postgresql+psycopg://sft_api:test-only-password@127.0.0.1:5432/sft",
     "LOCAL_POSTGRES_URL": "postgresql://sft:sft-local-only@127.0.0.1:5432/sft",
     "AWS_REGION": "ap-northeast-1",
     "AWS_ACCESS_KEY_ID": "local-only",
@@ -97,14 +98,60 @@ def aws(service: str):
     )
 
 
+def postgres(variable: str) -> psycopg.Connection:
+    url = cfg[variable].replace("postgresql+psycopg://", "postgresql://", 1)
+    return psycopg.connect(url, connect_timeout=5)
+
+
 def check_postgres() -> str:
-    url = cfg["LOCAL_POSTGRES_URL"].replace("postgresql+psycopg://", "postgresql://", 1)
-    with psycopg.connect(url, connect_timeout=5) as conn:
+    with postgres("LOCAL_POSTGRES_URL") as conn:
         one = conn.execute("SELECT 1").fetchone()
         version = conn.execute("SHOW server_version").fetchone()
+        # db-migrate ran: the database has a revision (alembic_version belongs to sft_owner).
+        revision = conn.execute("SELECT version_num FROM alembic_version").fetchone()
     assert one == (1,), one
     assert version and version[0].startswith("17."), version
-    return f"SELECT 1 ok, PostgreSQL {version[0]}"
+    assert revision, "the database has no migration revision"
+    return f"SELECT 1 ok, PostgreSQL {version[0]}, migrated to {revision[0]}"
+
+
+def check_api_role() -> str:
+    """The API's login reads no tenant's row without a scope, and its own row with one (ADR-0020)."""
+    tenant = uuid.uuid4()
+    with postgres("LOCAL_POSTGRES_URL") as admin:
+        admin.execute(
+            "INSERT INTO tenants (id, name, status) VALUES (%s, 'smoke check', 'active')",
+            (tenant,),
+        )
+        admin.commit()
+        try:
+            with postgres("DATABASE_URL") as conn:
+                role = conn.execute(
+                    "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles "
+                    "WHERE rolname = current_user"
+                ).fetchone()
+                assert role == ("sft_api", False, False), role
+                unscoped = conn.execute("SELECT count(*) FROM tenants").fetchone()
+                assert unscoped == (0,), (
+                    f"sft_api read {unscoped} tenant rows without a scope"
+                )
+                conn.rollback()
+                # The scope the API sets at the start of every transaction (sft.data.database).
+                conn.execute(
+                    "SELECT set_config('app.scope', 'tenant', true), "
+                    "set_config('app.tenant_id', %s, true)",
+                    (str(tenant),),
+                )
+                scoped = conn.execute("SELECT id FROM tenants").fetchall()
+                assert scoped == [(tenant,)], (
+                    f"in its tenant's scope sft_api read {scoped}"
+                )
+        finally:
+            admin.execute("DELETE FROM tenants WHERE id = %s", (tenant,))
+            admin.commit()
+    return (
+        "sft_api, no superuser or BYPASSRLS; 0 tenant rows unscoped, its own row scoped"
+    )
 
 
 def check_s3() -> str:
@@ -356,6 +403,7 @@ def check_oidc() -> str:
 
 CHECKS: dict[str, Callable[[], str]] = {
     "postgres": check_postgres,
+    "api-role": check_api_role,
     "s3": check_s3,
     "sqs": check_sqs,
     "valkey": check_valkey,
