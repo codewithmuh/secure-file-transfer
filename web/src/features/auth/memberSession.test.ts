@@ -99,6 +99,7 @@ describe('signOutMember: with the session restored on load, sign-out must end it
     await signOutMember();
 
     expect(api.sent[0]?.url).toBe('/auth/sign-out');
+    expect(api.sent[0]?.data).toBe(JSON.stringify({ all_sessions: false })); // only this session (SignOutRequest)
     expect(header(api.sent[0], 'X-CSRF-Token')).toBe(token);
     expect(useAuthStore.getState().memberStatus).toBe('anonymous');
     expect(api.location.assign).toHaveBeenCalledWith(logoutUrl);

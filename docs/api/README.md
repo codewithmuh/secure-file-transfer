@@ -448,13 +448,15 @@ Later, not in v1 (each needs its own issue; none is required by the security des
 
 ## 11. Checking the contract
 
-Three checks keep this file and the code in step. `make contract` runs the last two locally, as CI does.
+Four checks keep this file and the code in step. `make contract` runs the second and third locally, as CI does, and
+`make web-check` runs the last.
 
 | Check | CI job | Fails when |
 |---|---|---|
 | Lint | `ci.yml`, `repo-checks` | The spec breaks the linter's recommended rules, or an operation lacks `x-permission` or a `429` response (the rules in [`redocly.yaml`](../../redocly.yaml)) |
 | Generated spec | `contract.yml`, `Contract (generated spec)`; also `make check` | An operation the code implements isn't in this file, or differs from it (11.1) |
 | Breaking changes | `contract.yml`, `Contract (breaking changes)` | The pull request changes this file in a way that breaks clients, and doesn't carry the `breaking` label (11.2) |
+| Web app client | `ci.yml`, `web` | The web app's generated client, `web/src/api/schema.ts`, differs from what this file generates, or the web app no longer type-checks against it (11.3) |
 
 To lint locally, with the image `ci.yml` pins:
 
@@ -540,3 +542,12 @@ optional field rather than a required one, keep a field rather than remove it, a
 less, and return no less than before in a response. If the break is deliberate and one of the two cases above, add the
 label. `make contract` runs the same comparison against the merge base with `origin/main`; set `CONTRACT_BASE` to
 compare with another branch.
+
+### 11.3 Web app client
+
+The web app's types come from this file (FR-31). `npm run gen:api` in `web/` runs
+[openapi-typescript](https://openapi-ts.dev) on it and writes `web/src/api/schema.ts`, which is committed; the web
+app calls the API through a typed layer over it (see [web/README.md](../../web/README.md#api-client)). The `web` job in
+`ci.yml` runs whenever this file changes, regenerates the client and fails if the committed one differs. So a pull
+request that changes this file regenerates the client in the same pull request, and the web app's type check shows
+whatever the change breaks there.

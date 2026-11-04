@@ -113,8 +113,9 @@ jobs:
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
       - run: uv run pytest # against the PostgreSQL service; fails below 80% coverage (pyproject.toml)
 
-  # Always runs and reports, so it can be a required check (#59). A pull request that changes nothing under
-  # web/ and not this workflow skips the steps, and the job still passes; a job-level `if:` would report "skipped".
+  # Always runs and reports, so it can be a required check (#59). A pull request that changes nothing under web/,
+  # not the API contract (the source of the web app's generated client) and not this workflow skips the steps, and
+  # the job still passes; a job-level `if:` would report "skipped".
   web:
     name: Web app (types, lint, tests, build)
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
@@ -138,11 +139,11 @@ jobs:
             exit 0
           fi
           changed=$(git diff --name-only HEAD^1 HEAD)
-          if grep --quiet --extended-regexp '^(web/|\.github/workflows/ci\.yml$)' <<< "$changed"; then
+          if grep --quiet --extended-regexp '^(web/|docs/api/openapi\.yaml$|\.github/workflows/ci\.yml$)' <<< "$changed"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Nothing under web/ or in ci.yml changed: the web checks were skipped." >> "$GITHUB_STEP_SUMMARY"
+            echo "Nothing under web/, in the API contract or in ci.yml changed: the web checks were skipped." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.changes.outputs.run == 'true'
@@ -160,6 +161,16 @@ jobs:
         run: npm test
       - if: steps.changes.outputs.run == 'true'
         run: npm run build # the production bundle (ADR-0008)
+      - name: Check the generated API client matches the contract
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          # FR-31: src/api/schema.ts is generated from docs/api/openapi.yaml. Regenerate it; any change fails.
+          npm run gen:api
+          if [[ -n "$(git status --porcelain -- src/api)" ]]; then
+            git --no-pager diff --stat -- src/api
+            echo "::error file=web/src/api/schema.ts::The generated API client is out of date with docs/api/openapi.yaml. Run 'npm run gen:api' in web/ and commit the result."
+            exit 1
+          fi
 
   images:
     name: Image ${{ matrix.service }} (build, scan, smoke test)
