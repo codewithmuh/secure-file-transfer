@@ -21,3 +21,10 @@ updates:
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:
       base-images: { patterns: ["*"] }
+
+  - package-ecosystem: docker-compose # the local stack's images, pinned by version and digest in compose.yaml
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
+    groups:
+      local-stack: { patterns: ["*"] }
