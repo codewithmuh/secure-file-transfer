@@ -8,6 +8,22 @@ updates:
     groups:
       actions: { patterns: ["*"] }
 
+  # The AWS provider in every Terraform root, with its lock file (ADR-0005). One pull request per provider release
+  # for all roots, so they never drift apart. Modules set only a minimum version and aren't listed.
+  - package-ecosystem: terraform
+    directories:
+      - /infra/bootstrap/*/*
+      - /infra/environments/*/*/*
+      - /infra/environments/prod/retained
+      - /infra/organization
+      - /infra/shared
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
+    groups:
+      terraform-providers:
+        patterns: ["*"]
+        group-by: dependency-name
+
   - package-ecosystem: uv
     directory: /services/api
     schedule: { interval: weekly }
@@ -21,3 +37,10 @@ updates:
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:
       base-images: { patterns: ["*"] }
+
+  - package-ecosystem: docker-compose # the local stack's images, pinned by version and digest in compose.yaml
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
+    groups:
+      local-stack: { patterns: ["*"] }

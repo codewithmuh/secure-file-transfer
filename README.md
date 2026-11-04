@@ -30,6 +30,7 @@ settings, probes, metrics, logs and graceful shutdown are in place, and it serve
 | Request | Send an upload link so someone outside the company can deliver files to you |
 | Verify | Recipients prove they own their email address before they download |
 | Protect | Files encrypted at rest with KMS keys and in transit with TLS; malware scan before any download |
+| Prevent data loss | Files inspected for personal data and secrets, such as My Numbers and card numbers; the company's rules warn the sender, hold the transfer for an approver, or block it before anything leaves |
 | Control | Admins revoke any link at any time; every action is written to an audit log |
 | Web app | React + TypeScript app for senders and admins, plus the recipient and uploader pages |
 
@@ -70,20 +71,24 @@ Requirements: [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.
 ```bash
 make setup    # install dependencies and the git hooks (gitleaks runs on every commit)
 make check    # lint, type-check and test everything (same as CI)
-make up       # run the API on :8000
-make down
+make up       # run the API on :8000 with the local stack that stands in for AWS
+make smoke    # one round trip to every service of the local stack
+make down     # stop; `make reset` also deletes the local data
 ```
 
-Run `make` with no arguments to list every command.
+Run `make` with no arguments to list every command. [Local development](docs/local-development.md) lists the
+services of the local stack, their ports and credentials, and how they differ from AWS.
 
 ## Repository layout
 
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
+infra/                   Terraform for AWS, checked statically and not applied yet (infra/README.md)
 docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api/            API service (FastAPI); the workers will share its codebase
 compose.yaml             local run with production-like hardening
+local/                   configuration and smoke checks of the local stack
 Makefile                 every command you need
 ```
 

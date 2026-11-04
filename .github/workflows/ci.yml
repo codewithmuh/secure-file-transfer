@@ -49,6 +49,30 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+  local-stack:
+    name: Local stack (up, smoke checks)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: local/smoke.py
+      - name: Start the API and the local stack, wait until every service is healthy
+        run: make up
+      - name: Smoke checks (one round trip per service)
+        run: make smoke
+      - name: Show container logs
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove the stack and its volumes
+        if: always()
+        run: make reset
+
   python:
     name: Python (lint, types, layers, tests)
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"

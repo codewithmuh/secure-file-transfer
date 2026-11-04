@@ -9,9 +9,9 @@
 | Tracking | [#14](https://github.com/codewithmuh/secure-file-transfer/issues/14), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41) |
 
 Everything the web app does goes through this API (FR-31), and tenant automation uses the same API with API keys
-(FR-32). The contract is **design-first**: phase 2 writes it before any code. Once code exists, the document generated
-from the code is committed here and CI fails if the two differ; a breaking-change check fails the pull request unless
-it is marked as breaking (ADR-0002). Until then, CI lints this file (section 11).
+(FR-32). The contract is **design-first**: phase 2 wrote it before any code, and it leads while the code catches up.
+CI lints it, checks every operation the code implements against it, and fails a pull request that breaks it unless the
+pull request carries the `breaking` label (ADR-0002, section 11).
 
 The phase 3 security design settled the two parts that phase 2 left provisional. Members sign in through Amazon
 Cognito managed login or their tenant's own identity provider, and the API issues its own session (PRD open question
@@ -139,13 +139,13 @@ Every error is an RFC 9457 problem (`application/problem+json`) with these field
 |---|---|
 | 400 | `malformed_request`, `invalid_cursor` |
 | 401 | `authentication_required`, `session_expired`, `credentials_invalid`, `reauthentication_required` |
-| 403 | `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted` |
+| 403 | `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted`, `self_approval_forbidden` |
 | 404 | `not_found`, `link_not_found` |
-| 409 | `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`, `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`, `file_not_shareable`, `user_exists`, `last_admin` |
+| 409 | `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`, `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`, `file_not_shareable`, `user_exists`, `last_admin`, `dlp_decision_changed`, `dlp_policy_conflict`, `detector_in_use`, `no_eligible_approver`, `approval_limit_reached` |
 | 410 | `link_revoked`, `link_expired` |
 | 413 | `file_too_large`, `total_too_large`, `storage_quota_exceeded`, `request_too_large` |
 | 416 | `range_not_satisfiable` |
-| 422 | `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`, `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large` |
+| 422 | `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`, `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large`, `justification_required`, `approvers_insufficient` |
 | 429 | `rate_limited` |
 | 503 | `service_unavailable`: a call couldn't reach the audit archive, the rate-limit counters or the sign-in state store, or an API pod is full of download streams. A download grant, a verification or a sign-in changed nothing; a security-critical change took effect and a retry completes its record (section 5). |
 
@@ -167,13 +167,13 @@ returned whole. Audit search takes `cursor` and `limit` in its request body (sec
 ## 5. Idempotency
 
 Every `POST` that creates something accepts an `Idempotency-Key` header (architecture 5.4): `createTransfer`,
-`addTransferFile`, `createUploadRequest`, `addSessionUploadFile`, `inviteUser`, `createTenant` and
-`recoverTenantAdmin`; so does `extendTransferExpiry`. The key is scoped to the caller and kept for 24 hours with a
-fingerprint of the **method, the path with its resource IDs filled in, and the body**. The service keeps the response
-status and the ID of what was created, never the response body. A retry with the same key, method, path and body gets
-the same status, with the response rebuilt from the resource as it is now. The same key with any of them different
-gets `409 idempotency_conflict`, so a key reused with the same body on another transfer is refused, not answered with
-the first transfer.
+`addTransferFile`, `createUploadRequest`, `addSessionUploadFile`, `inviteUser`, `createDlpRule`, `createDlpDetector`,
+`createTenant` and `recoverTenantAdmin`; so does `extendTransferExpiry`. The key is scoped to the caller and kept for 24
+hours with a fingerprint of the **method, the path with its resource IDs filled in, and the body**. The service keeps
+the response status and the ID of what was created, never the response body. A retry with the same key, method, path and
+body gets the same status, with the response rebuilt from the resource as it is now. The same key with any of them
+different gets `409 idempotency_conflict`, so a key reused with the same body on another transfer is refused, not
+answered with the first transfer.
 
 These take no `Idempotency-Key`:
 
@@ -185,8 +185,10 @@ These take no `Idempotency-Key`:
 
 State changes are safe to retry by design: `sendTransfer`, `cancelTransfer`, `revokeTransfer`, `revokeUploadRequest`,
 `extendTransferExpiry` (to the same time), `completeUpload`, `unlockRecipient`, `unlockUploader`, `deactivateUser`,
-`signOutUser`, `revokeApiKey`, `configureTenantSso` (the same configuration) and `recordBreakGlassGrant` (the same
-`assignment_request_id`) return success with the current state when the change has already happened.
+`signOutUser`, `revokeApiKey`, `confirmTransfer` (the same decision), `approveTransfer`, `rejectTransfer`,
+`configureTenantSso` (the same configuration) and `recordBreakGlassGrant` (the same `assignment_request_id`) return
+success with the current state when the change has already happened. The DLP policy writes take an optional
+`expected_version`, so a retry after another admin's change gets `409 dlp_policy_conflict` instead of overwriting it.
 
 **Security-critical changes** (NFR-10, data model 2.5) are committed first, so they take effect at once, and then
 written to the audit archive in both regions before the `2xx`:
@@ -241,6 +243,7 @@ Starting limits from the abuse design:
 | Email | `sendTransfer`, `createUploadRequest`, `inviteUser` | 200 recipient emails an hour per member or key, 2,000 per tenant; 20 link emails a day to one address per tenant. A cap across tenants delays the email (`queued`) instead of refusing it. Invitations: 100 an hour per tenant, 3 a day per address. |
 | Audit | `searchAuditEvents`, `exportAuditEvents` | 60 searches a minute per tenant; 10 exports an hour, 1 at a time. An API key: 1 export an hour, at most 100,000 events (`422 export_too_large`). |
 | Keys and tenants | `createApiKey`, `createTenant` | 20 new keys a day and at most 25 active per tenant; 30 new tenants an hour per operator. |
+| DLP | The DLP policy, rule and detector writes, `testDlpDetectors`, `confirmTransfer`, `approveTransfer`, `rejectTransfer`, `getTransferDlp`, `getFileInspection`, `getDlpReport`, `listDlpDecisions` | 100 policy changes a day per tenant; 30 detector tests a minute per admin, 16,384 characters each; 3 approval requests per transfer (`409 approval_limit_reached`); 120 approval decisions an hour per approver; 600 reads of finding details an hour per member; 60 report reads a minute per tenant. `rejectTransfer`, like a revocation, never counts against the tenant's budget. |
 | Other tenant calls | Everything else for members and API keys | 300 a minute per member and per key; 100 failed authentications in 5 minutes block an IP for 15 minutes. |
 
 **The WAF** also limits by IP address before a request reaches the API: 100 link-step requests a minute and 6,000
@@ -355,6 +358,15 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-34 | Provision a tenant and its first admin | `createTenant`; the operator API's `createOperatorToken` |
 | FR-35 | Operators can't read contents; break-glass time-limited, audited and alerted | `recordBreakGlassGrant` (best effort; the record is Identity Center plus CloudTrail); no operator operation returns file names, messages or contents |
 | NFR-14 | Member unlocks a locked-out recipient or uploader | `unlockRecipient`, `unlockUploader` |
+| FR-36, FR-47 | Every file inspected; its result and reasons shown | `getFile` (`inspection`), `getFileInspection`, `listUploadRequestFiles` |
+| FR-37, FR-38 | Built-in detectors; tenant keyword lists | `listDlpDetectors`, `getDlpDetector`, `createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector` |
+| FR-40, FR-41, FR-48 | Rules with thresholds and actions; nothing sent until the decision allows it | `listDlpRules`, `createDlpRule`, `getDlpRule`, `updateDlpRule`, `deleteDlpRule`; `sendTransfer`, `getTransferDlp`; `awaiting_confirmation`, `pending_approval` and `held` in `TransferState` |
+| FR-42 | The sender confirms a warning | `getTransferDlp`, `confirmTransfer` |
+| FR-43 | Approval workflow | `confirmTransfer` (with a justification), `listApprovalRequests`, `getApprovalRequest`, `approveTransfer`, `rejectTransfer`; `dlp_approver` in `updateUser` |
+| FR-45 | Trusted domains and escalation for untrusted recipients | `updateDlpPolicy` (`trusted_domains`), `recipient_scope` on rules; `sendTransfer` re-checks the allowed and blocked domains |
+| FR-51 | Received files inspected; blocked by a rule | `getFileInspection` (`dlp_blocked`), `listUploadRequestFiles` |
+| FR-53 | Findings with masked previews, details only for the owner and approvers | `DlpFinding` in `getTransferDlp` and `getFileInspection` |
+| FR-54 | Every DLP decision and change audited | `searchAuditEvents`, `exportAuditEvents`; `listDlpDecisions` |
 
 Should requirements:
 
@@ -366,6 +378,14 @@ Should requirements:
 | FR-26 Tenant single sign-on | `startSignIn` (`method=sso`), `startInvitationSignIn`, `configureTenantSso`; `sso_fallback` in `updateUser` |
 | FR-29 Export the audit log | `exportAuditEvents` |
 | FR-32 Tenant API keys | `createApiKey`, `listApiKeys`, `revokeApiKey`; the `tenantApiKey` scheme |
+| FR-39 Tenant patterns | `createDlpDetector` with `kind: pattern` |
+| FR-44 Two approvers | `approvals_required` on rules |
+| FR-46 New recipient domains | `condition: new_domain` on rules; `new_domain` in `getTransferDlp` |
+| FR-49 The sender's last 24 hours | `include_sender_24h` on rules |
+| FR-50 Message inspection | `createTransfer`; `message_findings` in `getTransferDlp` |
+| FR-52 Monitor mode | `updateDlpPolicy` (`mode`) |
+| FR-55 DLP reports | `getDlpReport`, `listDlpDecisions`, `listApprovalRequests` (`scope=tenant`) |
+| FR-56 Test detectors | `testDlpDetectors` |
 
 Requirements with no user action of their own: FR-19 (scan retries; the state shows in `getFile`), FR-21 (expiry; the
 `link_expired` and `transfer_expired` errors), FR-27 (every operation is audited, including searches, exports, every
@@ -388,6 +408,8 @@ derived CSRF tokens, the operator token exchange, and that API keys can't unlock
 | Download grant budget | 3 × file size, 20 requests, 24 hours, one session and one stream (ADR-0018) |
 | Operator API address | `http://127.0.0.1:{local_port}/v1`, the local end of the port-forward; the port is the operator's choice |
 | Deprecation notice | At least 6 months |
+| DLP decisions by people only | API keys can't confirm a warning, request or decide an approval, read the DLP policy, or see finding details; automation can send transfers that need no confirmation. |
+| What an approver sees | Recipients, file names, the message, findings with masked previews and the justification, never contents: approvers have no download operation. |
 
 Later, not in v1 (each needs its own issue; none is required by the security design):
 
@@ -401,15 +423,87 @@ Later, not in v1 (each needs its own issue; none is required by the security des
 
 ## 11. Checking the contract
 
-CI lints the spec in the `repo-checks` job, with the linter image pinned in `ci.yml`: the linter's recommended rules
-plus the rules in [`redocly.yaml`](../../redocly.yaml), which fail the build if an operation lacks `x-permission` or a
-`429` response. To run the same check locally:
+Three checks keep this file and the code in step. `make contract` runs the last two locally, as CI does.
+
+| Check | CI job | Fails when |
+|---|---|---|
+| Lint | `ci.yml`, `repo-checks` | The spec breaks the linter's recommended rules, or an operation lacks `x-permission` or a `429` response (the rules in [`redocly.yaml`](../../redocly.yaml)) |
+| Generated spec | `contract.yml`, `Contract (generated spec)`; also `make check` | An operation the code implements isn't in this file, or differs from it (11.1) |
+| Breaking changes | `contract.yml`, `Contract (breaking changes)` | The pull request changes this file in a way that breaks clients, and doesn't carry the `breaking` label (11.2) |
+
+To lint locally, with the image `ci.yml` pins:
 
 ```bash
 docker run --rm -v "$PWD:/spec" redocly/cli:2.64.1 lint docs/api/openapi.yaml
 ```
 
-Once the API service exists, CI also compares the document generated from the code with this file, and a
-breaking-change check runs on every pull request (ADR-0002). A CI test also checks every `x-permission` value against
-the service's permission registry and the [permission table](../security/authn-authz.md#63-permission-table)
-(authn-authz 6.5).
+The contract checks have their own workflow because adding or removing a label re-runs them, and that shouldn't re-run
+everything in `ci.yml`. Both jobs run on every pull request, so `protect-main` can require them by name.
+
+### 11.1 Generated spec
+
+This file leads and the code follows. `services/api/tools/contract_check.py` builds the OpenAPI document of each app
+the service runs, as FastAPI generates it (`create_app().openapi()` for the public API; the operator API joins in M1),
+and compares each operation in it with this file:
+
+- **An operation that isn't here fails**, and so does a route the document doesn't show (`include_in_schema=False`, a
+  mount), because it can't be checked. Add the operation to this file first, in the same pull request.
+- **An operation that is here must match it** in method, path, operation ID, parameters (name, location, required,
+  style and schema), request body (required, media types and schema), success responses (every 2xx and 3xx status,
+  with its media types and schemas) and `deprecated`. Each app is checked against its own server's operations, so an
+  operator operation on the public app fails too.
+- **Operations not implemented yet are allowed.** The check prints how many remain.
+
+Schemas are compared after both sides are normalised, so two spellings of one schema compare equal. `$ref`s are
+resolved, so component names don't matter. `anyOf: [X, {type: 'null'}]`, which is how Pydantic writes `X | None`,
+equals `type: [..., 'null']`. `allOf` of object schemas is flattened, as Pydantic writes a subclass. `const` equals a
+one-value `enum`; the order of `enum`, `required` and `type` doesn't matter; `additionalProperties: true` equals
+leaving it out; `default: null` equals no default. In parameters and in an optional request body, `null` is dropped:
+FastAPI writes an optional parameter as `X | None`, but a client can only leave it out, never send null.
+
+What the check doesn't compare, and what covers it instead:
+
+| Not compared | Why | Covered by |
+|---|---|---|
+| `title`, `description`, `summary`, examples, `tags` and `x-` extensions | Documentation; FastAPI fills some of them from Python names | Review |
+| Error responses (4xx, 5xx and `default`) | FastAPI adds its own `422` until M1's first issue answers with the problems of section 3 | Each route's tests, then M1's error handler |
+| `security` | FastAPI writes each security dependency as a separate requirement, so it can't express "a session and a CSRF token" | The authorization matrix test (authn-authz 9.2) |
+| `x-permission` | An extension FastAPI doesn't generate | The CI test of the permission registry against every `x-permission` value and the [permission table](../security/authn-authz.md#63-permission-table) (authn-authz 6.5), from M1 |
+| Response headers, such as `Location`, `Set-Cookie` and `Retry-After` | Declared by hand in FastAPI, outside the response model | Each route's tests |
+
+**When it fails**, it names the operation and the JSON Pointer of each difference, for example:
+
+```text
+POST /v1/operator/tenants (createTenant): request body application/json at /properties/name/maxLength: the contract has 200, the code 100
+```
+
+Change the code to match, or, if the contract is wrong, change this file in the same pull request (definition of done,
+point 5). Pydantic's `Field(json_schema_extra=...)` adds what a Python type can't say, such as `format: email` or
+`format: hostname`. To run it alone, `uv run python -m tools.contract_check --list-remaining` in `services/api`.
+
+ADR-0002 expects the generated document to replace this file once the code is complete. Until then the generated
+document isn't committed; the check compares it with this file. Replacing the file needs the code to generate what the
+check ignores today, and is decided when the last operation lands.
+
+### 11.2 Breaking changes
+
+[oasdiff](https://github.com/oasdiff/oasdiff) 1.34.1 (Apache-2.0), pinned by image digest in `contract.yml` and the
+Makefile, compares this file in the pull request with the base branch's. It fails on errors and on warnings: a warning
+such as a removed request property breaks clients here, because request bodies don't accept unknown properties. The
+pull request's file is untrusted, so oasdiff runs with no network, a read-only file system and external `$ref`s
+refused. When a pull request doesn't change this file, the job skips the comparison and still reports.
+
+A breaking change fails the check unless the pull request carries the **`breaking`** label. Within `/v1` only
+backwards-compatible changes are made (section 1), so the label is only for a deliberate break that the rules allow:
+
+- a change to the draft contract before the API service's first release, while `info.version` is `1.0.0-draft`;
+- removing a deprecated operation after its sunset date (section 1).
+
+Anything else ships in a new version (`/v2`). Adding or removing the label re-runs the check, and the job summary lists
+each breaking change.
+
+**When it fails**, read the oasdiff report in the job log or summary and make the change backwards compatible: add an
+optional field rather than a required one, keep a field rather than remove it, accept more in a request rather than
+less, and return no less than before in a response. If the break is deliberate and one of the two cases above, add the
+label. `make contract` runs the same comparison against the merge base with `origin/main`; set `CONTRACT_BASE` to
+compare with another branch.

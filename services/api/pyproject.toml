@@ -24,7 +24,9 @@ dev = [
   "mypy>=1.18",
   "pytest>=8.4",
   "pytest-cov>=7.0",
+  "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17",
+  "types-pyyaml>=6.0.12.20260906",
 ]
 
 [build-system]
@@ -44,7 +46,7 @@ file_template = "%%(rev)s_%%(slug)s"
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests"]
+src = ["src", "tests", "."]
 
 [tool.ruff.lint]
 select = [
@@ -65,12 +67,13 @@ select = [
 
 [tool.mypy]
 strict = true
-mypy_path = "src"
-packages = ["sft"]
+mypy_path = "src:."
+packages = ["sft", "tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --cov=sft --cov-report=term-missing --cov-fail-under=80"
+pythonpath = ["."]  # so the tests import tools
+addopts = "-q --cov=sft --cov=tools --cov-report=term-missing --cov-fail-under=80"
 
 [tool.coverage.run]
 branch = true

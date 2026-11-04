@@ -29,8 +29,9 @@ What the compute platform has to carry ([architecture](../architecture.md) secti
 ## Decision
 
 Run every workload on **Amazon EKS**, one cluster per environment and region: dev in Tokyo, staging and prod in Tokyo
-and Osaka. **Karpenter** provisions the two node pools of capacity 4.2: main (m8g.xlarge) and scan (m8g.large, tainted,
-one scan pod per node), across 3 AZs. The cluster's own platform runs on a small, tainted EKS managed node group,
+and Osaka. **Karpenter** provisions the two node pools of capacity 4.2: main (m8g.xlarge) and scan (m8g.xlarge since
+ADR-0022 added a DLP inspector beside each scan worker, tainted, one scan pod of each kind per node), across 3 AZs.
+The cluster's own platform runs on a small, tainted EKS managed node group,
 `system`, two m8g.large in each Tokyo cluster: Karpenter, CoreDNS, Argo CD, the admission controller Kyverno
 ([ADR-0007](0007-container-registry-ecr.md)) and the egress proxy ([ADR-0021](0021-network-design-and-egress.md)), so
 nothing that Karpenter or admission depends on runs on nodes Karpenter manages. **Argo CD** in each cluster deploys

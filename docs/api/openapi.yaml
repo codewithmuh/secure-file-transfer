@@ -49,6 +49,10 @@ tags:
     description: Searching and exporting the audit log (UC-4, FR-27 to FR-29).
   - name: Tenant admin
     description: Members, roles and tenant policy (UC-5, FR-22 to FR-24).
+  - name: Data loss prevention
+    description: |
+      DLP policy, rules and detectors; findings on files and transfers; the sender's confirmation; approvals; and
+      reports (UC-7, FR-36 to FR-56). Findings never hold a matched value (FR-53).
   - name: API keys
     description: Tenant-scoped API keys for automation (FR-32).
   - name: Operator
@@ -353,16 +357,17 @@ paths:
 
         `expires_in` is how long the transfer stays open once it is submitted: between 1 hour and 30 days, and within
         the tenant's `max_expiry`. When it is left out, it is 7 days, or the tenant's maximum if that is shorter. A
-        draft has no `expires_at`: `sendTransfer` sets it to `submitted_at` plus `expires_in`, so time spent as a
-        draft never shortens the transfer. Each recipient's domain is checked against the tenant's allowed and blocked
-        domains, and an address this tenant's suppression list holds (a hard bounce in the last 90 days, or a
+        draft has no `expires_at`: `sendTransfer` sets it to `submitted_at` plus `expires_in`, so time spent as a draft
+        never shortens the transfer. The message is inspected with the tenant's DLP detectors, and its matches count
+        towards the transfer's DLP rules (FR-50). Each recipient's domain is checked against the tenant's allowed and
+        blocked domains, and an address this tenant's suppression list holds (a hard bounce in the last 90 days, or a
         complaint) is refused with `422 recipient_undeliverable`, with a pointer to the recipient in `errors`. A tenant
         admin can clear an entry with `clearEmailSuppression`.
 
         Errors: `422 expiry_out_of_range`, `422 recipient_domain_not_allowed`, `422 recipient_undeliverable`,
         `409 idempotency_conflict`.
 
-        Requirements: FR-1, FR-3, FR-4, FR-7, FR-8, FR-24, FR-33.
+        Requirements: FR-1, FR-3, FR-4, FR-7, FR-8, FR-24, FR-33, FR-50.
       x-permission: transfer.create
       security:
         - memberSession: []
@@ -477,13 +482,16 @@ paths:
       summary: Send a transfer
       description: |
         Moves a `draft` transfer to `submitted` and sets `submitted_at`, and `expires_at` to `submitted_at` plus
-        `expires_in`. Every file must have finished uploading. The service then runs the locked evaluation
-        (architecture 4.1): when every file is shareable the transfer becomes `sent` and each recipient is emailed a
-        link; when any file isn't shareable it becomes `held` and no recipient is notified.
+        `expires_in`. Every file must have finished uploading. The recipients' domains are checked again against the
+        tenant's allowed and blocked domains as they are now (`422 recipient_domain_not_allowed`, FR-45). The service
+        then runs the locked evaluation (architecture 4.1, 4.6). When every file is shareable it applies the tenant's
+        DLP rules: the transfer becomes `sent` and each recipient is emailed a link; or `awaiting_confirmation`, and
+        the sender confirms or requests approval (`confirmTransfer`); or `held`. When any file isn't shareable it
+        becomes `held`, and no recipient is notified.
 
-        Calling it again on a transfer that is already `submitted`, `held` or `sent` returns the current transfer, so
-        a retry is safe. Only the transfer's owner can send it; a tenant admin gets `403 permission_denied` on another
-        member's transfer.
+        Calling it again on a transfer that is already `submitted`, `awaiting_confirmation`, `pending_approval`, `held`
+        or `sent` returns the current transfer, so a retry is safe. Only the transfer's owner can send it; a tenant
+        admin gets `403 permission_denied` on another member's transfer.
 
         Link emails count against the email caps (abuse-and-rate-limits 2.2, group G): 200 recipient emails an hour per
         member or API key, 2,000 per tenant, and 20 link emails a day to one address from this tenant (`429`). A
@@ -491,9 +499,10 @@ paths:
         `queued`, which never says why (`listTransferRecipients`).
 
         Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
-        (cancelled), `409 transfer_revoked`, `409 transfer_expired`, `429 rate_limited`.
+        (cancelled), `409 transfer_revoked`, `409 transfer_expired`, `422 recipient_domain_not_allowed`,
+        `429 rate_limited`.
 
-        Requirements: FR-1, FR-5, FR-7.
+        Requirements: FR-1, FR-5, FR-7, FR-41, FR-45.
       x-permission: transfer.send
       security:
         - memberSession: []
@@ -501,7 +510,7 @@ paths:
         - tenantApiKey: ['transfers:write']
       responses:
         '200':
-          description: The transfer, now `submitted`, `sent` or `held`.
+          description: The transfer, now `submitted`, `awaiting_confirmation`, `sent` or `held`.
           content:
             application/json:
               schema:
@@ -514,6 +523,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
@@ -523,9 +534,10 @@ paths:
     post:
       tags: [Transfers]
       operationId: cancelTransfer
-      summary: Cancel a draft or held transfer
+      summary: Cancel a transfer that wasn't sent
       description: |
-        Cancels a `draft` or `held` transfer. No recipient is notified, and its files are deleted on the PRD data
+        Cancels a `draft`, `held`, `awaiting_confirmation` or `pending_approval` transfer, withdrawing a pending
+        approval request. No recipient is notified, and its files are deleted on the PRD data
         lifecycle schedule. Cancelling a transfer that is already `cancelled` returns it unchanged. A transfer that was
         sent is revoked instead (`revokeTransfer`). Only the transfer's owner can cancel it; a tenant admin gets
         `403 permission_denied` on another member's transfer and revokes it instead.
@@ -567,7 +579,8 @@ paths:
       operationId: revokeTransfer
       summary: Revoke a transfer
       description: |
-        Revokes a `submitted`, `held` or `sent` transfer. The member who created it can revoke it, and so can any
+        Revokes a `submitted`, `awaiting_confirmation`, `pending_approval`, `held` or `sent` transfer, withdrawing a
+        pending approval request. The member who created it can revoke it, and so can any
         tenant admin. In one transaction the transfer becomes `revoked`, every link session of the transfer ends and
         the audit record is written. No new download can start more than 5 seconds after the revocation, and a running
         download stops within 60 seconds of it, at its next 30-second re-check (NFR-6). Recipients then see that the
@@ -618,7 +631,9 @@ paths:
       operationId: extendTransferExpiry
       summary: Extend a transfer's expiry
       description: |
-        Moves `expires_at` later for a transfer that was submitted and hasn't ended (`submitted`, `held` or `sent`).
+        Moves `expires_at` later for a transfer that was submitted and hasn't ended (`submitted`,
+        `awaiting_confirmation`, `pending_approval`, `held` or `sent`). Time spent waiting for a confirmation or an
+        approver counts against the lifetime, so a sender may extend once a transfer is sent.
         A draft has no `expires_at` yet: its time starts when it is submitted, so there is nothing to extend
         (`409 invalid_state`).
 
@@ -650,6 +665,108 @@ paths:
       responses:
         '200':
           description: The transfer with its new expiry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transfer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/dlp:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    get:
+      tags: [Data loss prevention]
+      operationId: getTransferDlp
+      summary: Get a transfer's DLP decision and findings
+      description: |
+        Returns the transfer's current DLP decision (architecture 4.6): its outcome, the rules that matched with the
+        count that crossed each threshold, each recipient's trust and new-domain flags, the findings on each file and
+        on the message, and the approval request if there is one. The web app shows it while the transfer is
+        `awaiting_confirmation`, `pending_approval` or `held`. `decision` is `null` until every file is shareable.
+
+        **Who sees details.** Findings always list the detector and the counts at each confidence. Location hints and
+        masked previews (`locations`, `previews`) are present only for the transfer's owner and for approvers of its
+        approval request; a tenant admin or an API key gets the counts with `details_visible: false` (FR-53). Every
+        response that includes details is audited, with no value in the record. No response ever holds a matched
+        value.
+
+        Requirements: FR-41, FR-42, FR-45, FR-46, FR-53.
+      x-permission: dlp_findings.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+      responses:
+        '200':
+          description: The transfer's DLP decision and findings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferDlp'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /transfers/{transfer_id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/TransferId'
+    post:
+      tags: [Data loss prevention]
+      operationId: confirmTransfer
+      summary: Confirm a DLP warning, or request approval
+      description: |
+        The sender's answer to a transfer that is `awaiting_confirmation` (FR-42, FR-43). `decision_id` names the
+        decision the sender reviewed; if the transfer has a newer one, for example because a file was removed in
+        another tab, the call gets `409 dlp_decision_changed` and changes nothing.
+
+        - **A warning:** the confirmation is recorded with the optional `justification`, and the transfer is sent:
+          each recipient is emailed a link, as from `sendTransfer`.
+        - **A required approval:** `justification` is required (`422 justification_required`). The call creates an
+          approval request, moves the transfer to `pending_approval` and emails the tenant's approvers. It needs an
+          approver other than the sender (`409 no_eligible_approver`; the tenant's admins are told), and at most 3
+          requests per transfer (`409 approval_limit_reached`). After a request expires, the transfer is
+          `awaiting_confirmation` again and the sender may call this once more.
+
+        Only the transfer's owner, signed in to the web app, can confirm. API keys can't, so every confirmation is a
+        person's decision on record. Calling it again on a transfer that is already `sent` or `pending_approval` for
+        the same decision returns the current transfer, so a retry is safe. The justification is stored encrypted and
+        never written to the audit log, which records only that one was given.
+
+        Errors: `403 permission_denied`, `409 invalid_state`, `409 dlp_decision_changed`, `409 no_eligible_approver`,
+        `409 approval_limit_reached`, `409 transfer_revoked`, `409 transfer_expired`, `422 justification_required`,
+        `429 rate_limited`.
+
+        Requirements: FR-41, FR-42, FR-43, FR-54.
+      x-permission: transfer.confirm
+      security:
+        - memberSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferConfirmation'
+      responses:
+        '200':
+          description: The transfer, now `sent` or `pending_approval`.
           content:
             application/json:
               schema:
@@ -835,7 +952,9 @@ paths:
       summary: Get a file
       description: |
         Returns a file of a transfer or upload request the caller can see, with its state: `uploading`, `completing`,
-        `scanning`, `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`. `shareable` says whether
+        `scanning`, `clean`, `infected`, `unscannable`, `scan_failed`, `rejected` or `deleted`; `scanning` covers the
+        DLP inspection too, which runs in the same pass, and `inspection` gives its result (`getFileInspection` has
+        the findings). `shareable` says whether
         it can be downloaded under the current tenant policy. The web app polls this while a file is scanning.
 
         A member sees the files of their own transfers and upload requests; a tenant admin sees every file's metadata
@@ -872,9 +991,11 @@ paths:
       operationId: deleteFile
       summary: Remove or delete a file
       description: |
-        For a file of a transfer: removes it while the transfer is a `draft`, `submitted` or `held`. When files remain,
-        removing one from a `submitted` or `held` transfer runs the evaluation again (a `held` transfer moves back to
-        `submitted` first), so removing the blocked file lets the remaining files be sent (UC-1). Removing the last
+        For a file of a transfer: removes it while the transfer is a `draft`, `submitted`, `held`,
+        `awaiting_confirmation` or `pending_approval`. When files remain, removing one from any of them but a draft
+        runs the evaluation again (the transfer moves back to `submitted` first, and a pending approval request is
+        withdrawn), so removing the blocked or flagged file lets the remaining files be sent (UC-1), after a new DLP
+        decision. Removing the last
         counted file (one that isn't `rejected`) moves the transfer back to `draft` (data model 3.2): no recipient was
         ever notified, `submitted_at` and `expires_at` are cleared, and the member can add files and send it again, or
         cancel it.
@@ -891,7 +1012,7 @@ paths:
         Errors: `403 permission_denied`, `409 invalid_state` (the transfer was sent or cancelled),
         `409 transfer_revoked`, `409 transfer_expired`.
 
-        Requirements: FR-5, FR-13, FR-21.
+        Requirements: FR-5, FR-13, FR-21, FR-41.
       x-permission: file.delete
       security:
         - memberSession: []
@@ -909,6 +1030,48 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /files/{file_id}/inspection:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+    get:
+      tags: [Data loss prevention]
+      operationId: getFileInspection
+      summary: Get a file's DLP inspection and findings
+      description: |
+        Returns the file's inspection result (data model 3.5): `inspected`, `partial`, `not_inspected`, `failed`,
+        `skipped` or, before its scan finishes, `pending`, with the reasons for anything not fully inspected (FR-47),
+        the engine and policy versions that inspected it, and one finding per detector that matched. For a file
+        received through an upload request it also says whether a DLP rule blocked it (`dlp_blocked`, FR-51).
+
+        Details follow the same rule as `getTransferDlp`: `locations` and `previews` only for the file's owner and
+        for approvers of its transfer's approval request, and every response with details is audited. Location hints
+        and previews are deleted with the file's contents, so a deleted file shows counts only.
+
+        **API key scope follows the file's owner,** as for `getFile`: `transfers:read` for a file of a transfer,
+        `upload_requests:read` for a received file; a key with only the other scope gets `404`.
+
+        Requirements: FR-36, FR-47, FR-51, FR-53.
+      x-permission: dlp_findings.read
+      security:
+        - memberSession: []
+        - tenantApiKey: ['transfers:read']
+        - tenantApiKey: ['upload_requests:read']
+      responses:
+        '200':
+          description: The file's inspection and findings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileInspection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
@@ -2182,6 +2345,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/UserRoleFilter'
         - $ref: '#/components/parameters/UserStatusFilter'
+        - $ref: '#/components/parameters/DlpApproverFilter'
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
       responses:
@@ -2232,11 +2396,12 @@ paths:
     patch:
       tags: [Tenant admin]
       operationId: updateUser
-      summary: Change a user's role or fallback status
+      summary: Change a user's role, fallback or approver status
       description: |
-        Assigns the `admin` or `member` role, or names an admin as an SSO fallback admin (`sso_fallback`). The tenant
-        always keeps at least one active admin. Role changes are audited (FR-27). Setting the values a user already
-        has returns them unchanged.
+        Assigns the `admin` or `member` role, names an admin as an SSO fallback admin (`sso_fallback`), or names a
+        member or admin as a DLP approver (`dlp_approver`, FR-43). The tenant always keeps at least one active admin.
+        Role and approver changes are audited (FR-27) and emailed to the tenant's admins. Setting the values a user
+        already has returns them unchanged.
 
         **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
         passkey sign-in (`403 passkey_required`).
@@ -2255,10 +2420,14 @@ paths:
         the audit archive in both regions. If that write fails, the demotion and the key revocations have still taken
         effect and the call returns `503`; retry it, and the retry writes the record if it is still missing.
 
+        **DLP approvers.** Changing `dlp_approver` doesn't end the user's sessions. Taking it away doesn't change
+        decisions already made; if it leaves a rule that requires approval with no more approvers than it needs, the
+        tenant's admins are told, and new requests may get `409 no_eligible_approver` (`confirmTransfer`).
+
         Errors: `401 reauthentication_required`, `403 passkey_required`, `409 last_admin`, `409 invalid_state`
         (deactivated user), `422 validation_failed`, `503 service_unavailable`.
 
-        Requirements: FR-22, FR-26, FR-32, NFR-10.
+        Requirements: FR-22, FR-26, FR-32, FR-43, NFR-10.
       x-permission: user.update_role
       security:
         - memberSession: [admin]
@@ -2557,6 +2726,768 @@ paths:
       responses:
         '204':
           description: The address is no longer suppressed for this tenant, or wasn't.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/policy:
+    get:
+      tags: [Data loss prevention]
+      operationId: getDlpPolicy
+      summary: Get the DLP policy settings
+      description: |
+        Returns the tenant's DLP settings: monitor or enforce mode, the policy version, the trusted recipient domains,
+        the approval timeout, and how many active approvers the tenant has. The rules and the tenant's own detectors
+        are their own resources (`listDlpRules`, `listDlpDetectors`). Only tenant admins read the policy: members see
+        the names and actions of the rules that matched their own transfers (`getTransferDlp`), never the thresholds
+        or the keyword lists. A local admin needs a passkey sign-in (`403 passkey_required`).
+
+        Requirements: FR-40, FR-45, FR-52.
+      x-permission: dlp_policy.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The DLP policy settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpPolicy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [Data loss prevention]
+      operationId: updateDlpPolicy
+      summary: Update the DLP policy settings
+      description: |
+        Changes the fields sent: `mode`, `trusted_domains`, `approval_timeout`. Every change raises the policy
+        `version`, is audited with the fields that changed (never a keyword), and is emailed to every tenant admin
+        (FR-54). A change applies to decisions made after it: a transfer already decided, waiting or held keeps its
+        decision (data model 3.2). `expected_version`, when sent, must be the current version
+        (`409 dlp_policy_conflict`), so two admins editing at once can't overwrite each other.
+
+        Domains are compared lowercase and IDNA-normalised; a trusted domain also covers its subdomains. The tenant's
+        proven SSO domains are always trusted.
+
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+        passkey sign-in (`403 passkey_required`). API keys can't change the policy.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 dlp_policy_conflict`,
+        `422 validation_failed`.
+
+        Requirements: FR-40, FR-45, FR-52, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpPolicyUpdate'
+      responses:
+        '200':
+          description: The updated DLP policy settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/rules:
+    get:
+      tags: [Data loss prevention]
+      operationId: listDlpRules
+      summary: List the DLP rules
+      description: |
+        Lists the tenant's live rules, at most 50, so the list isn't paginated, with the policy version they belong to.
+        Replaced revisions aren't listed; the decisions that used them still name them (`listDlpDecisions`).
+
+        Requirements: FR-40.
+      x-permission: dlp_policy.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The live rules.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpRuleList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags: [Data loss prevention]
+      operationId: createDlpRule
+      summary: Create a DLP rule
+      description: |
+        Adds a rule (FR-40, FR-41). A rule has one condition:
+
+        - `content`: the `detectors` listed, built-in or the tenant's own, with at least `threshold` matches at or
+          above `min_confidence`, added up over the transfer's files and its message (FR-48), and over the sender's
+          other transfers of the last 24 hours when `include_sender_24h` is set (FR-49);
+        - `not_inspected`: a file not fully inspected for one of the `reasons` (FR-47);
+        - `new_domain`: a recipient domain the tenant hasn't sent to in 365 days (FR-46).
+
+        `recipient_scope: untrusted` makes the rule apply only when a recipient is outside the trusted domains (FR-45).
+        Rules for `received` files allow and record or block only, with a `content` or `not_inspected` condition and
+        scope `any` (FR-51), and `require_approval` can need one or two approvers (FR-44). A rule that requires approval
+        can be enabled only while the tenant has more active approvers than it needs (`422 approvers_insufficient`). The
+        tenant has at most 50 live rules (`422 validation_failed`).
+
+        The new rule raises the policy version and is audited and emailed to the tenant's admins, as for
+        `updateDlpPolicy`. **Step-up** as for `updateDlpPolicy`.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 dlp_policy_conflict`,
+        `409 idempotency_conflict`, `422 validation_failed`, `422 approvers_insufficient`.
+
+        Requirements: FR-40, FR-41, FR-44 to FR-49, FR-51, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpRuleCreate'
+      responses:
+        '201':
+          description: The rule was created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/rules/{rule_id}:
+    parameters:
+      - $ref: '#/components/parameters/RuleId'
+    get:
+      tags: [Data loss prevention]
+      operationId: getDlpRule
+      summary: Get a DLP rule
+      description: |
+        Returns the live revision of a rule. A deleted rule returns `404`.
+
+        Requirements: FR-40.
+      x-permission: dlp_policy.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The rule.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpRule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [Data loss prevention]
+      operationId: updateDlpRule
+      summary: Change a DLP rule
+      description: |
+        Changes the fields sent. A rule is never changed in place: the change writes its next `revision` and retires
+        the old one, so every decision keeps pointing at the revision it applied (data model 2.7). The checks of
+        `createDlpRule` apply, and so do its audit, notice and **step-up**. Sending the values the rule already has
+        returns it unchanged.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 dlp_policy_conflict`,
+        `422 validation_failed`, `422 approvers_insufficient`.
+
+        Requirements: FR-40, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpRuleUpdate'
+      responses:
+        '200':
+          description: The rule's new revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [Data loss prevention]
+      operationId: deleteDlpRule
+      summary: Delete a DLP rule
+      description: |
+        Retires the rule's live revision. Decisions that used it keep it, so reports still show it. Audit, notice
+        and **step-up** as for `updateDlpPolicy`. Deleting a rule that is already deleted returns `404`.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 dlp_policy_conflict`.
+
+        Requirements: FR-40, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '204':
+          description: The rule was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/detectors:
+    get:
+      tags: [Data loss prevention]
+      operationId: listDlpDetectors
+      summary: List the DLP detectors
+      description: |
+        Lists the built-in detectors of the current inspection engine (`kind: built_in`), with what each finds and its
+        confidence levels, and the tenant's own keyword lists and patterns, at most 50, with their definitions. The
+        list isn't paginated.
+
+        Requirements: FR-37, FR-38, FR-39.
+      x-permission: dlp_policy.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The detectors.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDetectorList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    post:
+      tags: [Data loss prevention]
+      operationId: createDlpDetector
+      summary: Add a keyword list or a pattern
+      description: |
+        Adds one of the tenant's own detectors (detectors 5). A **keyword list** has 1 to 1,000 terms of 1 to 100
+        characters, in English or Japanese; terms match whatever their full-width or half-width form and case, and
+        Japanese terms match without word boundaries (FR-38). A **pattern** is an RE2 expression of at most 512
+        characters, with optional context keywords and a minimum match length (FR-39); it is refused if it doesn't
+        compile, matches the empty string, or takes more than 50 ms on the test text (`422 validation_failed`, with a
+        pointer to the field). A tenant has at most 50 detectors, at most 20 of them patterns.
+
+        The definition is stored encrypted with the tenant's DLP data key, and the audit record names the detector,
+        never its terms. A new detector applies to files inspected from then on (ADR-0022). Audit, notice and
+        **step-up** as for `updateDlpPolicy`.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 dlp_policy_conflict`,
+        `409 idempotency_conflict`, `422 validation_failed`.
+
+        Requirements: FR-38, FR-39, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpDetectorCreate'
+      responses:
+        '201':
+          description: The detector was created.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDetector'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/detectors/{detector_id}:
+    parameters:
+      - $ref: '#/components/parameters/DetectorId'
+    get:
+      tags: [Data loss prevention]
+      operationId: getDlpDetector
+      summary: Get a DLP detector
+      description: |
+        Returns a built-in detector by its ID, such as `jp_my_number`, or one of the tenant's own by `custom:` and its
+        ID, with its definition.
+
+        Requirements: FR-37, FR-38, FR-39.
+      x-permission: dlp_policy.read
+      security:
+        - memberSession: [admin]
+      responses:
+        '200':
+          description: The detector.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDetector'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    patch:
+      tags: [Data loss prevention]
+      operationId: updateDlpDetector
+      summary: Change a keyword list or a pattern
+      description: |
+        Changes one of the tenant's own detectors, as a new revision (data model 2.7); built-in detectors can't be
+        changed (`409 invalid_state`), only left out of rules. The checks of `createDlpDetector` apply, and so do its
+        audit, notice and **step-up**.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 invalid_state`,
+        `409 dlp_policy_conflict`, `422 validation_failed`.
+
+        Requirements: FR-38, FR-39, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpDetectorUpdate'
+      responses:
+        '200':
+          description: The detector's new revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDetector'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+    delete:
+      tags: [Data loss prevention]
+      operationId: deleteDlpDetector
+      summary: Delete a keyword list or a pattern
+      description: |
+        Retires one of the tenant's own detectors. A detector that a live rule uses can't be deleted
+        (`409 detector_in_use`): change or delete the rule first. Findings that name it keep its name. Audit, notice
+        and **step-up** as for `updateDlpPolicy`.
+
+        Errors: `401 reauthentication_required`, `403 passkey_required`, `409 invalid_state` (a built-in detector),
+        `409 detector_in_use`, `409 dlp_policy_conflict`.
+
+        Requirements: FR-38, FR-39, FR-54.
+      x-permission: dlp_policy.update
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      responses:
+        '204':
+          description: The detector was deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/detector-tests:
+    post:
+      tags: [Data loss prevention]
+      operationId: testDlpDetectors
+      summary: Try detectors on sample text
+      description: |
+        Runs detectors on up to 16 KiB of sample text and returns what they would find, masked as findings are, so an
+        admin can check a keyword list or pattern before saving it (FR-56). It takes the IDs of existing detectors,
+        a `draft` definition that isn't saved, or both. The text is processed in memory and never stored or logged;
+        the audit record names the detectors, never the text. Only plain text is accepted: files are inspected only by
+        the sandboxed inspector (ADR-0022).
+
+        Errors: `413 request_too_large`, `422 validation_failed`, `429 rate_limited`.
+
+        Requirements: FR-56.
+      x-permission: dlp_policy.test
+      security:
+        - memberSession: [admin]
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DlpDetectorTest'
+      responses:
+        '200':
+          description: What the detectors found, masked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDetectorTestResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/ContentTooLarge'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/approval-requests:
+    get:
+      tags: [Data loss prevention]
+      operationId: listApprovalRequests
+      summary: List DLP approval requests
+      description: |
+        Lists approval requests, newest first. `scope=queue`, the default for an approver, returns the tenant's
+        requests the caller may decide: pending, and not for the caller's own transfers. `scope=own` returns the
+        requests for the caller's own transfers. `scope=tenant` returns every request in the tenant and needs the
+        admin role. A member who is neither an approver nor an admin gets `403 permission_denied` for `queue` and
+        `tenant`. Filter by `state`.
+
+        Requirements: FR-43, FR-55.
+      x-permission: dlp_approval.read
+      security:
+        - memberSession: []
+      parameters:
+        - $ref: '#/components/parameters/ApprovalScope'
+        - $ref: '#/components/parameters/ApprovalStateFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of approval requests.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequestPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/approval-requests/{approval_request_id}:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalRequestId'
+    get:
+      tags: [Data loss prevention]
+      operationId: getApprovalRequest
+      summary: Get a DLP approval request
+      description: |
+        Returns an approval request with what the approver needs to decide (FR-43): the sender, the recipients with
+        their trust and new-domain flags, the files with their names, sizes and inspection results, the message, the
+        matched rules, the sender's justification and the decisions so far. The findings with their details come
+        from `getTransferDlp`. File contents are never available to an approver: there is no download operation for
+        them.
+
+        Approvers see every request in the tenant, the sender sees their own, and a tenant admin sees every request;
+        anyone else gets `404`. `can_decide` says whether the caller may approve or reject it now.
+
+        Requirements: FR-43, FR-44.
+      x-permission: dlp_approval.read
+      security:
+        - memberSession: []
+      responses:
+        '200':
+          description: The approval request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/approval-requests/{approval_request_id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalRequestId'
+    post:
+      tags: [Data loss prevention]
+      operationId: approveTransfer
+      summary: Approve a transfer
+      description: |
+        Records the caller's approval, with an optional comment. Under the transfer's row lock the service checks that
+        the request is still `pending`, that the caller is an active approver, and that the caller isn't the
+        transfer's sender (`403 self_approval_forbidden`), which for a transfer an API key created is the key's owner.
+        One approver counts once. When the request has the approvals its rule needs, one or two (FR-44), it becomes
+        `approved`, the transfer is sent and each recipient is emailed a link; until then it stays `pending`.
+
+        **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`). Only a person signed in to
+        the web app approves: API keys can't, and no email holds an approve link. Approving a request the caller
+        already approved returns it unchanged, so a retry is safe. The comment is stored encrypted and never written
+        to the audit log.
+
+        Errors: `401 reauthentication_required`, `403 permission_denied` (not an approver),
+        `403 self_approval_forbidden`, `409 invalid_state` (not pending), `409 transfer_revoked`,
+        `409 transfer_expired`.
+
+        Requirements: FR-43, FR-44, FR-54.
+      x-permission: dlp_approval.decide
+      security:
+        - memberSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalApprove'
+      responses:
+        '200':
+          description: The approval request, `approved` or still `pending`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/approval-requests/{approval_request_id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/ApprovalRequestId'
+    post:
+      tags: [Data loss prevention]
+      operationId: rejectTransfer
+      summary: Reject a transfer
+      description: |
+        Records the caller's rejection, which needs a comment (`422 validation_failed`). The request becomes
+        `rejected` and the transfer `held` with `hold_reason: approval_rejected`; the sender is emailed and can remove
+        files or cancel. The checks are those of `approveTransfer`. A rejection only stops sharing, so, like a
+        revocation, it needs no step-up and never counts against the tenant's request budget. Rejecting a request the
+        caller already rejected returns it unchanged.
+
+        Errors: `403 permission_denied`, `403 self_approval_forbidden`, `409 invalid_state`, `422 validation_failed`.
+
+        Requirements: FR-43, FR-54.
+      x-permission: dlp_approval.decide
+      security:
+        - memberSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApprovalReject'
+      responses:
+        '200':
+          description: The rejected approval request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalRequest'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/decisions:
+    get:
+      tags: [Data loss prevention]
+      operationId: listDlpDecisions
+      summary: List DLP decisions
+      description: |
+        Lists the tenant's DLP decisions, newest first, for transfers and for received files, with their outcome,
+        policy version, mode and matched rules (FR-55). Filter by outcome, rule, sender and time. Decisions hold IDs,
+        counts and enums, never findings' details. A local admin needs a passkey sign-in. The same records are in the
+        audit log, so `exportAuditEvents` exports them (FR-29).
+
+        Requirements: FR-54, FR-55.
+      x-permission: dlp_report.read
+      security:
+        - memberSession: [admin]
+        - tenantApiKey: ['audit:read']
+      parameters:
+        - $ref: '#/components/parameters/DlpOutcomeFilter'
+        - $ref: '#/components/parameters/RuleIdFilter'
+        - $ref: '#/components/parameters/SenderFilter'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of decisions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpDecisionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /dlp/report:
+    get:
+      tags: [Data loss prevention]
+      operationId: getDlpReport
+      summary: Get the DLP report
+      description: |
+        Returns DLP totals for a range of at most 92 days (`422 validation_failed` beyond): decisions by outcome and by
+        day; matches by rule and by detector; decisions by sender and by recipient domain, the 50 largest of each;
+        approvals by approver, with how many each approved and rejected and the median time to decide; files not
+        fully inspected, by reason; and the number of policy changes (FR-55). Viewing it is audited.
+
+        Requirements: FR-55.
+      x-permission: dlp_report.read
+      security:
+        - memberSession: [admin]
+        - tenantApiKey: ['audit:read']
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: The DLP report for the range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DlpReport'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -3191,7 +4122,7 @@ components:
       explode: true
       schema:
         type: array
-        maxItems: 7
+        maxItems: 9
         uniqueItems: true
         items:
           $ref: '#/components/schemas/TransferState'
@@ -3304,6 +4235,99 @@ components:
         type: string
         maxLength: 100
 
+    RuleId:
+      name: rule_id
+      in: path
+      required: true
+      description: ID of the DLP rule; it stays the same across its revisions.
+      schema:
+        $ref: '#/components/schemas/Id'
+    DetectorId:
+      name: detector_id
+      in: path
+      required: true
+      description: A built-in detector's ID, such as `jp_my_number`, or `custom:` and the ID of one of the tenant's own.
+      schema:
+        $ref: '#/components/schemas/DlpDetectorId'
+    ApprovalRequestId:
+      name: approval_request_id
+      in: path
+      required: true
+      description: ID of the DLP approval request.
+      schema:
+        $ref: '#/components/schemas/Id'
+    ApprovalScope:
+      name: scope
+      in: query
+      required: false
+      description: |
+        `queue`: pending requests the caller may decide, for approvers. `own`: requests for the caller's own
+        transfers. `tenant`: every request in the tenant, for admins. Defaults to `queue` for an approver and `own`
+        for anyone else.
+      schema:
+        type: string
+        enum: [queue, own, tenant]
+    ApprovalStateFilter:
+      name: state
+      in: query
+      required: false
+      description: Return only approval requests in these states. Repeat the parameter for several states.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 5
+        uniqueItems: true
+        items:
+          $ref: '#/components/schemas/ApprovalState'
+    DlpOutcomeFilter:
+      name: outcome
+      in: query
+      required: false
+      description: Return only decisions with these outcomes. Repeat the parameter for several.
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 5
+        uniqueItems: true
+        items:
+          $ref: '#/components/schemas/DlpOutcome'
+    RuleIdFilter:
+      name: rule_id
+      in: query
+      required: false
+      description: Return only decisions in which this rule matched.
+      schema:
+        $ref: '#/components/schemas/Id'
+    SenderFilter:
+      name: sender_id
+      in: query
+      required: false
+      description: Return only decisions on transfers this member owns.
+      schema:
+        $ref: '#/components/schemas/Id'
+    From:
+      name: from
+      in: query
+      required: false
+      description: Start of the range, inclusive. Defaults to 30 days before `to`.
+      schema:
+        $ref: '#/components/schemas/Timestamp'
+    To:
+      name: to
+      in: query
+      required: false
+      description: End of the range, exclusive. Defaults to now.
+      schema:
+        $ref: '#/components/schemas/Timestamp'
+    DlpApproverFilter:
+      name: dlp_approver
+      in: query
+      required: false
+      description: Return only users who are, or aren't, DLP approvers.
+      schema:
+        type: boolean
   headers:
     RetryAfter:
       description: Seconds to wait before retrying.
@@ -3408,8 +4432,9 @@ components:
         The caller is known but may not do this: the role, scope or session kind doesn't allow it; a local admin's
         session wasn't signed in with a passkey and the operation needs the admin role; the CSRF check failed; the
         recipient or uploader is locked out; the download limit is used up; or a download grant has no time, bytes or
-        requests left. Codes: `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`,
-        `download_limit_reached`, `download_grant_exhausted`.
+        requests left; or an approver is the transfer's own sender. Codes: `permission_denied`, `passkey_required`,
+        `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted`,
+        `self_approval_forbidden`.
       content:
         application/problem+json:
           schema:
@@ -3448,7 +4473,8 @@ components:
         The request conflicts with the current state of the item or with an earlier request. Codes:
         `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`,
         `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`,
-        `file_not_shareable`, `user_exists`, `last_admin`.
+        `file_not_shareable`, `user_exists`, `last_admin`, `dlp_decision_changed`, `dlp_policy_conflict`,
+        `detector_in_use`, `no_eligible_approver`, `approval_limit_reached`.
       content:
         application/problem+json:
           schema:
@@ -3506,7 +4532,7 @@ components:
         The request is well formed but breaks a rule. `validation_failed` lists each problem in `errors`. Codes:
         `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`,
         `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`,
-        `export_too_large`.
+        `export_too_large`, `justification_required`, `approvers_insufficient`.
       content:
         application/problem+json:
           schema:
@@ -3640,8 +4666,10 @@ components:
 
     TransferState:
       type: string
-      enum: [draft, submitted, sent, held, revoked, expired, cancelled]
-      description: State of a transfer (data model section 3.2).
+      enum: [draft, submitted, awaiting_confirmation, pending_approval, sent, held, revoked, expired, cancelled]
+      description: |
+        State of a transfer (data model section 3.2). `awaiting_confirmation`: a DLP rule warns or needs approval, and
+        the sender must confirm or request approval (`confirmTransfer`). `pending_approval`: waiting for an approver.
 
     FileState:
       type: string
@@ -3761,6 +4789,7 @@ components:
         - reauthentication_required
         - permission_denied
         - passkey_required
+        - self_approval_forbidden
         - csrf_failed
         - recipient_locked
         - download_limit_reached
@@ -3779,6 +4808,11 @@ components:
         - file_not_shareable
         - user_exists
         - last_admin
+        - dlp_decision_changed
+        - dlp_policy_conflict
+        - detector_in_use
+        - no_eligible_approver
+        - approval_limit_reached
         - link_revoked
         - link_expired
         - file_too_large
@@ -3796,6 +4830,8 @@ components:
         - code_expired
         - code_attempts_exhausted
         - export_too_large
+        - justification_required
+        - approvers_insufficient
         - rate_limited
         - service_unavailable
 
@@ -3895,6 +4931,8 @@ components:
         - revoked_at
         - revoked_by
         - total_size
+        - hold_reason
+        - dlp
         - files
         - recipients
       properties:
@@ -3943,6 +4981,16 @@ components:
           type: integer
           minimum: 0
           description: Sum of the declared sizes of the files, in bytes.
+        hold_reason:
+          oneOf:
+            - $ref: '#/components/schemas/HoldReason'
+            - type: 'null'
+          description: Set while the transfer is `held`.
+        dlp:
+          oneOf:
+            - $ref: '#/components/schemas/TransferDlpSummary'
+            - type: 'null'
+          description: The current DLP decision in brief, once there is one (`getTransferDlp`).
         files:
           type: array
           maxItems: 50
@@ -3987,6 +5035,11 @@ components:
         total_size:
           type: integer
           minimum: 0
+        dlp_outcome:
+          oneOf:
+            - $ref: '#/components/schemas/DlpOutcome'
+            - type: 'null'
+          description: The outcome of the current DLP decision, once there is one.
 
     TransferPage:
       type: object
@@ -4112,7 +5165,7 @@ components:
 
     File:
       type: object
-      required: [id, transfer_id, upload_request_id, display_name, content_type, declared_size, actual_size, state, shareable, created_at]
+      required: [id, transfer_id, upload_request_id, display_name, content_type, declared_size, actual_size, state, shareable, inspection, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4144,7 +5197,11 @@ components:
           $ref: '#/components/schemas/FileState'
         shareable:
           type: boolean
-          description: True when the file is `clean`, or `unscannable` and the tenant policy allows it (FR-16).
+          description: |
+            True when the file is `clean`, or `unscannable` and the tenant policy allows it, and its DLP inspection
+            finished and didn't fail; for a received file, also not blocked by a DLP rule (FR-16).
+        inspection:
+          $ref: '#/components/schemas/FileInspectionSummary'
         scanned_at:
           type: [string, 'null']
           format: date-time
@@ -4773,7 +5830,7 @@ components:
 
     User:
       type: object
-      required: [id, email, role, status, sso_fallback, created_at]
+      required: [id, email, role, status, sso_fallback, dlp_approver, created_at]
       properties:
         id:
           $ref: '#/components/schemas/Id'
@@ -4788,6 +5845,9 @@ components:
           description: |
             For an admin of a tenant that uses SSO: keeps a local sign-in for when the identity provider breaks. At
             most two per tenant (`updateUser`).
+        dlp_approver:
+          type: boolean
+          description: May approve or reject transfers that need DLP approval, never their own (FR-43).
         created_at:
           $ref: '#/components/schemas/Timestamp'
 
@@ -4865,6 +5925,9 @@ components:
           description: |
             Names an admin of a tenant that uses SSO as a fallback admin, with a local sign-in, or takes it away. At
             most two per tenant (authn-authz 2.5).
+        dlp_approver:
+          type: boolean
+          description: Names an active member or admin as a DLP approver, or takes it away (FR-43).
 
     UserPage:
       type: object
@@ -5367,6 +6430,1043 @@ components:
           type: [string, 'null']
           format: uri
           description: Link to the after-action review once it is written.
+
+    # Data loss prevention
+
+    HoldReason:
+      type: string
+      enum: [file_blocked, dlp_blocked, approval_rejected]
+      description: |
+        Why a transfer is `held` (data model 3.2): a file isn't shareable (`file_blocked`), a DLP rule blocks it
+        (`dlp_blocked`), or an approver rejected it (`approval_rejected`).
+
+    InspectionState:
+      type: string
+      enum: [pending, inspected, partial, not_inspected, failed, skipped]
+      description: |
+        A file's DLP inspection result (data model 3.5, FR-36): not yet inspected (`pending`), all content checked
+        (`inspected`), some content checked (`partial`), nothing checked (`not_inspected`), engine errors on every
+        attempt, so the file is blocked (`failed`), or not inspected because the file is infected or its scan failed
+        (`skipped`).
+
+    InspectionReason:
+      type: string
+      enum: [encrypted, no_text, unsupported_type, too_large, limit_exceeded, parse_error]
+      description: |
+        Why content wasn't inspected (FR-47, detectors 1): encrypted content, a PDF with no text layer, a type with no
+        extractor, a file over 2,000,000,000 bytes, an extraction limit, or malformed content.
+
+    DlpDetectorId:
+      type: string
+      maxLength: 71
+      pattern: '^([a-z][a-z0-9_]{1,63}|custom:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+      description: |
+        A built-in detector's ID, such as `jp_my_number` (detectors 4), or `custom:` and the ID of one of the
+        tenant's own.
+      examples:
+        - jp_my_number
+
+    DlpConfidence:
+      type: string
+      enum: [low, medium, high]
+      description: How sure a detector is of a match, from its format, check digit and context (detectors 3).
+
+    DlpMode:
+      type: string
+      enum: [monitor, enforce]
+      description: In `monitor` mode every decision is recorded and nothing is warned, held or blocked (FR-52).
+
+    DlpAction:
+      type: string
+      enum: [allow_and_record, warn, require_approval, block]
+      description: What a rule does when it matches (FR-41). For received files only `allow_and_record` and `block`.
+
+    DlpOutcome:
+      type: string
+      enum: [none, allow_and_record, warn, require_approval, block]
+      description: The strictest action of the rules a decision matched; `none` when no rule matched.
+
+    ApprovalState:
+      type: string
+      enum: [pending, approved, rejected, expired, withdrawn]
+      description: State of a DLP approval request (data model 3.6).
+
+    FileInspectionSummary:
+      type: object
+      required: [state, reasons, dlp_blocked, detectors]
+      properties:
+        state:
+          $ref: '#/components/schemas/InspectionState'
+        reasons:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/InspectionReason'
+        dlp_blocked:
+          type: boolean
+          description: For a received file, true when a DLP rule blocked it (FR-51).
+        detectors:
+          type: array
+          maxItems: 70
+          uniqueItems: true
+          description: The detectors that matched in this file.
+          items:
+            $ref: '#/components/schemas/DlpDetectorId'
+
+    DlpLocation:
+      type: object
+      additionalProperties: false
+      description: |
+        Where a match is, never what is around it (detectors 7). Only the fields that apply are present: an archive
+        member path, then the member's own page, sheet and row, slide, line or paragraph, or the part of the document.
+      properties:
+        member:
+          type: string
+          maxLength: 1024
+        page:
+          type: integer
+          minimum: 1
+        sheet:
+          type: string
+          maxLength: 255
+        row:
+          type: integer
+          minimum: 1
+        slide:
+          type: integer
+          minimum: 1
+        line:
+          type: integer
+          minimum: 1
+        paragraph:
+          type: integer
+          minimum: 1
+        part:
+          type: string
+          enum: [body, header, footer, footnotes, comments, notes, properties, message]
+
+    DlpFinding:
+      type: object
+      required: [detector, detector_name, count_low, count_medium, count_high, details_visible]
+      description: |
+        What one detector found in one file or message (FR-53): distinct values at each confidence, and, for the
+        file's owner and the transfer's approvers, at most 10 location hints and 3 masked previews. Never the value.
+      properties:
+        detector:
+          $ref: '#/components/schemas/DlpDetectorId'
+        detector_name:
+          type: string
+          description: The detector's name, in the caller's language for built-in detectors.
+        count_low:
+          type: integer
+          minimum: 0
+        count_medium:
+          type: integer
+          minimum: 0
+        count_high:
+          type: integer
+          minimum: 0
+        details_visible:
+          type: boolean
+          description: False when the caller may see counts only, or the file's contents were deleted.
+        locations:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/DlpLocation'
+        previews:
+          type: array
+          maxItems: 3
+          description: Masked previews, such as the card network and the last 4 digits; none for My Numbers and secrets.
+          items:
+            type: string
+            maxLength: 64
+
+    FileInspection:
+      type: object
+      required: [file_id, state, reasons, dlp_blocked, engine_version, policy_version, inspected_at, findings]
+      properties:
+        file_id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/InspectionState'
+        reasons:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/InspectionReason'
+        dlp_blocked:
+          type: boolean
+        engine_version:
+          type: [string, 'null']
+          description: The inspection engine version that inspected the file (detectors 9).
+        policy_version:
+          type: [integer, 'null']
+          description: The tenant's DLP policy version whose detectors ran.
+        inspected_at:
+          type: [string, 'null']
+          format: date-time
+        findings:
+          type: array
+          maxItems: 70
+          items:
+            $ref: '#/components/schemas/DlpFinding'
+
+    DlpMatchedRule:
+      type: object
+      required: [rule_id, revision, name, condition, action, matched_count, threshold]
+      properties:
+        rule_id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+        condition:
+          $ref: '#/components/schemas/DlpRuleCondition'
+        action:
+          $ref: '#/components/schemas/DlpAction'
+        matched_count:
+          type: integer
+          minimum: 0
+          description: The count that crossed the threshold, for a `content` rule; the files or domains for the others.
+        threshold:
+          type: [integer, 'null']
+          minimum: 1
+
+    DlpDecision:
+      type: object
+      required: [id, transfer_id, file_id, policy_version, mode, outcome, enforced, untrusted_recipients, new_domains, matched_rules, decided_at]
+      description: One DLP decision, for a transfer or for a received file (data model 2.7). Never changed once made.
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        transfer_id:
+          type: [string, 'null']
+          format: uuid
+        file_id:
+          type: [string, 'null']
+          format: uuid
+          description: Set for a received file's decision.
+        policy_version:
+          type: integer
+          minimum: 1
+        mode:
+          $ref: '#/components/schemas/DlpMode'
+        outcome:
+          $ref: '#/components/schemas/DlpOutcome'
+        enforced:
+          type: boolean
+          description: False in monitor mode.
+        untrusted_recipients:
+          type: integer
+          minimum: 0
+        new_domains:
+          type: integer
+          minimum: 0
+        matched_rules:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpMatchedRule'
+        decided_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    DlpDecisionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DlpDecision'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    DlpRecipientCheck:
+      type: object
+      required: [recipient_id, email, trusted, new_domain]
+      properties:
+        recipient_id:
+          $ref: '#/components/schemas/Id'
+        email:
+          $ref: '#/components/schemas/EmailAddress'
+        trusted:
+          type: boolean
+          description: |
+            The domain is one of the tenant's trusted domains or proven SSO domains, or a subdomain of one (FR-45).
+        new_domain:
+          type: boolean
+          description: The tenant hadn't sent to this domain in the 365 days before the decision (FR-46).
+
+    TransferDlpFile:
+      type: object
+      required: [file_id, display_name, inspection, findings]
+      properties:
+        file_id:
+          $ref: '#/components/schemas/Id'
+        display_name:
+          type: string
+        inspection:
+          $ref: '#/components/schemas/FileInspectionSummary'
+        findings:
+          type: array
+          maxItems: 70
+          items:
+            $ref: '#/components/schemas/DlpFinding'
+
+    TransferDlpSummary:
+      type: object
+      required: [outcome, mode, enforced, approval_request_id]
+      description: The transfer's current DLP decision in brief; `getTransferDlp` has the rest.
+      properties:
+        outcome:
+          $ref: '#/components/schemas/DlpOutcome'
+        mode:
+          $ref: '#/components/schemas/DlpMode'
+        enforced:
+          type: boolean
+        approval_request_id:
+          type: [string, 'null']
+          format: uuid
+
+    TransferDlp:
+      type: object
+      required: [transfer_id, state, decision, recipients, files, message_findings, approval_request]
+      properties:
+        transfer_id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/TransferState'
+        decision:
+          oneOf:
+            - $ref: '#/components/schemas/DlpDecision'
+            - type: 'null'
+          description: '`null` until every file is shareable and the evaluation has decided.'
+        recipients:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpRecipientCheck'
+        files:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/TransferDlpFile'
+        message_findings:
+          type: array
+          maxItems: 70
+          items:
+            $ref: '#/components/schemas/DlpFinding'
+        approval_request:
+          oneOf:
+            - $ref: '#/components/schemas/ApprovalRequestSummary'
+            - type: 'null'
+
+    TransferConfirmation:
+      type: object
+      additionalProperties: false
+      required: [decision_id]
+      properties:
+        decision_id:
+          $ref: '#/components/schemas/Id'
+          description: The decision the sender reviewed (`getTransferDlp`).
+        justification:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why the transfer should go out. Required when the decision needs approval. Stored encrypted.
+
+    DlpPolicy:
+      type: object
+      required: [mode, version, trusted_domains, approval_timeout, active_approvers, updated_at, updated_by]
+      properties:
+        mode:
+          $ref: '#/components/schemas/DlpMode'
+        version:
+          type: integer
+          minimum: 1
+          description: Raised by every change to these settings, a rule or a detector.
+        trusted_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          description: |
+            Recipient domains the tenant trusts, with their subdomains (FR-45). Its proven SSO domains are trusted too.
+          items:
+            type: string
+            format: hostname
+        approval_timeout:
+          type: string
+          format: duration
+          description: How long an approval request waits, an ISO 8601 duration between `PT1H` and `P7D` (FR-43).
+          examples:
+            - PT72H
+        active_approvers:
+          type: integer
+          minimum: 0
+          description: Active users with `dlp_approver`.
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_by:
+          type: [string, 'null']
+          format: uuid
+
+    DlpPolicyUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Only the fields sent are changed.
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+          description: When sent, the change applies only if this is the current policy version.
+        mode:
+          $ref: '#/components/schemas/DlpMode'
+        trusted_domains:
+          type: array
+          maxItems: 500
+          uniqueItems: true
+          items:
+            type: string
+            format: hostname
+        approval_timeout:
+          type: string
+          format: duration
+          description: Between `PT1H` and `P7D`.
+
+    DlpRuleCondition:
+      type: string
+      enum: [content, not_inspected, new_domain]
+      description: |
+        `content`: detectors' matches reach a threshold. `not_inspected`: a file not fully inspected for one of the
+        reasons. `new_domain`: a recipient domain new to the tenant (FR-40).
+
+    DlpRule:
+      type: object
+      required: [id, revision, name, enabled, direction, condition, detectors, min_confidence, threshold, reasons, include_sender_24h, recipient_scope, action, approvals_required, created_by, created_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        revision:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          maxLength: 100
+        enabled:
+          type: boolean
+        direction:
+          type: string
+          enum: [sent, received]
+        condition:
+          $ref: '#/components/schemas/DlpRuleCondition'
+        detectors:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/DlpDetectorId'
+        min_confidence:
+          $ref: '#/components/schemas/DlpConfidence'
+        threshold:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        reasons:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/InspectionReason'
+        include_sender_24h:
+          type: boolean
+          description: Also count the sender's matches in their transfers sent in the last 24 hours (FR-49).
+        recipient_scope:
+          type: string
+          enum: [any, untrusted]
+          description: '`untrusted`: the rule applies only when a recipient is outside the trusted domains (FR-45).'
+        action:
+          $ref: '#/components/schemas/DlpAction'
+        approvals_required:
+          type: integer
+          minimum: 1
+          maximum: 2
+          description: For `require_approval`, how many different approvers must approve (FR-44).
+        created_by:
+          $ref: '#/components/schemas/Id'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    DlpRuleCreate:
+      type: object
+      additionalProperties: false
+      required: [name, direction, condition, action]
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        enabled:
+          type: boolean
+          default: true
+        direction:
+          type: string
+          enum: [sent, received]
+        condition:
+          $ref: '#/components/schemas/DlpRuleCondition'
+        detectors:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Required for a `content` condition.
+          items:
+            $ref: '#/components/schemas/DlpDetectorId'
+        min_confidence:
+          $ref: '#/components/schemas/DlpConfidence'
+          default: medium
+        threshold:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          default: 1
+        reasons:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          description: Required for a `not_inspected` condition.
+          items:
+            $ref: '#/components/schemas/InspectionReason'
+        include_sender_24h:
+          type: boolean
+          default: false
+        recipient_scope:
+          type: string
+          enum: [any, untrusted]
+          default: any
+        action:
+          $ref: '#/components/schemas/DlpAction'
+        approvals_required:
+          type: integer
+          minimum: 1
+          maximum: 2
+          default: 1
+
+    DlpRuleUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Only the fields sent are changed; the result is the rule's next revision.
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        enabled:
+          type: boolean
+        condition:
+          $ref: '#/components/schemas/DlpRuleCondition'
+        detectors:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/DlpDetectorId'
+        min_confidence:
+          $ref: '#/components/schemas/DlpConfidence'
+        threshold:
+          type: integer
+          minimum: 1
+          maximum: 100000
+        reasons:
+          type: array
+          maxItems: 6
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/InspectionReason'
+        include_sender_24h:
+          type: boolean
+        recipient_scope:
+          type: string
+          enum: [any, untrusted]
+        action:
+          $ref: '#/components/schemas/DlpAction'
+        approvals_required:
+          type: integer
+          minimum: 1
+          maximum: 2
+
+    DlpRuleList:
+      type: object
+      required: [policy_version, items]
+      properties:
+        policy_version:
+          type: integer
+          minimum: 1
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpRule'
+
+    DlpDetector:
+      type: object
+      required: [id, kind, name, enabled]
+      description: |
+        A built-in detector, or one of the tenant's own with its definition. Built-in detectors are always enabled;
+        a rule that leaves one out doesn't use it.
+      properties:
+        id:
+          $ref: '#/components/schemas/DlpDetectorId'
+        kind:
+          type: string
+          enum: [built_in, keywords, pattern]
+        name:
+          type: string
+          maxLength: 100
+        description:
+          type: string
+          description: For a built-in detector, what it finds and how its confidence is set.
+        enabled:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 1
+          description: For the tenant's own detectors.
+        keywords:
+          type: array
+          maxItems: 1000
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        pattern:
+          type: string
+          maxLength: 512
+          description: An RE2 expression.
+        context_keywords:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        case_insensitive:
+          type: boolean
+        min_length:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    DlpDetectorCreate:
+      type: object
+      additionalProperties: false
+      required: [name, kind]
+      description: '`keywords` is required for a keyword list, `pattern` for a pattern (detectors 5).'
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        kind:
+          type: string
+          enum: [keywords, pattern]
+        enabled:
+          type: boolean
+          default: true
+        keywords:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        pattern:
+          type: string
+          minLength: 1
+          maxLength: 512
+        context_keywords:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        case_insensitive:
+          type: boolean
+          default: true
+        min_length:
+          type: integer
+          minimum: 1
+          maximum: 1000
+
+    DlpDetectorUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Only the fields sent are changed; the result is the detector's next revision.
+      properties:
+        expected_version:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        enabled:
+          type: boolean
+        keywords:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        pattern:
+          type: string
+          minLength: 1
+          maxLength: 512
+        context_keywords:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        case_insensitive:
+          type: boolean
+        min_length:
+          type: integer
+          minimum: 1
+          maximum: 1000
+
+    DlpDetectorList:
+      type: object
+      required: [engine_version, items]
+      properties:
+        engine_version:
+          type: string
+          description: The inspection engine version whose built-in detectors are listed.
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/DlpDetector'
+
+    DlpDetectorTest:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 16384
+          description: Sample text, processed in memory and never stored or logged.
+        detectors:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: Existing detectors to run. Leave out to run only `draft`, or every detector if there is no draft.
+          items:
+            $ref: '#/components/schemas/DlpDetectorId'
+        draft:
+          $ref: '#/components/schemas/DlpDetectorCreate'
+          description: A keyword list or pattern to try without saving it.
+
+    DlpDetectorTestResult:
+      type: object
+      required: [matches, truncated]
+      properties:
+        matches:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [detector, confidence, line, preview]
+            properties:
+              detector:
+                type: string
+                description: The detector's ID, or `draft`.
+              confidence:
+                $ref: '#/components/schemas/DlpConfidence'
+              line:
+                type: integer
+                minimum: 1
+              preview:
+                type: string
+                maxLength: 64
+                description: Masked as in findings.
+        truncated:
+          type: boolean
+          description: True when there were more than 100 matches.
+
+    ApprovalDecision:
+      type: object
+      required: [approver_id, decision, comment, decided_at]
+      properties:
+        approver_id:
+          $ref: '#/components/schemas/Id'
+        decision:
+          type: string
+          enum: [approve, reject]
+        comment:
+          type: [string, 'null']
+          maxLength: 1000
+        decided_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    ApprovalRequestSummary:
+      type: object
+      required: [id, transfer_id, state, requested_by, requested_at, expires_at, approvals_required, approvals, rule_names]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        transfer_id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/ApprovalState'
+        requested_by:
+          $ref: '#/components/schemas/Id'
+        requested_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        approvals_required:
+          type: integer
+          minimum: 1
+          maximum: 2
+        approvals:
+          type: integer
+          minimum: 0
+          maximum: 2
+        rule_names:
+          type: array
+          maxItems: 50
+          description: Names of the rules that asked for approval.
+          items:
+            type: string
+
+    ApprovalRequestPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApprovalRequestSummary'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    ApprovalTransferFile:
+      type: object
+      required: [id, display_name, size, inspection]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        display_name:
+          type: string
+        size:
+          type: integer
+          minimum: 1
+          maximum: 5000000000
+        inspection:
+          $ref: '#/components/schemas/FileInspectionSummary'
+
+    ApprovalTransferView:
+      type: object
+      required: [created_by, message, expires_at, recipients, files]
+      description: What an approver sees of the transfer. There is never a way to download its files.
+      properties:
+        created_by:
+          $ref: '#/components/schemas/Id'
+        message:
+          type: [string, 'null']
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        recipients:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpRecipientCheck'
+        files:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/ApprovalTransferFile'
+
+    ApprovalRequest:
+      type: object
+      required: [id, transfer_id, state, requested_by, requested_at, expires_at, approvals_required, approvals, justification, matched_rules, transfer, decisions, can_decide]
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        transfer_id:
+          $ref: '#/components/schemas/Id'
+        state:
+          $ref: '#/components/schemas/ApprovalState'
+        requested_by:
+          $ref: '#/components/schemas/Id'
+        requested_at:
+          $ref: '#/components/schemas/Timestamp'
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+        approvals_required:
+          type: integer
+          minimum: 1
+          maximum: 2
+        approvals:
+          type: integer
+          minimum: 0
+          maximum: 2
+        justification:
+          type: string
+          maxLength: 1000
+        matched_rules:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpMatchedRule'
+        transfer:
+          $ref: '#/components/schemas/ApprovalTransferView'
+        decisions:
+          type: array
+          maxItems: 2
+          items:
+            $ref: '#/components/schemas/ApprovalDecision'
+        can_decide:
+          type: boolean
+          description: |
+            True when the caller is an active approver, isn't the sender, hasn't decided, and the request is pending.
+
+    ApprovalApprove:
+      type: object
+      additionalProperties: false
+      properties:
+        comment:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Optional. Stored encrypted.
+
+    ApprovalReject:
+      type: object
+      additionalProperties: false
+      required: [comment]
+      properties:
+        comment:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why the transfer may not go out. Shown to the sender; stored encrypted.
+
+    DlpCount:
+      type: object
+      required: [key, count]
+      description: One row of a report breakdown. `key` is an outcome, rule ID, detector ID, user ID, domain or reason.
+      properties:
+        key:
+          type: string
+        count:
+          type: integer
+          minimum: 0
+
+    DlpReport:
+      type: object
+      required: [from, to, policy_changes, decisions_by_outcome, decisions_by_day, matches_by_rule, matches_by_detector, decisions_by_sender, decisions_by_recipient_domain, approvals_by_approver, not_inspected_by_reason]
+      properties:
+        from:
+          $ref: '#/components/schemas/Timestamp'
+        to:
+          $ref: '#/components/schemas/Timestamp'
+        policy_changes:
+          type: integer
+          minimum: 0
+        decisions_by_outcome:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/DlpCount'
+        decisions_by_day:
+          type: array
+          maxItems: 92
+          items:
+            type: object
+            required: [date, by_outcome]
+            properties:
+              date:
+                type: string
+                format: date
+              by_outcome:
+                type: array
+                maxItems: 5
+                items:
+                  $ref: '#/components/schemas/DlpCount'
+        matches_by_rule:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpCount'
+        matches_by_detector:
+          type: array
+          maxItems: 70
+          items:
+            $ref: '#/components/schemas/DlpCount'
+        decisions_by_sender:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpCount'
+        decisions_by_recipient_domain:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/DlpCount'
+        approvals_by_approver:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [approver_id, approved, rejected, median_seconds_to_decide]
+            properties:
+              approver_id:
+                $ref: '#/components/schemas/Id'
+              approved:
+                type: integer
+                minimum: 0
+              rejected:
+                type: integer
+                minimum: 0
+              median_seconds_to_decide:
+                type: [integer, 'null']
+                minimum: 0
+        not_inspected_by_reason:
+          type: array
+          maxItems: 6
+          items:
+            $ref: '#/components/schemas/DlpCount'
 
     # Pagination
 
