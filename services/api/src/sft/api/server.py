@@ -85,7 +85,7 @@ class ApiServer:
         self.settings = settings
         self.readiness = Readiness()
         self.metrics = HttpMetrics.create()
-        public_app = RequestContextMiddleware(app or create_app(), self.metrics)
+        public_app = RequestContextMiddleware(app or create_app(settings), self.metrics)
         internal_app = create_internal_app(self.readiness, self.metrics.registry)
         self._public = _Server(
             _config(

@@ -337,7 +337,8 @@ commit, so nothing is skipped; then the cursor moves to `xmin`.
 
 - **Long transactions would stall it**, because the cursor can't pass a transaction that is still open. So every
   transaction that writes stays short. The workload roles set `statement_timeout`, `idle_in_transaction_session_timeout`
-  and `transaction_timeout` (PostgreSQL 17 or later), which ends any transaction open for more than 30 seconds. Jobs
+  and `transaction_timeout` (PostgreSQL 17 or later), which ends any transaction open for more than 30 seconds; a
+  single statement, or a wait inside a transaction, gets 10 seconds. The bootstrap job sets them on the roles. Jobs
   delete and purge in small batches, one transaction each (section 6). No code holds a transaction open across an S3
   or SES call. Upload completion, for example, runs in three phases with its S3 calls between two short transactions
   (3.1). Migrations are the one exception (section 7). An alert fires when the oldest unarchived audit row is more
@@ -564,10 +565,13 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    - **The scope is transaction-local.** The data-access layer opens every transaction with
      `set_config('app.scope', …, true)` and `set_config('app.tenant_id', …, true)`, which end at commit or rollback, so
      they can't leak to the next user of a pooled connection. A session-level `SET` is forbidden by a lint rule, and a
-     query without a scope is refused before it reaches the database.
+     query without a scope is refused before it reaches the database. `app.scope` is `tenant`, `resource`, `system`,
+     `platform`, `lookup` (credential lookup) or `recovery`; only `tenant` and `resource` set `app.tenant_id`.
    - **Tenant policy.** Every tenant table has a `tenant_isolation` policy, `tenant_id = app_tenant_id()` for reads
      and writes, for each workload role granted the table. Lifecycle jobs also have `jobs_find`, a read-only policy in
-     system scope, to find due work across tenants.
+     system scope, to find due work across tenants. `tenants` itself has no `tenant_id`, so its policy compares `id`:
+     the API reads its own tenant's row, and the operator API creates a tenant, and later suspends it, in that
+     tenant's own scope.
    - **Rows without a tenant** get policies of their own, never `tenant_id IS NOT DISTINCT FROM app_tenant_id()`,
      which would accept a row from any transaction that forgot its tenant:
      - Platform audit events are inserted only in platform scope (`tenant_id IS NULL AND app_tenant_id() IS NULL AND
@@ -579,6 +583,9 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
      `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events only), `sft_recovery` and
      `sft_migrate`; plus two roles nobody logs in as, `sft_owner`, which owns the tables, and `sft_lookup`, which owns
      the lookup functions. The authentication and authorization design (7.3) lists each role's scopes and policies.
+     The bootstrap job creates every role (encryption and keys 6.3); migrations only grant tables and write policies.
+     `sft_migrate` is a member of `sft_owner` with `INHERIT FALSE`, so it has no privileges until it runs
+     `SET ROLE sft_owner`, and only the login roles may connect to the database.
    - **`sft_recovery`** (IAM role `sft-{env}-recovery`) is used only by the restore and failover jobs that the runbooks
      start (architecture 7), never by a running service. Its `recovery_reapply` policies apply only in recovery scope
      (`app_scope() = 'recovery'`) and let it read and update, across tenants, exactly the rows a security-critical
@@ -734,6 +741,11 @@ This keeps every deploy free of downtime (NFR-18).
   `schema_compatibility`, a small table owned by `sft_owner` next to `alembic_version`. When the database is ahead (a
   rollback), the job checks that the image's revision is in the list recorded for the database's head and skips; if
   it isn't, the job fails and the sync stops.
+- **Each migration file declares its list** as `compatible_with`, and each upgrade step records it in
+  `schema_compatibility` in the step's own transaction, so the database's head always has its row. Revisions are
+  numbered `0001`, `0002`, … in one line without branches, which keeps "newer" unambiguous; a test checks both. An
+  advisory lock keeps two migration jobs apart, and a run that hits the 2-second lock timeout is retried up to five
+  times, with a growing wait, before the job fails.
 - The migration role isn't held to the 30-second transaction limit (2.5). Long steps can hold the archive cursor back
   while they run, so they run outside peak hours, and the archive lag alert shows any delay.
 

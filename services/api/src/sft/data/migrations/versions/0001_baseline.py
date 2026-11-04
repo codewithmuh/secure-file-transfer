@@ -1,0 +1,75 @@
+"""Baseline: the scope functions, schema_compatibility and tenants.
+
+Revision 0001, the first. Later tables arrive with the issues that use them (#49 to #51 and on),
+each with its row-level security in the same migration (`sft.data.rls`).
+"""
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+from sft.data.rls import enable_tenant_rls
+
+revision = "0001"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+# The earlier revisions whose code still runs on this schema: none, this is the first.
+compatible_with: tuple[str, ...] = ()
+
+
+def upgrade() -> None:
+    # The scope of the current transaction, set by sft.data.database at its start (ADR-0020). A
+    # missing or empty setting reads as null, so no tenant policy matches it.
+    op.execute(
+        """
+        CREATE FUNCTION app_tenant_id() RETURNS uuid
+            LANGUAGE sql STABLE PARALLEL SAFE
+            AS $$ SELECT NULLIF(current_setting('app.tenant_id', true), '')::uuid $$
+        """
+    )
+    op.execute(
+        """
+        CREATE FUNCTION app_scope() RETURNS text
+            LANGUAGE sql STABLE PARALLEL SAFE
+            AS $$ SELECT NULLIF(current_setting('app.scope', true), '') $$
+        """
+    )
+
+    # Only the migration job reads and writes it, as the owner (data model 7).
+    op.create_table(
+        "schema_compatibility",
+        sa.Column("revision", sa.Text, primary_key=True),
+        sa.Column("compatible_with", postgresql.ARRAY(sa.Text), nullable=False),
+        sa.Column(
+            "recorded_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+    )
+
+    # Data model 2.1. Recovery and SSO columns arrive with their features.
+    op.create_table(
+        "tenants",
+        sa.Column("id", sa.Uuid, primary_key=True),
+        sa.Column("name", sa.Text, nullable=False),
+        sa.Column("status", sa.Text, nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.CheckConstraint("status IN ('active', 'suspended')", name="tenants_status_check"),
+    )
+    # A tenant's own row, in its scope: the API reads it; the operator API creates a tenant in the
+    # new tenant's scope and suspends it in that scope (authentication and authorization 7.3).
+    enable_tenant_rls(
+        "tenants",
+        key="id",
+        grants={"sft_api": "SELECT", "sft_operator": "SELECT, INSERT, UPDATE"},
+    )
+
+
+def downgrade() -> None:
+    # Deploys and rollbacks never run a down-migration (ADR-0005).
+    raise NotImplementedError

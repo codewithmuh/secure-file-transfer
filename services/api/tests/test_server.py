@@ -15,6 +15,7 @@ import httpx2 as httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from sft.api.app import create_app
 from sft.api.server import ApiServer
@@ -35,6 +36,10 @@ def free_ports(count: int) -> list[int]:
             s.close()
 
 
+# Nothing listens on port 1. The server never connects at startup, so these tests need no database.
+DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:1/sft"
+
+
 def settings(drain: int = 5) -> Settings:
     public, internal = free_ports(2)
     return Settings(
@@ -42,6 +47,7 @@ def settings(drain: int = 5) -> Settings:
         public_port=public,
         internal_port=internal,
         shutdown_drain_seconds=drain,
+        database_url=SecretStr(DATABASE_URL),
     )
 
 
@@ -194,7 +200,7 @@ def test_uvicorn_still_lets_us_replace_its_signal_handling() -> None:
 def start_process(env: dict[str, str]) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [sys.executable, "-m", "sft.api"],
-        env={**os.environ, **env},
+        env={**os.environ, "DATABASE_URL": DATABASE_URL, **env},
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
