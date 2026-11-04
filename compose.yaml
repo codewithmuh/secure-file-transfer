@@ -1,4 +1,5 @@
-# Local run of every service with production-like hardening: `make up`, then `make down`.
+# Local run of every service and the local stack, with production-like hardening: `make up`, then `make down`.
+# The stack stands in for AWS on a laptop (docs/local-development.md); every credential in it is local-only and fake.
 # Settings come from your shell or a `.env` file (see .env.example); defaults below.
 name: secure-file-transfer
 
@@ -20,3 +21,167 @@ services:
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
+
+  # ---- Local stack: AWS stand-ins, pinned by version and digest. Ports bind to 127.0.0.1 only. ----
+
+  postgres: # Aurora PostgreSQL 17 (ADR-0011)
+    <<: *hardening
+    image: postgres:17.11-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+    user: "999:999" # postgres; the entrypoint needs no root, so no capabilities either
+    environment:
+      POSTGRES_DB: sft
+      POSTGRES_USER: sft
+      POSTGRES_PASSWORD: sft-local-only
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    tmpfs: [/tmp, /var/run/postgresql]
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "--host=127.0.0.1", "--username=sft", "--dbname=sft"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+      start_interval: 1s
+
+  s3: # S3 (ADR-0012): Adobe S3Mock. Buckets come from s3-init.
+    <<: *hardening
+    image: adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /s3mockroot
+      COM_ADOBE_TESTING_S3MOCK_STORE_RETAIN_FILES_ON_EXIT: "true"
+      COM_ADOBE_TESTING_S3MOCK_STORE_REGION: ap-northeast-1
+      # The only SSE-KMS keys it accepts, like the bucket policy that refuses other keys: files, then audit.
+      # Listed as ARNs; requests must name the bare key ID (S3_FILES_KMS_KEY_ID), which S3Mock checks against them.
+      COM_ADOBE_TESTING_S3MOCK_STORE_VALID_KMS_KEYS: >-
+        arn:aws:kms:ap-northeast-1:000000000000:key/00000000-0000-4000-8000-000000000001,arn:aws:kms:ap-northeast-1:000000000000:key/00000000-0000-4000-8000-000000000002
+    volumes: [s3-data:/s3mockroot]
+    ports: ["127.0.0.1:9090:9090"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/favicon.ico"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+      start_interval: 1s
+
+  s3-init: # one-shot: creates the buckets of ADR-0012 with versioning, then exits
+    <<: *hardening
+    image: curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    restart: "no"
+    entrypoint: ["/bin/sh", "/s3-init.sh"]
+    volumes: ["./local/s3/init.sh:/s3-init.sh:ro"]
+    depends_on:
+      s3: { condition: service_healthy }
+
+  sqs: # SQS (ADR-0013): ElasticMQ, queues from its config file
+    <<: *hardening
+    image: softwaremill/elasticmq-native:1.7.1@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c
+    user: "65534:65534" # nobody: the image defaults to root and needs nothing it gives
+    volumes: ["./local/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro"]
+    tmpfs: [/tmp, /data] # queues live in memory; this keeps the image's /data volume from piling up on each run
+    ports: ["127.0.0.1:9324:9324"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9324/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  valkey: # ElastiCache Serverless for Valkey (ADR-0014): counters only, nothing persisted
+    <<: *hardening
+    image: valkey/valkey:9.0.7-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+    user: "999:1000" # valkey
+    # One ACL user with a password stands in for the workload's IAM user and token; the default user is off.
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --user
+      - default
+      - "off"
+      - --user
+      - sft-local
+      - "on"
+      - ">local-only-valkey-password"
+      - "~*"
+      - "&*"
+      - "+@all"
+    ports: ["127.0.0.1:6379:6379"]
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli --user sft-local --pass local-only-valkey-password --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  mail: # SES (ADR-0015): Mailpit catches everything sent to it; nothing leaves the laptop
+    <<: *hardening
+    image: axllent/mailpit:v1.33.0@sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231
+    user: "65534:65534" # nobody: the image defaults to root
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+      MP_MAX_MESSAGES: "5000"
+      MP_ALLOWED_HOSTS: localhost:8025,127.0.0.1:8025,mail:8025 # refuse other Host headers (DNS rebinding)
+    ports: ["127.0.0.1:1025:1025", "127.0.0.1:8025:8025"] # SMTP; web UI and API
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+      start_interval: 1s
+
+  clamd: # ClamAV clamd in its own container (ADR-0019)
+    <<: *hardening
+    image: clamav/clamav:1.5.4-debian@sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1
+    user: "1000:1000" # clamav
+    entrypoint: ["/init-unprivileged"]
+    environment:
+      # Signatures are the ones baked into the pinned image: no update traffic, the same results on every machine.
+      CLAMAV_NO_FRESHCLAMD: "true"
+    volumes: ["./local/clamav/clamd.conf:/etc/clamav/clamd.conf:ro"]
+    ports: ["127.0.0.1:3310:3310"]
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+      start_interval: 2s
+
+  oidc: # Cognito user pool (ADR-0016): Keycloak with the sft realm, its app client and a test member
+    <<: *hardening
+    image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+    # start-dev rebuilds Keycloak into /opt/keycloak/lib at startup, so its root file system can't be read-only.
+    read_only: false
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: local-only-admin
+      KC_HOSTNAME: http://localhost:8180 # the issuer, the same for the browser and for containers
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes: ["./local/keycloak/sft-realm.json:/opt/keycloak/data/import/sft-realm.json:ro"]
+    ports: ["127.0.0.1:8180:8080"]
+    healthcheck:
+      # The image has no curl or wget; ask the management port's readiness check over bash's /dev/tcp.
+      test:
+        - CMD-SHELL
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"UP"' <&3
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+      start_interval: 2s
+
+volumes:
+  postgres-data:
+  s3-data:

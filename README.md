@@ -70,11 +70,13 @@ Requirements: [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.
 ```bash
 make setup    # install dependencies and the git hooks (gitleaks runs on every commit)
 make check    # lint, type-check and test everything (same as CI)
-make up       # run the API on :8000
-make down
+make up       # run the API on :8000 with the local stack that stands in for AWS
+make smoke    # one round trip to every service of the local stack
+make down     # stop; `make reset` also deletes the local data
 ```
 
-Run `make` with no arguments to list every command.
+Run `make` with no arguments to list every command. [Local development](docs/local-development.md) lists the
+services of the local stack, their ports and credentials, and how they differ from AWS.
 
 ## Repository layout
 
@@ -84,6 +86,7 @@ Run `make` with no arguments to list every command.
 docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api/            API service (FastAPI); the workers will share its codebase
 compose.yaml             local run with production-like hardening
+local/                   configuration and smoke checks of the local stack
 Makefile                 every command you need
 ```
 
