@@ -9,9 +9,9 @@
 | Tracking | [#14](https://github.com/codewithmuh/secure-file-transfer/issues/14), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41) |
 
 Everything the web app does goes through this API (FR-31), and tenant automation uses the same API with API keys
-(FR-32). The contract is **design-first**: phase 2 writes it before any code. Once code exists, the document generated
-from the code is committed here and CI fails if the two differ; a breaking-change check fails the pull request unless
-it is marked as breaking (ADR-0002). Until then, CI lints this file (section 11).
+(FR-32). The contract is **design-first**: phase 2 wrote it before any code, and it leads while the code catches up.
+CI lints it, checks every operation the code implements against it, and fails a pull request that breaks it unless the
+pull request carries the `breaking` label (ADR-0002, section 11).
 
 The phase 3 security design settled the two parts that phase 2 left provisional. Members sign in through Amazon
 Cognito managed login or their tenant's own identity provider, and the API issues its own session (PRD open question
@@ -401,15 +401,87 @@ Later, not in v1 (each needs its own issue; none is required by the security des
 
 ## 11. Checking the contract
 
-CI lints the spec in the `repo-checks` job, with the linter image pinned in `ci.yml`: the linter's recommended rules
-plus the rules in [`redocly.yaml`](../../redocly.yaml), which fail the build if an operation lacks `x-permission` or a
-`429` response. To run the same check locally:
+Three checks keep this file and the code in step. `make contract` runs the last two locally, as CI does.
+
+| Check | CI job | Fails when |
+|---|---|---|
+| Lint | `ci.yml`, `repo-checks` | The spec breaks the linter's recommended rules, or an operation lacks `x-permission` or a `429` response (the rules in [`redocly.yaml`](../../redocly.yaml)) |
+| Generated spec | `contract.yml`, `Contract (generated spec)`; also `make check` | An operation the code implements isn't in this file, or differs from it (11.1) |
+| Breaking changes | `contract.yml`, `Contract (breaking changes)` | The pull request changes this file in a way that breaks clients, and doesn't carry the `breaking` label (11.2) |
+
+To lint locally, with the image `ci.yml` pins:
 
 ```bash
 docker run --rm -v "$PWD:/spec" redocly/cli:2.64.1 lint docs/api/openapi.yaml
 ```
 
-Once the API service exists, CI also compares the document generated from the code with this file, and a
-breaking-change check runs on every pull request (ADR-0002). A CI test also checks every `x-permission` value against
-the service's permission registry and the [permission table](../security/authn-authz.md#63-permission-table)
-(authn-authz 6.5).
+The contract checks have their own workflow because adding or removing a label re-runs them, and that shouldn't re-run
+everything in `ci.yml`. Both jobs run on every pull request, so `protect-main` can require them by name.
+
+### 11.1 Generated spec
+
+This file leads and the code follows. `services/api/tools/contract_check.py` builds the OpenAPI document of each app
+the service runs, as FastAPI generates it (`create_app().openapi()` for the public API; the operator API joins in M1),
+and compares each operation in it with this file:
+
+- **An operation that isn't here fails**, and so does a route the document doesn't show (`include_in_schema=False`, a
+  mount), because it can't be checked. Add the operation to this file first, in the same pull request.
+- **An operation that is here must match it** in method, path, operation ID, parameters (name, location, required,
+  style and schema), request body (required, media types and schema), success responses (every 2xx and 3xx status,
+  with its media types and schemas) and `deprecated`. Each app is checked against its own server's operations, so an
+  operator operation on the public app fails too.
+- **Operations not implemented yet are allowed.** The check prints how many remain.
+
+Schemas are compared after both sides are normalised, so two spellings of one schema compare equal. `$ref`s are
+resolved, so component names don't matter. `anyOf: [X, {type: 'null'}]`, which is how Pydantic writes `X | None`,
+equals `type: [..., 'null']`. `allOf` of object schemas is flattened, as Pydantic writes a subclass. `const` equals a
+one-value `enum`; the order of `enum`, `required` and `type` doesn't matter; `additionalProperties: true` equals
+leaving it out; `default: null` equals no default. In parameters and in an optional request body, `null` is dropped:
+FastAPI writes an optional parameter as `X | None`, but a client can only leave it out, never send null.
+
+What the check doesn't compare, and what covers it instead:
+
+| Not compared | Why | Covered by |
+|---|---|---|
+| `title`, `description`, `summary`, examples, `tags` and `x-` extensions | Documentation; FastAPI fills some of them from Python names | Review |
+| Error responses (4xx, 5xx and `default`) | FastAPI adds its own `422` until M1's first issue answers with the problems of section 3 | Each route's tests, then M1's error handler |
+| `security` | FastAPI writes each security dependency as a separate requirement, so it can't express "a session and a CSRF token" | The authorization matrix test (authn-authz 9.2) |
+| `x-permission` | An extension FastAPI doesn't generate | The CI test of the permission registry against every `x-permission` value and the [permission table](../security/authn-authz.md#63-permission-table) (authn-authz 6.5), from M1 |
+| Response headers, such as `Location`, `Set-Cookie` and `Retry-After` | Declared by hand in FastAPI, outside the response model | Each route's tests |
+
+**When it fails**, it names the operation and the JSON Pointer of each difference, for example:
+
+```text
+POST /v1/operator/tenants (createTenant): request body application/json at /properties/name/maxLength: the contract has 200, the code 100
+```
+
+Change the code to match, or, if the contract is wrong, change this file in the same pull request (definition of done,
+point 5). Pydantic's `Field(json_schema_extra=...)` adds what a Python type can't say, such as `format: email` or
+`format: hostname`. To run it alone, `uv run python -m tools.contract_check --list-remaining` in `services/api`.
+
+ADR-0002 expects the generated document to replace this file once the code is complete. Until then the generated
+document isn't committed; the check compares it with this file. Replacing the file needs the code to generate what the
+check ignores today, and is decided when the last operation lands.
+
+### 11.2 Breaking changes
+
+[oasdiff](https://github.com/oasdiff/oasdiff) 1.34.1 (Apache-2.0), pinned by image digest in `contract.yml` and the
+Makefile, compares this file in the pull request with the base branch's. It fails on errors and on warnings: a warning
+such as a removed request property breaks clients here, because request bodies don't accept unknown properties. The
+pull request's file is untrusted, so oasdiff runs with no network, a read-only file system and external `$ref`s
+refused. When a pull request doesn't change this file, the job skips the comparison and still reports.
+
+A breaking change fails the check unless the pull request carries the **`breaking`** label. Within `/v1` only
+backwards-compatible changes are made (section 1), so the label is only for a deliberate break that the rules allow:
+
+- a change to the draft contract before the API service's first release, while `info.version` is `1.0.0-draft`;
+- removing a deprecated operation after its sunset date (section 1).
+
+Anything else ships in a new version (`/v2`). Adding or removing the label re-runs the check, and the job summary lists
+each breaking change.
+
+**When it fails**, read the oasdiff report in the job log or summary and make the change backwards compatible: add an
+optional field rather than a required one, keep a field rather than remove it, accept more in a request rather than
+less, and return no less than before in a response. If the break is deliberate and one of the two cases above, add the
+label. `make contract` runs the same comparison against the merge base with `origin/main`; set `CONTRACT_BASE` to
+compare with another branch.
