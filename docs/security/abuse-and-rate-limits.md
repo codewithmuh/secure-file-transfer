@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| Requirements | [PRD](../prd.md), especially FR-4, FR-6, FR-14, FR-15, NFR-4, NFR-6, NFR-14 and open question 8 |
+| Requirements | [PRD](../prd.md), especially FR-4, FR-6, FR-14, FR-15, FR-43, FR-47, NFR-4, NFR-6, NFR-14 and open question 8 |
 | Architecture | [architecture.md](../architecture.md), [data model](../design/data-model.md), [capacity and cost](../design/capacity-and-cost.md) |
 | API | [openapi.yaml](../api/openapi.yaml) |
-| Tracking | [#24](https://github.com/codewithmuh/secure-file-transfer/issues/24), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)) |
+| Tracking | [#24](https://github.com/codewithmuh/secure-file-transfer/issues/24), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)); DLP limits in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64) |
 
 This page covers how the service is misused and what stops it: the abuse cases, every rate limit with its key, value and
 enforcement point, the WAF, where the counters live (input to the rate-limit store ADR in phase 4), and the decision on
@@ -47,6 +47,7 @@ code caps (section 2) and the upload and download limits NFR-14 left open.
 | AB-9 | API key abuse | Whoever holds a leaked key | Hashed, scoped, expiring keys with no download right; per-key limits |
 | AB-10 | Denial of service | Anyone on the internet | Shield Standard, WAF, per-IP and per-stream caps, fair scan queues |
 | AB-11 | Download-limit and session abuse | A verified recipient | Count at grant creation, grants bound to a session, byte and request budgets |
+| AB-12 | DLP evasion and approval abuse | A member, a member and an approver together, or a crafted file | Reasons for every file not fully inspected, counts across files and 24 hours, inspection limits, no self-approval, capped approval requests |
 
 ### AB-1 Link token brute force and enumeration
 
@@ -103,6 +104,14 @@ There are four ways to make the service email someone, and each one is capped:
 | Prevention | A file becomes `clean` only when an engine inspected all of it: ClamAV for files up to 2 GB, GuardDuty Malware Protection for S3 above (the capacity baseline; the scan ADR decides). Encrypted archives and documents are `unscannable`, which tenant policy blocks by default (FR-18). Any engine limit exceeded (size, nesting depth, file count, compression ratio, time) also gives `unscannable`, never `clean`. Engine errors are retried and end in `scan_failed` (FR-19). The declared content type is ignored. Downloads serve the exact object version that was scanned, always as an attachment. Section 6.4. |
 | Detection | `scan_results_total{state,reason}`, with the unscannable rate per tenant and reason, and scan times far above the size-based estimate. |
 | Response | Runbook `scan-evasion`: tell the tenant's admins, who review their unscannable policy; an operator looks for a pattern across tenants. |
+
+### AB-12 DLP evasion and approval abuse
+
+| | |
+|---|---|
+| Prevention | A file is never treated as having no findings unless all of it was inspected: encrypted content, an unsupported type, a file over 2 GB and every inspection limit give a reason that the tenant's rules act on (FR-47). Counts add up across a transfer's files and message, and optionally the sender's last 24 hours (FR-48, FR-49). The type comes from the bytes. Inspection limits stop bombs (6.5). Approvals: never by the sender, never by an API key, at most 3 requests per transfer, step-up to approve (FR-43, authn-authz 6.3). |
+| Detection | `dlp_decisions_total{outcome}`, `dlp_not_inspected_total{reason}`, `dlp_inspection_seconds`, `dlp_approval_requests_pending` and the age of the oldest; DLP reports by sender and by approver (FR-55). |
+| Response | Runbook `dlp-evasion`: tell the tenant's admins, who review their rules for uninspectable files and the sender's transfers; an operator looks for crafted files that crash the inspector across tenants. |
 
 ### AB-7 Enumeration and scraping
 
@@ -264,13 +273,13 @@ Section 7 explains each cap.
 |---|---|---|---|
 | Account | 300 requests a minute | App | `429` |
 | API key | 300 requests a minute | App | `429` |
-| Tenant | 1,000 requests a minute (NFR-14), members and API keys together, groups D, F, G, H and I included | App | `429` |
+| Tenant | 1,000 requests a minute (NFR-14), members and API keys together, groups D, F, G, H, I and K included | App | `429` |
 | IP | 100 failed authentications (any `401`) in 5 minutes | App | `429` for 15 minutes |
 | IP | 6,000 requests in 5 minutes | WAF `rate-api-ip` | `429`, `Retry-After: 300` |
 
 Safety actions never count against the tenant budget and are never refused by it: `revokeTransfer`,
-`revokeUploadRequest`, `revokeApiKey`, `deactivateUser`, `unlockRecipient` and `unlockUploader`. A runaway automation
-can't stop an admin from revoking a leaked transfer. The per-member limit still applies to them.
+`revokeUploadRequest`, `revokeApiKey`, `deactivateUser`, `unlockRecipient`, `unlockUploader` and `rejectTransfer`. A
+runaway automation can't stop an admin from revoking a leaked transfer. The per-member limit still applies to them.
 
 **I. Audit:** `searchAuditEvents`, `exportAuditEvents`. Fail open to the per-pod limiter.
 
@@ -286,6 +295,25 @@ can't stop an admin from revoking a leaked transfer. The per-member limit still 
 |---|---|---|---|
 | Tenant | 20 new API keys a day; at most 25 active keys (#23 5.2) | App; PostgreSQL | `429`; `422 validation_failed` |
 | Operator | 30 new tenants an hour | App | `429` |
+
+**K. Data loss prevention:** the policy, rule and detector writes (`updateDlpPolicy`, `createDlpRule`,
+`updateDlpRule`, `deleteDlpRule`, `createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector`), `testDlpDetectors`,
+`confirmTransfer`, `approveTransfer`, `rejectTransfer`, `getTransferDlp`, `getFileInspection`, `getDlpReport` and
+`listDlpDecisions`. Fail open to the per-pod limiter, except the PostgreSQL rows.
+
+| Key | Limit | Enforced by | Over the limit |
+|---|---|---|---|
+| Tenant | 100 DLP policy changes a day | App | `429` |
+| Account | 30 detector tests a minute, each at most 16,384 characters | App; the contract's schema | `429`; `413 request_too_large` |
+| Account | 30 confirmations a minute | App | `429` |
+| Transfer | 3 approval requests in total, 1 pending at a time | PostgreSQL | `409 approval_limit_reached` |
+| Account | 120 approval decisions an hour | App | `429` |
+| Account | 600 responses with finding details an hour, each audited | App | `429` |
+| Tenant | 60 DLP report and decision-list reads a minute | App | `429` |
+
+The detail-read cap keeps a stolen member session or an approver's from scraping masked previews quickly; a sender
+reviewing a transfer uses a few. Approval decisions are capped per approver so a compromised approver session can't
+release a backlog in seconds; `rejectTransfer`, a safety action, counts only against it.
 
 ### 2.3 NFR-14 coverage
 
@@ -738,6 +766,17 @@ bucket only (#22). Results map to file states like this:
   serve that same version (5.6), so the bytes can't change between scan and download. Unscannable files allowed by
   policy are served with the `unscannable` warning (FR-18).
 
+### 6.5 DLP inspection limits
+
+DLP inspection runs in the same pass as the malware scan, in the DLP inspector beside each scan worker (ADR-0022,
+architecture 4.6), so it shares the scan's queues, fair queues, per-tenant caps and pools. Its own limits per file:
+3 levels of nesting, 10,000 archive members, 4 GiB decompressed and a 100:1 ratio per member, 256 MiB of extracted
+text, 5,000 PDF pages, 10 minutes of CPU and 15 of wall-clock time, 2 GiB of memory and 4 GiB of scratch. Past a
+limit, the file is `partial` with `limit_exceeded`; the findings so far count, and the tenant's rules for uninspected
+files decide (FR-47). XML is parsed with DTDs and entities off, so an entity bomb has nothing to expand. Tenant
+patterns run on RE2, in linear time, and are timed when they are saved (detectors 5). A file that crashes or times out
+the inspector on every attempt ends `failed`: blocked, with an operator alert, as for `scan_failed`.
+
 ## 7. Email abuse
 
 ### 7.1 Who can cause which email
@@ -751,6 +790,9 @@ bucket only (#22). Results map to file states like this:
 | First-download notice (FR-8) | The system, on the first download | The member | Once per transfer |
 | Files-arrived and blocked-file notices (FR-12) | The system, on scan results | The member; for blocked files also the uploader | Coalesced: at most one per upload request every 10 minutes |
 | Held-transfer and lockout notices (NFR-14) | The system | The member; for a lockout also the tenant admins | Once per hold or lockout |
+| DLP notices to the sender: confirmation needed, approval decided or expired (FR-42, FR-43) | The system, on a DLP decision or an approval event | The transfer's sender | Once per event; a transfer has at most 3 approval requests |
+| DLP approval requests (FR-43) | A member requesting approval (`confirmTransfer`) | The tenant's eligible approvers | 3 requests per transfer; one email per request per approver, coalesced into one digest an hour past 20 an hour |
+| DLP policy changes and approver changes (FR-54) | A tenant admin | Every tenant admin | Coalesced: at most one email per tenant every 10 minutes, listing every change |
 | Any email to an address the tenant had suppressed | A tenant admin clearing the suppression (`clearEmailSuppression`, 7.4) | That address, by the next email a member sends it | Tenant admins only, audited; the address's own later bounce or complaint suppresses it again |
 
 No unauthenticated person can make the service email an address of their choosing. The only public trigger, a code
@@ -767,6 +809,9 @@ The caps are in section 2.2, groups A and G. Three design points:
 - **Codes:** the daily cap a leaked link can use up is per link (20), so it can't deny the address a code from every
   tenant for a day; the cross-tenant caps (5 an hour, 50 a day) stay against email bombing (9.1).
 - **Notices are coalesced** in the notification worker: one email lists what changed since the last one.
+- **DLP emails go only to the tenant's own people,** never to a recipient or an uploader, and hold no file names,
+  messages, findings or approve links (architecture 4.6). A blocked received file reaches the uploader only as the
+  FR-12 notice, which says the company's policy blocked it and nothing more.
 
 ### 7.3 SES reputation
 
@@ -844,6 +889,7 @@ The caps are in section 2.2, groups A and G. Three design points:
 | Sign-in and authentication | Cognito sign-in and risk metrics; `signin_attempts_denied_total` from the trigger; `auth_failures_total{scheme}` | Cognito, trigger, API |
 | Downloads | `download_grants_total{result}`, `download_streams_active`, `download_bytes_total`, `download_streams_ended_total{reason}` (complete, client, revoked, shutdown, budget, takeover) | API |
 | Uploads, quotas and scans | `upload_declared_bytes_total`, `tenant_quota_used_ratio`, `scan_results_total{state,reason}`, `scan_deferrals_total` | API, lifecycle job, scan worker |
+| DLP | `dlp_inspection_seconds`, `dlp_inspection_results_total{state,reason}`, `dlp_inspector_failures_total{kind}`, `dlp_decisions_total{outcome,mode}`, `dlp_approval_requests_pending`, `dlp_oldest_pending_approval_seconds`; detector IDs and counts, never values (NFR-26) | Scan worker, API, lifecycle job |
 | Email | `emails_sent_total{type}`, `email_caps_hit_total{cap}`, SES reputation metrics, sends, bounces and complaints per SES tenant, SES tenant status events | Notification worker, SES |
 | Queues | Age per queue, dead-letter queue depth, the number of noisy message groups | SQS |
 
@@ -871,6 +917,9 @@ names; the NFR-17 test fails until each exists.
 | `DownloadCapacity` | Active streams above 70 % of the pods' total cap for 10 minutes, or any stream refused with `503` | Ticket | `download-capacity` |
 | `TenantQuota` | A tenant at 80 % of its storage quota, its daily upload volume or its daily granted download bytes | Ticket | `tenant-quota` |
 | `ScanEvasion` | A tenant's unscannable rate above 5 % of its files in an hour, or more than 20 limits-exceeded results in an hour | Ticket | `scan-evasion` |
+| `DlpInspectorFailing` | Inspector failures above 1 % of inspections for 10 minutes, any file ending `failed`, or NFR-23's p95 missed for 30 minutes | Page | `dlp-inspector` |
+| `DlpEvasion` | A tenant's files not fully inspected for `encrypted` or `limit_exceeded` above 5 % in an hour, or one sender with more than 20 warnings confirmed in a day | Ticket | `dlp-evasion` |
+| `DlpApprovalBacklog` | A pending approval request older than half the tenant's approval timeout, or a tenant whose rules need approval with no eligible approver | Ticket | `dlp-approvals` |
 
 The `account-compromise` runbook (AB-7) has no alert of its own; other alerts and admin reports lead to it.
 
@@ -899,7 +948,9 @@ verification funnel, streams and email reputation.
 | Many people behind one address (corporate NAT, cloud proxies, mobile carrier NAT) share per-IP limits | IP is the only key before verification | Per-IP limits apply only to public steps and floods and are sized for a 1,000-member tenant behind one address (3.2); tuned from metrics |
 | WAF rules act late and approximately, and the link-page challenge doesn't touch scripts that call the API directly | AWS documents up to several minutes, usually under 30 s; challenges work only on page navigations, and the link pages load no WAF script | The application enforces every NFR-14 limit exactly; Bot Control is a later lever |
 | During a counter store outage, recipients can't verify and members can't sign in, while other calls run at up to (pods ÷ 3) × each limit | Fail closed where the limits are the main defence; fail open elsewhere to keep the service up | Multi-AZ cache, a paging alert, a runbook |
-| Phishing documents and links inside clean files pass the scan | Content inspection beyond malware is a non-goal | Only invited, verified recipients see them; complaint signals and SES tenant pauses |
+| Phishing documents and links inside clean files pass the scan | DLP inspection (FR-36) looks for sensitive data, not phishing | Only invited, verified recipients see them; complaint signals and SES tenant pauses |
+| A sender gets data past DLP by encryption the policy allows, by splitting it over days, or as images | No content inspection stops a determined insider; v1 has no OCR | Reasons for every file not fully inspected, counts across files and 24 hours, `DlpEvasion`; threat model R-16, R-17 |
+| A sender and an approver together release a transfer | Approval is a second person's decision, not a guarantee | Two-approver rules, reports by approver, the audit trail; threat model R-18 |
 | A malicious tenant sends up to its caps before it is stopped | A pause needs at least 1,000 emails to judge | Caps, SES tenant pause, `TenantSendingSpike`, suspension |
 | A long `queued` status can hint that an address receives many emails from other tenants | The cross-tenant cap delays rather than refuses | The status never says why or from whom |
 | One counted download can deliver up to 3 copies of the file | The byte budget allows restarts | Accepted; tenants are told |
@@ -930,6 +981,7 @@ verification funnel, streams and email reputation.
 | Part URLs and completion checks | A different `Content-Length`, an expired URL, or a `GET` with a part URL: rejected by S3. Completing after a revocation returns `409` and calls no `CompleteMultipartUpload`; a size mismatch marks the file `rejected` and leaves the object to the deletion job; the API role's `DeleteObject` is denied. | CI with a mocked S3; dev, once the AWS profile exists |
 | Scan results and zip bombs | A corpus: a test signature in a nested archive is `infected`; an encrypted archive and a zip bomb are `unscannable`, never `clean`; a forced timeout ends `scan_failed`; a 3 GB file goes to GuardDuty, never ClamAV | Scan worker CI with the engine container; GuardDuty in dev |
 | Email caps and coalescing | The 21st link to one address in a day from one tenant gets `429`; the cross-tenant cap delays and doesn't refuse, and the recipient shows `queued`; 50 uploads give one files-arrived email | CI |
+| DLP limits and approval caps | Each limit of 6.5 with its fixture: the file ends `partial` with `limit_exceeded`, and the inspector pod survives; a pattern that takes 51 ms on the test text is refused; a fourth approval request gets `409 approval_limit_reached`; the 121st decision in an hour, the 601st detail read and the 101st policy change in a day get `429`; `rejectTransfer` still works for a tenant at its request budget | CI |
 | Alerts have runbooks (NFR-17) | The test that fails if an alert has no runbook | CI |
 
 ## 10. Changes asked of other documents: status
@@ -963,6 +1015,10 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
   grant intent and committed records and the 60-second stop (5.3, 5.4); three-phase completion and rejected-file
   deletion (6.3); clamd in its own pods, the 2,000,000,000-byte boundary and the large-file cap (6.4); per-tenant
   suppression with `clearEmailSuppression` (7.1, 7.4).
+
+- **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** AB-12, group K, the inspection
+  limits (6.5), the DLP emails (7.1, 7.2), signals and alerts (8.1, 8.2), and `rejectTransfer` among the safety
+  actions. The API README lists group K.
 
 **Open points for the maintainer:**
 

@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Requirements | [PRD](../prd.md), especially FR-1 to FR-35, NFR-8, NFR-9, NFR-12, NFR-14, NFR-15 |
+| Requirements | [PRD](../prd.md), especially FR-1 to FR-56, NFR-8, NFR-9, NFR-12, NFR-14, NFR-15, NFR-26 |
 | Architecture | [architecture.md](../architecture.md) |
 | Security design | [Authentication and authorization](../security/authn-authz.md), [encryption and keys](../security/encryption-and-keys.md), [abuse and rate limits](../security/abuse-and-rate-limits.md), [threat model](../threat-model.md) |
-| Decisions | [ADR-0003](../adr/0003-multi-tenancy-shared-schema.md) (tenancy model) |
-| Tracking | [#13](https://github.com/codewithmuh/secure-file-transfer/issues/13), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41) |
+| Decisions | [ADR-0003](../adr/0003-multi-tenancy-shared-schema.md) (tenancy model), [ADR-0022](../adr/0022-dlp-inspection-engine.md) (DLP inspection) |
+| Tracking | [#13](https://github.com/codewithmuh/secure-file-transfer/issues/13), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) and with the phase 4 reviews in [#41](https://github.com/codewithmuh/secure-file-transfer/issues/41); data loss prevention in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64) |
 
 PostgreSQL is the single system of record (architecture section 2). This page defines its tables, the states rows move
 through, how tenants are kept apart, and how the PRD's data lifecycle maps onto columns and jobs. Column lists show the
@@ -35,7 +35,10 @@ columns that carry meaning; every table also has `created_at`, and mutable table
   itself.
 - **File names and messages are stored only encrypted**, in `files.display_name_ct`, `transfers.message_ct` and
   `upload_requests.message_ct`, under the tenant's data key (2.1). They never appear in object keys, logs or queue
-  messages, and SQL can't search or sort them.
+  messages, and SQL can't search or sort them. DLP justifications and approvers' comments are free text too, and are
+  stored the same way; DLP keyword lists, patterns and finding details use the tenant's DLP data key (2.7).
+- **No column ever holds a value a DLP detector matched** (FR-53, NFR-26): findings keep detectors, counts, location
+  hints and masked previews only.
 
 ## 2. Entities
 
@@ -67,6 +70,21 @@ erDiagram
     MEMBER_SESSION ||--o{ DOWNLOAD_GRANT : creates
     TENANT ||--o{ EMAIL_SUPPRESSION : "suppresses for"
     TENANT ||--o{ AUDIT_EVENT : "is scoped to"
+    TENANT ||--|| DLP_POLICY : "is guarded by"
+    TENANT ||--o{ TENANT_DLP_KEY : "encrypts DLP data with"
+    DLP_POLICY ||--o{ DLP_RULE : "is made of"
+    DLP_POLICY ||--o{ DLP_DETECTOR : "adds"
+    FILE ||--o{ DLP_FINDING : has
+    TRANSFER ||--o{ DLP_FINDING : "has, for its message"
+    TRANSFER ||--o{ DLP_DECISION : "is decided by"
+    FILE ||--o{ DLP_DECISION : "is decided by, when received"
+    DLP_DECISION ||--o{ DLP_DECISION_RULE : matched
+    DLP_RULE ||--o{ DLP_DECISION_RULE : "is matched in"
+    TRANSFER ||--o{ DLP_CONFIRMATION : "is confirmed by"
+    TRANSFER ||--o{ DLP_APPROVAL_REQUEST : "waits on"
+    DLP_APPROVAL_REQUEST ||--o{ DLP_APPROVAL_DECISION : "is decided by"
+    USER ||--o{ DLP_APPROVAL_DECISION : makes
+    TENANT ||--o{ DLP_KNOWN_DOMAIN : "has sent to"
 ```
 
 Every arrow is a composite foreign key that includes `tenant_id` (section 4.2), with these exceptions:
@@ -87,7 +105,7 @@ aren't drawn.
 |---|---|---|
 | `tenants` | `id`, `name`, `status` (active, suspended), `recovery_contact`, `sso_required`, `sso_mfa_confirmed_by`, `sso_mfa_confirmed_at` | Created by a platform operator (FR-34), with a second contact besides the first admin, through which operator-assisted recovery confirms a request (`recoverTenantAdmin`, authentication and authorization 2.5). A tenant that uses SSO has an `idp_connections` row and its proven domains in `sso_domains` (FR-26). `sso_required` lets its members sign in only through the identity provider, except its fallback admins. `sso_mfa_confirmed_by` and `sso_mfa_confirmed_at` record the tenant admin's confirmation that their identity provider enforces MFA, which is also audited. Suspending a tenant ends every session of the tenant (2.4). |
 | `tenant_policies` | `tenant_id` (PK), `max_expiry`, `unscannable_policy` (block, allow_with_warning), `received_file_retention_days` (1–90, default 30), `allowed_domains`, `blocked_domains`, `default_locale` (en, ja) | One row per tenant (FR-23, FR-24, FR-33). |
-| `users` | `id`, `tenant_id`, `email`, `email_normalized`, `role` (admin, member), `status` (invited, active, deactivated), `sso_fallback`, `invitation_token_hash`, `invitation_expires_at` | Unique on `(tenant_id, email_normalized)` (FR-22, FR-25). `invitation_token_hash` (unique) is the SHA-256 of the one-time invitation link that binds an SSO identity to this user: 256 random bits, valid 7 days, replaced by a new invitation and cleared when it is used (authentication and authorization 2.5). `sso_fallback` marks the at most two admins of an SSO tenant who keep a local sign-in. |
+| `users` | `id`, `tenant_id`, `email`, `email_normalized`, `role` (admin, member), `status` (invited, active, deactivated), `sso_fallback`, `dlp_approver`, `invitation_token_hash`, `invitation_expires_at` | Unique on `(tenant_id, email_normalized)` (FR-22, FR-25). `dlp_approver` marks a member or admin a tenant admin named as a DLP approver (FR-43, 2.7). `invitation_token_hash` (unique) is the SHA-256 of the one-time invitation link that binds an SSO identity to this user: 256 random bits, valid 7 days, replaced by a new invitation and cleared when it is used (authentication and authorization 2.5). `sso_fallback` marks the at most two admins of an SSO tenant who keep a local sign-in. |
 | `idp_connections` | `id`, `tenant_id` (empty for the platform's own pools), `kind` (local, oidc, saml), `provider_name`, `issuer`, `status` (active, inactive) | One row for each of the platform's own user pools for local members (FR-25): Tokyo, and the Osaka standby in staging and prod (authentication and authorization 2.3). One row for each tenant's SSO provider (FR-26), written by the operator API (`configureTenantSso`). The provider exists in both pools under the same name, so one row and one identity serve either pool. `provider_name` is unique: the pool's ID, or the name the operator CLI gives a tenant's provider. `issuer` is recorded for checks and display, but it is not unique and never used to find a connection, because issuer strings repeat across tenants (a copied SAML entity ID, a shared multi-tenant issuer). |
 | `sso_domains` | `domain` (PK, lowercase), `tenant_id`, `idp_connection_id`, `verified_at` | Email domains a tenant has proven with a DNS TXT record (authentication and authorization 2.5). The primary key means a domain belongs to one tenant at most. "Continue with SSO" finds the tenant's connection through it. |
 | `user_identities` | `id`, `tenant_id`, `user_id`, `idp_connection_id`, `subject`, `expires_at` | Unique on `(idp_connection_id, subject)`: a subject is only unique within the connection it came through. Sign-in finds the connection from how the sign-in arrived (the pool that issued the token, and for SSO the provider it names), then the identity. Through a tenant's connection it accepts only an identity whose user is in that tenant, so one tenant's identity provider can never sign anyone in to another tenant (FR-26, NFR-12). Rows are written in two places only: by the notification worker, from the `sub` Cognito returns when it creates a local member, and by the invitation flow, which binds an SSO subject to the invited user (authentication and authorization 2.4). An email claim never finds or binds a user. A member can hold one local identity per pool, so one in Tokyo and one in Osaka after a failover. A sign-in reset deletes the member's local identities in the API transaction. `expires_at` is set only on the temporary local sign-in that operator-assisted recovery gives an SSO tenant's admin, for 72 hours. |
@@ -112,7 +130,7 @@ version, the key version, the nonce, and the ciphertext with its tag; the additi
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `transfers` | `id`, `tenant_id`, `created_by`, `state`, `message_ct`, `data_key_version`, `expires_in` (an interval, 1 hour to 30 days), `expires_at` (empty while a draft), `download_limit` (null for no limit, or 1–100), `notify_on_first_download`, `last_activity_at`, `submitted_at`, `sent_at`, `ended_at`, `revoked_by`, `purge_after` | States in section 3.2. `expires_at` is the authority for expiry; the API compares it with the current time on every call (architecture 4.2). `ended_at` is set when the transfer is revoked, expires or is cancelled. `message_ct` is the encrypted message (2.1). |
+| `transfers` | `id`, `tenant_id`, `created_by`, `state`, `hold_reason` (file_blocked, dlp_blocked, approval_rejected; set only while `held`), `dlp_decision_id`, `message_ct`, `data_key_version`, `expires_in` (an interval, 1 hour to 30 days), `expires_at` (empty while a draft), `download_limit` (null for no limit, or 1–100), `notify_on_first_download`, `last_activity_at`, `submitted_at`, `sent_at`, `ended_at`, `revoked_by`, `purge_after` | States in section 3.2. `dlp_decision_id` is the transfer's current DLP decision (2.7). `expires_at` is the authority for expiry; the API compares it with the current time on every call (architecture 4.2). `ended_at` is set when the transfer is revoked, expires or is cancelled. `message_ct` is the encrypted message (2.1). |
 | `transfer_recipients` | `id`, `tenant_id`, `transfer_id`, `email`, `email_normalized`, `locale`, `link_token_hash`, `link_key_id`, `link_issued_at`, `delivery_state`, `notified_at`, `first_verified_at`, `last_verified_at`, `failed_attempts`, `locked_at`, `unlocked_by` | One row per recipient per transfer. Unique on `(tenant_id, transfer_id, email_normalized)`, so a request that lists the same address twice is rejected. `link_token_hash` is unique. `delivery_state` and `notified_at` follow the link email (below); `first_verified_at` and `last_verified_at` are set when a link session is created (2.4). Together they are the recipient's status (FR-7). |
 | `upload_requests` | `id`, `tenant_id`, `created_by`, `state`, `uploader_email`, `email_normalized`, `locale`, `message_ct`, `data_key_version`, `expires_at`, `link_token_hash`, `link_key_id`, `link_issued_at`, `delivery_state`, `notified_at`, `failed_attempts`, `locked_at`, `unlocked_by`, `ended_at`, `revoked_by`, `purge_after` | One uploader per request (FR-10). States in section 3.3. |
 
@@ -167,7 +185,7 @@ same for its uploader, and an unlock does it for the subject it unlocks (2.4). `
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `completion_started_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1. |
+| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `completion_started_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `inspection_state`, `inspection_reasons`, `inspection_engine_version`, `inspection_policy_version`, `dlp_blocked`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1; the inspection columns in 3.5. `dlp_blocked` is set only on a received file a DLP rule blocked (FR-51). |
 | `download_counters` | `tenant_id`, `recipient_id`, `file_id`, `download_limit`, `count`, `first_downloaded_at`, `last_downloaded_at` | Primary key `(recipient_id, file_id)`. All rows for a transfer are created in the transaction that moves it to `sent`, with the transfer's limit copied in, so a row always exists before the first download. The two times are the recipient's download status (FR-7). |
 | `download_grants` | `id`, `tenant_id`, `file_id`, `s3_version_id`, `recipient_id` and `link_session_id`, or `user_id` and `member_session_id`, `byte_budget`, `bytes_served`, `request_count`, `expires_at`, `active_stream_id`, `active_stream_until`, `archived_at` | One counted download of one file by one session (abuse and rate limits 5.4). A check constraint requires exactly one of the two pairs, each through composite foreign keys; the keys to the session cascade on delete. `id` is the API's `grant_id`. |
 
@@ -364,6 +382,43 @@ Two tables have no tenant and no row-level security. Only `sft_operator`, the op
 | `operator_sessions` | `id`, `token_hash`, `signature_hash`, `aws_account_id`, `operator_name`, `expires_at` (15 min), `revoked_at` | Created by `createOperatorToken` from a signed STS `GetCallerIdentity` request (authentication and authorization 8.2). `token_hash` and `signature_hash` are both unique: the SHA-256 of the operator token, and of the request's signature, so a signature seen before is refused. `operator_name` is the operator's Identity Center user name (the role session name), recorded on every operator audit event. |
 | `break_glass_grants` | `id`, `requester`, `approver`, `incident_id`, `reason`, `tenant_ids`, `starts_at`, `ends_at`, `assignment_request_id`, `recorded_by` (tool, reconciliation), `review_due_at`, `review_url` | The service's copy of a break-glass grant (FR-35, authentication and authorization 8.3). The authoritative record is the Identity Center assignment plus CloudTrail. `recordBreakGlassGrant` writes this row as best effort, with a security-critical platform audit event and one in each listed tenant's audit log. Every 15 minutes a job in `sft-operator` matches CloudTrail's assignments by `assignment_request_id` (unique) and writes any missing row with `recorded_by = reconciliation`. `tenant_ids` is an array, not a foreign key, because platform rows don't refer to tenant rows. |
 
+### 2.7 Data loss prevention
+
+The tables behind FR-36 to FR-56 ([architecture](../architecture.md) 4.6, [detectors](dlp-detectors.md)). Every one
+has `tenant_id`, composite foreign keys and row-level security like every other tenant table (4.2).
+
+| Table | Key columns | Notes |
+|---|---|---|
+| `dlp_policies` | `tenant_id` (PK), `mode` (monitor, enforce), `version`, `trusted_domains`, `approval_timeout` (an interval, 1 hour to 7 days, default 72 hours), `updated_by`, `updated_at` | One row per tenant, written with the default policy when the tenant is created (detectors 6). `version` goes up by one in the transaction of every change to this row, a rule or a detector, so a decision names the exact policy it applied. `trusted_domains` holds up to 500 lowercase, IDNA-normalised domains (FR-45). |
+| `tenant_dlp_keys` | `tenant_id`, `key_version`, `wrapped_key`, `created_at`, `retired_at` | Primary key `(tenant_id, key_version)`. The tenant's DLP data key, like `tenant_data_keys` (2.1) but wrapped under the encryption context `purpose = dlp-dek` ([encryption and keys](../security/encryption-and-keys.md) 3.3), so the scan worker can unwrap it without being able to unwrap the field data key. The API or the scan worker, whichever needs it first, creates the first version; the primary key settles a race. |
+| `dlp_detectors` | `id`, `revision`, `tenant_id`, `name`, `kind` (keywords, pattern), `definition_ct`, `dlp_key_version`, `enabled`, `created_by`, `created_at`, `retired_at` | A tenant's own detectors (FR-38, FR-39), at most 50 live. Primary key `(id, revision)`. `definition_ct` is the keyword list, or the pattern with its context keywords and options, encrypted with the tenant's DLP data key. Built-in detectors have no rows: they ship with the inspection engine. |
+| `dlp_rules` | `id`, `revision`, `tenant_id`, `name`, `direction` (sent, received), `condition` (content, not_inspected, new_domain), `detectors`, `min_confidence` (low, medium, high), `threshold` (1–100,000), `reasons`, `include_sender_24h`, `recipient_scope` (any, untrusted), `action` (allow_and_record, warn, require_approval, block), `approvals_required` (1, 2), `enabled`, `created_by`, `created_at`, `retired_at` | At most 50 live per tenant (FR-40). Primary key `(id, revision)`. `detectors` lists built-in IDs (`jp_my_number`) and own detectors (`custom:` and the detector ID). Check constraints allow only allow_and_record and block, only the `content` and `not_inspected` conditions, and only `any` scope for `received`, and `approvals_required = 2` only with require_approval. |
+| `dlp_findings` | `id`, `tenant_id`, `file_id` or `transfer_id`, `detector`, `count_low`, `count_medium`, `count_high`, `detail_ct`, `dlp_key_version`, `created_at` | One row per file, or transfer message, and detector that matched. Exactly one of `file_id` (the file's content) and `transfer_id` (the transfer's message, FR-50) is set. The counts are distinct values at each confidence (detectors 3). `detail_ct` holds at most 10 location hints and 3 masked previews (FR-53), encrypted with the tenant's DLP data key, and is cleared when the file's contents are deleted (section 6). No column holds a matched value. |
+| `dlp_decisions` | `id`, `tenant_id`, `transfer_id` or `file_id`, `policy_version`, `mode`, `outcome` (none, allow_and_record, warn, require_approval, block), `enforced`, `untrusted_recipients`, `new_domains`, `decided_at` | One row per decision, never updated: a transfer's evaluation (3.2) or a received file's inspection (FR-51). `enforced` is false in monitor mode. The two counts say how many recipients were untrusted or at a new domain, never which. |
+| `dlp_decision_rules` | `decision_id`, `tenant_id`, `rule_id`, `rule_revision`, `action`, `matched_count` | The rules a decision matched, with the count that crossed each threshold. The foreign key to `dlp_rules (id, revision)` keeps a replaced revision as long as a decision refers to it. |
+| `dlp_confirmations` | `id`, `tenant_id`, `transfer_id`, `decision_id`, `confirmed_by`, `justification_ct`, `data_key_version`, `confirmed_at` | The sender's confirmation of a decision (FR-42), and the justification of an approval request (FR-43). `justification_ct` is free text, encrypted with the tenant's field data key (2.1). |
+| `dlp_approval_requests` | `id`, `tenant_id`, `transfer_id`, `decision_id`, `confirmation_id`, `requested_by`, `approvals_required`, `state` (pending, approved, rejected, expired, withdrawn), `expires_at`, `ended_at` | States in 3.6. At most 3 per transfer and at most one pending (a partial unique index). `expires_at` is the earlier of the request time plus the tenant's `approval_timeout` and the transfer's `expires_at`. |
+| `dlp_approval_decisions` | `id`, `tenant_id`, `approval_request_id`, `approver_id`, `decision` (approve, reject), `comment_ct`, `data_key_version`, `decided_at` | Unique on `(approval_request_id, approver_id)`, so one approver counts once. A rejection needs a comment. `comment_ct` uses the field data key. |
+| `dlp_known_domains` | `tenant_id`, `domain`, `first_sent_at`, `last_sent_at` | Primary key `(tenant_id, domain)`. Written in the transaction that moves a transfer to `sent`, for each recipient domain (FR-46). |
+
+- **Rules and detectors are never changed in place.** An update writes the next revision and sets `retired_at` on the
+  one it replaces; a deletion only sets `retired_at`. A decision therefore points at the revisions it applied, and a
+  report can show the rule as it was. Each change raises `dlp_policies.version`, writes its audit event and an outbox
+  notice to the tenant's admins (FR-54).
+- **Counting for a rule** (FR-48, FR-49). The evaluation adds up, over the transfer's counted files and its message,
+  the findings of the rule's detectors at or above its confidence: `count_medium + count_high` for `medium`, for
+  example. With `include_sender_24h` it adds the sender's transfers that moved to `sent` in the last 24 hours.
+- **The scan worker writes findings it can't read back.** `sft_scan` may insert `dlp_findings` but has no column grant
+  to select `detail_ct` (4.2). Only the API reads details, for the file's owner and its approvers (FR-53), and every
+  such read is audited.
+- **Eligible approvers** are active users of the tenant with `dlp_approver`, other than the transfer's `created_by`.
+  The service checks it under the transfer's row lock when an approver decides, and when a sender requests approval
+  (`409 no_eligible_approver` if nobody is left). A rule that needs approval can be created or enabled only while the
+  tenant has more active approvers than `approvals_required` (`422 approvers_insufficient`).
+- **Approvals aren't security-critical records** (2.5). They open access rather than close it, and an approval lost
+  with Tokyo leaves its transfer waiting, never sent without one. A rejection lost the same way leaves the transfer
+  waiting for a new decision.
+
 ## 3. State machines
 
 State values use underscores, so the PRD's `scan-failed` is `scan_failed` here.
@@ -390,10 +445,16 @@ stateDiagram-v2
     deleted --> [*]
 ```
 
-- A file is **shareable** when it is `clean`, or `unscannable` with `unscannable_allowed` set (FR-16, FR-18). Only
-  shareable files can be downloaded: a grant is created only for a shareable file, and each content request checks the
-  file again. `infected` files can never be downloaded by anyone (FR-17).
-- A file is **blocked** when it is `infected`, `scan_failed`, or `unscannable` without `unscannable_allowed`.
+- A file is **shareable** when it is `clean`, or `unscannable` with `unscannable_allowed` set (FR-16, FR-18), and its
+  `inspection_state` is `inspected`, `partial` or `not_inspected` (3.5); a received file must also not be
+  `dlp_blocked` (FR-51). Only shareable files can be downloaded: a grant is created only for a shareable file, and
+  each content request checks the file again. `infected` files can never be downloaded by anyone (FR-17).
+- A file is **blocked** when it is `infected`, `scan_failed`, or `unscannable` without `unscannable_allowed`; when its
+  inspection `failed`; or when it is a received file with `dlp_blocked`.
+- **The scan and the inspection are recorded together.** `scanning` covers both: the scan worker streams the file to
+  clamd and the DLP inspector in one pass and records the state, the inspection columns and the findings in one
+  transaction (ADR-0022). Files over 2 GB get their GuardDuty result and `inspection_state = not_inspected` with the
+  reason `too_large` together.
 - **The policy decision is recorded at scan time.** When the scan worker records `unscannable`, it sets
   `unscannable_allowed` from the tenant's `unscannable_policy` in the same transaction. A later policy change applies
   only to files scanned after it: it never makes a shared file blocked or a held file shareable, so it never needs to
@@ -421,11 +482,11 @@ stateDiagram-v2
   for a file of a transfer, runs the evaluation (3.2), all in one transaction, with no S3 call. The deletion job then
   aborts the multipart upload by `s3_upload_id` if it still exists and removes any object in both regions: only
   lifecycle jobs delete objects.
-- **A scan has a deadline.** When a file enters `scanning`, `scan_deadline` is set from its size: long enough for
-  every attempt's timeout and the backoff between them. If a worker dies without recording a result (for example out of
-  memory on a zip bomb, with the message dead-lettered), reconciliation moves the file to `scan_failed` once the
-  deadline passes, raises the operator alert (FR-19) and runs the evaluation. The scan worker records a result only
-  with `WHERE state = 'scanning'`, so a result that arrives later changes nothing.
+- **A scan has a deadline.** When a file enters `scanning`, `scan_deadline` is set from its size: long enough for every
+  attempt's timeout, the inspection's limits included, and the backoff between them. If a worker dies without recording
+  a result (for example out of memory on a zip bomb, with the message dead-lettered), reconciliation moves the file to
+  `scan_failed` once the deadline passes, raises the operator alert (FR-19) and runs the evaluation. The scan worker
+  records a result only with `WHERE state = 'scanning'`, so a result that arrives later changes nothing.
 - **Deletion waits for a scan to finish.** The deletion job skips files in `scanning`. If a deletion trigger passes
   while a file is being scanned, the scan worker records the result, and the next deletion run removes it. The deadline
   is longer than every attempt together, so no file stays in `scanning` for good, and none is deleted underneath a
@@ -438,17 +499,32 @@ stateDiagram-v2
     [*] --> draft
     draft --> submitted: member presses send
     draft --> cancelled: member cancels, or 7 days without activity
-    submitted --> sent: every counted file shareable
-    submitted --> held: a counted file is blocked
+    submitted --> sent: every counted file shareable, the DLP decision allows it
+    submitted --> awaiting_confirmation: every counted file shareable, a DLP rule warns or needs approval
+    submitted --> held: a counted file is blocked, or a DLP rule blocks
     submitted --> draft: no counted files remain
+    awaiting_confirmation --> sent: sender confirms a warning
+    awaiting_confirmation --> pending_approval: sender requests approval
+    awaiting_confirmation --> submitted: a file removed, evaluated again
+    awaiting_confirmation --> cancelled: member cancels
+    pending_approval --> sent: enough approvers approve
+    pending_approval --> held: an approver rejects
+    pending_approval --> awaiting_confirmation: the approval request expires
+    pending_approval --> submitted: a file removed, request withdrawn, evaluated again
+    pending_approval --> cancelled: member cancels, request withdrawn
     held --> submitted: blocked files removed, others still uploading or scanning
-    held --> sent: blocked files removed, the rest shareable
+    held --> sent: blocked files removed, the rest shareable, the DLP decision allows it
+    held --> awaiting_confirmation: blocked files removed, a DLP rule warns or needs approval
     held --> draft: blocked files removed, no counted files remain
     held --> cancelled: member cancels
     submitted --> revoked
+    awaiting_confirmation --> revoked
+    pending_approval --> revoked
     sent --> revoked
     held --> revoked
     submitted --> expired
+    awaiting_confirmation --> expired
+    pending_approval --> expired
     sent --> expired
     held --> expired
     revoked --> [*]
@@ -458,25 +534,46 @@ stateDiagram-v2
 
 **The evaluation.** The send call, every scan result (including a scan deadline passing, 3.1), every file removal and
 every file rejection lock the transfer row (`SELECT … FOR UPDATE`) and run the same evaluation (architecture 4.1). It
-counts the transfer's files that are not `rejected` and have no `removed_at`. The first row that matches decides:
+counts the transfer's files that are not `rejected` and have no `removed_at`. On an `awaiting_confirmation` or
+`pending_approval` transfer, a file removal first withdraws any pending approval request and sets the state back to
+`submitted`. Then the first row that matches decides:
 
 | Situation | Result |
 |---|---|
 | The transfer is neither `submitted` nor `held` | No change. |
 | `expires_at` has passed | Nothing is sent; the transfer is treated as expired. |
 | No counted file remains | `draft`, with an outbox notice to the member. `submitted_at` and `expires_at` are cleared and `last_activity_at` is moved to now, so the next send starts the expiry again from `expires_in` (2.2). |
-| Any counted file is blocked | `held`, with an outbox message to the member, unless it is held already. |
+| Any counted file is blocked | `held` with `hold_reason = file_blocked`, with an outbox message to the member, unless it is held already. |
 | Any counted file is still `uploading`, `completing` or `scanning` | `submitted`: no change for a submitted transfer, and a held one goes back. A later scan result or rejection runs the evaluation again. |
-| Every counted file is shareable | `sent`: download counters are created, the recipients' `delivery_state` becomes `queued`, and an outbox message notifies them. |
+| Every counted file is shareable | The DLP decision (architecture 4.6): a new `dlp_decisions` row with its matched rules, and its audit event. In monitor mode, or when no rule matched or every matched rule only allows and records, `sent` (below). A warning or a required approval gives `awaiting_confirmation`, with an outbox message to the member. A block gives `held` with `hold_reason = dlp_blocked`. |
+
+**Moving to `sent`**, from the evaluation, a confirmation or an approval: download counters are created, the
+recipients' `delivery_state` becomes `queued`, each recipient domain is recorded in `dlp_known_domains`, and an outbox
+message notifies the recipients.
 
 A transfer can only be submitted with at least one counted file (FR-1), and the send call sets `expires_at` (2.2).
 `expired` is recorded by the lifecycle job, but the API already treats the transfer as expired from `expires_at`
 onwards.
 
-**Removing a file.** A member can remove a file from a `draft`, `submitted` or `held` transfer (`deleteFile`), but not
-once it is `sent`. Removal sets `removed_at` and `delete_after` on the file. On a submitted or held transfer it runs
-the evaluation, so removing the blocked file of a held transfer lets the rest be sent (UC-1), and removing the last
-counted file returns the transfer to `draft`.
+**Confirmation and approval** (architecture 4.6), each under the transfer's row lock:
+
+- `confirmTransfer` needs `awaiting_confirmation`. For a warning it writes `dlp_confirmations` and moves the transfer
+  to `sent`. For a required approval it needs a justification, an eligible approver (2.7) and fewer than 3 earlier
+  requests; it writes the confirmation and a `pending` approval request, moves the transfer to `pending_approval`, and
+  writes an outbox message to the approvers.
+- `approveTransfer` needs `pending_approval` and a pending request, and an approver who is eligible and hasn't decided
+  it yet. When the request has its `approvals_required`, the request becomes `approved` and the transfer `sent`.
+- `rejectTransfer` makes the request `rejected` and the transfer `held` with `hold_reason = approval_rejected`.
+- The lifecycle job expires a request past its `expires_at`: the request becomes `expired`, and the transfer goes back
+  to `awaiting_confirmation` with a notice to the sender, unless it has expired itself.
+
+A decision isn't recomputed when the DLP policy changes. Like `unscannable_allowed` (3.1), it holds for the files it
+saw; only a change to the counted files makes a new one.
+
+**Removing a file.** A member can remove a file from a `draft`, `submitted`, `held`, `awaiting_confirmation` or
+`pending_approval` transfer (`deleteFile`), but not once it is `sent`. Removal sets `removed_at` and `delete_after` on
+the file. On any but a draft it runs the evaluation, so removing the blocked or flagged file of a held transfer lets
+the rest be sent (UC-1), and removing the last counted file returns the transfer to `draft`.
 
 ### 3.3 Upload request
 
@@ -506,6 +603,41 @@ stateDiagram-v2
 ```
 
 These states are derived from `link_issued_at`, `locked_at` and the active `link_sessions`, not stored as a column.
+
+### 3.5 File inspection
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> inspected: all content checked
+    pending --> partial: some content checked, reasons recorded
+    pending --> not_inspected: nothing could be checked, reasons recorded
+    pending --> failed: engine errors on every attempt, or the scan deadline passed
+    pending --> skipped: the file is infected or its scan failed
+```
+
+`inspection_state` is set once, in the transaction that records the scan result (3.1), and never changes. With it go
+`inspection_reasons` (encrypted, no_text, unsupported_type, too_large, limit_exceeded, parse_error),
+`inspection_engine_version` and `inspection_policy_version`, the version of the tenant's DLP policy whose detectors
+ran. A `failed` inspection blocks the file, as `scan_failed` does (FR-47). A `skipped` file keeps no findings. Files
+aren't inspected again when the engine or the policy changes (ADR-0022).
+
+### 3.6 DLP approval request
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: the sender requests approval
+    pending --> approved: enough approvers approve
+    pending --> rejected: an approver rejects
+    pending --> expired: the approval timeout or the transfer's expiry passes
+    pending --> withdrawn: a file is removed, or the transfer is cancelled or revoked
+    approved --> [*]
+    rejected --> [*]
+    expired --> [*]
+    withdrawn --> [*]
+```
+
+Every change of state sets `ended_at` and writes its audit event in the transaction that changes the transfer.
 
 ## 4. Multi-tenancy model
 
@@ -554,7 +686,8 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 2. **Composite foreign keys.** Every tenant-owned table has a unique key `(tenant_id, id)`, and children reference
    their parent by both columns, for example `files (tenant_id, transfer_id) → transfers (tenant_id, id)`. The database
    itself refuses a row that points at another tenant's parent. This includes `verification_codes`, `link_sessions`,
-   `member_sessions`, `download_grants` and the ciphertext columns' `data_key_version` (sections 2.1 to 2.4).
+   `member_sessions`, `download_grants`, the ciphertext columns' `data_key_version` (sections 2.1 to 2.4), and every
+   DLP table with its `dlp_key_version` (2.7).
 3. **Row-level security as a second layer**, decided in the
    [authentication and authorization design](../security/authn-authz.md), sections 7.2 to 7.5:
    - **Enabled, not forced.** Every tenant-owned table has row-level security enabled, in every environment, dev and
@@ -579,6 +712,12 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
      `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events only), `sft_recovery` and
      `sft_migrate`; plus two roles nobody logs in as, `sft_owner`, which owns the tables, and `sft_lookup`, which owns
      the lookup functions. The authentication and authorization design (7.3) lists each role's scopes and policies.
+   - **DLP grants.** `sft_scan` reads the tenant's DLP policy, live rules and detectors, its wrapped DLP data keys,
+     recipient domains and `dlp_known_domains`; it inserts findings, decisions and their rules, and updates `files`
+     and `transfers` for the evaluation. It has no column grant to select `dlp_findings.detail_ct`, the field
+     ciphertext columns or `dlp_confirmations.justification_ct`. `sft_jobs` may clear `detail_ct` and expire approval
+     requests. `sft_operator` writes the default policy at tenant creation and has no grant on any DLP ciphertext
+     column. `sft_recovery` gets nothing new: no DLP change is a security-critical record (2.7).
    - **`sft_recovery`** (IAM role `sft-{env}-recovery`) is used only by the restore and failover jobs that the runbooks
      start (architecture 7), never by a running service. Its `recovery_reapply` policies apply only in recovery scope
      (`app_scope() = 'recovery'`) and let it read and update, across tenants, exactly the rows a security-critical
@@ -627,10 +766,10 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 | Latest code for a subject | `verification_codes (recipient_id, created_at DESC)`, `verification_codes (upload_request_id, created_at DESC)` |
 | Download counters of a file (purge) | `download_counters (file_id)` |
 | Grants of a file, recipient or session (foreign key checks) | `download_grants (file_id)`, `download_grants (recipient_id)`, `download_grants (link_session_id)`, `download_grants (member_session_id)` |
-| Rows that use a data key version | `files (tenant_id, data_key_version)`, `transfers (tenant_id, data_key_version)`, `upload_requests (tenant_id, data_key_version)` |
+| Rows that use a data key version | `files (tenant_id, data_key_version)`, `transfers (tenant_id, data_key_version)`, `upload_requests (tenant_id, data_key_version)`, `dlp_confirmations (tenant_id, data_key_version)`, `dlp_approval_decisions (tenant_id, data_key_version)`; for DLP data keys `dlp_findings (tenant_id, dlp_key_version)`, `dlp_detectors (tenant_id, dlp_key_version)` |
 | Suppression lookup | unique `email_suppressions (tenant_id, email_hmac)` |
 | Break-glass reconciliation | unique `break_glass_grants (assignment_request_id)` |
-| Expiry job | partial `transfers (expires_at) WHERE state IN ('submitted', 'sent', 'held')`, same for `upload_requests` |
+| Expiry job | partial `transfers (expires_at) WHERE state IN ('submitted', 'awaiting_confirmation', 'pending_approval', 'sent', 'held')`, same for `upload_requests` |
 | Abandoned drafts | partial `transfers (last_activity_at) WHERE state = 'draft'` |
 | Abandoned uploads | partial `files (last_part_at) WHERE state = 'uploading'` |
 | Stuck completions | partial `files (completion_started_at) WHERE state = 'completing'` |
@@ -644,6 +783,15 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 | Audit archive | per partition: `(tx_id, id)` |
 | Unpublished outbox rows | partial `outbox (created_at) WHERE published_at IS NULL` |
 | Users by email | unique `users (tenant_id, email_normalized)` |
+| Live DLP rules and detectors of a tenant | partial `dlp_rules (tenant_id) WHERE retired_at IS NULL`, partial `dlp_detectors (tenant_id) WHERE retired_at IS NULL` |
+| Findings of a file or a message, and the sum for a rule | `dlp_findings (tenant_id, file_id, detector)`, `dlp_findings (tenant_id, transfer_id, detector)` |
+| A sender's transfers of the last 24 hours (FR-49) | partial `transfers (tenant_id, created_by, sent_at) WHERE sent_at IS NOT NULL` |
+| Decisions of a transfer or file, and reports by time | `dlp_decisions (tenant_id, transfer_id)`, `dlp_decisions (tenant_id, file_id)`, `dlp_decisions (tenant_id, decided_at DESC)` |
+| Rules a decision matched; revisions still referred to | `dlp_decision_rules (decision_id)`, `dlp_decision_rules (rule_id, rule_revision)` |
+| The approval queue, one pending request per transfer, the expiry job | partial `dlp_approval_requests (tenant_id, created_at) WHERE state = 'pending'`; partial unique `dlp_approval_requests (transfer_id) WHERE state = 'pending'`; partial `dlp_approval_requests (expires_at) WHERE state = 'pending'` |
+| Approval decisions, by request and by approver | unique `dlp_approval_decisions (approval_request_id, approver_id)`; `dlp_approval_decisions (tenant_id, approver_id, decided_at)` |
+| Eligible approvers | partial `users (tenant_id) WHERE dlp_approver AND status = 'active'` |
+| Known recipient domains to expire | `dlp_known_domains (last_sent_at)` |
 
 Every foreign key column that a parent's delete has to check is covered by an index in this table.
 
@@ -675,6 +823,12 @@ How the PRD's data lifecycle table and the architecture's operational retention 
 | Outbox rows | `published_at + 7 days` | Daily job |
 | Processed messages | `processed_at + 14 days` | Daily job |
 | Idempotency keys | `expires_at` (24 hours) | Daily job |
+| DLP findings, decisions, confirmations, approval requests and approval decisions | Their transfer's or upload request's `purge_after` | Purge job, with the rest of the parent's child rows |
+| DLP finding details (`detail_ct`) | The file's `deleted_at` | Deletion job, in the transaction that marks the file deleted |
+| DLP approval requests past their expiry | `dlp_approval_requests.expires_at` while `pending` | Lifecycle job: the request expires and the transfer goes back to its sender (3.2) |
+| Replaced DLP rule and detector revisions | `retired_at` set, and no decision (rules) or live rule or finding (detectors) refers to the revision | Daily job |
+| Known recipient domains | `last_sent_at + 365 days` | Daily job |
+| Retired DLP data key versions | No row's `dlp_key_version` uses the version any more | Purge job; the foreign key refuses the delete while a row still uses it |
 
 **Why `purge_after` is computed, not tracked.** After a transfer ends, no download or verification can happen, and its
 files are deleted within 7 days, so its last audit event is at most 7 days after `ended_at`. An upload request's last
@@ -753,11 +907,15 @@ turns these into database sizing.
 | `email_suppressions` | under 300 | under 150,000 after a year, ended entries kept as markers included | Assumes at most 1 % of about 30,000 link emails a day bounce or complain |
 | `tenant_data_keys` | — | about 1,500 | 500 tenants, up to 3 versions while rows under old versions are purged |
 | `operator_sessions`, `break_glass_grants` | a few | hundreds | Negligible |
-| `audit_events` | about 300,000 | about 110 million | About 25 events per transfer, plus sign-ins |
+| `audit_events` | about 316,000 | about 115 million | About 25 events per transfer, plus sign-ins; DLP adds about 16,000 a day, mostly decisions (the inspection result rides on the scan result's event) |
 | `outbox` | about 100,000 | about 0.7 million | Kept 7 days |
+| `dlp_findings` | about 15,000 | about 5.6 million | A quarter of files match one or two detectors (capacity A46); `detail_ct` only until the file is deleted |
+| `dlp_decisions`, `dlp_decision_rules` | about 14,000 and 4,000 | about 5.2 and 1.5 million | One per transfer that reaches a decision and per received file |
+| `dlp_confirmations`, `dlp_approval_requests`, `dlp_approval_decisions` | about 480, 80 and 100 | under 0.2 million together | 5 % of transfers warned, 1 % needing approval (capacity A46) |
+| `dlp_policies`, `dlp_rules`, `dlp_detectors`, `tenant_dlp_keys`, `dlp_known_domains` | a few | tens of thousands | 500 tenants |
 
-That comes to roughly 100–150 GB including indexes at steady state, most of it audit events. The tables phase 3 added
-take well under 1 GB together.
+That comes to roughly 110–165 GB including indexes at steady state, most of it audit events. The tables phase 3 added
+take well under 1 GB together; the DLP tables about 4 GB, and their audit events about 6 GB.
 
 ## 9. Requirements coverage
 
@@ -776,6 +934,8 @@ take well under 1 GB together.
 | FR-35 (break-glass access) | `break_glass_grants`, `operator_sessions`, `audit_events` |
 | NFR-12 (tenant isolation) | `tenant_id` and composite foreign keys everywhere, row-level security (4.2), `tenant_data_keys` and the ciphertext columns |
 | NFR-14 (abuse resistance) | `verification_codes`, the lockout columns, `download_grants` budgets, `tenant_usage`, `email_suppressions` |
+| FR-36 to FR-56 (DLP) | `files` inspection columns and `dlp_blocked`, `transfers.hold_reason` and `dlp_decision_id`, `users.dlp_approver`, and the tables of 2.7 |
+| NFR-26 (findings privacy) | `dlp_findings` (counts and encrypted details, no values), `tenant_dlp_keys` |
 
 ## 10. Not in v1, and open items
 

@@ -139,13 +139,13 @@ Every error is an RFC 9457 problem (`application/problem+json`) with these field
 |---|---|
 | 400 | `malformed_request`, `invalid_cursor` |
 | 401 | `authentication_required`, `session_expired`, `credentials_invalid`, `reauthentication_required` |
-| 403 | `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted` |
+| 403 | `permission_denied`, `passkey_required`, `csrf_failed`, `recipient_locked`, `download_limit_reached`, `download_grant_exhausted`, `self_approval_forbidden` |
 | 404 | `not_found`, `link_not_found` |
-| 409 | `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`, `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`, `file_not_shareable`, `user_exists`, `last_admin` |
+| 409 | `idempotency_conflict`, `idempotency_in_progress`, `invalid_state`, `transfer_revoked`, `transfer_expired`, `upload_request_revoked`, `upload_request_expired`, `transfer_empty`, `upload_incomplete`, `file_not_shareable`, `user_exists`, `last_admin`, `dlp_decision_changed`, `dlp_policy_conflict`, `detector_in_use`, `no_eligible_approver`, `approval_limit_reached` |
 | 410 | `link_revoked`, `link_expired` |
 | 413 | `file_too_large`, `total_too_large`, `storage_quota_exceeded`, `request_too_large` |
 | 416 | `range_not_satisfiable` |
-| 422 | `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`, `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large` |
+| 422 | `validation_failed`, `expiry_out_of_range`, `recipient_domain_not_allowed`, `recipient_undeliverable`, `too_many_files`, `upload_size_mismatch`, `code_invalid`, `code_expired`, `code_attempts_exhausted`, `export_too_large`, `justification_required`, `approvers_insufficient` |
 | 429 | `rate_limited` |
 | 503 | `service_unavailable`: a call couldn't reach the audit archive, the rate-limit counters or the sign-in state store, or an API pod is full of download streams. A download grant, a verification or a sign-in changed nothing; a security-critical change took effect and a retry completes its record (section 5). |
 
@@ -167,13 +167,13 @@ returned whole. Audit search takes `cursor` and `limit` in its request body (sec
 ## 5. Idempotency
 
 Every `POST` that creates something accepts an `Idempotency-Key` header (architecture 5.4): `createTransfer`,
-`addTransferFile`, `createUploadRequest`, `addSessionUploadFile`, `inviteUser`, `createTenant` and
-`recoverTenantAdmin`; so does `extendTransferExpiry`. The key is scoped to the caller and kept for 24 hours with a
-fingerprint of the **method, the path with its resource IDs filled in, and the body**. The service keeps the response
-status and the ID of what was created, never the response body. A retry with the same key, method, path and body gets
-the same status, with the response rebuilt from the resource as it is now. The same key with any of them different
-gets `409 idempotency_conflict`, so a key reused with the same body on another transfer is refused, not answered with
-the first transfer.
+`addTransferFile`, `createUploadRequest`, `addSessionUploadFile`, `inviteUser`, `createDlpRule`, `createDlpDetector`,
+`createTenant` and `recoverTenantAdmin`; so does `extendTransferExpiry`. The key is scoped to the caller and kept for 24
+hours with a fingerprint of the **method, the path with its resource IDs filled in, and the body**. The service keeps
+the response status and the ID of what was created, never the response body. A retry with the same key, method, path and
+body gets the same status, with the response rebuilt from the resource as it is now. The same key with any of them
+different gets `409 idempotency_conflict`, so a key reused with the same body on another transfer is refused, not
+answered with the first transfer.
 
 These take no `Idempotency-Key`:
 
@@ -185,8 +185,10 @@ These take no `Idempotency-Key`:
 
 State changes are safe to retry by design: `sendTransfer`, `cancelTransfer`, `revokeTransfer`, `revokeUploadRequest`,
 `extendTransferExpiry` (to the same time), `completeUpload`, `unlockRecipient`, `unlockUploader`, `deactivateUser`,
-`signOutUser`, `revokeApiKey`, `configureTenantSso` (the same configuration) and `recordBreakGlassGrant` (the same
-`assignment_request_id`) return success with the current state when the change has already happened.
+`signOutUser`, `revokeApiKey`, `confirmTransfer` (the same decision), `approveTransfer`, `rejectTransfer`,
+`configureTenantSso` (the same configuration) and `recordBreakGlassGrant` (the same `assignment_request_id`) return
+success with the current state when the change has already happened. The DLP policy writes take an optional
+`expected_version`, so a retry after another admin's change gets `409 dlp_policy_conflict` instead of overwriting it.
 
 **Security-critical changes** (NFR-10, data model 2.5) are committed first, so they take effect at once, and then
 written to the audit archive in both regions before the `2xx`:
@@ -241,6 +243,7 @@ Starting limits from the abuse design:
 | Email | `sendTransfer`, `createUploadRequest`, `inviteUser` | 200 recipient emails an hour per member or key, 2,000 per tenant; 20 link emails a day to one address per tenant. A cap across tenants delays the email (`queued`) instead of refusing it. Invitations: 100 an hour per tenant, 3 a day per address. |
 | Audit | `searchAuditEvents`, `exportAuditEvents` | 60 searches a minute per tenant; 10 exports an hour, 1 at a time. An API key: 1 export an hour, at most 100,000 events (`422 export_too_large`). |
 | Keys and tenants | `createApiKey`, `createTenant` | 20 new keys a day and at most 25 active per tenant; 30 new tenants an hour per operator. |
+| DLP | The DLP policy, rule and detector writes, `testDlpDetectors`, `confirmTransfer`, `approveTransfer`, `rejectTransfer`, `getTransferDlp`, `getFileInspection`, `getDlpReport`, `listDlpDecisions` | 100 policy changes a day per tenant; 30 detector tests a minute per admin, 16,384 characters each; 3 approval requests per transfer (`409 approval_limit_reached`); 120 approval decisions an hour per approver; 600 reads of finding details an hour per member; 60 report reads a minute per tenant. `rejectTransfer`, like a revocation, never counts against the tenant's budget. |
 | Other tenant calls | Everything else for members and API keys | 300 a minute per member and per key; 100 failed authentications in 5 minutes block an IP for 15 minutes. |
 
 **The WAF** also limits by IP address before a request reaches the API: 100 link-step requests a minute and 6,000
@@ -355,6 +358,15 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-34 | Provision a tenant and its first admin | `createTenant`; the operator API's `createOperatorToken` |
 | FR-35 | Operators can't read contents; break-glass time-limited, audited and alerted | `recordBreakGlassGrant` (best effort; the record is Identity Center plus CloudTrail); no operator operation returns file names, messages or contents |
 | NFR-14 | Member unlocks a locked-out recipient or uploader | `unlockRecipient`, `unlockUploader` |
+| FR-36, FR-47 | Every file inspected; its result and reasons shown | `getFile` (`inspection`), `getFileInspection`, `listUploadRequestFiles` |
+| FR-37, FR-38 | Built-in detectors; tenant keyword lists | `listDlpDetectors`, `getDlpDetector`, `createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector` |
+| FR-40, FR-41, FR-48 | Rules with thresholds and actions; nothing sent until the decision allows it | `listDlpRules`, `createDlpRule`, `getDlpRule`, `updateDlpRule`, `deleteDlpRule`; `sendTransfer`, `getTransferDlp`; `awaiting_confirmation`, `pending_approval` and `held` in `TransferState` |
+| FR-42 | The sender confirms a warning | `getTransferDlp`, `confirmTransfer` |
+| FR-43 | Approval workflow | `confirmTransfer` (with a justification), `listApprovalRequests`, `getApprovalRequest`, `approveTransfer`, `rejectTransfer`; `dlp_approver` in `updateUser` |
+| FR-45 | Trusted domains and escalation for untrusted recipients | `updateDlpPolicy` (`trusted_domains`), `recipient_scope` on rules; `sendTransfer` re-checks the allowed and blocked domains |
+| FR-51 | Received files inspected; blocked by a rule | `getFileInspection` (`dlp_blocked`), `listUploadRequestFiles` |
+| FR-53 | Findings with masked previews, details only for the owner and approvers | `DlpFinding` in `getTransferDlp` and `getFileInspection` |
+| FR-54 | Every DLP decision and change audited | `searchAuditEvents`, `exportAuditEvents`; `listDlpDecisions` |
 
 Should requirements:
 
@@ -366,6 +378,14 @@ Should requirements:
 | FR-26 Tenant single sign-on | `startSignIn` (`method=sso`), `startInvitationSignIn`, `configureTenantSso`; `sso_fallback` in `updateUser` |
 | FR-29 Export the audit log | `exportAuditEvents` |
 | FR-32 Tenant API keys | `createApiKey`, `listApiKeys`, `revokeApiKey`; the `tenantApiKey` scheme |
+| FR-39 Tenant patterns | `createDlpDetector` with `kind: pattern` |
+| FR-44 Two approvers | `approvals_required` on rules |
+| FR-46 New recipient domains | `condition: new_domain` on rules; `new_domain` in `getTransferDlp` |
+| FR-49 The sender's last 24 hours | `include_sender_24h` on rules |
+| FR-50 Message inspection | `createTransfer`; `message_findings` in `getTransferDlp` |
+| FR-52 Monitor mode | `updateDlpPolicy` (`mode`) |
+| FR-55 DLP reports | `getDlpReport`, `listDlpDecisions`, `listApprovalRequests` (`scope=tenant`) |
+| FR-56 Test detectors | `testDlpDetectors` |
 
 Requirements with no user action of their own: FR-19 (scan retries; the state shows in `getFile`), FR-21 (expiry; the
 `link_expired` and `transfer_expired` errors), FR-27 (every operation is audited, including searches, exports, every
@@ -388,6 +408,8 @@ derived CSRF tokens, the operator token exchange, and that API keys can't unlock
 | Download grant budget | 3 × file size, 20 requests, 24 hours, one session and one stream (ADR-0018) |
 | Operator API address | `http://127.0.0.1:{local_port}/v1`, the local end of the port-forward; the port is the operator's choice |
 | Deprecation notice | At least 6 months |
+| DLP decisions by people only | API keys can't confirm a warning, request or decide an approval, read the DLP policy, or see finding details; automation can send transfers that need no confirmation. |
+| What an approver sees | Recipients, file names, the message, findings with masked previews and the justification, never contents: approvers have no download operation. |
 
 Later, not in v1 (each needs its own issue; none is required by the security design):
 

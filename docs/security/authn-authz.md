@@ -3,12 +3,12 @@
 | | |
 |---|---|
 | Status | Phase 3 design, aligned with the phase 2 documents in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26); ADR-0016 records the identity provider choice |
-| Requirements | [PRD](../prd.md), especially FR-14, FR-15, FR-20, FR-22 to FR-27, FR-32, FR-34, FR-35, NFR-12 to NFR-15 |
+| Requirements | [PRD](../prd.md), especially FR-14, FR-15, FR-20, FR-22 to FR-27, FR-32, FR-34, FR-35, FR-40 to FR-44, FR-53 to FR-55, NFR-12 to NFR-15 |
 | Architecture | [architecture.md](../architecture.md), sections 4.2, 5.1, 5.2, 5.4 and 8 |
 | API | [openapi.yaml](../api/openapi.yaml) and its [README](../api/README.md) |
 | Data model | [data-model.md](../design/data-model.md), sections 2.1, 2.2, 2.4 and 4.2 |
 | Decisions | [ADR-0002](../adr/0002-api-framework.md) (caller resolution, permissions in the service layer, the `public` marker) |
-| Tracking | [#23](https://github.com/codewithmuh/secure-file-transfer/issues/23), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)) |
+| Tracking | [#23](https://github.com/codewithmuh/secure-file-transfer/issues/23), part of phase 3 ([#25](https://github.com/codewithmuh/secure-file-transfer/issues/25)); DLP approvers and permissions in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64) |
 
 This page decides how every caller proves who it is, how long that proof lasts, how it is revoked, and what each caller
 may do. It answers PRD open question 1 (member sign-in) and decides that PostgreSQL row-level security is a second
@@ -330,8 +330,11 @@ devices; starting an 11th ends the oldest.
 | Sign-in reset, deactivation, forced sign-out | Every session of that user ends (2.5, 3.6) |
 | Tenant suspended | Every session of the tenant ends |
 
-**Step-up.** `inviteUser`, `updateUser`, `deactivateUser`, `updateTenantPolicy`, `createApiKey`, `resetUserSignIn` and
-`exportAuditEvents` need a sign-in within the last 15 minutes. `inviteUser` is on the list because an invitation can
+**Step-up.** `inviteUser`, `updateUser`, `deactivateUser`, `updateTenantPolicy`, `createApiKey`, `resetUserSignIn`,
+`exportAuditEvents`, the DLP policy writes (`updateDlpPolicy`, `createDlpRule`, `updateDlpRule`, `deleteDlpRule`,
+`createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector`) and `approveTransfer` need a sign-in within the last 15
+minutes. An approval releases data to outsiders, so it is as sensitive as an audit export; `rejectTransfer` only stops
+sharing and needs none. `inviteUser` is on the list because an invitation can
 create an admin; since an invitation never changes an existing user's role (2.5), every way to grant the admin role
 needs step-up. Otherwise these operations return `401 reauthentication_required` (API contract). The web app
 runs sign-in again the same way in, which sends `prompt=login` to Cognito and on to the tenant's identity provider, and
@@ -527,7 +530,11 @@ gitleaks rule in this repository matches the format, and the format suits GitHub
   outside the browser's protections, so a leaked key must not expose files. FR-32's examples, creating transfers and
   exporting the audit log, don't need contents. Automated retrieval of received files would be a later feature with
   its own scope and an IP allowlist.
-- No user, role, policy, SSO or key management. Those need a web session.
+- No user, role, policy, SSO or key management. Those need a web session. That includes the DLP policy, its rules and
+  detectors, and the approver designation.
+- **No DLP decisions.** A key can't confirm a warning, request an approval or approve or reject one (FR-42, FR-43), so
+  every DLP decision on record is a person's. Automation can still send transfers that need no confirmation, and reads
+  a transfer's DLP outcome and finding counts with `transfers:read`, never location hints or previews (FR-53).
 - No unlocking of recipients or uploaders (4.4).
 - **Audit export limits.** A key with `audit:read` may export at most once an hour, at most 100,000 events per export
   (an admin's export stops at 1,000,000), and every export is its own audit record. The tenant's admins are emailed the
@@ -558,9 +565,10 @@ gitleaks rule in this repository matches the format, and the format suits GitHub
 
 | Caller | May |
 |---|---|
-| Member | Everything on their own transfers and upload requests: create, upload, send, cancel, extend, revoke, unlock, delete files, and download files received through their own requests. Read the tenant policy. |
-| Tenant admin | Everything a member may do on their own items. Tenant-wide: read, revoke and unlock every transfer and upload request (metadata only, never contents); members and roles; tenant policy; audit search and export; API keys. A local admin has these rights only in a session signed in with a passkey, apart from revocations (3.3). |
-| API key | Its owner's rights, limited to its scopes, without downloads, unlocks or any administration |
+| Member | Everything on their own transfers and upload requests: create, upload, send, cancel, extend, revoke, unlock, delete files, and download files received through their own requests. See the DLP findings on their own files, with location hints and masked previews, and confirm their own transfers' warnings or request approval. Read the tenant policy. |
+| Approver (designation) | A member or admin a tenant admin names with `dlp_approver`. Read the tenant's DLP approval requests, with the findings of those transfers, and approve or reject them, never their own. No download of the files. |
+| Tenant admin | Everything a member may do on their own items. Tenant-wide: read, revoke and unlock every transfer and upload request (metadata and DLP finding counts only, never contents or finding details); members, roles and approvers; tenant policy and the DLP policy; audit search and export, and DLP reports; API keys. A local admin has these rights only in a session signed in with a passkey, apart from revocations (3.3). |
+| API key | Its owner's rights, limited to its scopes, without downloads, unlocks, DLP decisions, finding details or any administration |
 | Recipient | Read and download within one transfer |
 | Uploader | Read and upload within one upload request |
 | Platform operator | The operator API only: no tenant data, no file contents (section 8) |
@@ -600,7 +608,7 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `audit.export` | `exportAuditEvents` | — | Tenant, step-up | `audit:read`; 1 an hour, at most 100,000 events (5.3) | — | — | — | |
 | `user.invite` | `inviteUser` | — | Tenant, step-up | — | — | — | — | `409 user_exists` only within the tenant; never changes an existing user's role |
 | `user.read` | `listUsers`, `getUser` | — | Tenant | — | — | — | — | |
-| `user.update_role` | `updateUser` | — | Tenant, step-up | — | — | — | — | Keeps one active admin; ends the user's sessions; also names fallback admins (2.5) |
+| `user.update_role` | `updateUser` | — | Tenant, step-up | — | — | — | — | Keeps one active admin; ends the user's sessions on a role change; also names fallback admins (2.5) and DLP approvers (`dlp_approver`), which is audited and emailed to the tenant's admins |
 | `user.deactivate` | `deactivateUser` | — | Tenant, step-up | — | — | — | — | Keeps one active admin; ends sessions; revokes the user's keys |
 | `tenant_policy.read` | `getTenantPolicy` | Yes | Yes | `transfers:read` or `upload_requests:read` | — | — | — | |
 | `tenant_policy.update` | `updateTenantPolicy` | — | Tenant, step-up | — | — | — | — | |
@@ -608,6 +616,14 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `api_key.create` | `createApiKey` | — | Tenant, step-up | — | — | — | — | Web session only |
 | `api_key.read` | `listApiKeys` | — | Tenant | — | — | — | — | |
 | `api_key.revoke` | `revokeApiKey` | — | Tenant | — | — | — | — | Any key of the tenant |
+| `dlp_findings.read` | `getTransferDlp`, `getFileInspection` | Own | Tenant, counts only | `transfers:read` or `upload_requests:read` as for `getFile`, tenant, counts only | — | — | — | Location hints and masked previews only for the file's owner and for approvers of its transfer's approval request (FR-53); every response with details is audited. An approver who isn't an admin reaches only transfers with an approval request. |
+| `transfer.confirm` | `confirmTransfer` | Own | Own | — | — | — | — | Web session only; the transfer must be `awaiting_confirmation` for the decision named. Requesting approval needs an eligible approver and a justification. |
+| `dlp_approval.read` | `listApprovalRequests`, `getApprovalRequest` | Own requests; the tenant's queue if an approver | Tenant | — | — | — | — | `scope=queue` needs the approver designation, `scope=tenant` the admin role |
+| `dlp_approval.decide` | `approveTransfer`, `rejectTransfer` | Approvers only | Approvers only | — | — | — | — | The caller has `dlp_approver`, is active, and isn't the transfer's `created_by` (`403 self_approval_forbidden`); one decision per approver per request; approving needs step-up. Not an admin right, so no passkey rule (3.3). |
+| `dlp_policy.read` | `getDlpPolicy`, `listDlpRules`, `getDlpRule`, `listDlpDetectors`, `getDlpDetector` | — | Tenant | — | — | — | — | Members never see thresholds or keyword lists, only the names of the rules that matched their own transfers |
+| `dlp_policy.update` | `updateDlpPolicy`, `createDlpRule`, `updateDlpRule`, `deleteDlpRule`, `createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector` | — | Tenant, step-up | — | — | — | — | Every change raises the policy version, is audited and is emailed to every tenant admin (FR-54) |
+| `dlp_policy.test` | `testDlpDetectors` | — | Tenant | — | — | — | — | Text only, never stored or logged |
+| `dlp_report.read` | `listDlpDecisions`, `getDlpReport` | — | Tenant | `audit:read` | — | — | — | Counts, IDs and enums only; viewing the report is audited |
 | `operator.tenant.create` | `createTenant` | — | — | — | — | — | Yes | Creates the tenant and invites its first admin; no tenant data returned |
 | `account.sign_out` | `signOut` | Self | Self | — | — | — | — | |
 | `user.sign_out` | `signOutUser` | — | Tenant | — | — | — | — | Security-critical record |
@@ -737,7 +753,7 @@ The login roles use IAM database authentication, one per workload (#22).
 |---|---|---|---|
 | `sft_api` | API service | Tenant, resource or platform, plus the credential lookup functions | Tenant policy on every table; tenant and platform audit inserts; reads its tenant's audit events |
 | `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts. No column grant on file names or messages. |
-| `sft_scan` | Scan worker | Tenant, from the message | Tenant policy |
+| `sft_scan` | Scan worker | Tenant, from the message | Tenant policy. For DLP it reads the tenant's DLP policy, rules, detectors and wrapped DLP data keys, recipient domains and known domains, and inserts findings and decisions; no column grant to select finding details or any field ciphertext (data model 4.2). |
 | `sft_notify` | Notification worker | Tenant, from the message | Tenant policy |
 | `sft_relay` | Outbox relay | System | `outbox` only: reads and marks rows of every tenant, in system scope |
 | `sft_jobs` | Lifecycle jobs | System to find work, tenant to do it | `jobs_find` reads across tenants in system scope, with column grants limited to what the jobs need; every write under the tenant policy |
@@ -920,6 +936,7 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 | Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator` and the `grafana` namespace, and can't exec, attach, port-forward, patch or restart in application namespaces; Argo CD refuses a sync or change from `ReadOnly` or `Operator`. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
 | Break-glass | A drill: request, approval, alerts within 5 minutes (including one for an exec into an API pod), assignment removed after 1 hour, the service record written, or filled in by reconciliation when the drill stops the API first, review written | Staging, in every disaster recovery drill |
 | User pool configuration | Static checks on the Terraform: MFA required, Plus plan, threat protection enforced, admin-only sign-up, implicit grant off, no provider identifiers, the app client can't write `email` or `custom:tenant_id`, both triggers attached in both pools. Once deployed, a daily drift check. | Every pull request; daily |
+| DLP approvals and findings | The authorization matrix adds an approver who is a member, an approver who is an admin, and the transfer's sender who is also an approver. The sender is refused on their own request (`403 self_approval_forbidden`), also when an API key created the transfer; a member without the designation gets `403`; a second decision by the same approver doesn't count twice; an API key gets `403` on `confirmTransfer`, `approveTransfer` and `rejectTransfer` and never sees location hints or previews; an admin who isn't an approver sees counts only; approving without a recent sign-in gets `401 reauthentication_required`; taking away `dlp_approver` stops that user deciding at once | Every pull request |
 
 ### 9.3 ASVS 5.0 Level 2 (NFR-13)
 
@@ -957,6 +974,12 @@ Everything this design asked of the phase 2 documents was applied in
   keeps a member session active (3.2); the private cluster endpoint and read-only Argo CD (8.1); data events in the
   Object Lock log archive and the key-admin role (8.3).
 
+- **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** The approver designation
+  (`users.dlp_approver`), the permissions `dlp_findings.read`, `transfer.confirm`, `dlp_approval.read`,
+  `dlp_approval.decide`, `dlp_policy.read`, `dlp_policy.update`, `dlp_policy.test` and `dlp_report.read` (6.3), the
+  step-up list (3.3), the API key restrictions (5.3) and `sft_scan`'s DLP grants (7.3) are in the API contract and the
+  data model.
+
 Left for later, on purpose: the admin passkey rule waits for the staging test that both pools issue `amr` (3.3); SCIM
 deprovisioning and SAML single logout come after v1 (3.5, 3.6); Cognito's replication is revisited by an ADR once it
 supports Osaka (2.6).
@@ -972,3 +995,6 @@ supports Osaka (2.6).
 | Cognito Plus plan | Needed for the breached-password check (ASVS 5.0 V6.2); about $400–500 a month at design load, under a dollar in the reference run |
 | API keys bound to their owner | Deactivating or demoting the owner revokes their keys (5.2). Tenant-owned service keys would survive staff changes but leave credentials with no person behind them. |
 | Contract and data model changes in section 10 | Applied in #26 |
+| DLP approvers | Named one by one by a tenant admin; any approver can decide any request of the tenant, never their own. Approver groups per rule, or the sender's manager, would need an org chart, which v1 doesn't have. |
+| What an approver sees | Findings, masked previews, file names, the message and the justification, never contents (threat model point 14) |
+| DLP and API keys | Keys never confirm or decide, so automation can't clear its own warnings; a tenant whose automation sends personal data runs those rules as allow and record, or in monitor mode |
