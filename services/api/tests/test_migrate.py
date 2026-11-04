@@ -11,16 +11,17 @@ from types import SimpleNamespace
 
 import pytest
 from alembic import command
-from sqlalchemy import Connection, Engine, create_engine, text
+from alembic.util.exc import CommandError
+from sqlalchemy import Connection, Engine, text
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.pool import NullPool
 
 from pg import ScratchDatabase
 from sft.core import settings as settings_module
 from sft.data import migrate
-from sft.data.database import psycopg_url
+from sft.data.database import sync_engine
 from sft.data.migrate import (
     Action,
+    InvalidMigrationError,
     MigrationRefusedError,
     Plan,
     alembic_config,
@@ -40,7 +41,7 @@ def run_fixture(db: ScratchDatabase, **options: object) -> Plan:
 
 
 def upgrade_to(db: ScratchDatabase, revision: str) -> None:
-    engine = create_engine(psycopg_url(db.url(MIGRATE)), poolclass=NullPool)
+    engine = sync_engine(db.url(MIGRATE))
     try:
         with engine.connect() as connection:
             become_owner(connection)
@@ -96,7 +97,7 @@ def test_an_older_database_is_upgraded(empty_db: ScratchDatabase) -> None:
 def test_stamping_down_records_nothing(empty_db: ScratchDatabase) -> None:
     # Only developers move a database back, by hand; the job never does (ADR-0005).
     run_fixture(empty_db)
-    engine = create_engine(psycopg_url(empty_db.url(MIGRATE)), poolclass=NullPool)
+    engine = sync_engine(empty_db.url(MIGRATE))
     try:
         with engine.connect() as connection:
             become_owner(connection)
@@ -123,9 +124,11 @@ def test_a_newer_database_that_does_not_serve_this_image_is_refused(
     empty_db: ScratchDatabase, compatible: list[str] | None
 ) -> None:
     database_ahead(empty_db, compatible)
-    with pytest.raises(MigrationRefusedError, match="at 0003, which this image doesn't know"):
+    with pytest.raises(MigrationRefusedError, match="at 0003, which this image doesn't know") as e:
         run_fixture(empty_db)
     assert version(empty_db) == [("0003",)]
+    # A missing record and an empty list are different facts, and the reason says which.
+    assert str(e.value).endswith("(no record)" if compatible is None else f"({compatible})")
 
 
 def test_a_database_without_the_compatibility_table_is_refused(empty_db: ScratchDatabase) -> None:
@@ -150,9 +153,20 @@ def test_an_image_without_migrations_is_refused(empty_db: ScratchDatabase, tmp_p
         run(empty_db.url(MIGRATE), script_location=str(tmp_path))
 
 
+def test_an_image_with_two_heads_fails_in_alembic(
+    empty_db: ScratchDatabase, tmp_path: Path
+) -> None:
+    shutil.copytree(FIXTURE, tmp_path, dirs_exist_ok=True)
+    (tmp_path / "versions" / "0003_fork.py").write_text(
+        'revision = "0003"\ndown_revision = "0001"\ncompatible_with = ("0001",)\n'
+    )
+    with pytest.raises(CommandError):
+        run(empty_db.url(MIGRATE), script_location=str(tmp_path))
+
+
 def test_a_migration_that_cannot_get_its_lock_is_retried(empty_db: ScratchDatabase) -> None:
     upgrade_to(empty_db, "0001")
-    holder = create_engine(empty_db.admin, poolclass=NullPool)
+    holder = sync_engine(empty_db.admin)
     with holder.connect() as connection:
         connection.execute(text("LOCK TABLE one IN ACCESS EXCLUSIVE MODE"))
         waits: list[float] = []
@@ -170,7 +184,7 @@ def test_a_migration_that_cannot_get_its_lock_is_retried(empty_db: ScratchDataba
 
 def test_a_migration_gives_up_after_the_last_attempt(empty_db: ScratchDatabase) -> None:
     upgrade_to(empty_db, "0001")
-    holder = create_engine(empty_db.admin, poolclass=NullPool)
+    holder = sync_engine(empty_db.admin)
     waits: list[float] = []
     with holder.connect() as connection:
         connection.execute(text("LOCK TABLE one IN ACCESS EXCLUSIVE MODE"))
@@ -183,7 +197,7 @@ def test_a_migration_gives_up_after_the_last_attempt(empty_db: ScratchDatabase) 
 
 
 def hold_advisory_lock(db: ScratchDatabase) -> tuple[Engine, Connection]:
-    engine = create_engine(db.admin, poolclass=NullPool)
+    engine = sync_engine(db.admin)
     connection = engine.connect()
     connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": migrate._ADVISORY_LOCK})
     connection.commit()
@@ -235,7 +249,7 @@ def test_offline_migrations_are_refused() -> None:
 def test_every_migration_says_what_it_serves(value: object) -> None:
     module = SimpleNamespace() if value is None else SimpleNamespace(compatible_with=value)
     script = SimpleNamespace(revision="0009", module=module)
-    with pytest.raises(TypeError, match="0009 must set compatible_with"):
+    with pytest.raises(InvalidMigrationError, match="0009 must set compatible_with"):
         compatible_with(script)  # type: ignore[arg-type]
 
 
@@ -273,9 +287,47 @@ def test_main_exits_1_when_it_refuses(
 
 
 @pytest.mark.usefixtures("quiet_logging")
-def test_main_exits_1_when_the_database_is_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_exits_1_when_the_database_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch, json_logs: Logs
+) -> None:
     monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql://sft_migrate@127.0.0.1:1/sft")
     assert migrate.main() == 1
+    [line] = [line for line in json_logs() if line["msg"] == "migration failed"]
+    assert line["error"] == "OperationalError"
+    assert "[SQL:" not in str(line["reason"])  # the driver's message, not the statement
+
+
+@pytest.mark.usefixtures("quiet_logging")
+@pytest.mark.parametrize(
+    "error",
+    [CommandError("Multiple head revisions are present"), InvalidMigrationError("0009 is broken")],
+)
+def test_main_exits_1_with_one_line_when_the_images_migrations_are_wrong(
+    monkeypatch: pytest.MonkeyPatch, json_logs: Logs, error: Exception
+) -> None:
+    def broken(url: str) -> Plan:
+        raise error
+
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql://sft_migrate@127.0.0.1:1/sft")
+    monkeypatch.setattr(migrate, "run", broken)
+    assert migrate.main() == 1
+    [line] = [line for line in json_logs() if line["msg"] == "migration failed"]
+    assert (line["reason"], line["error"]) == (str(error), type(error).__name__)
+
+
+@pytest.mark.usefixtures("quiet_logging")
+def test_the_alembic_command_line_never_echoes_bad_settings(
+    monkeypatch: pytest.MonkeyPatch, json_logs: Logs, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "mysql://sft_migrate:hunter2@db/sft")
+    with pytest.raises(SystemExit) as exit_:
+        command.upgrade(alembic_config(script_location=FIXTURE), "head")
+    assert exit_.value.code == 2
+    [line] = json_logs()
+    assert line["msg"] == "invalid settings"
+    assert [e["setting"] for e in line["errors"]] == ["MIGRATION_DATABASE_URL"]  # type: ignore[attr-defined]
+    captured = capsys.readouterr()
+    assert "hunter2" not in str(json_logs()) + captured.out + captured.err
 
 
 @pytest.mark.usefixtures("quiet_logging")

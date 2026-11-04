@@ -1,17 +1,21 @@
-"""Grants and row-level security policies, as migrations write them (ADR-0020, data model 4.2).
+"""Grants and row-level security policies, generated for migrations (ADR-0020, data model 4.2).
 
 A tenant-owned table ships with row-level security and its policies in the migration that creates
-it; the catalog test fails otherwise. In that migration:
+it; the catalog test fails otherwise. These functions write that SQL **when you author the
+migration**; the revision keeps the literal statements, never a call to this module, so a later
+change here can't change what an old revision does to a fresh database (a test checks that no
+revision imports `sft`). To write one:
 
-    op.create_table("widgets", sa.Column("tenant_id", sa.Uuid, nullable=False), ...)
-    enable_tenant_rls("widgets", grants={roles.API: "SELECT, INSERT, UPDATE", roles.JOBS: "SELECT"})
+    uv run python -c 'from sft.data.rls import tenant_rls_sql; print(*tenant_rls_sql(
+        "widgets", grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_jobs": "SELECT"}), sep="\\n")'
 
-That enables row-level security, grants each workload role its privileges, and creates the
-`tenant_isolation` policy, `tenant_id = app_tenant_id()` for reads and writes, for exactly those
-roles. Row-level security is enabled, not forced: it doesn't apply to the owner, which only
-migrations act as (ADR-0020). Policies for other scopes, such as `jobs_find` or the relay's, go in
-the same migration with `create_policy`. A later migration that gives one more role the table
-calls `grant` and replaces the policy's role list with `ALTER POLICY tenant_isolation ON … TO …`.
+and paste the statements into the revision as a tuple it runs with `op.execute`. That enables
+row-level security, grants each workload role its privileges, and creates the `tenant_isolation`
+policy, `tenant_id = app_tenant_id()` for reads and writes, for exactly those roles. Row-level
+security is enabled, not forced: it doesn't apply to the owner, which only migrations act as
+(ADR-0020). Policies for other scopes, such as `jobs_find` or the relay's, come from `policy_sql`.
+A later migration that gives one more role the table uses `grant_sql` and replaces the policy's
+role list with `ALTER POLICY tenant_isolation ON … TO …`.
 
 Only `SELECT`, `INSERT`, `UPDATE` and `DELETE` can be granted, and only to workload roles: never
 `TRUNCATE`, which ignores row-level security, and never to the owner, migration or lookup roles.
@@ -22,8 +26,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from typing import Literal
-
-from alembic import op
 
 from sft.data.roles import WORKLOAD_ROLES
 
@@ -89,7 +91,11 @@ def policy_sql(
 
 
 def tenant_rls_sql(table: str, *, grants: Mapping[str, str], key: str = "tenant_id") -> list[str]:
-    """The statements `enable_tenant_rls` runs, for review and tests."""
+    """Row-level security, grants and the tenant policy for a tenant-owned table.
+
+    `grants` maps each workload role to its privileges. `key` is the column that holds the
+    tenant: `tenant_id`, or `id` for `tenants` itself.
+    """
     if not grants:
         raise ValueError("grant the table to at least one workload role")
     condition = f"{_identifier(key)} = app_tenant_id()"
@@ -98,33 +104,3 @@ def tenant_rls_sql(table: str, *, grants: Mapping[str, str], key: str = "tenant_
         *(grant_sql(table, role, privileges) for role, privileges in grants.items()),
         policy_sql(TENANT_POLICY, table, roles=list(grants), using=condition, with_check=condition),
     ]
-
-
-def enable_tenant_rls(table: str, *, grants: Mapping[str, str], key: str = "tenant_id") -> None:
-    """In a migration: row-level security, grants and the tenant policy for a tenant-owned table.
-
-    `grants` maps each workload role to its privileges. `key` is the column that holds the
-    tenant: `tenant_id`, or `id` for `tenants` itself.
-    """
-    for statement in tenant_rls_sql(table, grants=grants, key=key):
-        op.execute(statement)
-
-
-def create_policy(
-    name: str,
-    table: str,
-    *,
-    roles: Sequence[str],
-    command: Command = "ALL",
-    using: str | None = None,
-    with_check: str | None = None,
-) -> None:
-    """In a migration: a policy for another scope, e.g. `jobs_find` or an audit insert policy."""
-    op.execute(
-        policy_sql(name, table, roles=roles, command=command, using=using, with_check=with_check)
-    )
-
-
-def grant(table: str, role: str, privileges: str) -> None:
-    """In a migration: grant one workload role `privileges` on `table`."""
-    op.execute(grant_sql(table, role, privileges))

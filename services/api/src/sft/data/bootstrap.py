@@ -11,6 +11,9 @@ What it sets up (authentication and authorization 7.3):
 - One login role per workload, and `sft_migrate`, with no attributes beyond `LOGIN`: no
   superuser, `CREATEROLE`, `CREATEDB`, replication or `BYPASSRLS`. `sft_migrate` may become
   `sft_owner` with `SET ROLE`, but doesn't inherit its privileges.
+- A role that already exists with other attributes is put back: a re-run repairs drift. Only an
+  attribute that differs is altered, because on Aurora the master user may not name some
+  attributes at all; drift it can't repair fails the job instead of passing silently.
 - `CONNECT` on this database for the login roles only, and the workload roles' timeouts.
 - With `BOOTSTRAP_IAM_AUTH=true`, `rds_iam` for every login role, so each signs in with a 15-minute
   IAM token and has no password at all. Locally (`false`) the roles get no password from here: the
@@ -24,13 +27,12 @@ from __future__ import annotations
 import logging
 import sys
 
-from sqlalchemy import Connection, create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import NullPool
+from sqlalchemy import Connection, text
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from sft.core.logs import configure_logging
-from sft.core.settings import BootstrapSettings, load_settings
-from sft.data.database import psycopg_url
+from sft.core.settings import EXIT_BAD_SETTINGS, BootstrapSettings, load_settings
+from sft.data.database import sync_engine
 from sft.data.roles import (
     LOGIN_ROLES,
     LOOKUP,
@@ -43,25 +45,44 @@ from sft.data.roles import (
 log = logging.getLogger("sft.data.bootstrap")  # not __main__ under python -m
 
 EXIT_FAILED = 1
-EXIT_BAD_SETTINGS = 2
+
+# (pg_roles column, the value every role of ours has, the ALTER ROLE keyword that restores it)
+_ATTRIBUTES = (
+    ("rolsuper", False, "NOSUPERUSER"),
+    ("rolcreatedb", False, "NOCREATEDB"),
+    ("rolcreaterole", False, "NOCREATEROLE"),
+    ("rolreplication", False, "NOREPLICATION"),
+    ("rolbypassrls", False, "NOBYPASSRLS"),
+    # Membership options decide inheritance (sft_migrate's of sft_owner is INHERIT FALSE); the
+    # role attribute stays at PostgreSQL's default.
+    ("rolinherit", True, "INHERIT"),
+)
 
 
-def _create_role(role: str, *, login: bool) -> list[str]:
-    attribute = "LOGIN" if login else "NOLOGIN"
-    return [
-        f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') "
-        f"THEN CREATE ROLE {role} {attribute}; END IF; END $$",
-        f"ALTER ROLE {role} {attribute}",
-    ]
+def _create_role(role: str, *, login: bool) -> str:
+    """Create `role`, or put back any attribute that has drifted from what the design says."""
+    expected = (("rolcanlogin", login, "LOGIN" if login else "NOLOGIN"), *_ATTRIBUTES)
+    repairs = " ".join(
+        f"IF r.{column} IS DISTINCT FROM {str(value).lower()} THEN ALTER ROLE {role} {keyword}; "
+        "END IF;"
+        for column, value, keyword in expected
+    )
+    # Role names are the constants of sft.data.roles, never input.
+    return (
+        f"DO $$ DECLARE r pg_roles%ROWTYPE; BEGIN "  # noqa: S608
+        f"SELECT * INTO r FROM pg_roles WHERE rolname = '{role}'; "
+        f"IF NOT FOUND THEN CREATE ROLE {role} {expected[0][2]}; RETURN; END IF; "
+        f"{repairs} END $$"
+    )
 
 
 def bootstrap_sql(*, iam_auth: bool) -> list[str]:
     """Every statement the bootstrap runs, in order. Role names are constants, never input."""
     logins = ", ".join(LOGIN_ROLES)
     statements = [
-        *_create_role(OWNER, login=False),
-        *_create_role(LOOKUP, login=False),
-        *(s for role in LOGIN_ROLES for s in _create_role(role, login=True)),
+        _create_role(OWNER, login=False),
+        _create_role(LOOKUP, login=False),
+        *(_create_role(role, login=True) for role in LOGIN_ROLES),
         # Migrations act as the owner only after an explicit SET ROLE.
         f"GRANT {OWNER} TO {MIGRATE} WITH INHERIT FALSE, SET TRUE",
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
@@ -92,13 +113,14 @@ def main() -> int:
     if settings is None:
         return EXIT_BAD_SETTINGS
     configure_logging(settings.log_level)
-    url = psycopg_url(settings.bootstrap_database_url.get_secret_value())
-    engine = create_engine(url, poolclass=NullPool)
+    engine = sync_engine(settings.bootstrap_database_url.get_secret_value())
     try:
         with engine.begin() as connection:
             bootstrap(connection, iam_auth=settings.bootstrap_iam_auth)
-    except SQLAlchemyError:
-        log.exception("bootstrap failed")
+    except SQLAlchemyError as exc:
+        # The driver's message, not SQLAlchemy's, which appends the statement.
+        reason = str(exc.orig) if isinstance(exc, DBAPIError) else str(exc)
+        log.critical("bootstrap failed", extra={"reason": reason, "error": type(exc).__name__})
         return EXIT_FAILED
     finally:
         engine.dispose()

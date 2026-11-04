@@ -1,13 +1,12 @@
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.pool import NullPool
 
 from pg import ScratchDatabase
 from sft.core import settings as settings_module
 from sft.data import bootstrap as bootstrap_module
 from sft.data.bootstrap import bootstrap, bootstrap_sql
-from sft.data.database import psycopg_url
+from sft.data.database import sync_engine
 from sft.data.roles import LOGIN_ROLES, MIGRATE, OWNER
 
 
@@ -24,7 +23,7 @@ def test_locally_there_is_no_rds_iam_and_never_a_password() -> None:
 
 def test_bootstrap_can_run_again(empty_db: ScratchDatabase) -> None:
     # The fixture ran it once; an environment runs it again whenever the role list changes.
-    engine = create_engine(empty_db.admin, poolclass=NullPool)
+    engine = sync_engine(empty_db.admin)
     try:
         with engine.begin() as connection:
             bootstrap(connection, iam_auth=False)
@@ -37,8 +36,49 @@ def test_bootstrap_can_run_again(empty_db: ScratchDatabase) -> None:
     assert members == [(MIGRATE,)]
 
 
+ATTRIBUTES = (
+    "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, "
+    "rolinherit FROM pg_roles WHERE rolname = :role"
+)
+DESIGNED = {"sft_api": (True, False, False, False, False, False, True)}
+DESIGNED["sft_owner"] = (False, *DESIGNED["sft_api"][1:])
+RESTORE = {
+    "sft_api": "LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+    "sft_owner": "NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS INHERIT",
+}
+
+
+def test_every_role_statement_repairs_every_attribute() -> None:
+    for statement in bootstrap_sql(iam_auth=False)[: len(LOGIN_ROLES) + 2]:
+        for keyword in ("NOSUPERUSER", "NOCREATEDB", "NOCREATEROLE", "NOREPLICATION"):
+            assert f" {keyword};" in statement
+        assert " NOBYPASSRLS;" in statement
+        assert " INHERIT;" in statement
+
+
+def test_a_rerun_repairs_roles_that_have_drifted(empty_db: ScratchDatabase) -> None:
+    # Roles are cluster-wide, so both exist already: give them every attribute they must not have.
+    try:
+        empty_db.sql(
+            "ALTER ROLE sft_api BYPASSRLS SUPERUSER CREATEDB CREATEROLE REPLICATION "
+            "NOINHERIT NOLOGIN"
+        )
+        empty_db.sql("ALTER ROLE sft_owner LOGIN BYPASSRLS")
+        engine = sync_engine(empty_db.admin)
+        try:
+            with engine.begin() as connection:
+                bootstrap(connection, iam_auth=False)
+        finally:
+            engine.dispose()
+        for role, designed in DESIGNED.items():
+            assert empty_db.sql(ATTRIBUTES, role=role) == [designed], role
+    finally:
+        for role, attributes in RESTORE.items():  # never leave a superuser on the shared server
+            empty_db.sql(f"ALTER ROLE {role} {attributes}")
+
+
 def test_sft_migrate_must_become_the_owner_to_create_anything(empty_db: ScratchDatabase) -> None:
-    engine = create_engine(psycopg_url(empty_db.url(MIGRATE)), poolclass=NullPool)
+    engine = sync_engine(empty_db.url(MIGRATE))
     try:
         with engine.connect() as connection:
             with pytest.raises(DBAPIError, match="permission denied for schema public"):

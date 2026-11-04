@@ -7,9 +7,7 @@ import sys
 
 from sft.api.server import ApiServer
 from sft.core.logs import configure_logging
-from sft.core.settings import Settings, load_settings
-
-EXIT_BAD_SETTINGS = 2
+from sft.core.settings import EXIT_BAD_SETTINGS, Settings, load_settings
 
 
 def main() -> int:

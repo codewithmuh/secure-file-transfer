@@ -2,8 +2,6 @@
 
 from alembic import op
 
-from sft.data.rls import create_policy, grant
-
 revision = "0002"
 down_revision = "0001"
 branch_labels = None
@@ -13,5 +11,5 @@ compatible_with: tuple[str, ...] = ("0001",)
 
 def upgrade() -> None:
     op.execute("ALTER TABLE one ADD COLUMN two integer")
-    grant("one", "sft_jobs", "SELECT")
-    create_policy("jobs_find", "one", roles=["sft_jobs"], command="SELECT", using="true")
+    op.execute("GRANT SELECT ON one TO sft_jobs")
+    op.execute("CREATE POLICY jobs_find ON one FOR SELECT TO sft_jobs USING (true)")

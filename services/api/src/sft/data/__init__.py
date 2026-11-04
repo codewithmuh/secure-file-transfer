@@ -10,7 +10,7 @@ behind it (ADR-0020).
   the tenant.
 - `models`: the tables, for queries; a test keeps them in step with the migrations.
 - `roles`: the PostgreSQL roles. `bootstrap` creates them (`python -m sft.data.bootstrap`).
-- `rls`: grants and policies for migrations; `enable_tenant_rls` for every tenant-owned table.
+- `rls`: generates the grants and policies a migration pastes in as literal SQL.
 - `migrations`: the Alembic revisions. `migrate` runs them: the migration job
   (`python -m sft.data.migrate`).
 

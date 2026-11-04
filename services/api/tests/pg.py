@@ -5,10 +5,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.pool import NullPool
+from sqlalchemy import URL, text
 
 from sft.data.bootstrap import bootstrap
+from sft.data.database import sync_engine
 from sft.data.roles import LOGIN_ROLES
 
 # A superuser URL for a PostgreSQL 17 server, e.g. postgresql://postgres:…@127.0.0.1:5432/postgres.
@@ -39,7 +39,7 @@ class ScratchDatabase:
 
     def sql(self, statement: str, **params: object) -> list[tuple[object, ...]]:
         """Run one statement as the superuser, which row-level security doesn't apply to."""
-        engine = create_engine(self.admin, poolclass=NullPool)
+        engine = sync_engine(self.admin)
         try:
             with engine.begin() as connection:
                 result = connection.execute(text(statement), params)
@@ -52,12 +52,12 @@ class ScratchDatabase:
 def fresh_database(admin_url: URL) -> Iterator[ScratchDatabase]:
     """An empty database with the roles bootstrapped, dropped afterwards."""
     name = f"sft_test_{secrets.token_hex(4)}"
-    server = create_engine(admin_url, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+    server = sync_engine(admin_url, isolation_level="AUTOCOMMIT")
     with server.connect() as connection:
         connection.execute(text(f'CREATE DATABASE "{name}"'))
     db = ScratchDatabase(admin_url.set(database=name))
     try:
-        engine = create_engine(db.admin, poolclass=NullPool)
+        engine = sync_engine(db.admin)
         try:
             with engine.begin() as connection:
                 bootstrap(connection, iam_auth=False)

@@ -37,8 +37,8 @@ def app_with_database_route(settings: Settings | None) -> FastAPI:
     app = create_app(settings)
 
     @app.get("/v1/pool")
-    async def pool(database: Annotated[Database, Depends(get_database)]) -> dict[str, int]:
-        return {"size": database.engine.pool.size()}  # type: ignore[attr-defined]
+    async def pool(database: Annotated[Database, Depends(get_database)]) -> dict[str, bool]:
+        return {"same": database is app.state.database}
 
     return app
 
@@ -58,7 +58,8 @@ def test_the_lifespan_opens_the_pool_and_closes_it(monkeypatch: pytest.MonkeyPat
     app = app_with_database_route(settings)
     with TestClient(app) as client:
         # No connection is made: nothing listens on port 1, and the request still succeeds.
-        assert client.get("/v1/pool").json() == {"size": 3}
+        assert client.get("/v1/pool").json() == {"same": True}
+        assert app.state.database._engine.pool.size() == 3  # read here only to check the setting
         assert disposed == []
     assert disposed == [app.state.database]
 

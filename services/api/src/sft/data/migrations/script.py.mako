@@ -1,7 +1,8 @@
 """${message}
 
 Revision ${up_revision}, after ${down_revision | comma,n}. Expand only (data model 7): the code of
-the revisions in `compatible_with` must still run on this schema.
+the revisions in `compatible_with` must still run on this schema. Literal SQL only: paste what
+`sft.data.rls` prints, never import from `sft` (service README, Migrations).
 """
 
 import sqlalchemy as sa

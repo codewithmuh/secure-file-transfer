@@ -34,13 +34,13 @@ from alembic import command, context
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext, MigrationInfo
 from alembic.script import Script, ScriptDirectory
-from sqlalchemy import Connection, create_engine, text
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from sqlalchemy.pool import NullPool
+from alembic.util.exc import CommandError
+from sqlalchemy import Connection, text
+from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 
 from sft.core.logs import configure_logging
-from sft.core.settings import MigrationSettings, load_settings
-from sft.data.database import psycopg_url
+from sft.core.settings import EXIT_BAD_SETTINGS, MigrationSettings, load_settings
+from sft.data.database import sync_engine
 from sft.data.models import Base
 from sft.data.roles import OWNER
 
@@ -54,7 +54,6 @@ LOCK_WAIT_SECONDS = 300.0
 _ADVISORY_LOCK = 48_000_001
 
 EXIT_REFUSED = 1
-EXIT_BAD_SETTINGS = 2
 
 
 class Action(StrEnum):
@@ -72,6 +71,10 @@ class Plan:
 
 class MigrationRefusedError(Exception):
     """The database isn't one this image can run against, or another job holds the lock."""
+
+
+class InvalidMigrationError(Exception):
+    """A migration file in the image breaks a rule the job relies on."""
 
 
 def alembic_config(
@@ -118,7 +121,7 @@ def plan(connection: Connection, script: ScriptDirectory) -> Plan:
         return Plan(Action.SKIP, database, head)
     raise MigrationRefusedError(
         f"the database is at {database}, which this image doesn't know, and its schema "
-        f"doesn't list {head} as compatible ({compatible or 'no record'})"
+        f"doesn't list {head} as compatible ({'no record' if compatible is None else compatible})"
     )
 
 
@@ -161,7 +164,7 @@ def run(
 ) -> Plan:
     """Bring the database at `url` up to this image's head, or check it may run as it is."""
     script = ScriptDirectory.from_config(alembic_config(script_location=script_location))
-    engine = create_engine(psycopg_url(url), poolclass=NullPool)
+    engine = sync_engine(url)
     try:
         with engine.connect() as connection:
             become_owner(connection, lock_timeout=lock_timeout)
@@ -219,7 +222,9 @@ def compatible_with(script: Script) -> Sequence[str]:
     """The earlier revisions a migration says its schema still serves. Every migration says."""
     value = getattr(script.module, "compatible_with", None)
     if not isinstance(value, tuple) or not all(isinstance(v, str) for v in value):
-        raise TypeError(f"migration {script.revision} must set compatible_with to a tuple of str")
+        raise InvalidMigrationError(
+            f"migration {script.revision} must set compatible_with to a tuple of str"
+        )
     return value
 
 
@@ -231,11 +236,12 @@ def run_env() -> None:
     if connection is not None:
         _run_in(connection)
         return
-    # The alembic command line, for developers: MIGRATION_DATABASE_URL, as for the job.
-    settings = MigrationSettings()  # type: ignore[call-arg]
-    engine = create_engine(
-        psycopg_url(settings.migration_database_url.get_secret_value()), poolclass=NullPool
-    )
+    # The alembic command line, for developers: MIGRATION_DATABASE_URL, as for the job, and the
+    # same one log line naming bad settings, never their values.
+    settings = load_settings(MigrationSettings)
+    if settings is None:
+        raise SystemExit(EXIT_BAD_SETTINGS)
+    engine = sync_engine(settings.migration_database_url.get_secret_value())
     try:
         with engine.connect() as connection:
             become_owner(connection)
@@ -265,8 +271,14 @@ def main() -> int:
     except MigrationRefusedError as exc:
         log.critical("migration refused", extra={"reason": str(exc)})
         return EXIT_REFUSED
-    except SQLAlchemyError:
-        log.exception("migration failed")
+    except (CommandError, InvalidMigrationError) as exc:
+        # The image's migrations themselves are wrong: several heads, a broken file, and so on.
+        log.critical("migration failed", extra={"reason": str(exc), "error": type(exc).__name__})
+        return EXIT_REFUSED
+    except SQLAlchemyError as exc:
+        # The driver's message, not SQLAlchemy's, which appends the statement and its parameters.
+        reason = str(exc.orig) if isinstance(exc, DBAPIError) else str(exc)
+        log.critical("migration failed", extra={"reason": reason, "error": type(exc).__name__})
         return EXIT_REFUSED
     log.info(
         "database ready",

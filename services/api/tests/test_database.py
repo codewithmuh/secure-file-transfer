@@ -1,6 +1,8 @@
 """The transaction helper and row-level security, against real PostgreSQL as the workload roles."""
 
+import re
 import uuid
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select, text, update
@@ -35,7 +37,7 @@ async def test_without_a_tenant_a_workload_role_reads_nothing(
     # The acceptance test of #48: no app.tenant_id, no rows, though the role may read the table.
     await create_tenant(operator_db)
     await create_tenant(operator_db)
-    async with api_db.engine.connect() as connection:
+    async with api_db.raw_connection_for_tests() as connection:
         assert await connection.scalar(text("SELECT current_user")) == "sft_api"
         assert await connection.scalar(text("SELECT app_tenant_id()")) is None
         assert await connection.scalar(text("SELECT count(*) FROM tenants")) == 0
@@ -114,7 +116,7 @@ async def test_a_pooled_connection_carries_no_scope_after_rollback(api_db: Datab
 
 
 async def assert_next_user_has_no_scope(database: Database, backend: object) -> None:
-    async with database.engine.connect() as connection:
+    async with database.raw_connection_for_tests() as connection:
         row = await connection.execute(
             text(
                 "SELECT pg_backend_pid(), current_setting('app.scope', true), "
@@ -170,9 +172,24 @@ def test_urls_use_psycopg_3() -> None:
 def test_connect_opens_no_connection() -> None:
     # Nothing listens on port 1: the pool is made, and no connection is tried until a transaction.
     database = Database.connect("postgresql://sft_api@127.0.0.1:1/sft", pool_size=3)
-    assert database.engine.pool.size() == 3  # type: ignore[attr-defined]
-    assert database.engine.pool.checkedout() == 0  # type: ignore[attr-defined]
+    pool = database._engine.pool  # the private engine, read here only to count connections
+    assert pool.size() == 3  # type: ignore[attr-defined]
+    assert pool.checkedout() == 0  # type: ignore[attr-defined]
 
 
 def test_scratch_databases_are_bootstrapped(migrated_db: ScratchDatabase) -> None:
     assert migrated_db.sql("SELECT current_database()") == [(migrated_db.name,)]
+
+
+SOURCE = Path(__file__).resolve().parents[1] / "src"
+
+
+def test_only_tests_reach_the_pool_without_a_scope() -> None:
+    # Database's engine is private, and its test-only connection is for tests alone.
+    offenders = [
+        str(path.relative_to(SOURCE))
+        for path in SOURCE.rglob("*.py")
+        if path.name != "database.py"
+        and re.search(r"\._engine\b|raw_connection_for_tests", path.read_text())
+    ]
+    assert offenders == []

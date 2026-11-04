@@ -151,16 +151,42 @@ Each revision:
   `VALIDATE`);
 - sets `compatible_with`, the earlier revisions whose code still runs on its schema, usually the previous release's
   head. The job records it in `schema_compatibility` in the same transaction;
-- gives every tenant-owned table its row-level security in the same migration:
+- gives every tenant-owned table its row-level security in the same migration;
+- **keeps literal SQL.** The `sft.data.rls` helpers generate the grants and policies when you write the revision;
+  the revision holds the statements they printed, never a call to the helpers, so changing a helper later can't
+  change what an old revision does to a fresh database. A test fails if a revision imports anything from `sft`.
 
 ```python
-from sft.data.rls import create_policy, enable_tenant_rls
+from sft.data.rls import policy_sql, tenant_rls_sql
 
-op.create_table("widgets", sa.Column("tenant_id", sa.Uuid, nullable=False), ...)
-enable_tenant_rls("widgets", grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_jobs": "SELECT"})
-create_policy(
-    "jobs_find", "widgets", roles=["sft_jobs"], command="SELECT", using="app_scope() = 'system'"
+# At authoring time, print the statements …
+print(
+    *tenant_rls_sql("widgets", grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_jobs": "SELECT"}),
+    sep="\n",
 )
+print(
+    policy_sql(
+        "jobs_find", "widgets", roles=["sft_jobs"], command="SELECT", using="app_scope() = 'system'"
+    )
+)
+```
+
+```python
+# … and paste them into the revision, which runs them as they are.
+WIDGETS_RLS = (
+    "ALTER TABLE widgets ENABLE ROW LEVEL SECURITY",
+    "GRANT SELECT, INSERT, UPDATE ON widgets TO sft_api",
+    "GRANT SELECT ON widgets TO sft_jobs",
+    "CREATE POLICY tenant_isolation ON widgets FOR ALL TO sft_api, sft_jobs "
+    "USING (tenant_id = app_tenant_id()) WITH CHECK (tenant_id = app_tenant_id())",
+    "CREATE POLICY jobs_find ON widgets FOR SELECT TO sft_jobs USING (app_scope() = 'system')",
+)
+
+
+def upgrade() -> None:
+    op.create_table("widgets", sa.Column("tenant_id", sa.Uuid, nullable=False), ...)
+    for statement in WIDGETS_RLS:
+        op.execute(statement)
 ```
 
 Add the table to `sft/data/models.py` too: a test compares the models with the migrated schema. The catalog tests fail

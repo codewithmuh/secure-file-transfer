@@ -19,16 +19,19 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
-from sqlalchemy import Connection, event, text
+from sqlalchemy import Connection, Engine, create_engine, event, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
 from sqlalchemy.orm import Session, SessionTransaction
+from sqlalchemy.pool import NullPool
 
 from sft.data.scope import Scope
 
@@ -41,12 +44,20 @@ class ScopeMissingError(RuntimeError):
     """A transaction was about to run without a scope."""
 
 
-def psycopg_url(url: str) -> URL:
+def psycopg_url(url: str | URL) -> URL:
     """The URL with the psycopg 3 driver, which serves both the async app and the sync jobs."""
     parsed = make_url(url)
     if parsed.drivername not in ("postgresql", "postgresql+psycopg"):
         raise ValueError("only postgresql:// and postgresql+psycopg:// URLs are supported")
     return parsed.set(drivername="postgresql+psycopg")
+
+
+def sync_engine(url: str | URL, **options: Any) -> Engine:
+    """A synchronous engine without a pool, for one-shot jobs (bootstrap, migrations) and tests.
+
+    It has no scope: it is never used for the application's queries, which go through `Database`.
+    """
+    return create_engine(psycopg_url(url), poolclass=NullPool, **options)
 
 
 class _ScopedSession(Session):
@@ -62,10 +73,14 @@ def _set_scope(session: Session, transaction: SessionTransaction, connection: Co
 
 
 class Database:
-    """The engine and its pool, shared by the whole process. Create one at startup."""
+    """The engine and its pool, shared by the whole process. Create one at startup.
+
+    Its only ways in are `transaction()` and `dispose()`; the engine stays private, so no code
+    can reach the pool without a scope.
+    """
 
     def __init__(self, engine: AsyncEngine) -> None:
-        self.engine = engine
+        self._engine = engine
         self._sessions = async_sessionmaker(
             engine,
             sync_session_class=_ScopedSession,
@@ -95,4 +110,11 @@ class Database:
 
     async def dispose(self) -> None:
         """Close every pooled connection. Call it once, at shutdown."""
-        await self.engine.dispose()
+        await self._engine.dispose()
+
+    def raw_connection_for_tests(self) -> AsyncConnection:
+        """Tests only: a connection from this pool with no scope, to check what it leaves behind.
+
+        A test fails if any code under src/ calls it.
+        """
+        return self._engine.connect()

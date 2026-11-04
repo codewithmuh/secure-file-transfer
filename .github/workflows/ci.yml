@@ -56,18 +56,20 @@ jobs:
       run:
         working-directory: services/api
     # Real PostgreSQL for the data layer's tests, at ADR-0011's major version. The tests make their
-    # own databases on it and drop them; the password guards a throwaway container on the runner.
+    # own databases on it and drop them. Password auth, as in every real environment, so logins are
+    # tested too; the password is made per run from the run's ID, so no literal sits in the workflow.
+    # (The services block can't read the env context, so the expression appears twice.)
     services:
       postgres:
         image: postgres:17.11-trixie
         env:
-          POSTGRES_PASSWORD: ci-only-postgres
+          POSTGRES_PASSWORD: pg-${{ github.run_id }}-${{ github.run_attempt }}
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready --username postgres --host 127.0.0.1"
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
-      TEST_DATABASE_URL: postgresql://postgres:ci-only-postgres@127.0.0.1:5432/postgres
+      TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -145,15 +147,16 @@ jobs:
         if: matrix.service == 'api'
         env:
           IMAGE: ${{ matrix.service }}:ci
+          PG_PASSWORD: pg-${{ github.run_id }}-${{ github.run_attempt }} # per run, as above
         run: |
           docker network create smoke-db
           docker run --detach --name smoke-postgres --network smoke-db \
-            --env POSTGRES_PASSWORD=ci-only-postgres postgres:17.11-trixie
+            --env POSTGRES_PASSWORD="$PG_PASSWORD" postgres:17.11-trixie
           for _ in $(seq 1 30); do
             if docker exec smoke-postgres pg_isready --host 127.0.0.1 --quiet; then break; fi
             sleep 1
           done
-          admin=postgresql://postgres:ci-only-postgres@smoke-postgres:5432/postgres
+          admin="postgresql://postgres:${PG_PASSWORD}@smoke-postgres:5432/postgres"
           job() { # job MODULE [docker run options]: python -m MODULE in the image, hardened as above
             local module=$1
             shift

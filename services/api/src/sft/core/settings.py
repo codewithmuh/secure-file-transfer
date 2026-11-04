@@ -119,6 +119,10 @@ class BootstrapSettings(_Base):
     )
 
 
+EXIT_BAD_SETTINGS = 2
+"""The exit status of every entry point whose settings are wrong."""
+
+
 def setting_errors(exc: ValidationError, cls: type[BaseSettings]) -> list[dict[str, str]]:
     """Which settings of `cls` are wrong and why, never their values: one may be a secret."""
     names = [name.upper() for name in cls.model_fields]
@@ -138,8 +142,8 @@ def setting_errors(exc: ValidationError, cls: type[BaseSettings]) -> list[dict[s
 def load_settings[S: BaseSettings](cls: type[S]) -> S | None:
     """Read `cls` from the environment, or log which settings are wrong and return None.
 
-    Every entry point starts with it, so each exits the same way on bad settings: status 2 and one
-    log line that names the settings, never their values.
+    Every entry point starts with it, so each exits the same way on bad settings: status
+    `EXIT_BAD_SETTINGS` and one log line that names the settings, never their values.
     """
     try:
         return cls()

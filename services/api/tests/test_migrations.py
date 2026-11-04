@@ -1,17 +1,18 @@
 """The real revisions: numbered in a line, honest about what they serve, in step with the models."""
 
+import ast
 import re
 from pathlib import Path
 
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine
-from sqlalchemy.pool import NullPool
 
 from pg import ScratchDatabase
+from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, compatible_with
 from sft.data.models import Base
+from sft.data.rls import tenant_rls_sql
 
 SCRIPTS = ScriptDirectory.from_config(alembic_config())
 
@@ -36,8 +37,27 @@ def test_compatible_with_names_only_earlier_revisions() -> None:
         assert set(compatible_with(script)) <= earlier, script.revision
 
 
+def test_revisions_keep_literal_sql_and_import_nothing_of_ours() -> None:
+    # A revision that called sft.data.rls would change what it does whenever the helpers change.
+    for script in SCRIPTS.walk_revisions():
+        tree = ast.parse(Path(str(script.path)).read_text())
+        modules = [n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
+        modules += [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
+        ours = [m for m in modules if m == "sft" or m.startswith("sft.")]
+        assert ours == [], f"{script.revision} imports {ours}"
+
+
+def test_0001_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # 0001 was written by pasting this output. If a helper changes on purpose, 0001 must not:
+    # replace the call below with the old output, as a literal, and keep the test.
+    frozen = SCRIPTS.get_revision("0001").module.TENANTS_RLS
+    assert list(frozen) == tenant_rls_sql(
+        "tenants", key="id", grants={"sft_api": "SELECT", "sft_operator": "SELECT, INSERT, UPDATE"}
+    )
+
+
 def test_the_models_match_the_migrations(migrated_db: ScratchDatabase) -> None:
-    engine = create_engine(migrated_db.admin, poolclass=NullPool)
+    engine = sync_engine(migrated_db.admin)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection, opts={"compare_type": True})
