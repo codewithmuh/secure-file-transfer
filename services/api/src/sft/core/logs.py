@@ -25,6 +25,10 @@ trace_id_var: ContextVar[str | None] = ContextVar("trace_id", default=None)
 # uvicorn adds `color_message`, a copy of the message with terminal colour codes.
 _SKIP = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "color_message"}
 
+# The fields the formatter writes itself. An `extra=` field with one of these names can't replace
+# them; it is logged as `extra_<name>` instead.
+_CORE_FIELDS = frozenset({"ts", "level", "logger", "msg", "request_id", "trace_id", "exc"})
+
 
 def bind_context(*, request_id: str | None, trace_id: str | None) -> None:
     """Set the IDs that every log line in the current context carries."""
@@ -44,7 +48,9 @@ class JsonFormatter(logging.Formatter):
             payload["request_id"] = request_id
         if (trace_id := trace_id_var.get()) is not None:
             payload["trace_id"] = trace_id
-        payload.update({k: v for k, v in vars(record).items() if k not in _SKIP})
+        for key, value in vars(record).items():
+            if key not in _SKIP:
+                payload[f"extra_{key}" if key in _CORE_FIELDS else key] = value
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload, default=str)

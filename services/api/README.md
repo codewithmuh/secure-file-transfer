@@ -67,3 +67,5 @@ Architecture section 8, as built here:
   `SHUTDOWN_DRAIN_SECONDS`, the internal listener closes, and the process exits 0. uvicorn closes the public listener
   the moment the signal arrives, so the app can't keep accepting while the load balancer catches up. In Kubernetes,
   a `preStop` sleep in the pod spec holds the signal back for that time (`src/sft/api/server.py` has the details).
+  Ctrl+C during the drain (a second SIGINT) cuts it short and cancels in-flight requests, as in uvicorn; a repeated
+  SIGTERM changes nothing.

@@ -1,6 +1,7 @@
 """The runtime contract end to end: real listeners and sockets, and real signals in a subprocess."""
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -8,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 
 import httpx2 as httpx
 import pytest
@@ -17,6 +19,8 @@ from fastapi import FastAPI
 from sft.api.app import create_app
 from sft.api.server import ApiServer
 from sft.core.settings import Settings
+
+Logs = Callable[[], list[dict[str, object]]]
 
 
 def free_ports(count: int) -> list[int]:
@@ -131,15 +135,54 @@ async def test_requests_still_running_after_the_drain_are_cut() -> None:
 
 
 @pytest.mark.anyio
-async def test_a_second_shutdown_changes_nothing() -> None:
-    s = settings()
-    server = ApiServer(s)
+async def test_ctrl_c_during_the_drain_cuts_it_short() -> None:
+    s = settings(drain=20)
+    in_flight = asyncio.Event()
+    server = ApiServer(s, app_with_slow_route(in_flight, seconds=30))
     run = asyncio.create_task(server.run(handle_signals=False))
+    public, internal = urls(s)
     async with httpx.AsyncClient() as client:
-        await wait_until_ready(client, urls(s)[1])
-    server.shutdown()
-    server.shutdown()
+        await wait_until_ready(client, internal)
+        slow = asyncio.create_task(client.get(f"{public}/slow", timeout=40))
+        await in_flight.wait()
+        server.handle_signal(signal.SIGINT)
+        await asyncio.sleep(0.3)  # the drain has begun
+        started = time.monotonic()
+        server.handle_signal(signal.SIGINT)
+        assert await run == 0
+        assert time.monotonic() - started < 3  # not the 20 s drain
+        assert (await slow).status_code == 500  # the request was cancelled
+
+
+@pytest.mark.anyio
+async def test_a_repeated_sigterm_does_not_cut_the_drain() -> None:
+    s = settings(drain=5)
+    in_flight = asyncio.Event()
+    server = ApiServer(s, app_with_slow_route(in_flight, seconds=0.5))
+    run = asyncio.create_task(server.run(handle_signals=False))
+    public, internal = urls(s)
+    async with httpx.AsyncClient() as client:
+        await wait_until_ready(client, internal)
+        slow = asyncio.create_task(client.get(f"{public}/slow"))
+        await in_flight.wait()
+        server.handle_signal(signal.SIGTERM)
+        await asyncio.sleep(0.1)
+        server.handle_signal(signal.SIGTERM)
+        r = await slow
+        assert (r.status_code, r.json()) == (200, {"status": "done"})
     assert await run == 0
+
+
+@pytest.mark.anyio
+async def test_a_signal_during_startup_never_reports_ready(json_logs: Logs) -> None:
+    server = ApiServer(settings())
+    server.handle_signal(signal.SIGTERM)  # before the listeners have started
+    assert await server.run(handle_signals=False) == 0
+    assert not server.readiness.started
+    messages = [line["msg"] for line in json_logs()]
+    assert "shutting down: readiness fails, in-flight requests drain" in messages
+    assert "ready" not in messages
+    assert messages[-1] == "stopped"
 
 
 def test_uvicorn_still_lets_us_replace_its_signal_handling() -> None:
@@ -172,11 +215,10 @@ def test_a_signal_drains_and_exits_zero(sig: signal.Signals) -> None:
     )
     try:
         for _ in range(200):
-            try:
+            with contextlib.suppress(httpx.TransportError):
                 if httpx.get(f"{urls(s)[1]}/readyz").status_code == 200:
                     break
-            except httpx.TransportError:
-                time.sleep(0.05)
+            time.sleep(0.05)  # on a 503 too, not only when the port isn't open yet
         else:
             raise AssertionError("never became ready")
         proc.send_signal(sig)

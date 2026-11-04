@@ -63,3 +63,28 @@ def test_configure_logging_sends_everything_through_one_json_handler() -> None:
         assert root.level == logging.WARNING
     finally:
         root.handlers[:], root.level = saved[0], saved[1]
+
+
+def test_extra_fields_cannot_replace_the_core_fields() -> None:
+    clashing = {
+        "ts": "fake-ts",
+        "level": "fake-level",
+        "logger": "fake-logger",
+        "request_id": "fake-request",
+        "trace_id": "fake-trace",
+        "exc": "fake-exc",
+    }
+
+    def in_a_request() -> dict[str, object]:
+        bind_context(request_id="req_real", trace_id="b" * 32)
+        return format_record(**clashing)
+
+    out = contextvars.copy_context().run(in_a_request)
+    assert out["level"] == "info"
+    assert out["logger"] == "t"
+    assert out["request_id"] == "req_real"
+    assert out["trace_id"] == "b" * 32
+    assert out["ts"] != "fake-ts"
+    assert "exc" not in out  # no exception was logged
+    for key, value in clashing.items():
+        assert out[f"extra_{key}"] == value  # kept, under another name

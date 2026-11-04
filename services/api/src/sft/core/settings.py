@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
 
 
+# Pods set enableServiceLinks: false, so Service variables can't clash with these (architecture 8).
 class Settings(BaseSettings):
     """Every setting the process reads. The field name in capitals is the environment variable."""
 
