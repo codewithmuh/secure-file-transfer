@@ -55,6 +55,10 @@ dropped**: ECR is the only registry for our images.
   code, CI builds once, fails on a critical or high Trivy finding, pushes `sft/app:<git-sha>` through an OIDC role in
   shared that may push only to `sft/*`, and signs the digest. The SBOM (SPDX) and provenance are attached as artifacts
   of that digest; the release-please release links the digest and attaches the SBOM, as the template does today.
+  `build.yml` (#107) pushes the image by digest with no tag, scans that digest, signs it, and only then tags it
+  `<git-sha>`, so the image scanned is the image that runs; a failed scan leaves an untagged, unsigned image that
+  admission refuses and the lifecycle expires. A re-run finds the commit's tag and reuses its digest. The push role
+  trusts only the `registry` GitHub environment, which accepts deployments from `main` only (T-71).
 - **Signing identity.** Admission accepts an `sft/*` image only with a certificate whose identity is this repository's
   build workflow on `main`, issued by GitHub's OIDC issuer. Keyless signing records that identity and the digest in
   the public Rekor log. Kyverno verifies offline, from the bundle stored with the signature and a Sigstore trust root
@@ -82,11 +86,11 @@ dropped**: ECR is the only registry for our images.
   registries ([ADR-0021](0021-network-design-and-egress.md)), and add nothing to NAT.
 - **Re-scanning.** A scheduled workflow re-scans the digests that the deploy config names and opens an issue on any
   new critical or high finding (NFR-13).
-- **Dropping GHCR.** In the first build milestone, `release.yml` stops logging in to and publishing to GHCR, in the
-  same change that adds the ECR push and removes the Go sample ([ADR-0010](0010-no-go-in-v1.md)). `SECURITY.md`'s
-  `cosign verify` example, which names the GHCR `api-go` image, changes to the ECR `sft/app` image and the build
-  workflow's identity, and the README line about GHCR changes with it. Until then the template's workflow runs
-  unchanged.
+- **Dropping GHCR.** `build.yml` ([#107](https://github.com/codewithmuh/secure-file-transfer/issues/107)) adds the
+  ECR push, and `SECURITY.md` shows how to verify its images. It can't run until the shared account exists, so
+  `release.yml` keeps publishing to GHCR until the first ECR build on `main` has passed; the change after it stops
+  `release.yml` logging in to and publishing to GHCR, drops `SECURITY.md`'s GHCR `cosign verify` example and changes
+  the README line about GHCR. Until then a release still has a signed image and an SBOM somewhere.
 
 When to revisit: if the project needs public images, for example a guide to run it yourself (add a public copy then);
 if verifying signatures offline turns out not to work in Kyverno; or if a customer's dedicated deployment needs its own
