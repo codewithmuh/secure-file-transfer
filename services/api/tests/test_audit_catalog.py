@@ -69,11 +69,12 @@ def test_the_audit_table_is_partitioned_with_a_default(migrated_db: ScratchDatab
 def test_definer_functions_pin_their_path_and_are_not_public(migrated_db: ScratchDatabase) -> None:
     # A SECURITY DEFINER function runs with its owner's rights: it must not resolve names
     # through the caller's search_path, nor be callable by every role (authn and authz 7.5).
+    # pg_temp goes last, explicitly: left out, it is searched first, so a caller's temporary
+    # table could stand in for one of ours.
     rows = migrated_db.sql(
         """
         SELECT p.proname,
-               coalesce(EXISTS (SELECT FROM unnest(p.proconfig) s WHERE s LIKE 'search_path=%'),
-                        false),
+               coalesce('search_path=pg_catalog, public, pg_temp' = ANY(p.proconfig), false),
                p.proacl IS NULL OR EXISTS (
                    SELECT FROM aclexplode(p.proacl) a WHERE a.grantee = 0)
           FROM pg_proc p
@@ -82,8 +83,28 @@ def test_definer_functions_pin_their_path_and_are_not_public(migrated_db: Scratc
     )
     assert rows, "no definer functions: the check would pass by checking nothing"
     for name, pinned, public in rows:
-        assert pinned, f"{name} doesn't pin search_path"
+        assert pinned, f"{name} doesn't pin search_path to pg_catalog, public, pg_temp"
         assert not public, f"every role may execute {name}"
+
+
+# Every column but tx_id and occurred_at, which only the database sets (and sft_recovery, which
+# re-imports archived events with their own values).
+WRITER_COLUMNS = [
+    "id",
+    "tenant_id",
+    "actor_type",
+    "actor_id",
+    "action",
+    "target_type",
+    "target_id",
+    "outcome",
+    "source_ip",
+    "user_agent",
+    "request_id",
+    "trace_id",
+    "security_critical",
+    "details",
+]
 
 
 def test_0002_keeps_the_sql_the_helpers_wrote_for_it() -> None:
@@ -93,7 +114,7 @@ def test_0002_keeps_the_sql_the_helpers_wrote_for_it() -> None:
     writers = ["sft_api", "sft_scan", "sft_notify", "sft_jobs", "sft_operator"]
     assert list(revision.AUDIT_EVENTS_RLS) == [
         "ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY",
-        *(grant_sql("audit_events", role, "INSERT") for role in writers),
+        *(grant_sql("audit_events", role, "INSERT", columns=WRITER_COLUMNS) for role in writers),
         grant_sql("audit_events", "sft_api", "SELECT"),
         grant_sql("audit_events", "sft_archive", "SELECT"),
         grant_sql("audit_events", "sft_recovery", "INSERT"),
@@ -102,7 +123,7 @@ def test_0002_keeps_the_sql_the_helpers_wrote_for_it() -> None:
             "audit_events",
             roles=writers,
             command="INSERT",
-            with_check="tenant_id = app_tenant_id()",
+            with_check="tenant_id = app_tenant_id() AND app_scope() IN ('tenant', 'resource')",
         ),
         policy_sql(
             "audit_platform_insert",
@@ -116,7 +137,7 @@ def test_0002_keeps_the_sql_the_helpers_wrote_for_it() -> None:
             "audit_events",
             roles=["sft_api"],
             command="SELECT",
-            using="tenant_id = app_tenant_id()",
+            using="tenant_id = app_tenant_id() AND app_scope() = 'tenant'",
         ),
         policy_sql(
             "audit_archive_read",

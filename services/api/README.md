@@ -229,10 +229,12 @@ async with database.transaction(Scope.tenant(tenant_id)) as session:
 ```
 
 The tenant comes from the scope, the request and trace IDs from the log context, `tx_id` and `occurred_at` from the
-database. `details` takes IDs, enums, numbers, flags and aware times only, never free text. Workload roles may insert
-audit events but never change or delete them. `audit_events` is partitioned by UTC month, with a default partition
+database: workload roles may insert audit events, but not set those two columns, nor change or delete an event.
+`details` takes IDs, `StrEnum` and `IntEnum` members, numbers, flags and aware times only, never free text; control
+characters are stripped from the user agent. `audit_events` is partitioned by UTC month, with a default partition
 for a month that has none; the lifecycle job's step, `sft.service.audit_partitions.maintain_audit_partitions`, keeps
-three months ahead and exports `sft_audit_default_partition_rows` and `sft_audit_partition_months_covered`.
+three months ahead and exports `sft_audit_default_partition_rows`, `sft_audit_partition_months_covered` and
+`sft_audit_partition_last_success_timestamp_seconds`.
 
 ### Tests against PostgreSQL
 

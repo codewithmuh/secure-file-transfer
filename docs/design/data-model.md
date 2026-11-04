@@ -331,7 +331,7 @@ doesn't lock the subject again.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `outcome` (success, failure), `source_ip`, `user_agent`, `request_id`, `trace_id`, `security_critical`, `details` (JSON) | Partitioned by UTC month on `occurred_at`; primary key `(id, occurred_at)`, because a partitioned table's keys must include the partition key. The database sets `tx_id` (`pg_current_xact_id()`) and `occurred_at` (`now()`, the transaction's start, which also serves as `created_at`), so code can't backdate an event. The tenant comes from the transaction's scope, and the request and trace IDs from the log context. The application roles can only insert. `action` is a dotted code (`transfer.revoked`), `target_type` a code (`transfer`), and actor and target are IDs. `details` holds IDs, enums, numbers, flags and times only, never free text, so no file name, message, address, token or code can reach it (FR-27, NFR-15). `user_agent` is cut to 512 characters. |
+| `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `outcome` (success, failure), `source_ip`, `user_agent`, `request_id`, `trace_id`, `security_critical`, `details` (JSON) | Partitioned by UTC month on `occurred_at`; primary key `(id, occurred_at)`, because a partitioned table's keys must include the partition key. The database sets `tx_id` (`pg_current_xact_id()`) and `occurred_at` (`now()`, the transaction's start, which also serves as `created_at`), so code can't backdate an event. The tenant comes from the transaction's scope, and the request and trace IDs from the log context. The application roles can only insert, and their grant leaves out `tx_id` and `occurred_at`; only `sft_recovery`, re-importing archived events, sets them. Events are inserted in tenant or resource scope (a recipient's download) or platform scope, and read by `sft_api` in tenant scope only, so a link session can't read the log. `action` is a dotted code (`transfer.revoked`), `target_type` a code (`transfer`), and actor and target are IDs. `details` holds IDs, enums, numbers, flags and times only, never free text, so no file name, message, address, token or code can reach it (FR-27, NFR-15). `user_agent` is cut to 512 characters. |
 | `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `archived_at` | One row: the current archive generation, and how far the archive job has got in it. |
 | `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `delay_seconds` asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4). |
 | `processed_messages` | `consumer`, `message_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`), `message_id` is the SHA-256 of `mail.messageId`, `eventType`, the HMAC of the recipient address and the event's timestamp, not the SQS message ID, because SES can publish one event more than once and a bounce can name several recipients. |
@@ -872,15 +872,24 @@ partition. An alert fires if the next month's partition is missing 7 days before
 the default partition.
 
 - Partitions cover whole UTC months and are named `audit_events_yYYYYmMM`. The migration makes this month's and the
-  next three; after that the job calls `audit_create_partitions(3)`, a `SECURITY DEFINER` function only `sft_jobs` may
-  run. It creates each missing partition on its own and then attaches it, which locks only the new table and the
-  default partition, so inserts into other months don't wait.
+  next three; after that the job calls `audit_create_partitions(3)`, a `SECURITY DEFINER` function that only `sft_jobs`
+  and `sft_recovery` may run. It locks the default partition, then creates each missing partition on its own and
+  attaches it, which locks only the new table and the default partition, so inserts into other months don't wait.
+- One run at a time: a run that finds another holding the function's advisory lock returns nothing. Each month is
+  handled in its own subtransaction, so a month that fails, on a lock timeout say, is reported as **failed** and
+  the later months are still made; the next run tries again.
 - A month whose rows already sit in the default partition is **blocked**: the function skips it and reports it, and
   makes the later months. Moving those rows into a new partition is an operator's step in the runbook, so the alert
   stays on until someone has looked.
+- **Restores and failovers re-import archived events with their original `occurred_at`** (2.5). Before re-importing,
+  the runbook runs `audit_create_partitions(3, <first day of the oldest re-imported event's month>)` as
+  `sft_recovery`, which also makes past months, up to 24 back, so old events land in their own months, not the default
+  partition.
 - `audit_partition_status()` returns the rows in the default partition and the months from the current one on with a
   partition, without a gap. The job exports them as `sft_audit_default_partition_rows` (alert above 0) and
-  `sft_audit_partition_months_covered` (alert below 2 in a month's last 7 days).
+  `sft_audit_partition_months_covered` (alert below 2 in a month's last 7 days). It measures even when creation fails,
+  and exports `sft_audit_partition_last_success_timestamp_seconds`, the last run that made every month it had to, so a
+  job that keeps failing or stops running shows too.
 
 Database backups keep 14 days of point-in-time recovery, so deleted rows age out of backups within 14 days. File
 contents are never in database backups.

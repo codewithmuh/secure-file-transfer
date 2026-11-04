@@ -47,7 +47,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Final, Literal
 
-from sft.data.rls import _identifier as identifier
+from sft.data.rls import identifier
 
 TRIGGER: Final = "audit_required"
 """The constraint trigger's name on every audited table, and the constraint named in its error."""
