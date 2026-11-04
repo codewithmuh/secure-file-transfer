@@ -26,6 +26,14 @@ Only the latest release receives security fixes.
 | Vulnerability and misconfiguration scans (repo + images) | `ci.yml` (Trivy) |
 | GitHub Actions pinned to commit SHAs, least-privilege tokens | `.github/workflows/*` |
 | Containers run as non-root, read-only, all capabilities dropped | `Dockerfile`s, `compose.yaml` |
-| Signed images (cosign, keyless) with SBOM and provenance, pinned by digest | ECR in the shared account, from M4 ([ADR-0007](docs/adr/0007-container-registry-ecr.md)) |
+| Signed images (cosign, keyless) with SBOM and provenance | `release.yml` (GHCR until ECR replaces it in M4, [ADR-0007](docs/adr/0007-container-registry-ecr.md)) |
 
-Images aren't published yet. The verification command for ECR images comes with the release pipeline in M4.
+Verify a published image:
+
+```bash
+cosign verify ghcr.io/codewithmuh/secure-file-transfer/api-python:<version> \
+  --certificate-identity 'https://github.com/codewithmuh/secure-file-transfer/.github/workflows/release.yml@refs/heads/main' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+When M4 moves images to ECR, this command changes to the ECR image (ADR-0007).

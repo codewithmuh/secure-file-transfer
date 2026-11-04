@@ -16,6 +16,8 @@ repos:
     rev: v8.30.1
     hooks:
       - id: gitleaks
+        # The hook is built with Go. The repo has no Go toolchain, so pin the one pre-commit downloads.
+        language_version: 1.27.3
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.0

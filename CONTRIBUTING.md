@@ -27,7 +27,7 @@ make up      # run all services locally
    squash commit is the PR title with an empty body, and release-please reads it for the version bump and changelog
    (`feat` → minor, `fix` → patch, `feat!` → major). Mark a breaking change with `!` in the title: a
    `BREAKING CHANGE:` footer in a branch commit does not survive the squash.
-5. **Review and CI.** The PR gets a code review and findings are fixed on the same branch. The five CI checks must pass
+5. **Review and CI.** The PR gets a code review and findings are fixed on the same branch. The CI checks must pass
    and the branch must be up to date with `main`. No approval count is required: GitHub does not let authors approve
    their own PRs, and this repo has one maintainer.
 6. **Merge.** The maintainer squash-merges; the branch is deleted automatically.
