@@ -95,8 +95,17 @@ jobs:
         options: >-
           --health-cmd "pg_isready --username postgres --host 127.0.0.1"
           --health-interval 2s --health-timeout 5s --health-retries 30
+      # ElasticMQ, the local SQS (as in compose.yaml), for the SQS adapter's integration tests and
+      # the relay's entry point. It takes no credentials; the tests make their own queues and delete them.
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.7.1@sha256:e4580ab9ad1bd5cd37b4ba04911bc5ccc8cd2d9ab4de56ece65acee71c24e05c
+        ports: ["9324:9324"]
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:9324/health"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
+      TEST_SQS_ENDPOINT_URL: http://127.0.0.1:9324
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -111,7 +120,7 @@ jobs:
       - run: uv run ruff check --output-format=github .
       - run: uv run mypy
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
-      - run: uv run pytest # against the PostgreSQL service; fails below 80% coverage (pyproject.toml)
+      - run: uv run pytest # against the PostgreSQL and ElasticMQ services; fails below 80% coverage
 
   # Always runs and reports, so it can be a required check (#59). A pull request that changes nothing under
   # web/ and not this workflow skips the steps, and the job still passes; a job-level `if:` would report "skipped".
@@ -243,3 +252,36 @@ jobs:
           # finds the database at the image's head and does nothing.
           job sft.data.migrate --env MIGRATION_DATABASE_URL="$admin"
           job sft.data.migrate --env MIGRATION_DATABASE_URL="$admin" | grep --quiet '"action": "current"'
+      - name: Smoke test the outbox relay (the same image, its own entry point and role)
+        if: matrix.service == 'api'
+        env:
+          IMAGE: ${{ matrix.service }}:ci
+          RELAY_PASSWORD: relay-${{ github.run_id }}-${{ github.run_attempt }} # per run, as above
+        run: |
+          # The relay logs in as sft_relay; bootstrap gave it no password, so give it a throwaway one.
+          docker exec smoke-postgres psql --username postgres --quiet \
+            --command "ALTER ROLE sft_relay PASSWORD '${RELAY_PASSWORD}'"
+          # No topics exist yet, so it sends nothing: SQS can be unreachable, the database can't.
+          docker run --detach --name smoke-relay --network smoke-db --read-only --tmpfs /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --env DATABASE_URL="postgresql://sft_relay:${RELAY_PASSWORD}@smoke-postgres:5432/postgres" \
+            --env SQS_QUEUE_PREFIX=sft-ci- --env SQS_ENDPOINT_URL=http://127.0.0.1:1 \
+            --env AWS_ACCESS_KEY_ID=ci-fake --env AWS_SECRET_ACCESS_KEY=ci-fake \
+            --publish 127.0.0.1:9011:8001 "$IMAGE" python -m sft.workers.relay
+          for _ in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9011/readyz; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:9011/healthz
+          # It reached the database: its batches ran and none failed.
+          for _ in $(seq 1 10); do
+            if curl --fail --silent http://127.0.0.1:9011/metrics \
+              | grep --quiet '^outbox_relay_batch_duration_seconds_count [1-9]'; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error http://127.0.0.1:9011/metrics \
+            | grep --quiet '^outbox_oldest_unpublished_age_seconds 0.0'
+          docker stop --time 30 smoke-relay
+          docker logs smoke-relay | tail -n 8
+          test "$(docker inspect --format '{{.State.ExitCode}}' smoke-relay)" = 0
+          if docker logs smoke-relay | grep --quiet 'outbox batch failed'; then exit 1; fi
