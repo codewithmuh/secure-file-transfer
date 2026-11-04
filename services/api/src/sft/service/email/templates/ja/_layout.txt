@@ -1,0 +1,4 @@
+{% block body %}{% endblock %}
+
+--
+このメールは、Secure File Transferが{{ tenant_name }}に代わって自動送信しています。Secure File Transferがメールにファイルを添付したり、コードやパスワードを返信で求めたりすることはありません。

@@ -1,0 +1,7 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }} has invited you to Secure File Transfer, where you send and receive confidential files. You sign in with your organisation's single sign-on.</p>
+{{ button(invitation_url, 'Accept the invitation', 'Or copy this address into your browser:') }}
+<p style="margin:0 0 16px;">The link works once and expires on {{ expires_at }}.</p>
+{% endblock %}

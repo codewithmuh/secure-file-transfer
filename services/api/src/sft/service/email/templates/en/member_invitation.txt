@@ -1,0 +1,13 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{{ tenant_name }} invited you to Secure File Transfer{% endblock %}
+{% block body %}
+{{ tenant_name }} has invited you to Secure File Transfer, where you send
+and receive confidential files.
+
+Your temporary password: {{ temporary_password }}
+
+It works for {{ valid_days }} {% if valid_days == 1 %}day{% else %}days{% endif %}. When you first sign in with it, you choose your own password and set up an authenticator app.
+
+Sign in:
+{{ sign_in_url }}
+{% endblock %}

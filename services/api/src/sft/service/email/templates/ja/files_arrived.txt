@@ -1,0 +1,8 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}アップロード依頼にファイルが届きました（{{ file_count }}件）{% endblock %}
+{% block body %}
+{{ tenant_name }}のアップロード依頼に新しいファイルが{{ file_count }}件届き、ダウンロードできるようになりました。
+
+アップロード依頼を見る：
+{{ upload_request_url }}
+{% endblock %}

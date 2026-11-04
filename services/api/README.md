@@ -19,6 +19,7 @@ src/sft/
     __main__.py       python -m sft.api
   (workers/)    later, beside api: asyncio workers that use the service layer without HTTP
   service/      business rules and permission checks
+    email/            every email, rendered in English and Japanese as text and HTML (Email below)
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations
     database.py       the pool, and Database.transaction(scope), the only way to open a transaction
     scope.py          Scope: tenant, resource, system, platform, lookup or recovery
@@ -28,6 +29,7 @@ src/sft/
     audit.py          audit events, written in the transaction of the change; partition upkeep
     audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
     migrations/       the Alembic revisions; migrate.py is the migration job
+    mail/             the mail adapter: SES API v2 in AWS, SMTP to Mailpit locally (Email below)
   core/         settings and logging, used by every layer
 ```
 
@@ -64,6 +66,19 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `SHUTDOWN_DRAIN_SECONDS` | `20` | How long in-flight requests get after SIGTERM (1 to 120) |
 | `DATABASE_URL` | none, required | The workload's own login role, `postgresql://` or `postgresql+psycopg://`; a secret |
 | `DATABASE_POOL_SIZE` | `5` | Connections per process, with no overflow (1 to 50) |
+
+Whatever sends email (the notification worker) also reads `MailSettings`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAIL_BACKEND` | none, required | `ses` in AWS; `smtp` only for the local stack's Mailpit |
+| `MAIL_FROM_ADDRESS` | none, required | The `From` address on our sending subdomain, e.g. `no-reply@mail.<domain>` |
+| `MAIL_FROM_NAME` | `Secure File Transfer` | The `From` display name (ASCII) |
+| `WEB_APP_URL` | none, required | The web app's origin, the only place emails link to; `https`, or `http` for localhost |
+| `SES_REGION` | `ap-northeast-1` | Tokyo, or `ap-northeast-3` (Osaka) after a failover; nothing else (NFR-21) |
+| `SES_CONFIGURATION_SET` | none | The region's configuration set; required for `ses` |
+| `SES_TENANTS` | `true` | Name the tenant's SES tenant on every send (ADR-0015); `false` only where SES has no tenant management |
+| `SMTP_HOST`, `SMTP_PORT` | `127.0.0.1`, `1025` | Mailpit, for `smtp` |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
 `BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
@@ -248,3 +263,38 @@ docker run --detach --name sft-test-postgres --publish 127.0.0.1:55432:5432 \
   --env POSTGRES_PASSWORD=test-only postgres:17.11-trixie
 TEST_DATABASE_URL=postgresql://postgres:test-only@127.0.0.1:55432/postgres uv run pytest
 ```
+
+## Email
+
+Every email the PRD names, in English and Japanese, as plain text and HTML (FR-33, abuse 7.1), and one adapter to
+send them (ADR-0015).
+
+```python
+from sft.data.mail import mailer_from_settings
+from sft.service.email import EmailRenderer, Locale
+from sft.service.email.catalog import VerificationCode
+
+renderer = EmailRenderer(settings.web_app_url)
+email = renderer.compose(
+    VerificationCode(tenant_name=tenant.name, code=code), Locale.JA, to=address, tenant_id=tenant.id
+)
+message_id = mailer_from_settings(settings).send(email)  # blocks: call it from a thread pool
+```
+
+- **One class per email** in `sft/service/email/catalog.py`. Its fields are all its templates get. Links are built
+  there from `WEB_APP_URL`, never written in a template; tokens go in the fragment (`/t#…`, `/u#…`, `/invite#…`).
+- **Templates** in `sft/service/email/templates/<locale>/<type>.txt` and `.html`; the text file holds the subject in
+  its `subject` block, and both extend the locale's `_layout`. Jinja2 escapes every value in `.html` and nothing in
+  `.txt`, and a missing key is an error (`StrictUndefined`). Tests check that every template of both languages uses
+  exactly its email's keys, that each secret (link token, code, temporary password) appears only in its own email,
+  and that every URL points to the web app.
+- **No personal data in logs.** Rendering logs nothing. The adapters log the email type, the provider and its message
+  ID, or an error code. Their `MailError` carries a kind (`throttled`, `unavailable`, `paused`, `rejected`) and the
+  provider's error code, raised `from None`, because a provider's message can quote the address. `OutgoingEmail`,
+  `RenderedEmail` and the email classes keep addresses and secrets out of their reprs.
+- **SES** (`sft/data/mail/ses.py`): `SendEmail` with the region's configuration set, the SES tenant named by our
+  tenant ID, and the tags `tenant_id` and `email_type`, plus any the caller adds, so delivery events find their row.
+  Tested with botocore's Stubber; nothing calls AWS.
+- **SMTP** (`sft/data/mail/smtp.py`): plain SMTP to Mailpit, tags as `X-Sft-Tag-*` headers. Its integration test runs
+  against Mailpit in CI's mail job, and locally after `make up` with
+  `TEST_MAIL_CATCHER_URL=http://127.0.0.1:8025 TEST_SMTP_PORT=1025 uv run pytest tests/test_mail_mailpit.py`.

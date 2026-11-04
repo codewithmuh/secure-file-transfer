@@ -1,0 +1,6 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{% if request_count == 1 %}A transfer in {{ tenant_name }} needs{% else %}{{ request_count }} transfers in {{ tenant_name }} need{% endif %} approval under a data loss prevention rule, and you are an approver. Sign in to the web app to review {% if request_count == 1 %}it{% else %}them{% endif %}.</p>
+{{ button(approvals_url, 'Open the approval queue', 'Or copy this address into your browser:') }}
+{% endblock %}

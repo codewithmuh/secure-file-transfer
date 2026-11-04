@@ -1,0 +1,9 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}A recipient has downloaded from your transfer{% endblock %}
+{% block body %}
+A recipient has downloaded a file from your transfer for the first time. The
+transfer page shows who downloaded which file, and when.
+
+View the transfer:
+{{ transfer_url }}
+{% endblock %}

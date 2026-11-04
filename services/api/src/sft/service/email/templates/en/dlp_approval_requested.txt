@@ -1,0 +1,8 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{% if request_count == 1 %}A transfer waits{% else %}{{ request_count }} transfers wait{% endif %} for your approval{% endblock %}
+{% block body %}
+{% if request_count == 1 %}A transfer in {{ tenant_name }} needs{% else %}{{ request_count }} transfers in {{ tenant_name }} need{% endif %} approval under a data loss prevention rule, and you are an approver. Sign in to the web app to review {% if request_count == 1 %}it{% else %}them{% endif %}.
+
+Open the approval queue:
+{{ approvals_url }}
+{% endblock %}

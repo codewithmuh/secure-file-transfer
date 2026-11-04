@@ -15,6 +15,10 @@ dependencies = [
   # The binary wheel bundles libpq, so the slim image needs no system packages.
   "psycopg[binary]>=3.3.6",
   "alembic>=1.20.1",
+  # Email (#100): Jinja2 renders the fixed templates with autoescaping (sft.service.email);
+  # boto3 is the SES API v2 client behind the mail adapter (sft.data.mail, ADR-0015).
+  "jinja2>=3.1.6",
+  "boto3>=1.43.120",
 ]
 
 [dependency-groups]
@@ -27,6 +31,7 @@ dev = [
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17",
   "types-pyyaml>=6.0.12.20260906",
+  "types-boto3[sesv2]>=1.43.120",  # mypy types for the SES client (sft.data.mail.ses)
 ]
 
 [build-system]

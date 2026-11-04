@@ -1,0 +1,12 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}Secure File Transferのサインインを再設定してください{% endblock %}
+{% block body %}
+障害のため、Secure File Transferは現在、予備のリージョンで稼働しています。{{ tenant_name }}のメンバーとして引き続きご利用いただくには、下記の仮パスワードでサインインし、新しいパスワードと認証アプリを改めて設定してください。
+
+仮パスワード：{{ temporary_password }}
+
+仮パスワードの有効期間は{{ valid_days }}日間です。送信やファイルには影響ありません。メインのリージョンが復旧した後は、これまでどおりサインインできます。
+
+サインイン：
+{{ sign_in_url }}
+{% endblock %}

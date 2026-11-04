@@ -1,0 +1,8 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">障害のため、Secure File Transferは現在、予備のリージョンで稼働しています。{{ tenant_name }}のメンバーとして引き続きご利用いただくには、下記の仮パスワードでサインインし、新しいパスワードと認証アプリを改めて設定してください。</p>
+{{ secret('仮パスワード', temporary_password) }}
+<p style="margin:0 0 16px;">仮パスワードの有効期間は{{ valid_days }}日間です。送信やファイルには影響ありません。メインのリージョンが復旧した後は、これまでどおりサインインできます。</p>
+{{ button(sign_in_url, 'サインイン', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

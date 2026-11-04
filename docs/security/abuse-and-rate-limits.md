@@ -875,6 +875,10 @@ The caps are in section 2.2, groups A and G. Three design points:
   domain; `Reply-To` is the sender.
 - A "report this email" footer link, which would suppress the address for that tenant and alert an operator, is
   recommended for the API contract (section 10).
+- **As built** (#100): one template per email of 7.1 in each language, in `services/api/src/sft/service/email`. The
+  service builds every link from the web app's origin, so a template can't link anywhere else. Tests check that each
+  link token, code and temporary password appears only in its own email, that the code email has no link, that every
+  URL is on the web app, and that every value is escaped in HTML. DLP notices name no file, finding or comment.
 
 ## 8. Monitoring and response
 

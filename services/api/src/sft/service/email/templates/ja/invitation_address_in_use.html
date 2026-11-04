@@ -1,0 +1,6 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }}から、このメールアドレスがSecure File Transferに招待されました。ただし、このアドレスは別の組織でのパスワードによるサインインにすでに使われており、1つのアドレスで持てるこのサインインは1つだけです。</p>
+<p style="margin:0 0 16px;">招待を受けるには、{{ tenant_name }}に別のメールアドレスでの招待か、メンバー向けのシングルサインオンの設定を依頼してください。</p>
+{% endblock %}

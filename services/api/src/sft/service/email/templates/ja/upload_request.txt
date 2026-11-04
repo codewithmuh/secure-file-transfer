@@ -1,0 +1,12 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}からファイルのアップロード依頼が届いています{% endblock %}
+{% block body %}
+{{ tenant_name }}（{{ sender_email }}）から、Secure File Transferでのファイルのアップロードを依頼されました。
+
+ファイルをアップロードする：
+{{ link_url }}
+
+アップロードの前に、ご本人確認のため、このアドレスに確認コードをお送りします。リンクの有効期限は{{ expires_at }}です。
+
+お心当たりがない場合は、このメールを破棄してください。このメールへの返信は送信者（{{ sender_email }}）に届きます。
+{% endblock %}

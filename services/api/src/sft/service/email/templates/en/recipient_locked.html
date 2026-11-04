@@ -1,0 +1,7 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{% if is_transfer %}A recipient of a transfer{% else %}The uploader of an upload request{% endif %} in {{ tenant_name }} entered too many wrong verification codes and has been locked out. Someone else may have the link.</p>
+<p style="margin:0 0 16px;">The {% if is_transfer %}sender of the transfer{% else %}owner of the request{% endif %} or a tenant admin can unlock them. Unlocking sends them a new link, and the old one stops working.</p>
+{{ button(page_url, 'View the transfer' if is_transfer else 'View the upload request', 'Or copy this address into your browser:') }}
+{% endblock %}

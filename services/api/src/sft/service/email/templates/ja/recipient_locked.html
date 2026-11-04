@@ -1,0 +1,7 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }}の{% if is_transfer %}送信の受信者{% else %}アップロード依頼の相手{% endif %}が、確認コードを規定の回数以上間違えたため、ロックされました。第三者がリンクを入手している可能性があります。</p>
+<p style="margin:0 0 16px;">{% if is_transfer %}送信者{% else %}依頼者{% endif %}またはテナント管理者がロックを解除できます。解除すると新しいリンクが送られ、古いリンクは使えなくなります。</p>
+{{ button(page_url, '送信の詳細を見る' if is_transfer else 'アップロード依頼を見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

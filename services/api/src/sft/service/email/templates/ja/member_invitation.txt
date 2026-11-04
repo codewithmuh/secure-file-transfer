@@ -1,0 +1,12 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}からSecure File Transferへの招待が届いています{% endblock %}
+{% block body %}
+{{ tenant_name }}から、機密ファイルを安全に送受信できるSecure File Transferに招待されました。
+
+仮パスワード：{{ temporary_password }}
+
+仮パスワードの有効期間は{{ valid_days }}日間です。初回のサインイン時に、ご自身のパスワードと認証アプリを設定してください。
+
+サインイン：
+{{ sign_in_url }}
+{% endblock %}

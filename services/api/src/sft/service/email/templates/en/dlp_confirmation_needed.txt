@@ -1,0 +1,12 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your transfer needs your confirmation{% endblock %}
+{% block body %}
+A data loss prevention rule of {{ tenant_name }} matched your transfer, and
+it waits for you. No recipient has been notified yet.
+
+Review the findings on the transfer page, then confirm, remove files or
+cancel.
+
+Review the transfer:
+{{ transfer_url }}
+{% endblock %}
