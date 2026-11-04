@@ -31,7 +31,7 @@ Only the latest release receives security fixes.
 Verify a published image:
 
 ```bash
-cosign verify ghcr.io/codewithmuh/secure-file-transfer/api-python:<version> \
+cosign verify ghcr.io/codewithmuh/secure-file-transfer/api:<version> \
   --certificate-identity 'https://github.com/codewithmuh/secure-file-transfer/.github/workflows/release.yml@refs/heads/main' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

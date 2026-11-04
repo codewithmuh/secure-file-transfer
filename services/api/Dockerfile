@@ -19,15 +19,18 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-edi
 # ---- runtime: slim image, only the virtualenv, non-root ----
 FROM python:3.13-slim-trixie
 ARG APP_VERSION=0.0.0
-ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1 APP_VERSION=${APP_VERSION}
+ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1 APP_VERSION=${APP_VERSION} BIND_HOST=0.0.0.0
 # pip is only needed to build, and its bundled libraries (urllib3, msgpack, …) show up in CVE scans.
 RUN python -m pip uninstall --yes pip \
  && groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
 WORKDIR /app
-COPY --from=build --chown=app:app /app/.venv /app/.venv
+# Owned by root: the app user can read and run its code but not change it.
+COPY --from=build /app/.venv /app/.venv
 USER 10001:10001
-EXPOSE 8000
+# 8000: the API (PUBLIC_PORT). 8001: /healthz, /readyz and /metrics (INTERNAL_PORT), never routed
+# by the public load balancer (architecture 8).
+EXPOSE 8000 8001
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD ["python", "-c", "import sys, urllib.request; sys.exit(urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status != 200)"]
-# uvicorn handles SIGTERM: stop accepting, finish in-flight requests for up to 20 s, then exit.
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--timeout-graceful-shutdown", "20"]
+  CMD ["python", "-c", "import os, sys, urllib.request; port = os.environ.get('INTERNAL_PORT', '8001'); sys.exit(urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=2).status != 200)"]
+# On SIGTERM: readiness fails, in-flight requests get up to 20 s, exit 0 (src/sft/api/server.py).
+CMD ["python", "-m", "sft.api"]

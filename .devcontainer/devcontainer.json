@@ -7,7 +7,7 @@
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "postCreateCommand": "pipx install uv==0.13.0 && pipx install pre-commit && make setup",
-  "forwardPorts": [8000],
+  "forwardPorts": [8000, 8001],
   "customizations": {
     "vscode": {
       "extensions": [

@@ -50,11 +50,11 @@ jobs:
           exit-code: "1"
 
   python:
-    name: Python (lint, types, tests)
+    name: Python (lint, types, layers, tests)
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
     defaults:
       run:
-        working-directory: services/api-python
+        working-directory: services/api
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,11 +63,12 @@ jobs:
         with:
           version: "0.13.0"
           enable-cache: true
-          cache-dependency-glob: services/api-python/uv.lock
+          cache-dependency-glob: services/api/uv.lock
       - run: uv sync --locked
       - run: uv run ruff format --check .
       - run: uv run ruff check --output-format=github .
       - run: uv run mypy
+      - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
       - run: uv run pytest # fails below 80% coverage (see pyproject.toml)
 
   images:
@@ -79,8 +80,9 @@ jobs:
       # One image today; the matrix stays for the web app image in M3.
       matrix:
         include:
-          - service: api-python
-            port: 8000
+          - service: api
+            port: 8000 # the API
+            internal_port: 8001 # /healthz, /readyz and /metrics
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -103,18 +105,25 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
-      - name: Smoke test (container starts, becomes ready, serves traffic)
+      - name: Smoke test (read-only, no capabilities; probes, metrics, graceful shutdown)
         env:
           IMAGE: ${{ matrix.service }}:ci
           PORT: ${{ matrix.port }}
+          INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
-            --publish "127.0.0.1:9000:${PORT}" "$IMAGE"
+            --security-opt no-new-privileges \
+            --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9000/readyz; then break; fi
+            if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi
             sleep 1
           done
-          curl --fail --silent --show-error http://127.0.0.1:9000/readyz
-          curl --fail --silent --show-error "http://127.0.0.1:9000/v1/hello?name=ci"
-          docker stop --time 20 smoke # graceful shutdown must finish in time
-          docker logs smoke | tail -n 5
+          curl --fail --silent --show-error http://127.0.0.1:9001/healthz
+          curl --fail --silent --show-error http://127.0.0.1:9001/readyz
+          curl --fail --silent --show-error http://127.0.0.1:9001/metrics | grep --quiet '^# TYPE http_requests_total counter'
+          # The public port serves only the API: probes and metrics aren't there.
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:9000/metrics)" = 404
+          # SIGTERM: fail readiness, drain, exit 0. docker stop sends SIGKILL (exit 137) after 30 s.
+          docker stop --time 30 smoke
+          docker logs smoke | tail -n 8
+          test "$(docker inspect --format '{{.State.ExitCode}}' smoke)" = 0
