@@ -24,7 +24,8 @@ cd web
 npm install
 npm run dev     # http://localhost:3000, proxies /v1 to localhost:8000
 npm run build   # production bundle in dist/
-npm run check   # tsc --noEmit + eslint
+npm test        # unit tests (Vitest, *.test.ts next to the code)
+npm run check   # type check, eslint and unit tests; `make web-check` adds a clean install and the build, as CI
 ```
 
 ## Structure

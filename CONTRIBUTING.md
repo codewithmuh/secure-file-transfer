@@ -6,13 +6,15 @@ Thanks for helping! This guide gets you from clone to merged pull request.
 
 Option A — **Dev Container** (VS Code / Codespaces): open the repo and choose *Reopen in Container*. Everything is installed.
 
-Option B — local: install [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.com/) and Docker, then:
+Option B — local: install [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.com/), Docker and Node (the
+version in `web/.nvmrc`), then:
 
 ```bash
-make setup     # dependencies + git hooks
-make check     # lint, type-check and test everything (what CI runs)
-make contract  # the API contract checks (what CI's contract workflow runs)
-make up        # run all services locally
+make setup      # dependencies + git hooks
+make check      # lint, type-check and test everything (what CI runs)
+make web-check  # only the web app: clean install, types, lint, tests, build
+make contract   # the API contract checks (what CI's contract workflow runs)
+make up         # run all services locally
 ```
 
 ## Workflow
@@ -40,7 +42,8 @@ anything else.
 
 ## Standards
 
-- Tests for every behaviour change; coverage must stay ≥ 80 %.
+- Tests for every behaviour change; coverage must stay ≥ 80 %. Web app unit tests sit next to the code as
+  `*.test.ts(x)` and run with Vitest.
 - **The API contract leads.** Add or change an operation in `docs/api/openapi.yaml` in the same pull request as the
   code. Two CI checks hold the two together ([docs/api/README.md](docs/api/README.md#11-checking-the-contract),
   section 11):

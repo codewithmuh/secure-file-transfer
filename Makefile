@@ -33,7 +33,14 @@ lint: ## Lint, type-check and check the import layers (same as CI)
 test: ## Run all tests with the coverage gates (same as CI)
 	cd $(PY) && uv run pytest
 
-check: lint test ## Everything CI runs before building images
+check: lint test web-check ## Everything CI runs before building images
+
+# The web app's CI job, run the same way (needs Node, the version in web/.nvmrc).
+.PHONY: web-check
+web-check: ## Web app: clean install, type check, lint, tests and build (same as CI)
+	@want="v$$(cat web/.nvmrc)"; have="$$(node --version)"; \
+	  [[ "$$have" == "$$want" ]] || echo "warning: CI uses Node $$want (web/.nvmrc), this is $$have" >&2
+	cd web && npm ci --ignore-scripts && npm run check && npm run build
 
 # The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
 # The breaking-change check compares the working tree's contract with the one at the merge base of

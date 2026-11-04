@@ -1,0 +1,5 @@
+# Trivy settings for every scan run from the repository root: the repo-checks job in CI and `make scan`.
+pkg:
+  # Scan development dependencies too. They run in the build and in CI (vite, eslint, vitest), so a compromised or
+  # vulnerable one matters as much as a runtime one (threat model T-68). Without this Trivy skips them.
+  include-dev-deps: true
