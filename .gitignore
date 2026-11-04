@@ -25,6 +25,10 @@ dist/
 *.tfstate.*
 *.tfplan
 
+# Node / web app
+node_modules/
+web/dist/
+
 # Editors / OS
 .DS_Store
 .idea/
