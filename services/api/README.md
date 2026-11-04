@@ -13,6 +13,7 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
+    errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     internal.py       /healthz, /readyz, /metrics on the internal port
     observability.py  request and trace IDs, request metrics, one log line per request
     server.py         both listeners in one process, and the graceful shutdown
@@ -29,6 +30,7 @@ src/sft/
     audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
     migrations/       the Alembic revisions; migrate.py is the migration job
   core/         settings and logging, used by every layer
+    errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
 ```
 
 `service`, `data` and `core` never import FastAPI, Starlette or uvicorn.
