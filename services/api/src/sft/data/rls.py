@@ -37,7 +37,8 @@ _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 _PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
 
 
-def _identifier(name: str) -> str:
+def identifier(name: str) -> str:
+    """`name` if it is a plain lower-case SQL identifier, needing no quotes; else ValueError."""
     if not _IDENTIFIER.fullmatch(name):
         raise ValueError(f"not a plain lower-case identifier: {name!r}")
     return name
@@ -56,9 +57,20 @@ def _privileges(spec: str) -> str:
     return ", ".join(p for p in _PRIVILEGES if p in privileges)
 
 
-def grant_sql(table: str, role: str, privileges: str) -> str:
-    """`GRANT` of `privileges` (e.g. "SELECT, INSERT") on `table` to one workload role."""
-    return f"GRANT {_privileges(privileges)} ON {_identifier(table)} TO {_workload_role(role)}"
+def grant_sql(table: str, role: str, privileges: str, *, columns: Sequence[str] = ()) -> str:
+    """`GRANT` of `privileges` (e.g. "SELECT, INSERT") on `table` to one workload role.
+
+    `columns` limits the grant to those columns, as for `audit_events`, whose writers may not set
+    `tx_id` or `occurred_at`. `DELETE` applies to whole rows, so it takes no columns.
+    """
+    granted = _privileges(privileges)
+    if columns:
+        if "DELETE" in granted:
+            raise ValueError("DELETE applies to whole rows; grant it without columns")
+        granted = ", ".join(
+            f"{p} ({', '.join(identifier(c) for c in columns)})" for p in granted.split(", ")
+        )
+    return f"GRANT {granted} ON {identifier(table)} TO {_workload_role(role)}"
 
 
 def policy_sql(
@@ -80,7 +92,7 @@ def policy_sql(
     if using is None and with_check is None:
         raise ValueError("a policy needs USING, WITH CHECK or both")
     sql = (
-        f"CREATE POLICY {_identifier(name)} ON {_identifier(table)} FOR {command} "
+        f"CREATE POLICY {identifier(name)} ON {identifier(table)} FOR {command} "
         f"TO {', '.join(_workload_role(r) for r in roles)}"
     )
     if using is not None:
@@ -98,9 +110,9 @@ def tenant_rls_sql(table: str, *, grants: Mapping[str, str], key: str = "tenant_
     """
     if not grants:
         raise ValueError("grant the table to at least one workload role")
-    condition = f"{_identifier(key)} = app_tenant_id()"
+    condition = f"{identifier(key)} = app_tenant_id()"
     return [
-        f"ALTER TABLE {_identifier(table)} ENABLE ROW LEVEL SECURITY",
+        f"ALTER TABLE {identifier(table)} ENABLE ROW LEVEL SECURITY",
         *(grant_sql(table, role, privileges) for role, privileges in grants.items()),
         policy_sql(TENANT_POLICY, table, roles=list(grants), using=condition, with_check=condition),
     ]

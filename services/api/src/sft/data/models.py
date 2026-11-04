@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any
 
@@ -87,8 +88,30 @@ class Xid8(UserDefinedType[int]):
 # So reflection, and with it the models test, knows the type too.
 ischema_names["xid8"] = Xid8
 
-ACTOR_TYPES = ("member", "admin", "recipient", "uploader", "api_key", "operator", "system")
-OUTCOMES = ("success", "failure")
+
+class ActorType(StrEnum):
+    """Who acted (data model 2.5). The one list of actor types: the CHECK below is built from it,
+    and a test checks the migration's literal CHECK against it."""
+
+    MEMBER = "member"
+    ADMIN = "admin"
+    RECIPIENT = "recipient"
+    UPLOADER = "uploader"
+    API_KEY = "api_key"
+    OPERATOR = "operator"
+    SYSTEM = "system"
+
+
+class Outcome(StrEnum):
+    """Whether the action succeeded, e.g. a verification attempt (FR-27). One list, as above."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
+def sql_values(values: type[StrEnum]) -> str:
+    """An enum's values as an SQL list, `('a', 'b')`, for a CHECK."""
+    return "(" + ", ".join(f"'{member.value}'" for member in values) + ")"
 
 
 class AuditEvent(Base):
@@ -104,8 +127,8 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
         PrimaryKeyConstraint("id", "occurred_at"),
-        CheckConstraint(f"actor_type IN {ACTOR_TYPES}", name="actor_type"),
-        CheckConstraint(f"outcome IN {OUTCOMES}", name="outcome"),
+        CheckConstraint(f"actor_type IN {sql_values(ActorType)}", name="actor_type"),
+        CheckConstraint(f"outcome IN {sql_values(Outcome)}", name="outcome"),
         CheckConstraint("(target_type IS NULL) = (target_id IS NULL)", name="target"),
         CheckConstraint("jsonb_typeof(details) = 'object'", name="details"),
         Index("audit_events_tenant_id_occurred_at_idx", "tenant_id", text("occurred_at DESC")),

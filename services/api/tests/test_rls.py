@@ -76,3 +76,16 @@ def test_policy_mistakes_are_caught(options: dict[str, object], message: str) ->
     arguments: dict[str, object] = {"roles": ["sft_api"], **options}
     with pytest.raises(ValueError, match=message):
         policy_sql("p", "widgets", **arguments)  # type: ignore[arg-type]
+
+
+def test_grants_can_be_limited_to_columns() -> None:
+    assert grant_sql("audit_events", "sft_api", "INSERT", columns=["id", "action"]) == (
+        "GRANT INSERT (id, action) ON audit_events TO sft_api"
+    )
+    assert grant_sql("widgets", "sft_api", "SELECT, UPDATE", columns=["name"]) == (
+        "GRANT SELECT (name), UPDATE (name) ON widgets TO sft_api"
+    )
+    with pytest.raises(ValueError, match="whole rows"):
+        grant_sql("widgets", "sft_api", "DELETE", columns=["name"])
+    with pytest.raises(ValueError, match="identifier"):
+        grant_sql("widgets", "sft_api", "INSERT", columns=["name; DROP TABLE tenants"])

@@ -33,8 +33,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum, StrEnum
+from datetime import date, datetime
+from enum import Enum, IntEnum, StrEnum
 from ipaddress import IPv4Address, IPv6Address
 from typing import Final
 
@@ -42,7 +42,7 @@ from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.logs import request_id_var, trace_id_var
-from sft.data.models import AuditEvent
+from sft.data.models import ActorType, AuditEvent, Outcome
 from sft.data.scope import Scope, ScopeKind
 
 USER_AGENT_MAX: Final = 512
@@ -51,26 +51,27 @@ USER_AGENT_MAX: Final = 512
 _ACTION = re.compile(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+")
 _CODE = re.compile(r"[a-z][a-z_]*")
 _CODE_MAX = 64
+# C0 and C1 control characters and DEL. PostgreSQL text can't hold NUL, so one in a header would
+# fail the insert, and with it the audited change; the others have no place in a log either.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+__all__ = [
+    "USER_AGENT_MAX",
+    "Actor",
+    "ActorType",
+    "Detail",
+    "Origin",
+    "Outcome",
+    "PartitionStatus",
+    "Target",
+    "create_partitions",
+    "partition_status",
+    "record",
+    "uuid7",
+]
 
 # Tenant and resource scopes write their tenant's events; platform scope, events with no tenant.
 _WRITES_EVENTS = frozenset({ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.PLATFORM})
-
-
-class ActorType(StrEnum):
-    """Who acted (data model 2.5)."""
-
-    MEMBER = "member"
-    ADMIN = "admin"
-    RECIPIENT = "recipient"
-    UPLOADER = "uploader"
-    API_KEY = "api_key"
-    OPERATOR = "operator"
-    SYSTEM = "system"
-
-
-class Outcome(StrEnum):
-    SUCCESS = "success"
-    FAILURE = "failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,8 +120,9 @@ class Origin:
             raise TypeError("source_ip is an ipaddress address, parsed by the caller")
 
 
-Detail = uuid.UUID | int | bool | datetime | StrEnum | None
-"""A value in `details`: an ID, an enum, a number, a flag or a time. Never free text."""
+Detail = uuid.UUID | int | bool | datetime | StrEnum | IntEnum | None
+"""A value in `details`: an ID, a `StrEnum` or `IntEnum` member, a number, a flag or a time.
+Never free text."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +136,9 @@ class PartitionStatus:
     blocked: tuple[str, ...] = field(default=())
     """Partitions `create_partitions` couldn't create, because the default partition holds rows
     for their month."""
+    failed: tuple[str, ...] = field(default=())
+    """Partitions `create_partitions` couldn't create for another reason, such as a lock timeout;
+    the database's log has the error. The next run tries again."""
 
 
 async def record(
@@ -173,7 +178,7 @@ async def record(
             target_id=None if target is None else target.id,
             outcome=Outcome(outcome).value,
             source_ip=origin.source_ip,
-            user_agent=None if origin.user_agent is None else origin.user_agent[:USER_AGENT_MAX],
+            user_agent=_user_agent(origin.user_agent),
             request_id=request_id_var.get(),
             trace_id=trace_id_var.get(),
             security_critical=bool(security_critical),
@@ -183,15 +188,22 @@ async def record(
     return event_id
 
 
-async def create_partitions(session: AsyncSession, months_ahead: int = 3) -> dict[str, str]:
-    """Create the missing monthly partitions, this month through `months_ahead` months on.
+async def create_partitions(
+    session: AsyncSession, months_ahead: int = 3, from_month: date | None = None
+) -> dict[str, str]:
+    """Create the missing monthly partitions, `from_month` (default: this month) through
+    `months_ahead` months after this one.
 
-    Returns each partition's name with `created`, `exists` or `blocked`. A blocked month has rows
-    in the default partition; an operator moves them before its partition can exist.
+    Returns each partition's name with `created`, `exists`, `blocked` or `failed`. A blocked month
+    has rows in the default partition; an operator moves them before its partition can exist. A
+    failed month, on a lock timeout say, is tried again by the next run; the months after it are
+    still made. An empty result means another run holds the lock and is doing the same work.
+    The restore and failover runbooks pass `from_month`, the month of the oldest event they
+    re-import, as `sft_recovery` (data model 6).
     """
     rows = await session.execute(
-        text("SELECT partition_name, status FROM audit_create_partitions(:months)"),
-        {"months": months_ahead},
+        text("SELECT partition_name, status FROM audit_create_partitions(:months, :from_month)"),
+        {"months": months_ahead, "from_month": from_month},
     )
     return {name: status for name, status in rows.tuples()}
 
@@ -219,6 +231,14 @@ def uuid7() -> uuid.UUID:
     return uuid.UUID(int=value)
 
 
+def _user_agent(value: str | None) -> str | None:
+    """The user agent without control characters, cut to `USER_AGENT_MAX`; None if none is left."""
+    if value is None:
+        return None
+    cleaned = _CONTROL.sub("", value)[:USER_AGENT_MAX]
+    return cleaned or None
+
+
 def _code(what: str, value: object) -> None:
     if not isinstance(value, str) or len(value) > _CODE_MAX or not _CODE.fullmatch(value):
         raise ValueError(f"{what} must be a lower-case code like 'transfer', not {value!r}")
@@ -236,10 +256,14 @@ def _details(details: Mapping[str, Detail]) -> dict[str, object]:
     out: dict[str, object] = {}
     for key, value in details.items():
         _code("a details key", key)
-        if value is None or isinstance(value, bool | int):
-            out[key] = value
-        elif isinstance(value, Enum):
+        if isinstance(value, StrEnum | IntEnum):
             out[key] = value.value
+        elif isinstance(value, Enum):
+            raise TypeError(
+                f"details[{key!r}] is a {type(value).__name__}: use a StrEnum or IntEnum"
+            )
+        elif value is None or isinstance(value, bool | int):
+            out[key] = value
         elif isinstance(value, uuid.UUID):
             out[key] = str(value)
         elif isinstance(value, datetime):

@@ -707,13 +707,14 @@ CREATE POLICY jobs_find ON transfers FOR SELECT
 ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
 CREATE POLICY audit_tenant_insert ON audit_events FOR INSERT
     TO sft_api, sft_scan, sft_notify, sft_jobs, sft_operator
-    WITH CHECK (tenant_id = app_tenant_id());
+    WITH CHECK (tenant_id = app_tenant_id() AND app_scope() IN ('tenant', 'resource'));
 CREATE POLICY audit_platform_insert ON audit_events FOR INSERT
     TO sft_api, sft_operator
     WITH CHECK (tenant_id IS NULL AND app_tenant_id() IS NULL AND app_scope() = 'platform');
+-- Tenant scope only: a link session's resource scope carries the tenant too, and must not read the log.
 CREATE POLICY audit_tenant_read ON audit_events FOR SELECT
     TO sft_api
-    USING (tenant_id = app_tenant_id());
+    USING (tenant_id = app_tenant_id() AND app_scope() = 'tenant');
 CREATE POLICY audit_archive_read ON audit_events FOR SELECT
     TO sft_archive
     USING (app_scope() = 'system');
