@@ -1,7 +1,8 @@
 # prod in Tokyo, network layer. The VPC, subnets, NAT gateways, VPC endpoints and Route 53 Resolver DNS Firewall
 # (ADR-0021).
 #
-# Skeleton from #54: providers, backend and conventions only. #56 adds the network module and its call here.
+# Three AZs, a NAT gateway and every interface endpoint in each, and S3 in Osaka as the cross-Region endpoint
+# (architecture 3.1).
 
 terraform {
   required_version = "~> 1.17.0"
@@ -39,4 +40,24 @@ provider "aws" {
   default_tags {
     tags = module.conventions.tags
   }
+}
+
+# Our organization's ID, for the endpoint policies (ADR-0021): read from AWS, never committed. A member account may
+# describe its own organization.
+data "aws_organizations_organization" "current" {
+  return_organization_only = true
+}
+
+module "network" {
+  source = "../../../../modules/network"
+
+  name_prefix     = module.conventions.name_prefix
+  region          = module.conventions.region
+  organization_id = data.aws_organizations_organization.current.id
+
+  vpc_cidr_block        = "10.30.0.0/16"
+  availability_zone_ids = ["apne1-az1", "apne1-az2", "apne1-az4"]
+  peer_region           = "ap-northeast-3"
+
+  flow_log_destination_arn = var.flow_log_destination_arn
 }

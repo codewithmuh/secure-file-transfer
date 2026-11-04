@@ -41,6 +41,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Scan files for vulnerabilities and misconfigurations
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # The reviewed, path-scoped exceptions (each with its reason), the same file `make infra-check` reads.
+          TRIVY_IGNOREFILE: .trivyignore.yaml
         with:
           scan-type: fs
           scan-ref: .

@@ -42,7 +42,7 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 
 | Layer | Holds | Notes |
 |---|---|---|
-| `network` | VPC, subnets, NAT gateways, VPC endpoints, DNS Firewall (ADR-0021) | Module by [#56](https://github.com/codewithmuh/secure-file-transfer/issues/56) |
+| `network` | VPC, subnets, NAT gateways, VPC endpoints and their policies, the egress security groups, DNS Firewall, the flow log (ADR-0021) | [`modules/network`](modules/network/README.md); dev has two AZs, one NAT gateway and its endpoints in one AZ |
 | `data` | Aurora, the files buckets, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | |
 | `cluster-bootstrap` | Argo CD's Helm release (ADR-0005) | Planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
@@ -64,7 +64,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `tfstate-backend` | A state bucket and its tfstate key (or, in Osaka, the key's replica) with the bucket and key policies below |
 | `terraform-oidc-roles` | The GitHub OIDC provider, the plan role and the deploy role |
 | `key-admin-role` | `sft-<env>-keyadmin`, which only BreakGlass may assume (encryption 4.4, rule 6) |
-| `network` | [#56](https://github.com/codewithmuh/secure-file-transfer/issues/56) |
+| `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
 
 ## Apply order
 
@@ -76,7 +76,9 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
    prod, `bootstrap/<account>/ap-northeast-3`, which needs the Tokyo stack's `tfstate_key_arn` output and its roles.
 4. `shared`.
 5. For each environment, in Tokyo and then in Osaka: `network`, `data`, `cluster`, `cluster-bootstrap`, `edge`. In prod,
-   `retained` goes before `data`, because the environment refers to the archive by ARN.
+   `retained` goes before `data`, because the environment refers to the archive by ARN. On a fresh build `network`
+   runs twice: first without a flow log, then, once `data` has made the log bucket, with
+   `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
 
 Teardown runs the other way. Prod's `retained` stack stays, and a bootstrap stack goes only when its environment is
 destroyed for good: its bucket, key and key-admin role have `prevent_destroy`, which the last apply lifts
@@ -127,8 +129,8 @@ sets anything else.
 
 | Role | Trust (T-71) | May |
 |---|---|---|
-| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs |
-| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs |
+| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network layer (below) |
+| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network layer (below) |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
 
 All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
@@ -276,3 +278,19 @@ A module: a directory under `modules/` with `main.tf`, `variables.tf`, `outputs.
 and output described, no provider blocks, and names and tags taken from the caller's `conventions` outputs. Tokyo and
 Osaka call the same module with different inputs; a Region-specific branch inside a module needs a reason in a
 comment.
+
+## Layer permissions
+
+- **Network** (#56), in the Regions of the bootstrap root's `network_regions` (dev: Tokyo; staging and prod: both).
+  The plan role reads: EC2's network Describe calls, DNS Firewall's Get and List calls, and
+  `organizations:DescribeOrganization` for the endpoint policies' organization ID. The deploy role also creates and
+  changes VPC resources of the types the module uses in its own account, endpoints only for AWS services
+  (`ec2:VpceServiceOwner`), deletes only resources tagged `managed-by = terraform` and `project =
+  secure-file-transfer`, delivers flow logs (`logs:CreateLogDelivery`), writes DNS Firewall but no other Resolver
+  resource, and, where it has two Regions, holds `vpce:AllowMultiRegion` for the cross-Region S3 endpoint.
+
+These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
+`/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply
+`bootstrap/<env>/ap-northeast-1` again with the `Admin` permission set. The roles' inline policies share IAM's limit
+of 10,240 characters per role; when later layers outgrow it, they move to managed policies under `/sft-bootstrap/`,
+which SCP 4 must then cover as well.

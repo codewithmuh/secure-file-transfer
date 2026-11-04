@@ -175,7 +175,8 @@ covers a whole bucket and ClamAV can't scan them.
   (`aws:PrincipalOrgID`) and, where the service supports it, resources in our accounts; the S3 endpoints only our
   buckets and, for the gateway endpoint, the AWS-owned bucket that serves ECR image layers; the ECR endpoints and the
   S3 gateway endpoint also the AWS-owned EKS and Bottlerocket registry accounts for ap-northeast-1 and
-  ap-northeast-3, which serve the EKS add-ons and node images. Kyverno admits those registries only for the named
+  ap-northeast-3, which serve the EKS add-ons and node images; the EC2 endpoint also launches from AWS-owned AMIs,
+  which Bottlerocket's are. Kyverno admits those registries only for the named
   add-ons (VPC CNI, kube-proxy, CoreDNS, Pod Identity agent, EBS CSI driver, the pause image), by registry and
   repository; every other image is ours, mirrored and signed (ADR-0007).
 - **Egress goes through an allowlisting proxy, never to NAT directly.** Envoy runs as an HTTPS `CONNECT` proxy on the
