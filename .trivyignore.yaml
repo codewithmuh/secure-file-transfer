@@ -1,0 +1,14 @@
+# Trivy misconfiguration exceptions. Each entry names the check, the files it applies to (a glob, so it matches
+# whether Trivy scans infra/ or the whole repository), and why it is accepted, with its threat-model reference.
+# infra/scripts/check.sh trivy fails on every severity, so anything not listed here fails CI. Add an entry only with
+# a reason a reviewer can check, and never for a whole check without paths.
+misconfigurations:
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/modules/tfstate-backend/main.tf"
+    statement: >-
+      The Terraform state buckets record access through CloudTrail S3 data events, not S3 server access logs. The
+      organization trail (#55) logs data events on every sft-*-tfstate-* bucket into the shared account's log archive
+      under Object Lock, where a read or write by anyone but the Terraform roles stands out (T-73, T-75). Server access
+      logs would need a log bucket in every account and Region, before the state bucket exists, that is itself a
+      bucket without logging.

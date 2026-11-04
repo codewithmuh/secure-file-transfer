@@ -1,0 +1,85 @@
+name: infra
+
+# Static checks for the Terraform under infra/ (ADR-0005, #54): the layout conventions, fmt, init -backend=false and
+# validate for every root, tflint with the AWS ruleset, and Trivy's misconfiguration scan. Nothing here reaches AWS:
+# no job asks for an OIDC token, and infra/scripts/check.sh passes no credentials to the tools.
+#
+# It runs on every pull request, with no paths filter, so its check always reports and can be required by name (#59).
+# A workflow filtered by path doesn't run at all when its paths are untouched, which leaves a required check pending
+# forever. Instead the job looks at what changed: when nothing that affects infra/ changed, it passes without running
+# the tools. When it can't tell, it runs them.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege by default; jobs ask for more only when they need it.
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  terraform:
+    name: Terraform (fmt, validate, tflint, Trivy)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the change check compares with the base commit
+          persist-credentials: false
+
+      - name: Check whether anything that affects infra/ changed
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ $EVENT == pull_request ]]; then base=$PR_BASE; else base=$PUSH_BEFORE; fi
+          # A new branch, or a base commit that isn't in the history, counts as a change.
+          if [[ -z $base || $base =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "No usable base commit; running every check."
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a pull request HEAD is the merge commit, so this diff is exactly what the pull request changes.
+          changed=$(git diff --name-only "$base" HEAD -- infra .github/workflows/infra.yml .trivyignore.yaml)
+          if [[ -n $changed ]]; then
+            printf 'Changed:\n%s\n' "$changed"
+            echo "infra=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "infra=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Nothing under infra/ changed
+        if: steps.changes.outputs.infra == 'false'
+        run: echo "No change affects infra/, so the Terraform checks were skipped." >> "$GITHUB_STEP_SUMMARY"
+
+      # Each check runs even if an earlier one failed, so one run reports every problem.
+      - name: Layout conventions (state keys, backends, no account IDs)
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh conventions
+
+      - name: terraform fmt
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh fmt
+
+      - name: terraform init -backend=false and validate, every root
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh validate
+
+      - name: tflint with the AWS ruleset
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # downloading the ruleset from GitHub without hitting API rate limits
+        run: infra/scripts/check.sh tflint
+
+      - name: Trivy misconfiguration scan
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh trivy

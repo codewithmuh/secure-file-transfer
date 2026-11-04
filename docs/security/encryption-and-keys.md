@@ -284,7 +284,8 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Log and trace stores | — | — | — | — | E D | — | — | — |
 | AWS service principals in the key policy | — | — | — | CloudTrail, for the retained trail (8.4) | CloudWatch Logs, CloudTrail, log delivery | — | CloudWatch alarms, SES, SNS into SQS | — |
 | AWS services through grants | EBS | — | RDS | — | — | EKS | EBS, ElastiCache | — |
-| Terraform deploy role | A | A | A G | A (in prod, the retained stack's own deploy role) | A | A G; E for the secrets it writes (6.4) | A G | A, E D |
+| Terraform deploy role | A | A | A G | A (in prod, the retained stack's own deploy role) | A | A G; E for the secrets it writes (6.4) | A G | E D, through S3, its state bucket only; the bootstrap `Admin` role administers the key |
+| Terraform plan role (ADR-0005) | — | — | — | — | — | — | — | D and `GenerateDataKey`, through S3, its state bucket only, for the lock files it writes |
 | Audit reader (investigations, time-limited) | — | — | — | D | D | — | — | — |
 | BreakGlass permission set | R, D | R | R | R, D | R, D | R, D (master password) | R | R |
 | Operators in normal operation | — | — | — | — | — | — | — | — |
@@ -361,7 +362,7 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
     {
       "Sid": "Administer",
       "Effect": "Allow",
-      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-prod-terraform-deploy"},
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-bootstrap/sft-prod-terraform-deploy"},
       "Action": [
         "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus", "kms:ListKeyRotations",
         "kms:ListResourceTags", "kms:ListGrants", "kms:PutKeyPolicy", "kms:UpdateKeyDescription",
@@ -487,7 +488,7 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
       "Principal": {"AWS": "*"},
       "Action": ["kms:DisableKey", "kms:ScheduleKeyDeletion"],
       "Resource": "*",
-      "Condition": {"ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::<prod>:role/sft-prod-terraform-deploy"}}
+      "Condition": {"ArnNotEquals": {"aws:PrincipalArn": "arn:aws:iam::<prod>:role/sft-bootstrap/sft-prod-terraform-deploy"}}
     },
     {
       "Sid": "RequireThirtyDayWait",
@@ -575,7 +576,7 @@ How the other keys differ:
 | logs | Service principals (`logs.<region>.amazonaws.com`, `cloudtrail.amazonaws.com`, `delivery.logs.amazonaws.com`), each limited by `aws:SourceAccount` and its own encryption context (`aws:logs:arn`, `aws:cloudtrail:arn`), plus the log and trace store roles through S3, and the lifecycle jobs role (Decrypt through S3 for CloudTrail log files only, 4.3). |
 | secrets | Each workload may Decrypt only through Secrets Manager and only for its own secrets (`kms:EncryptionContext:SecretARN`). The writers in 6.4: the key rotation job encrypts and decrypts for the keyrings and the identity provider client secrets; the deploy role encrypts (`GenerateDataKey`) for the master password and the platform component secrets, and may decrypt only Secrets Manager's key-access check (`kms:EncryptionContext:SecretVersionId` = `RequestToValidateKeyAccess`), which runs when a secret is created. EKS uses the key for etcd through a grant the deploy role creates. |
 | platform | Producers and consumers through SQS (`aws:sqs:arn`): the relay, the workers, the sign-in triggers and the EventBridge delivery role. The service statements above for SNS. The node provisioner for EBS root volumes, as in the files key. ElastiCache through grants. |
-| tfstate | The deploy role encrypts and decrypts through S3 for the state bucket only; the replication role as for the files key. |
+| tfstate | The deploy role encrypts and decrypts through S3 for the state bucket only; the plan role decrypts and generates data keys the same way, for its lock files; the bootstrap `Admin` role administers the key and uses it for the bootstrap stack's own state; the replication role as for the files key. |
 | registry (shared stack) | Administered by the shared stack's deploy role, which also creates the repositories (`CreateGrant` for AWS resources and `DescribeKey`; `RetireGrant` in its IAM policy for deletions). ECR encrypts pushed layers and decrypts pulled ones through the grants it creates for each repository. The environments' node roles may only `kms:Decrypt` through ECR (`kms:ViaService` = ECR, `kms:EncryptionContext:aws:ecr:arn` = our repositories), so no environment can encrypt with or administer the key. The key lives until the shared stack is destroyed after the last environment (capacity 5.4), with the 30-day wait. |
 
 ## 5. Open question 3: per-tenant keys

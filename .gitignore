@@ -24,6 +24,9 @@ dist/
 *.tfstate
 *.tfstate.*
 *.tfplan
+# local overrides, such as the backend_override.tf a bootstrap stack starts with (infra/README.md)
+override.tf
+*_override.tf
 
 # Node / web app
 node_modules/
