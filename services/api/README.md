@@ -14,7 +14,7 @@ src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
     internal.py       /healthz, /readyz, /metrics on the internal port
-    observability.py  request and trace IDs, request metrics, one log line per request
+    observability.py  request IDs, the request span, request metrics, one log line per request
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
   (workers/)    later, beside api: asyncio workers that use the service layer without HTTP
@@ -28,7 +28,8 @@ src/sft/
     audit.py          audit events, written in the transaction of the change; partition upkeep
     audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
     migrations/       the Alembic revisions; migrate.py is the migration job
-  core/         settings and logging, used by every layer
+  core/         settings, logging and tracing, used by every layer
+    telemetry.py      OpenTelemetry setup, the span attribute allowlist, trace context for messages
 ```
 
 `service`, `data` and `core` never import FastAPI, Starlette or uvicorn.
@@ -64,6 +65,7 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `SHUTDOWN_DRAIN_SECONDS` | `20` | How long in-flight requests get after SIGTERM (1 to 120) |
 | `DATABASE_URL` | none, required | The workload's own login role, `postgresql://` or `postgresql+psycopg://`; a secret |
 | `DATABASE_POOL_SIZE` | `5` | Connections per process, with no overflow (1 to 50) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | The collector's OTLP/HTTP base URL, e.g. `http://<node>:4318`; spans go to `<endpoint>/v1/traces`. Unset or empty: nothing is exported |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
 `BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
@@ -76,12 +78,26 @@ Architecture section 8, as built here:
   routing mistake on the public side can't expose them and probe traffic stays out of the request metrics. The docs
   pages and the OpenAPI document aren't served at all (ADR-0002); `create_app().openapi()` generates the document.
 - **Logs.** One JSON line per event on stdout. Every line logged while a request runs carries its `request_id`, which
-  the service always generates (`req_…`, also sent as `X-Request-Id`), and its `trace_id`, from a valid W3C
-  `traceparent` header or new. Requests are logged by route template, never with query strings.
+  the service always generates (`req_…`, also sent as `X-Request-Id`), and its `trace_id`, the trace ID of the
+  request's span. Requests are logged by route template, never with query strings.
+- **Traces.** OpenTelemetry (ADR-0009, `src/sft/core/telemetry.py`). Each request is one SERVER span, named by
+  route template (`GET /v1/transfers/{transfer_id}`); it continues the caller's trace when the request has exactly
+  one valid `traceparent`, and starts a new one otherwise. Every SQL statement is a CLIENT span under it, with the
+  SQL text but never the parameter values, and so is every call of a boto3 client passed to `trace_aws_client`.
+  The service records every span; the collector gateway's tail sampling decides what is kept, so a caller's
+  "not sampled" flag is ignored. Only the attributes in `ALLOWED_ATTRIBUTES` are exported; never paths, query
+  strings, headers, client addresses or exception messages (T-49, T-88). A caller's `tracestate` and baggage are
+  dropped. FastAPI's own telemetry is off, so a request has one span, not two. Probes and scrapes on the internal
+  port aren't traced.
+- **Trace context in messages.** `current_trace_context()` returns `{"traceparent": "00-…"}` (or `{}` outside a
+  span) to store in a message; the consumer runs its work in `with continued_trace(carrier, name):`, so the API
+  request, the queue and the worker share one trace, and its log lines carry that trace ID (architecture 5.3).
 - **Metrics.** `http_requests_total` and `http_request_duration_seconds` by method, route template and status, with
-  bucket edges at 0.3 s and 1 s for NFR-2, plus the process and Python metrics.
+  bucket edges at 0.3 s and 1 s for NFR-2, plus the process and Python metrics. Metrics stay with the Prometheus
+  client, scraped from `/metrics`; the OpenTelemetry SDK carries traces only, so nothing is counted twice.
 - **Shutdown.** On SIGTERM or SIGINT, `/readyz` answers 503, the public listener closes, in-flight requests get up to
-  `SHUTDOWN_DRAIN_SECONDS`, the internal listener closes, and the process exits 0. uvicorn closes the public listener
+  `SHUTDOWN_DRAIN_SECONDS`, the internal listener closes, the spans still buffered are exported (a few seconds at
+  most), and the process exits 0. uvicorn closes the public listener
   the moment the signal arrives, so the app can't keep accepting while the load balancer catches up. In Kubernetes,
   a `preStop` sleep in the pod spec holds the signal back for that time (`src/sft/api/server.py` has the details).
   Ctrl+C during the drain (a second SIGINT) cuts it short and cancels in-flight requests, as in uvicorn; a repeated

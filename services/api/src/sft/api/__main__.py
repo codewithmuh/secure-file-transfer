@@ -8,6 +8,9 @@ import sys
 from sft.api.server import ApiServer
 from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, Settings, load_settings
+from sft.core.telemetry import configure_tracing
+
+SERVICE_NAME = "sft-api"
 
 
 def main() -> int:
@@ -16,7 +19,14 @@ def main() -> int:
     if settings is None:
         return EXIT_BAD_SETTINGS
     configure_logging(settings.log_level)
-    return asyncio.run(ApiServer(settings).run())
+    tracing = configure_tracing(
+        SERVICE_NAME, settings.app_version, settings.otel_exporter_otlp_endpoint
+    )
+    try:
+        return asyncio.run(ApiServer(settings).run())
+    finally:
+        # After the drain: export the spans still buffered, waiting a few seconds at most.
+        tracing.shutdown()
 
 
 if __name__ == "__main__":

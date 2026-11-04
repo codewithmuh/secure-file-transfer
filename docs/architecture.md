@@ -804,7 +804,8 @@ across tenants fails to decrypt.
 Work for the workers is written to an outbox table in the same transaction as the change that causes it. The outbox
 relay publishes rows to SQS and marks them sent. Delivery is at least once, so every consumer is idempotent: it records
 the message ID it processed and skips duplicates. The trace context travels in the message, so one trace covers the
-API call, the queue and the worker. Messages carry IDs, never link tokens or codes.
+API call, the queue and the worker: the message holds `{"traceparent": "00-…"}` from the span that wrote it, and
+the consumer's span is that span's child. Messages carry IDs, never link tokens or codes.
 
 After a regional failover, every outbox message from the last 24 hours that has no processed-message record is
 published again. That recovers work that was sitting in Tokyo's queues when the region failed (section 7); consumers
@@ -829,7 +830,13 @@ response: they are checked and audited every time.
 The API and workers use OpenTelemetry for traces and Prometheus-format metrics. JSON logs carry `request_id`,
 `trace_id` and `tenant_id`, never file names, message text or plain email addresses. Business signals that the SLOs
 depend on (scan latency, time to shareable, queue age, outbox age, replication lag) are metrics with alerts, and every
-alert links to a runbook (NFR-17). DLP adds inspection time and results by reason (NFR-23), decisions by outcome, the
+alert links to a runbook (NFR-17). Each request is one server span named by its route template, each SQL statement
+and AWS call a client span under it; spans go over OTLP/HTTP to the node's collector agent when
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nowhere otherwise. The service records every span and leaves sampling to
+the gateway's tail sampling (ADR-0009), so a caller's "not sampled" flag is ignored. Only allowlisted span attributes
+are exported: route templates, never paths or query strings; SQL text with its parameters, never their values; error
+types, never messages. Trace context is the W3C `traceparent` alone; a caller's `tracestate` and baggage are dropped.
+Metrics stay with the Prometheus client on `/metrics`. DLP adds inspection time and results by reason (NFR-23), decisions by outcome, the
 age of the oldest pending approval request, and inspector failures; metrics carry detector IDs and counts, never
 values (NFR-26).
 

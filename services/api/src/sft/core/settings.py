@@ -91,6 +91,18 @@ class Settings(_Base):
         le=50,
         description="Connections per process, with no overflow, so the total is predictable.",
     )
+    otel_exporter_otlp_endpoint: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^/?#\s]+(/[^?#\s]*)?$",
+        description="The collector's OTLP/HTTP base URL; spans go to <endpoint>/v1/traces. "
+        "Unset: traces are made for the logs and messages but not exported (ADR-0009).",
+    )
+
+    @field_validator("otel_exporter_otlp_endpoint", mode="before")
+    @classmethod
+    def _empty_endpoint_is_unset(cls, value: object) -> object:
+        # A chart that renders the variable empty means "don't export", not a bad URL.
+        return None if value == "" else value
 
     @model_validator(mode="after")
     def _ports_differ(self) -> Self:

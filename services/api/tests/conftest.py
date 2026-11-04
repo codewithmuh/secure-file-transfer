@@ -5,10 +5,13 @@ import os
 from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import URL
 
 from pg import ADMIN_URL_VARIABLE, ScratchDatabase, fresh_database
 from sft.core.logs import JsonFormatter
+from sft.core.telemetry import build_tracer_provider
 from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
 from sft.data.roles import API, MIGRATE, OPERATOR
@@ -17,6 +20,20 @@ from sft.data.roles import API, MIGRATE, OPERATOR
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+# The process's tracer provider, as the service sets it up, exporting through the allowlist to
+# memory as each span ends. A provider can be set only once per process, so it is set here.
+_SPANS = InMemorySpanExporter()
+trace.set_tracer_provider(build_tracer_provider("sft-test", "0.0.0", exporter=_SPANS, batch=False))
+
+
+@pytest.fixture(autouse=True)
+def spans() -> Iterator[InMemorySpanExporter]:
+    """The spans exported during the test, as the collector would get them."""
+    _SPANS.clear()
+    yield _SPANS
+    _SPANS.clear()
 
 
 @pytest.fixture

@@ -5,6 +5,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import DBAPIError, InvalidRequestError
 
@@ -200,3 +203,44 @@ def test_only_tests_reach_the_pool_without_a_scope() -> None:
         and re.search(r"\._engine\b|raw_connection_for_tests", path.read_text())
     ]
     assert offenders == []
+
+
+# ---- statement spans ----
+
+
+async def test_each_statement_is_a_span_under_the_current_one(
+    api_db: Database, spans: InMemorySpanExporter
+) -> None:
+    with trace.get_tracer(__name__).start_as_current_span("request") as request:
+        async with api_db.transaction(Scope.system()) as session:
+            await session.execute(text("SELECT :secret_value AS v"), {"secret_value": "hunter2"})
+    statements = [s for s in spans.get_finished_spans() if s.kind == SpanKind.CLIENT]
+    set_scope, query = statements
+    assert set_scope.attributes is not None
+    assert str(set_scope.attributes["db.query.text"]).startswith("SELECT set_config(")
+    assert query.attributes is not None
+    database = query.attributes["db.namespace"]
+    assert query.name == f"SELECT {database}"
+    assert query.attributes["db.system.name"] == "postgresql"
+    assert query.attributes["db.operation.name"] == "SELECT"
+    assert query.attributes["server.address"] == "127.0.0.1"
+    assert "secret_value" in str(query.attributes["db.query.text"])  # the placeholder …
+    assert "hunter2" not in str(spans.get_finished_spans())  # … never the value
+    for span in statements:
+        assert span.parent is not None
+        assert span.parent.span_id == request.get_span_context().span_id
+
+
+async def test_a_failed_statement_is_an_error_span_without_the_message(
+    api_db: Database, spans: InMemorySpanExporter
+) -> None:
+    tenant_id = uuid.uuid4()
+    with pytest.raises(DBAPIError):
+        async with api_db.transaction(Scope.tenant(tenant_id)) as session:
+            session.add(Tenant(id=tenant_id, name="Secret Corp", status="active"))
+    [failed] = [s for s in spans.get_finished_spans() if s.status.status_code == StatusCode.ERROR]
+    assert failed.name.startswith("INSERT ")
+    assert failed.attributes is not None
+    assert failed.attributes["error.type"] == "InsufficientPrivilege"
+    assert failed.status.description is None
+    assert "Secret Corp" not in str(spans.get_finished_spans())

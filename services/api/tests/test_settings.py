@@ -17,6 +17,7 @@ ENV_NAMES = (
     "SHUTDOWN_DRAIN_SECONDS",
     "DATABASE_URL",
     "DATABASE_POOL_SIZE",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -46,6 +47,7 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.shutdown_drain_seconds == 20
     assert s.database_url.get_secret_value() == DATABASE_URL
     assert s.database_pool_size == 5
+    assert s.otel_exporter_otlp_endpoint is None
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -57,6 +59,7 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("SHUTDOWN_DRAIN_SECONDS", "30")
     clean_env.setenv("DATABASE_URL", "postgresql://sft_api@db:5432/sft?sslmode=verify-full")
     clean_env.setenv("DATABASE_POOL_SIZE", "10")
+    clean_env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent.observability:4318")
     s = Settings()
     assert s.app_version == "1.4.0"
     assert s.log_level == "debug"
@@ -65,6 +68,12 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     assert s.shutdown_drain_seconds == 30
     assert s.database_url.get_secret_value().endswith("sslmode=verify-full")
     assert s.database_pool_size == 10
+    assert s.otel_exporter_otlp_endpoint == "http://otel-agent.observability:4318"
+
+
+def test_an_empty_otlp_endpoint_means_none(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    assert Settings().otel_exporter_otlp_endpoint is None
 
 
 @pytest.mark.parametrize(
@@ -81,6 +90,9 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
         ("DATABASE_URL", "postgresql+asyncpg://sft_api@db/sft"),
         ("DATABASE_POOL_SIZE", "0"),
         ("DATABASE_POOL_SIZE", "51"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-agent:4318"),  # no scheme
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "grpc://otel-agent:4317"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent:4318?x=1"),
     ],
 )
 def test_rejects_bad_values(clean_env: pytest.MonkeyPatch, name: str, value: str) -> None:
