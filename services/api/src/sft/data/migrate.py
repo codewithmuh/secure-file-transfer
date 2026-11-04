@@ -22,6 +22,7 @@ keeps two jobs from migrating at once.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -195,6 +196,15 @@ def run(
 
 # ---- what env.py runs, inside Alembic ----
 
+# The monthly partitions of audit_events and its default partition: made by the migration and the
+# lifecycle job (data model 6), not by the models, so autogenerate must not see them as strays.
+_AUDIT_PARTITION = re.compile(r"audit_events_(default|y\d{4}m\d{2})")
+
+
+def include_name(name: str | None, type_: str, parent_names: object) -> bool:
+    """Alembic's `include_name` hook: compare everything but the audit partitions."""
+    return not (type_ == "table" and name is not None and _AUDIT_PARTITION.fullmatch(name))
+
 
 def record_compatibility(
     ctx: MigrationContext,
@@ -254,6 +264,7 @@ def _run_in(connection: Connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=Base.metadata,
+        include_name=include_name,
         transaction_per_migration=True,
         on_version_apply=record_compatibility,
     )

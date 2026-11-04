@@ -13,9 +13,24 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from ipaddress import IPv4Address, IPv6Address
+from typing import Any
 
-from sqlalchemy import ARRAY, CheckConstraint, DateTime, MetaData, Text, func
+from sqlalchemy import (
+    ARRAY,
+    CheckConstraint,
+    DateTime,
+    Index,
+    MetaData,
+    PrimaryKeyConstraint,
+    Text,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import INET, JSONB
+from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import UserDefinedType
 
 NAMING_CONVENTION = {
     "pk": "%(table_name)s_pkey",
@@ -58,3 +73,71 @@ class SchemaCompatibility(Base):
     revision: Mapped[str] = mapped_column(Text, primary_key=True)
     compatible_with: Mapped[list[str]] = mapped_column(ARRAY(Text))
     recorded_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Xid8(UserDefinedType[int]):
+    """PostgreSQL's 64-bit transaction ID, which `pg_current_xact_id()` returns."""
+
+    cache_ok = True
+
+    def get_col_spec(self, **kw: Any) -> str:
+        return "xid8"
+
+
+# So reflection, and with it the models test, knows the type too.
+ischema_names["xid8"] = Xid8
+
+ACTOR_TYPES = ("member", "admin", "recipient", "uploader", "api_key", "operator", "system")
+OUTCOMES = ("success", "failure")
+
+
+class AuditEvent(Base):
+    """One audit record (data model 2.5, FR-27). Written only through `sft.data.audit.record`.
+
+    Partitioned by month on `occurred_at`, with a `DEFAULT` partition for any month that has no
+    partition yet (data model 6). The partitions aren't models: queries go through this table, so
+    its row-level security applies, and no role is granted a partition. Workload roles may insert
+    rows, never update or delete them. `tx_id` and `occurred_at` are always the database's own
+    values, which the fail-closed check (`audit_required`) relies on.
+    """
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", "occurred_at"),
+        CheckConstraint(f"actor_type IN {ACTOR_TYPES}", name="actor_type"),
+        CheckConstraint(f"outcome IN {OUTCOMES}", name="outcome"),
+        CheckConstraint("(target_type IS NULL) = (target_id IS NULL)", name="target"),
+        CheckConstraint("jsonb_typeof(details) = 'object'", name="details"),
+        Index("audit_events_tenant_id_occurred_at_idx", "tenant_id", text("occurred_at DESC")),
+        Index(
+            "audit_events_tenant_id_target_type_target_id_idx",
+            "tenant_id",
+            "target_type",
+            "target_id",
+        ),
+        Index(
+            "audit_events_tenant_id_actor_id_occurred_at_idx",
+            "tenant_id",
+            "actor_id",
+            text("occurred_at DESC"),
+        ),
+        Index("audit_events_tx_id_id_idx", "tx_id", "id"),
+        {"postgresql_partition_by": "RANGE (occurred_at)", "implicit_returning": False},
+    )
+
+    id: Mapped[uuid.UUID]
+    tenant_id: Mapped[uuid.UUID | None]
+    tx_id: Mapped[int] = mapped_column(Xid8, server_default=func.pg_current_xact_id())
+    occurred_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    actor_type: Mapped[str] = mapped_column(Text)
+    actor_id: Mapped[uuid.UUID | None]
+    action: Mapped[str] = mapped_column(Text)
+    target_type: Mapped[str | None] = mapped_column(Text)
+    target_id: Mapped[uuid.UUID | None]
+    outcome: Mapped[str] = mapped_column(Text)
+    source_ip: Mapped[IPv4Address | IPv6Address | None] = mapped_column(INET)
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    request_id: Mapped[str | None] = mapped_column(Text)
+    trace_id: Mapped[str | None] = mapped_column(Text)
+    security_critical: Mapped[bool] = mapped_column(server_default=text("false"))
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'"))

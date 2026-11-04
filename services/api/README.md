@@ -25,6 +25,8 @@ src/sft/
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
+    audit.py          audit events, written in the transaction of the change; partition upkeep
+    audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
     migrations/       the Alembic revisions; migrate.py is the migration job
   core/         settings and logging, used by every layer
 ```
@@ -189,9 +191,48 @@ def upgrade() -> None:
         op.execute(statement)
 ```
 
+- decides whether changes to each new tenant-owned table need an audit event (FR-27, NFR-15). Either it pastes in the
+  `audit_required` trigger, which refuses to commit a change by a workload role without an audit event in the same
+  transaction, or the table goes in `NOT_AUDITED` in `sft/data/audit_required.py`, with the reason. The trigger's SQL
+  comes from the helper at authoring time, like the policies:
+
+```python
+from sft.data.audit_required import require_audit_sql
+
+print(
+    require_audit_sql("widgets")
+)  # or narrower: commands=("INSERT", "UPDATE"), update_of=("state",)
+# CREATE CONSTRAINT TRIGGER audit_required AFTER INSERT OR UPDATE OR DELETE ON widgets
+#     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION audit_required()
+```
+
 Add the table to `sft/data/models.py` too: a test compares the models with the migrated schema. The catalog tests fail
-if a tenant table has no row-level security, a role is granted a table without a policy for it, `TRUNCATE` is granted,
-or anyone but `sft_owner` owns a table.
+if a tenant table has no row-level security or neither the audit trigger nor a `NOT_AUDITED` entry, a role is granted
+a table without a policy for it, `TRUNCATE` is granted, anyone but `sft_owner` owns a table, or a `SECURITY DEFINER`
+function leaves its `search_path` open or is executable by every role.
+
+### Audit events
+
+Every security-relevant change writes its audit event in its own transaction, through `sft.data.audit.record`:
+
+```python
+async with database.transaction(Scope.tenant(tenant_id)) as session:
+    ...  # the change
+    await audit.record(
+        session,
+        action="transfer.revoked",
+        actor=Actor(ActorType.MEMBER, user_id),
+        target=Target("transfer", transfer_id),
+        origin=Origin(source_ip=client_ip, user_agent=user_agent),
+        security_critical=True,
+    )
+```
+
+The tenant comes from the scope, the request and trace IDs from the log context, `tx_id` and `occurred_at` from the
+database. `details` takes IDs, enums, numbers, flags and aware times only, never free text. Workload roles may insert
+audit events but never change or delete them. `audit_events` is partitioned by UTC month, with a default partition
+for a month that has none; the lifecycle job's step, `sft.service.audit_partitions.maintain_audit_partitions`, keeps
+three months ahead and exports `sft_audit_default_partition_rows` and `sft_audit_partition_months_covered`.
 
 ### Tests against PostgreSQL
 

@@ -9,6 +9,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import DBAPIError, InvalidRequestError
 
 from pg import ScratchDatabase
+from sft.data import audit
 from sft.data.database import Database, ScopeMissingError, psycopg_url
 from sft.data.models import Tenant
 from sft.data.scope import Scope
@@ -19,10 +20,16 @@ INSUFFICIENT_PRIVILEGE = "42501"
 
 
 async def create_tenant(operator: Database, name: str = "Example") -> uuid.UUID:
-    """As the operator API does: in the new tenant's own scope."""
+    """As the operator API does: in the new tenant's own scope, with its audit event (#50)."""
     tenant_id = uuid.uuid4()
     async with operator.transaction(Scope.tenant(tenant_id)) as session:
         session.add(Tenant(id=tenant_id, name=name, status="active"))
+        await audit.record(
+            session,
+            action="tenant.created",
+            actor=audit.Actor(audit.ActorType.OPERATOR, uuid.uuid4()),
+            target=audit.Target("tenant", tenant_id),
+        )
     return tenant_id
 
 

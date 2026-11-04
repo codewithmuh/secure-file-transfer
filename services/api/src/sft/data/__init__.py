@@ -11,6 +11,10 @@ behind it (ADR-0020).
 - `models`: the tables, for queries; a test keeps them in step with the migrations.
 - `roles`: the PostgreSQL roles. `bootstrap` creates them (`python -m sft.data.bootstrap`).
 - `rls`: generates the grants and policies a migration pastes in as literal SQL.
+- `audit`: `audit.record(session, ...)` writes an audit event in the transaction of the change it
+  describes (FR-27); partition upkeep for the lifecycle job.
+- `audit_required`: generates the fail-closed trigger a migration pastes in, `require_audit_sql`:
+  a change to the table commits only with an audit event in its transaction (NFR-15).
 - `migrations`: the Alembic revisions. `migrate` runs them: the migration job
   (`python -m sft.data.migrate`).
 
