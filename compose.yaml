@@ -18,6 +18,10 @@ services:
       args: { APP_VERSION: local }
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Its own login role, never a superuser, so row-level security applies (ADR-0020). Required;
+      # the API connects only when a request needs the database. The `postgres` service comes with
+      # the local stack (#52); running the bootstrap and migration jobs in it is a follow-up issue.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://sft_api@postgres:5432/sft}
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain

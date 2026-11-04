@@ -1,14 +1,16 @@
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
-from sft.api.__main__ import setting_errors
-from sft.core.settings import Settings
+from sft.core.settings import BootstrapSettings, Settings, setting_errors
+
+# DATABASE_URL is required; give it, so each test sees only the error it causes.
+DATABASE_URL = SecretStr("postgresql://sft_api@127.0.0.1:1/sft")
 
 
 def errors_for(**values: object) -> list[dict[str, str]]:
     with pytest.raises(ValidationError) as caught:
-        Settings(**values)  # type: ignore[arg-type]
-    return setting_errors(caught.value)
+        Settings(database_url=DATABASE_URL, **values)  # type: ignore[arg-type]
+    return setting_errors(caught.value, Settings)
 
 
 def test_names_the_bad_setting() -> None:
@@ -26,3 +28,21 @@ def test_never_includes_the_value() -> None:
     [error] = errors_for(log_level="hunter2-secret")
     assert error["setting"] == "LOG_LEVEL"
     assert "hunter2" not in str(error)
+
+
+def test_names_a_missing_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with pytest.raises(ValidationError) as caught:
+        Settings()  # type: ignore[call-arg]
+    assert setting_errors(caught.value, Settings) == [
+        {"setting": "DATABASE_URL", "error": "Field required"}
+    ]
+
+
+def test_names_settings_of_the_class_being_read() -> None:
+    # A job's settings are named after its own fields: BOOTSTRAP_DATABASE_URL, not DATABASE_URL.
+    with pytest.raises(ValidationError) as caught:
+        BootstrapSettings(bootstrap_database_url=SecretStr("mysql://x"), bootstrap_iam_auth=True)
+    [error] = setting_errors(caught.value, BootstrapSettings)
+    assert error["setting"] == "BOOTSTRAP_DATABASE_URL"
+    assert "mysql" not in str(error)

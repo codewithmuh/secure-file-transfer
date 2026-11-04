@@ -79,6 +79,21 @@ jobs:
     defaults:
       run:
         working-directory: services/api
+    # Real PostgreSQL for the data layer's tests, at ADR-0011's major version. The tests make their
+    # own databases on it and drop them. Password auth, as in every real environment, so logins are
+    # tested too; the password is made per run from the run's ID, so no literal sits in the workflow.
+    # (The services block can't read the env context, so the expression appears twice.)
+    services:
+      postgres:
+        image: postgres:17.11-trixie
+        env:
+          POSTGRES_PASSWORD: pg-${{ github.run_id }}-${{ github.run_attempt }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready --username postgres --host 127.0.0.1"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,7 +108,7 @@ jobs:
       - run: uv run ruff check --output-format=github .
       - run: uv run mypy
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
-      - run: uv run pytest # fails below 80% coverage (see pyproject.toml)
+      - run: uv run pytest # against the PostgreSQL service; fails below 80% coverage (pyproject.toml)
 
   # Always runs and reports, so it can be a required check (#59). A pull request that changes nothing under
   # web/ and not this workflow skips the steps, and the job still passes; a job-level `if:` would report "skipped".
@@ -183,8 +198,9 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
+          # The API needs DATABASE_URL to start, but connects only when a request needs it.
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
-            --security-opt no-new-privileges \
+            --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi
@@ -199,3 +215,28 @@ jobs:
           docker stop --time 30 smoke
           docker logs smoke | tail -n 8
           test "$(docker inspect --format '{{.State.ExitCode}}' smoke)" = 0
+      - name: Smoke test the database jobs (the migrations ship in the image and run from empty)
+        if: matrix.service == 'api'
+        env:
+          IMAGE: ${{ matrix.service }}:ci
+          PG_PASSWORD: pg-${{ github.run_id }}-${{ github.run_attempt }} # per run, as above
+        run: |
+          docker network create smoke-db
+          docker run --detach --name smoke-postgres --network smoke-db \
+            --env POSTGRES_PASSWORD="$PG_PASSWORD" postgres:17.11-trixie
+          for _ in $(seq 1 30); do
+            if docker exec smoke-postgres pg_isready --host 127.0.0.1 --quiet; then break; fi
+            sleep 1
+          done
+          admin="postgresql://postgres:${PG_PASSWORD}@smoke-postgres:5432/postgres"
+          job() { # job MODULE [docker run options]: python -m MODULE in the image, hardened as above
+            local module=$1
+            shift
+            docker run --rm --network smoke-db --read-only --cap-drop ALL \
+              --security-opt no-new-privileges "$@" "$IMAGE" python -m "$module"
+          }
+          job sft.data.bootstrap --env BOOTSTRAP_DATABASE_URL="$admin" --env BOOTSTRAP_IAM_AUTH=false
+          # The superuser may become sft_owner too, so no role needs a password here. The second run
+          # finds the database at the image's head and does nothing.
+          job sft.data.migrate --env MIGRATION_DATABASE_URL="$admin"
+          job sft.data.migrate --env MIGRATION_DATABASE_URL="$admin" | grep --quiet '"action": "current"'
