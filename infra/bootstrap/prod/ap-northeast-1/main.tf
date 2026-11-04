@@ -1,6 +1,6 @@
 # Bootstrap for the prod account in Tokyo (ADR-0005, encryption 4.4): this Region's state bucket and tfstate key, the
-# GitHub OIDC provider, the Terraform plan and deploy roles, and the key-admin role. The roles are global, so they live
-# here; Osaka's bootstrap stack only adds its own bucket and key.
+# GitHub OIDC provider, the Terraform plan and deploy roles, the key-admin role and the emergency user. IAM is
+# global, so the roles and the user live here; Osaka's bootstrap stack only adds its own bucket and key.
 #
 # Applied by the maintainer with the time-boxed Admin permission set, starting from local state, never by CI
 # (infra/README.md, "Bootstrap an account").
@@ -69,6 +69,14 @@ module "key_admin" {
   role_name                          = module.conventions.bootstrap_role_names.key_admin
   iam_path                           = module.conventions.bootstrap_iam_path
   break_glass_principal_arn_patterns = local.break_glass_principal_arn_patterns
+}
+
+# Identity Center lives in Tokyo; this user is the way in without it (authn-authz 8.4).
+module "emergency_user" {
+  source = "../../../modules/emergency-user"
+
+  user_name = module.conventions.emergency_user.name
+  iam_path  = module.conventions.emergency_user.path
 }
 
 module "state" {

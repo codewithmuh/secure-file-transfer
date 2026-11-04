@@ -4,7 +4,7 @@
 # first; this stack grants them access through its own bucket and key policies and changes no IAM.
 #
 # Applied by the maintainer with the time-boxed Admin permission set, starting from local state, never by CI
-# (infra/README.md, "Bootstrap an account").
+# (infra/README.md, "Bootstrap an account"); in a Tokyo outage, with the account's emergency user.
 
 terraform {
   required_version = "~> 1.17.0"
@@ -44,6 +44,13 @@ provider "aws" {
   }
 }
 
+# A Tokyo outage takes Identity Center, and with it Admin, so the account's emergency user (authn-authz 8.4), created
+# by the Tokyo stack, is a bootstrap admin here too: by its exact ARN, never a pattern. Only Osaka names it, because
+# Tokyo's state is out of reach in that outage anyway.
+locals {
+  admin_principal_arn_patterns = [module.conventions.sso_role_arn_patterns.admin, module.conventions.emergency_user.arn]
+}
+
 module "state" {
   source = "../../../modules/tfstate-backend"
 
@@ -52,7 +59,7 @@ module "state" {
   kms_alias                          = "${module.conventions.kms_alias_prefix}/tfstate"
   primary_key_arn                    = var.tfstate_primary_key_arn
   deletion_window_in_days            = 7
-  admin_principal_arn_patterns       = [module.conventions.sso_role_arn_patterns.admin]
+  admin_principal_arn_patterns       = local.admin_principal_arn_patterns
   break_glass_principal_arn_patterns = [module.conventions.sso_role_arn_patterns.break_glass]
   plan_role_arn                      = module.conventions.bootstrap_role_arns.terraform_plan
   deploy_role_arn                    = module.conventions.bootstrap_role_arns.terraform_deploy

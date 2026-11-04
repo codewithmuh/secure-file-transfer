@@ -2,8 +2,9 @@
 #
 # - The bucket is versioned, blocks public access and encrypts every object with the tfstate key through S3 Bucket
 #   Keys. Locking uses S3 native lock files (use_lockfile), so there is no DynamoDB table.
-# - Only the Terraform roles and the bootstrap admins may read or write objects. The plan role may write and delete
-#   only the .tflock lock files, and may use the key only to decrypt and generate data keys.
+# - Only the Terraform roles and the bootstrap admins may read or write objects, and only the admins may change the
+#   bucket's policy, versioning, lifecycle, encryption, replication or public access. The plan role may write and
+#   delete only the .tflock lock files, and may use the key only to decrypt and generate data keys.
 # - In Tokyo the key is a multi-Region primary. In Osaka (staging and prod) it is that key's replica, created here
 #   from the primary's ARN, so Osaka's state never needs Tokyo once the replica exists.
 #
@@ -385,13 +386,15 @@ data "aws_iam_policy_document" "bucket" {
   }
 
   # T-73: state is readable only by the Terraform roles and the bootstrap admins, whatever other identity policies in
-  # the account allow (BreakGlass and ReadOnly included).
+  # the account allow (BreakGlass and ReadOnly included). The Replicate actions are what a replication role needs on
+  # its destination, so nobody can write a forged version in by replicating from a bucket of their own.
   statement {
     sid    = "DenyStateAccessToEveryoneElse"
     effect = "Deny"
     actions = [
       "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes",
       "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:RestoreObject",
+      "s3:ReplicateObject", "s3:ReplicateDelete", "s3:ReplicateTags",
       "s3:ListBucket", "s3:ListBucketVersions",
     ]
     resources = [local.bucket_arn, "${local.bucket_arn}/*"]
@@ -405,6 +408,38 @@ data "aws_iam_policy_document" "bucket" {
       test     = "ArnNotLike"
       variable = "aws:PrincipalArn"
       values   = local.state_principal_arns
+    }
+  }
+
+  # T-73, #81: only the bootstrap admins change the bucket itself. Without this, anyone whose identity policy allows S3
+  # (BreakGlass has AdministratorAccess) could erase every state and its history with a lifecycle rule or by suspending
+  # versioning, read or forge state by replacing this policy, change the default key, or copy every object elsewhere
+  # with replication or an inventory. The Delete* calls for lifecycle, encryption, replication, inventory, ownership
+  # and public access are authorized by these Put* actions. The plan and deploy roles never need any of them: the
+  # bootstrap stack, applied by the admins, is the only code that manages this bucket. Reading the settings stays open,
+  # for ReadOnly and AWS Config. SCP 3 (infra/organization/scps.tf) repeats this in the member accounts, so it holds
+  # even if this policy is replaced. The account root can always delete a bucket policy, which is the way out of one
+  # that locks the admins out (docs/runbooks/organization-and-bootstrap.md, "If something goes wrong").
+  statement {
+    sid    = "DenyBucketSettingsToEveryoneElse"
+    effect = "Deny"
+    actions = [
+      "s3:DeleteBucket", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketOwnershipControls",
+      "s3:PutBucketPublicAccessBlock", "s3:PutBucketVersioning", "s3:PutBucketObjectLockConfiguration",
+      "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration", "s3:PutReplicationConfiguration",
+      "s3:PutInventoryConfiguration",
+    ]
+    resources = [local.bucket_arn]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "ArnNotLike"
+      variable = "aws:PrincipalArn"
+      values   = var.admin_principal_arn_patterns
     }
   }
 

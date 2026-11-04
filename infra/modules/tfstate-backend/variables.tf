@@ -53,7 +53,7 @@ variable "deletion_window_in_days" {
 }
 
 variable "admin_principal_arn_patterns" {
-  description = "ArnLike patterns for the principals that apply the bootstrap stack: the Admin permission set (ADR-0006)."
+  description = "ArnLike patterns for the bootstrap admins: Admin (ADR-0006); in Osaka, the emergency user too (authn-authz 8.4)."
   type        = list(string)
 
   validation {

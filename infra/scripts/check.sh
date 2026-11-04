@@ -2,7 +2,7 @@
 # Static checks for infra/, run the same way locally (make infra-check) and in CI (.github/workflows/infra.yml).
 #
 # Usage: infra/scripts/check.sh <command>
-#   conventions  every root's backend and stack name follow infra/README.md; no account IDs in the code
+#   conventions  every root's backend and stack name follow infra/README.md; no override files; no account IDs
 #   fmt          terraform fmt -check, with a diff
 #   fmt-fix      terraform fmt, rewriting files
 #   validate     terraform init -backend=false and validate, for every root
@@ -75,6 +75,18 @@ conventions() {
     grep -Eq "^ *stack += \"$stack\"$" "$root"/*.tf ||
       { echo "$root: the conventions module call must set stack = \"$stack\"" >&2; status=1; }
   done < <(roots)
+
+  # Terraform merges override files into a root after everything else, so one could replace the backend checked above,
+  # or anything else, without showing in the file it changes. None may exist under infra/, committed or not: the
+  # backend_override.tf that a bootstrap starts with is deleted before its state moves (infra/README.md).
+  local overrides
+  overrides=$(find infra -type f -not -path '*/.terraform/*' \
+    \( -name override.tf -o -name '*_override.tf' -o -name override.tf.json -o -name '*_override.tf.json' \) | sort)
+  if [[ -n $overrides ]]; then
+    echo "Terraform override files under infra/ (infra/README.md, \"State\"); remove them:" >&2
+    echo "$overrides" >&2
+    status=1
+  fi
 
   # Account IDs come in as variables, never in the code. An AWS-owned account (for example a regional registry that
   # serves EKS add-ons, ADR-0021) is allowed on a line marked "aws-owned-account".

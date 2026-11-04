@@ -896,9 +896,17 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 
 ### 8.4 When Identity Center is unavailable
 
-- Each AWS account has one emergency IAM user with a hardware security key, console access only and no access keys. Its
-  password is kept offline. Any sign-in alerts. It is used only when Identity Center can't be reached, for example in
-  a regional outage that also takes down Identity Center's home region.
+- Each member account has one emergency IAM user with a hardware security key, console access only and no access
+  keys. Its password is kept offline. Any sign-in alerts. It is used only when Identity Center can't be reached, for
+  example in a regional outage that also takes down Identity Center's home region. It is `sft-{env}-emergency` under
+  the `/sft-emergency/` path, created by the account's Tokyo bootstrap stack with `AdministratorAccess`, bound by the
+  SCPs like any other principal; the maintainer sets its password and security keys in the console, so neither is in
+  Terraform state (infra/README, "Roles for CI"). Only `Admin` may create, rename or delete IAM users or change their
+  passwords, policies or MFA devices (SCP 4).
+- In staging and prod it is a bootstrap admin of the Osaka state bucket and tfstate key, named by its exact ARN, never
+  a pattern, so Osaka's bootstrap stack can still be applied with Tokyo, and so Identity Center and `Admin`, gone;
+  SCPs 2 and 3 let it through for them, and those are the only policies that name it (#81). Osaka's other stacks
+  keep applying from CI, whose OIDC roles don't depend on Identity Center.
 - Member accounts have no root user credentials: centralized root access is on, and a privileged root task runs from
   the management account through `sts:AssumeRoot` for at most 15 minutes (ADR-0006). The management account's root
   user has a hardware security key, is never used, and any sign-in alerts.

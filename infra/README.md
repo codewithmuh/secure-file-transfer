@@ -33,8 +33,8 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 
 | Stack | Account | Regions | Holds | Applied by |
 |---|---|---|---|---|
-| `bootstrap/<account>/ap-northeast-1` | each | Tokyo | The state bucket and tfstate key for Tokyo; the GitHub OIDC provider; the Terraform plan and deploy roles; the key-admin role (none of the last two in the management account) | The maintainer, `Admin` permission set, local state first |
-| `bootstrap/<account>/ap-northeast-3` | staging, prod | Osaka | The state bucket for Osaka and the Osaka replica of the tfstate key | The maintainer, `Admin` permission set, local state first |
+| `bootstrap/<account>/ap-northeast-1` | each | Tokyo | The state bucket and tfstate key for Tokyo; the GitHub OIDC provider; the Terraform plan and deploy roles; the key-admin role and the emergency user (none of the last three in the management account) | The maintainer, `Admin` permission set, local state first |
+| `bootstrap/<account>/ap-northeast-3` | staging, prod | Osaka | The state bucket for Osaka and the Osaka replica of the tfstate key | The maintainer, `Admin` permission set, local state first; in a Tokyo outage, the account's emergency user |
 | `organization` | management | Tokyo (Organizations is global) | Organizations, OUs and accounts, Identity Center and permission sets, SCPs, budgets: [#55](https://github.com/codewithmuh/secure-file-transfer/issues/55) | The maintainer with MFA, never CI; CI plans it read-only (ADR-0006) |
 | `shared` | shared | Tokyo, with Osaka and us-east-1 aliases when needed | ECR and the registry key, web bundle artifacts, the public DNS zone, the organization's log archive | CI, `shared` environment |
 | `environments/<env>/<region>/<layer>` | dev, staging, prod | dev: Tokyo; staging and prod: Tokyo and Osaka | Architecture 3.1 and 3.2, split into layers (below) | CI, the environment's GitHub environment |
@@ -64,16 +64,21 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `tfstate-backend` | A state bucket and its tfstate key (or, in Osaka, the key's replica) with the bucket and key policies below |
 | `terraform-oidc-roles` | The GitHub OIDC provider, the plan role and the deploy role |
 | `key-admin-role` | `sft-<env>-keyadmin`, which only BreakGlass may assume (encryption 4.4, rule 6) |
+| `emergency-user` | `sft-<env>-emergency` under `/sft-emergency/`, the account's way in when Identity Center can't be reached (authn-authz 8.4) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
 
 ## Apply order
+
+Before any of it, the GitHub environments `dev`, `staging`, `prod` and `shared`, each accepting deployments from
+`main` only, so that no deploy role ever exists without the rule its trust relies on (the runbook's step 0, T-71).
 
 1. `bootstrap/management/ap-northeast-1`, before anything else exists.
 2. `organization`: the budgets first, then the organization, OUs and member accounts, the SCPs, and, once Identity
    Center is enabled in the console, the permission sets and groups. Two console steps and a few flags make it more
    than one apply: follow [the runbook](../docs/runbooks/organization-and-bootstrap.md), which covers steps 1 to 3.
-3. For each member account (shared, dev, staging, prod): `bootstrap/<account>/ap-northeast-1`, then, for staging and
-   prod, `bootstrap/<account>/ap-northeast-3`, which needs the Tokyo stack's `tfstate_key_arn` output and its roles.
+3. For each member account (shared, dev, staging, prod): `bootstrap/<account>/ap-northeast-1`, then the emergency
+   user's password and security keys in the console, then, for staging and prod, `bootstrap/<account>/ap-northeast-3`,
+   which needs the Tokyo stack's `tfstate_key_arn` output and its roles.
 4. `shared`.
 5. For each environment, in Tokyo and then in Osaka: `network`, `data`, `cluster`, `cluster-bootstrap`, `edge`. In prod,
    `retained` goes before `data`, because the environment refers to the archive by ARN. On a fresh build `network`
@@ -94,7 +99,7 @@ identity:
 cd infra/bootstrap/<account>/<region>
 export AWS_PROFILE=<named profile> TF_VAR_account_id=<account id>
 # Osaka only: export TF_VAR_tfstate_primary_key_arn=<tfstate_key_arn output of the Tokyo stack>
-printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf   # git-ignored
+printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf   # git-ignored; check.sh fails while it exists
 terraform init && terraform apply
 bucket=$(terraform output -raw state_bucket_name)
 rm backend_override.tf
@@ -113,7 +118,8 @@ with, because Identity Center doesn't exist yet the first time.
 | Key | The root's directory under `infra/`, plus `/terraform.tfstate`: `environments/prod/ap-northeast-3/network/terraform.tfstate`. The `stack` tag has the same value, so a resource names the code that owns it. |
 | Locking | S3 native lock files (`use_lockfile = true`): `<key>.tflock` next to the state. No DynamoDB table. |
 | Encryption | The bucket's default SSE-KMS with the account's tfstate key (`alias/sft/<env>/tfstate`) and S3 Bucket Keys. The backend sets no `encrypt` or `kms_key_id`: `encrypt = true` without a key asks S3 for SSE-S3 instead. The bucket policy refuses any other encryption. |
-| Access | Only the plan role, the deploy role and the bootstrap admins may read or write objects; the bucket policy denies everyone else, BreakGlass included. The plan role writes and deletes only `.tflock` files and uses the key only to decrypt and generate data keys (ADR-0005). Versioning keeps every replaced state for 90 days, and the last ten of each always. |
+| Access | Only the plan role, the deploy role and the bootstrap admins may read or write objects, and only the bootstrap admins may change the bucket: its policy, versioning, lifecycle rules, default encryption, replication, inventory, Object Lock, ownership and public access settings, or delete it. The bucket policy denies both to everyone else, BreakGlass included, and SCP 3 repeats the second in the member accounts. The plan role writes and deletes only `.tflock` files and uses the key only to decrypt and generate data keys (ADR-0005). Versioning keeps every replaced state for 90 days, and the last ten of each always. |
+| Bootstrap admins | The `Admin` permission set; in the management account, whatever `TF_VAR_admin_principal_arn_patterns` names. In Osaka, also the account's emergency user, `sft-<env>-emergency`, by its exact ARN: a Tokyo outage takes Identity Center and so `Admin` with it (ADR-0006, authn-authz 8.4). |
 
 Each root's backend block sets only `key`, `region` and `use_lockfile`. The bucket names the account, so it comes in
 at init, and no bucket name or account ID is ever in the code:
@@ -123,7 +129,9 @@ terraform init -backend-config="bucket=sft-<env>-<region-short>-tfstate-${TF_VAR
 ```
 
 `check.sh conventions` fails a root whose key isn't its directory, whose region isn't its Region, or whose backend
-sets anything else.
+sets anything else, and any `override.tf`, `*_override.tf` or their `.tf.json` forms anywhere under `infra/`,
+committed or not, because an override file replaces a backend without showing in the file it changes. The
+bootstrap's `backend_override.tf` is the one override ever used, and it is gone before the state moves.
 
 ## Roles for CI
 
@@ -137,8 +145,17 @@ All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may chang
 retained stack's own deploy role, which must be named `sft-prod-retained-terraform-deploy`: the SCPs treat every
 `sft-*-terraform-deploy` under that path as a deploy role, and SCP 5 names this one. Both trusts pin
 the audience and the exact subject with `StringEquals`; the module's variables reject wildcards. Each GitHub
-environment must accept deployments from `main` only, which is set in the repository settings, not here. The
-management account has a plan role only.
+environment must accept deployments from `main` only, which is set in the repository settings, not here: the
+bootstrap runbook creates all four with that rule in its step 0, before any deploy role exists, because GitHub
+creates an environment with no rules the first time a job names it. The management account has a plan role only.
+
+Each member account also has an **emergency IAM user**, `sft-<env>-emergency` under `/sft-emergency/`, made by its
+Tokyo bootstrap stack with `AdministratorAccess` and bound by the SCPs like everyone else. It is for when Identity
+Center can't be reached (authn-authz 8.4). The maintainer gives it a console password kept offline and a security
+key in the console, so neither is ever in state; it never has access keys. In staging and prod, Osaka's state bucket
+and tfstate key name it as a bootstrap admin, and SCPs 2 and 3 let it through for them, so Osaka's bootstrap stack
+can still be applied in a Tokyo outage. Only `Admin` may create or change IAM users, their passwords and their MFA
+devices (SCP 4).
 
 The plan and deploy roles' permissions beyond state are a **placeholder** in `modules/terraform-oidc-roles`: each
 issue that builds a layer adds what that layer needs. The management account's plan role is the first to have real
@@ -164,9 +181,9 @@ SCPs never bind the management account, so it holds nothing else and is applied 
 | SCP | Attached to | Denies |
 |---|---|---|
 | 1 `region-guard` | Root | Everything outside Tokyo and Osaka, except global services (IAM, STS, Route 53, CloudFront, Organizations, account, billing, Budgets, Cost Explorer, Support, Health) and, in us-east-1 only, ACM, WAF, CloudWatch, SNS, CloudWatch Logs delivery and KMS (NFR-21). Also log groups in us-east-1, KMS replicas outside Osaka, and VPC endpoints to services outside Japan; `vpce:AllowMultiRegion` passes (ADR-0021). |
-| 2 `keys` | Root | Disabling or deleting KMS keys, or deleting imported key material, to all but apply roles; putting key policies to all but apply roles and `sft-<env>-keyadmin` |
-| 3 `accounts-and-logging` | Root | Leaving the organization; the root user's own credentials; sharing EBS or RDS snapshots; turning off account-wide S3 Block Public Access or EBS default encryption, and changing CloudTrail, Config, GuardDuty, EKS logging, `sft-*` EventBridge rules and alarms or `/aws/eks/*` log groups, to all but apply roles |
-| 4 `iam` | Root | Changing roles, policies and OIDC or SAML providers to all but deploy roles; changing what is under `/sft-bootstrap/`, the GitHub OIDC provider and `OrganizationAccountAccessRole` to all but `Admin`; access keys and service-specific credentials to everyone; IAM users to all but `Admin` |
+| 2 `keys` | Root | Disabling or deleting KMS keys, or deleting imported key material, to all but apply roles and the staging and prod emergency users; putting key policies to all but those and `sft-<env>-keyadmin`. The key policies keep the emergency users to Osaka's tfstate keys. |
+| 3 `accounts-and-logging` | Root | Leaving the organization; the root user's own credentials; sharing EBS or RDS snapshots; turning off account-wide S3 Block Public Access or EBS default encryption, and changing CloudTrail, Config, GuardDuty, EKS logging, `sft-*` EventBridge rules and alarms or `/aws/eks/*` log groups, to all but apply roles; changing the settings of a `sft-*-apne?-tfstate-*` state bucket or deleting it, to all but `Admin`, the staging and prod emergency users and assumed-root sessions (#81) |
+| 4 `iam` | Root | Changing roles, policies and OIDC or SAML providers to all but deploy roles; changing what is under `/sft-bootstrap/`, the GitHub OIDC provider and `OrganizationAccountAccessRole` to all but `Admin`; access keys and service-specific credentials to everyone; creating, renaming, deleting IAM users or changing their passwords, policies or MFA devices to all but `Admin` |
 | 5 `audit-archive` | `prod` OU | Changing the policy, lifecycle, Object Lock, replication, versioning, encryption or public access settings of `sft-prod-apne?-audit-archive-*` and `sft-prod-apne?-retained-*` buckets to all but the retained stack's deploy role and `Admin` |
 
 **Permission sets.** Group assignments only; nobody holds `Admin` or `BreakGlass` standing.
@@ -251,7 +268,7 @@ AWS configuration and none of your environment.
 
 | Check | What it does |
 |---|---|
-| `conventions` | Each root's backend key is its directory, its region is its Region, it sets only `key`, `region` and `use_lockfile`, and its `stack` matches; no account IDs |
+| `conventions` | Each root's backend key is its directory, its region is its Region, it sets only `key`, `region` and `use_lockfile`, and its `stack` matches; no Terraform override files under `infra/`; no account IDs |
 | `fmt` | `terraform fmt -check -recursive -diff` |
 | `validate` | `terraform init -backend=false -lockfile=readonly` and `validate` for every root, so a missing or stale lock file fails too |
 | `tflint` | Terraform's own rules (preset `all`) and the AWS ruleset, through every root and the modules they call |

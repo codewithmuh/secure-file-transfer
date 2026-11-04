@@ -8,8 +8,12 @@
 # - deploy roles: sft-<env>-terraform-deploy under /sft-bootstrap/, and the retained stack's own deploy role,
 #   sft-prod-retained-terraform-deploy, which the same pattern matches (ADR-0006, "deploy roles");
 # - Admin: Identity Center's role for that permission set, whose name ends in a random suffix;
-# - the key-admin role, sft-<env>-keyadmin (ADR-0017).
-# Only Admin may create or change roles under /sft-bootstrap/ (SCP 4), so no other role can take one of those names.
+# - the key-admin role, sft-<env>-keyadmin (ADR-0017);
+# - the emergency users of staging and prod, sft-<env>-emergency under /sft-emergency/ (authn-authz 8.4), by exact
+#   name: in a Tokyo outage, when Identity Center and so Admin are gone, they administer Osaka's state bucket and
+#   tfstate key, which name them (#81). Only those policies name them, so the exemptions below reach nothing else.
+# Only Admin may create or change roles under /sft-bootstrap/ and IAM users (SCP 4), so no other principal can take
+# one of those names.
 
 locals {
   japan_regions = ["ap-northeast-1", "ap-northeast-3"]
@@ -21,6 +25,11 @@ locals {
   key_admin_role_arns       = ["${local.bootstrap_role_arn_prefix}sft-*-keyadmin"]
   # Identity Center puts its roles under /aws-reserved/sso.amazonaws.com/<region>/, a path nobody else can use.
   admin_role_arns = ["arn:aws:iam::*:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_Admin_*"]
+  # The accounts with an Osaka state bucket. The name is the conventions module's emergency_user for each.
+  emergency_user_arns = [
+    for env in ["staging", "prod"] :
+    "arn:aws:iam::*:user${module.conventions.emergency_user.path}sft-${env}-emergency"
+  ]
 
   # --- SCP 1: region guard (NFR-21) ------------------------------------------------------------------------------
 
@@ -87,18 +96,23 @@ locals {
 
   # --- SCP 2: keys (encryption decision 13, T-61) ----------------------------------------------------------------
 
-  # Admin is exempt because it applies the bootstrap stacks, which create the tfstate keys; the key policies are what
-  # keep it to those keys, since no other key policy names it. BreakGlass may still enable a key and cancel a pending
+  # Admin is exempt because it applies the bootstrap stacks, which create the tfstate keys, and the emergency users
+  # because they stand in for Admin on Osaka's tfstate key in a Tokyo outage; the key policies are what keep them to
+  # those keys, since no other key policy names them. BreakGlass may still enable a key and cancel a pending
   # deletion, which the key policies allow.
   scp_keys = {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "OnlyDeployRolesAndAdminDisableOrDeleteKeys"
-        Effect    = "Deny"
-        Action    = ["kms:DeleteImportedKeyMaterial", "kms:DisableKey", "kms:ScheduleKeyDeletion"]
-        Resource  = "*"
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.deploy_role_arns, local.admin_role_arns) } }
+        Sid      = "OnlyDeployRolesAndAdminDisableOrDeleteKeys"
+        Effect   = "Deny"
+        Action   = ["kms:DeleteImportedKeyMaterial", "kms:DisableKey", "kms:ScheduleKeyDeletion"]
+        Resource = "*"
+        Condition = {
+          ArnNotLike = {
+            "aws:PrincipalArn" = concat(local.deploy_role_arns, local.admin_role_arns, local.emergency_user_arns)
+          }
+        }
       },
       {
         # The key-admin role may only put a key policy back (ADR-0017).
@@ -108,7 +122,9 @@ locals {
         Resource = "*"
         Condition = {
           ArnNotLike = {
-            "aws:PrincipalArn" = concat(local.deploy_role_arns, local.admin_role_arns, local.key_admin_role_arns)
+            "aws:PrincipalArn" = concat(
+              local.deploy_role_arns, local.admin_role_arns, local.key_admin_role_arns, local.emergency_user_arns,
+            )
           }
         }
       },
@@ -118,6 +134,16 @@ locals {
   # --- SCP 3: accounts and logging (T-60, T-74, T-75) ------------------------------------------------------------
 
   apply_role_arns = concat(local.deploy_role_arns, local.admin_role_arns)
+
+  # The Terraform state buckets' own settings (T-73, #81): what would erase, expose or let someone forge state through
+  # the bucket rather than its objects. The state bucket policy denies the same actions to everyone but the bootstrap
+  # admins (modules/tfstate-backend, DenyBucketSettingsToEveryoneElse); this holds even if that policy is replaced.
+  state_bucket_settings_actions = [
+    "s3:DeleteBucket", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketOwnershipControls",
+    "s3:PutBucketPublicAccessBlock", "s3:PutBucketVersioning", "s3:PutBucketObjectLockConfiguration",
+    "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration", "s3:PutReplicationConfiguration",
+    "s3:PutInventoryConfiguration",
+  ]
 
   scp_accounts_and_logging = {
     Version = "2012-10-17"
@@ -191,6 +217,22 @@ locals {
         ]
         Condition = { ArnNotLike = { "aws:PrincipalArn" = local.apply_role_arns } }
       },
+      {
+        # Only Admin, which applies the bootstrap stacks, and the emergency users, which stand in for it in Osaka,
+        # change a state bucket; deploy roles never do. The pattern matches each sft-<env>-<region-short>-tfstate-
+        # <account-id>, not the retained stack's sft-prod-apne1-retained-tfstate-*, which SCP 5 guards. Assumed-root
+        # sessions, the only root left in a member account (DenyRootUserCredentials), pass, so the runbook's way out
+        # of a bucket policy that locks the admins out still works.
+        Sid      = "OnlyAdminChangesStateBuckets"
+        Effect   = "Deny"
+        Action   = local.state_bucket_settings_actions
+        Resource = ["arn:aws:s3:::sft-*-apne?-tfstate-*"]
+        Condition = {
+          ArnNotLike = {
+            "aws:PrincipalArn" = concat(local.admin_role_arns, local.emergency_user_arns, ["arn:aws:iam::*:root"])
+          }
+        }
+      },
     ]
   }
 
@@ -243,12 +285,16 @@ locals {
         Resource = "*"
       },
       {
-        # People sign in through Identity Center. The only IAM users are the emergency users of authn-authz 8.4.
+        # People sign in through Identity Center. The only IAM users are the emergency users of authn-authz 8.4, which
+        # the state bucket and key policies in Osaka name (#81): nobody but Admin may create one, rename or move a user
+        # into its name, set its password or MFA device, or remove it or its policy.
         Sid    = "OnlyAdminManagesIamUsers"
         Effect = "Deny"
         Action = [
           "iam:AddUserToGroup", "iam:AttachUserPolicy", "iam:CreateLoginProfile", "iam:CreateUser", "iam:PutUserPolicy",
-          "iam:UpdateLoginProfile",
+          "iam:UpdateLoginProfile", "iam:UpdateUser", "iam:DeleteUser", "iam:DeleteLoginProfile", "iam:DetachUserPolicy",
+          "iam:DeleteUserPolicy", "iam:RemoveUserFromGroup", "iam:EnableMFADevice", "iam:DeactivateMFADevice",
+          "iam:ResyncMFADevice",
         ]
         Resource  = "*"
         Condition = { ArnNotLike = { "aws:PrincipalArn" = local.admin_role_arns } }
