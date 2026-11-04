@@ -1,7 +1,7 @@
 # A frozen extract of docs/api/openapi.yaml (2026-11-04) for the tests of the generated-spec
-# check: seven operations and the components they use, without descriptions, examples, headers and
-# error responses, which the check doesn't compare. The tests build their routes against this file,
-# so a change to the contract doesn't break them. The contract itself is checked against the service
+# check: seven operations and the components they use, without descriptions, examples and headers,
+# which the check doesn't compare. The tests build their routes against this file, so a change to
+# the contract doesn't break them. The contract itself is checked against the service
 # by test_the_service_matches_the_contract, and by CI (docs/api/README.md, section 11.1).
 openapi: 3.1.0
 info:
@@ -33,6 +33,16 @@ paths:
       responses:
         '302':
           description: Redirect to Cognito managed login.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
   /auth/sign-out:
     post:
       operationId: signOut
@@ -53,6 +63,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/SignOutResult'
           description: Signed out.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
   /files/{file_id}:
     parameters:
     - $ref: '#/components/parameters/FileId'
@@ -67,6 +87,16 @@ paths:
       responses:
         '204':
           description: The file was removed.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
   /files/{file_id}/downloads/{grant_id}/content:
     parameters:
     - $ref: '#/components/parameters/FileId'
@@ -84,6 +114,18 @@ paths:
           $ref: '#/components/responses/FileContent'
         '206':
           $ref: '#/components/responses/PartialFileContent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '416':
+          $ref: '#/components/responses/RangeNotSatisfiable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /users:
     get:
       operationId: listUsers
@@ -102,6 +144,14 @@ paths:
               schema:
                 $ref: '#/components/schemas/UserPage'
           description: One page of users.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
   /users/{user_id}/sign-out:
     parameters:
     - $ref: '#/components/parameters/UserId'
@@ -118,6 +168,16 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
           description: The user, whose sessions have all ended.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
   /operator/tenants:
     servers:
     - url: http://127.0.0.1:{local_port}/v1
@@ -141,6 +201,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/TenantCreated'
           description: The tenant and its first admin were created.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 components:
   parameters:
     Cursor:
@@ -222,6 +294,66 @@ components:
       schema:
         $ref: '#/components/schemas/UserStatus'
   responses:
+    BadRequest:
+      description: BadRequest.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Conflict.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Forbidden.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: NotFound.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RangeNotSatisfiable:
+      description: RangeNotSatisfiable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: ServiceUnavailable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: TooManyRequests.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Unauthorized.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnexpectedError:
+      description: UnexpectedError.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnprocessableContent:
+      description: UnprocessableContent.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
     FileContent:
       content:
         application/octet-stream:
@@ -337,3 +469,86 @@ components:
     UserStatus:
       type: string
       enum: [invited, active, deactivated]
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: {type: string, format: uri}
+        title: {type: string}
+        status: {type: integer, minimum: 400, maximum: 599}
+        detail: {type: string}
+        instance: {type: string, format: uri-reference}
+        code: {$ref: '#/components/schemas/ProblemCode'}
+        request_id: {type: string}
+        errors:
+          type: array
+          items: {$ref: '#/components/schemas/ValidationIssue'}
+        attempts_remaining: {type: integer, minimum: 0}
+        current_state: {type: string}
+    ProblemCode:
+      type: string
+      enum:
+      - malformed_request
+      - invalid_cursor
+      - authentication_required
+      - session_expired
+      - credentials_invalid
+      - reauthentication_required
+      - permission_denied
+      - passkey_required
+      - self_approval_forbidden
+      - csrf_failed
+      - recipient_locked
+      - download_limit_reached
+      - download_grant_exhausted
+      - not_found
+      - link_not_found
+      - method_not_allowed
+      - idempotency_conflict
+      - idempotency_in_progress
+      - invalid_state
+      - transfer_revoked
+      - transfer_expired
+      - upload_request_revoked
+      - upload_request_expired
+      - transfer_empty
+      - upload_incomplete
+      - file_not_shareable
+      - user_exists
+      - last_admin
+      - dlp_decision_changed
+      - dlp_policy_conflict
+      - detector_in_use
+      - no_eligible_approver
+      - approval_limit_reached
+      - link_revoked
+      - link_expired
+      - file_too_large
+      - total_too_large
+      - storage_quota_exceeded
+      - request_too_large
+      - unsupported_media_type
+      - range_not_satisfiable
+      - validation_failed
+      - expiry_out_of_range
+      - recipient_domain_not_allowed
+      - recipient_undeliverable
+      - too_many_files
+      - upload_size_mismatch
+      - code_invalid
+      - code_expired
+      - code_attempts_exhausted
+      - export_too_large
+      - justification_required
+      - approvers_insufficient
+      - rate_limited
+      - internal_error
+      - service_unavailable
+    ValidationIssue:
+      type: object
+      required: [detail]
+      properties:
+        detail: {type: string}
+        pointer: {type: string}
+        parameter: {type: string}
+        header: {type: string}
