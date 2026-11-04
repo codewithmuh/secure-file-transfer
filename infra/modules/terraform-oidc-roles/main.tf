@@ -106,10 +106,12 @@ data "aws_iam_policy_document" "placeholder" {
   }
 }
 
+# A caller that knows its plan role's needs replaces the placeholder with plan_policy_json: the management account
+# passes read access to Organizations, Identity Center and Budgets for the organization stack (#55).
 resource "aws_iam_role_policy" "plan_placeholder" {
-  name   = "placeholder"
+  name   = var.plan_policy_json == null ? "placeholder" : "plan"
   role   = aws_iam_role.plan.id
-  policy = data.aws_iam_policy_document.placeholder.json
+  policy = coalesce(var.plan_policy_json, data.aws_iam_policy_document.placeholder.json)
 }
 
 resource "aws_iam_role_policy" "deploy_placeholder" {

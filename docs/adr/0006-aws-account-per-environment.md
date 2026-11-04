@@ -51,9 +51,11 @@ protections. The retained stack stays in the prod account, which stays open afte
   nobody holds `Admin` standing: a `BreakGlassApprover` assigns it for at most one hour through the break-glass tool, a
   schedule removes the assignment, and every assignment, sign-in and call alerts (authn-authz 8.3). One CLI profile per
   account. If Tokyo is lost, Identity Center is too, and operators use the emergency IAM users of authn-authz 8.4.
-- **SCPs**, attached to the organization root unless noted. At most five per target, `FullAWSAccess` included, and
-  5,120 characters each, so they are grouped by purpose; the root holds the limit of five. "Deploy roles" below are the
-  Terraform apply roles and the retained stack's deploy role.
+- **SCPs**, attached to the organization root unless noted, grouped by purpose: the root holds `FullAWSAccess` and
+  four. AWS allowed five per target and 5,120 characters each when this was written, and ten and 10,240 since May 2026,
+  which leaves room. "Deploy roles" below are the Terraform apply roles and the retained stack's deploy role
+  (`sft-prod-retained-terraform-deploy`, under `/sft-bootstrap/`). The organization stack (#55) holds them; infra/README
+  has the full table.
   1. **Region guard (NFR-21).** Deny any request outside ap-northeast-1 and ap-northeast-3, except the global services
      NFR-21 exempts (IAM, Route 53, Budgets) and the account-level services that exist only globally (Organizations,
      account settings, billing and Cost Explorer, Support, Health). In us-east-1 alone it also allows what CloudFront
@@ -79,8 +81,17 @@ protections. The retained stack stays in the prod account, which stays open afte
      `/sft-bootstrap/` path) are the exception the other way: only `Admin` may change them, never a deploy role, so no
      deploy role can widen its own trust (T-71).
   5. **prod OU only.** Only the retained stack's deploy role may change the archive buckets' policies, lifecycle rules
-     and Object Lock settings (encryption 8.4).
-- **The shared account** lives from the bootstrap until the last environment is torn down. The organization trail
+     and Object Lock settings (encryption 8.4), and the bootstrap `Admin` role, which runs the retained stack's first
+     apply from local state (ADR-0005).
+  The code added what the threat model asks of the same guards: SCP 4 also denies IAM access keys to everyone and IAM
+  users to all but `Admin` (T-71, T-74), and SCP 1 denies KMS replicas outside Osaka (encryption 4.4) and VPC endpoints
+  to services outside Japan.
+- **Root users.** Centralized root access is on: member accounts have no root credentials, and a privileged root task
+  runs from the management account through `sts:AssumeRoot`, which SCP 3 lets through. Only the management account's
+  root user has a password and security keys.
+- **The shared account** lives from the bootstrap until the last environment is torn down. It is CloudTrail's
+  delegated administrator and creates the organization trail next to its log archive, so the management account holds
+  no trail. GuardDuty and Config belong to each environment and have no delegated administrator. The organization trail
   writes to its log archive under Object Lock with 90-day retention (T-75), so after the final teardown it keeps
   billing a few cents for up to 90 days, the small exception NFR-19 records. The retained stack keeps its own trail
   (encryption 8.4), because the organization trail ends with the shared account.

@@ -136,6 +136,26 @@ data "aws_iam_policy_document" "key" {
     }
   }
 
+  # AWS Config's rules read the key's state (cmk-backing-key-rotation-enabled, kms-cmk-not-scheduled-for-deletion,
+  # encryption 9.2). Its service-linked role is matched by ARN through the account principal rather than named, because
+  # KMS refuses a policy that names a role that doesn't exist yet, and Config arrives after the bootstrap.
+  statement {
+    sid       = "AwsConfigReadsKeyState"
+    actions   = ["kms:DescribeKey", "kms:GetKeyRotationStatus"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.account_root]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = ["arn:aws:iam::${var.account_id}:role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig"]
+    }
+  }
+
   # The key-admin role can only read and put the key policy, to repair one (rule 6).
   dynamic "statement" {
     for_each = var.key_admin_role_arn == null ? [] : [var.key_admin_role_arn]
