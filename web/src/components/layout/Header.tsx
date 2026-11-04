@@ -1,16 +1,18 @@
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/stores/authStore';
 import { useUIStore } from '@/stores/uiStore';
+import { signOutMember } from '@/features/auth/memberSession';
+import { toast } from '@/components/ui';
 import { Menu, LogOut, Shield } from 'lucide-react';
 
 export function Header() {
   const { t } = useTranslation();
-  const { user, clearAuth } = useAuthStore();
+  const user = useAuthStore((s) => s.user);
   const { toggleSidebar } = useUIStore();
 
+  // The session lives in an HttpOnly cookie, so only the API can end it (signOut).
   const handleSignOut = () => {
-    clearAuth();
-    window.location.href = '/sign-in';
+    signOutMember().catch(() => toast('error', t('auth.signOutError')));
   };
 
   return (

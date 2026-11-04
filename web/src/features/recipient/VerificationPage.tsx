@@ -2,16 +2,18 @@ import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Shield, Mail, ArrowRight, AlertCircle } from 'lucide-react';
 import { Button, Input, Card } from '@/components/ui';
-import { useAuthStore } from '@/stores/authStore';
+import { useAuthStore, type LinkMode } from '@/stores/authStore';
 
 interface VerificationPageProps {
-  mode: 'recipient' | 'uploader';
-  onVerified: () => void;
+  mode: LinkMode;
 }
 
-export function VerificationPage({ mode, onVerified }: VerificationPageProps) {
+/** Verifies the recipient or uploader. The parent page shows its content once the store holds a link session. */
+export function VerificationPage({ mode }: VerificationPageProps) {
   const { t } = useTranslation();
-  const { setLinkSession } = useAuthStore();
+  const setLinkToken = useAuthStore((s) => s.setLinkToken);
+  const setLinkSession = useAuthStore((s) => s.setLinkSession);
+  const sessionLapsed = useAuthStore((s) => s.linkSessionLapsed);
 
   const [step, setStep] = useState<'resolve' | 'code'>('resolve');
   const [token, setToken] = useState<string | null>(null);
@@ -23,10 +25,19 @@ export function VerificationPage({ mode, onVerified }: VerificationPageProps) {
 
   useEffect(() => {
     const fragment = window.location.hash.slice(1);
+    let linkToken: string | null = null;
     if (fragment) {
-      setToken(fragment);
       window.history.replaceState(null, '', window.location.pathname);
-      resolveLink(fragment);
+      setLinkToken(mode, fragment);
+      linkToken = fragment;
+    } else {
+      // Back here after the link session lapsed: the fragment is gone, so use the token kept in memory.
+      const kept = useAuthStore.getState().linkToken;
+      if (kept?.mode === mode) linkToken = kept.value;
+    }
+    if (linkToken) {
+      setToken(linkToken);
+      resolveLink(linkToken);
     }
   }, []);
 
@@ -68,7 +79,6 @@ export function VerificationPage({ mode, onVerified }: VerificationPageProps) {
       const mockSessionId = crypto.randomUUID();
       const mockCsrfToken = crypto.randomUUID();
       setLinkSession(mockSessionId, mockCsrfToken);
-      onVerified();
     } catch {
       setError(t('recipient.codeExpired'));
     } finally {
@@ -122,6 +132,7 @@ export function VerificationPage({ mode, onVerified }: VerificationPageProps) {
               <h2 className="mt-3 text-lg font-semibold text-gray-900">{t('recipient.verifyTitle')}</h2>
               <p className="mt-1 text-sm text-gray-500">{t('recipient.verifySubtitle')}</p>
               {email && <p className="mt-2 text-sm font-medium text-brand-600">{email}</p>}
+              {sessionLapsed && <p className="mt-2 text-sm text-yellow-700">{t('recipient.sessionEnded')}</p>}
             </div>
 
             <Button variant="secondary" onClick={requestCode} loading={loading} className="w-full">

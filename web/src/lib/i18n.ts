@@ -32,6 +32,7 @@ const en = {
       signInWithPassword: 'Sign in with password or passkey',
       signingIn: 'Signing in…',
       signInError: 'Unable to sign in. Please try again.',
+      signOutError: 'Unable to sign out. Please try again.',
     },
     sender: {
       dashboard: 'Dashboard',
@@ -73,6 +74,7 @@ const en = {
       sendingCode: 'Sending code…',
       codeSent: 'Verification code sent to {{email}}',
       codeExpired: 'Code expired. Please request a new one.',
+      sessionEnded: 'Your session has ended. Verify your email address again to continue.',
       download: 'Download',
       downloading: 'Downloading…',
       linkRevoked: 'This link has been revoked',
@@ -152,6 +154,7 @@ const ja = {
       signInWithPassword: 'パスワードまたはパスキーでサインイン',
       signingIn: 'サインイン中…',
       signInError: 'サインインできませんでした。もう一度お試しください。',
+      signOutError: 'サインアウトできませんでした。もう一度お試しください。',
     },
     sender: {
       dashboard: 'ダッシュボード',
@@ -193,6 +196,7 @@ const ja = {
       sendingCode: 'コード送信中…',
       codeSent: '{{email}}に確認コードを送信しました',
       codeExpired: 'コードの有効期限が切れました。新しいコードをリクエストしてください。',
+      sessionEnded: 'セッションが終了しました。続けるには、もう一度メールアドレスを確認してください。',
       download: 'ダウンロード',
       downloading: 'ダウンロード中…',
       linkRevoked: 'このリンクは取り消されました',
