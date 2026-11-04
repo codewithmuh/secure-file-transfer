@@ -17,14 +17,19 @@
   - **Platform and lookup:** no tenant rows. Platform tables have no `TenantOwned` model, and
     credentials are found only through the lookup functions (data model 4.2).
 
-- **Find across, act within.** In system scope a write reaches no tenant rows,
-  `in_scope(Model, session, write=True)`, except for the relay, which marks every tenant's outbox
-  rows sent. A lifecycle job finds its work there and changes each item in that item's tenant
-  scope. Writes to no tenant's rows, such as the audit partition upkeep, aren't affected.
+- **Find across, act within.** In system scope no write reaches a tenant row: the session refuses
+  an `INSERT`, `UPDATE` or `DELETE` on a tenant table, and a flush that adds, changes or deletes
+  a tenant-owned object, before it reaches the database (`check_write`, called by `Database`'s
+  session). Nothing has to remember a flag. The relay is the one exception (`SYSTEM_WRITERS`): it
+  marks every tenant's outbox rows sent. A lifecycle job finds its work in system scope and changes
+  each item in that item's tenant scope. Work on no tenant's rows, such as the audit partition
+  upkeep, isn't affected.
 - **Functions of one scope** check it with `require_scope`: a credential lookup runs only in
   lookup scope, which is also the only scope its `lookup_read` policies match.
 - **Where the tenant of a write comes from:** `tenant_of(session)`, the scope's tenant, never an
   argument.
+- **Not found** is `NotFoundError`, which a data-access function raises for a row its scope
+  doesn't reach; the service answers 404 (authentication and authorization 6.1).
 
 Row-level security checks the tenant boundary only. Within a tenant, the resource rule is this
 module's alone, and so is the subject. The isolation suite (`tests/test_isolation.py`) runs every
@@ -33,15 +38,15 @@ data-access function with this layer alone, with row-level security alone, and w
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, ClassVar, Final
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, and_, false, true
+from sqlalchemy import ColumnElement, FromClause, and_, false, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.data import roles
-from sft.data.scope import Scope, ScopeKind, Subject
+from sft.data.scope import TENANT_SCOPES, Scope, ScopeKind, Subject
 
 _TENANT, _RESOURCE, _SYSTEM, _PLATFORM, _LOOKUP, _RECOVERY = (
     ScopeKind.TENANT,
@@ -51,7 +56,6 @@ _TENANT, _RESOURCE, _SYSTEM, _PLATFORM, _LOOKUP, _RECOVERY = (
     ScopeKind.LOOKUP,
     ScopeKind.RECOVERY,
 )
-_WITH_TENANT = frozenset({_TENANT, _RESOURCE})
 _ACROSS_TENANTS = frozenset({_SYSTEM, _RECOVERY})
 
 SCOPES_BY_ROLE: Final[Mapping[str, frozenset[ScopeKind]]] = {
@@ -77,7 +81,14 @@ SYSTEM_WRITERS: Final = frozenset({roles.RELAY})
 
 
 class ScopeNotAllowedError(RuntimeError):
-    """A workload asked for a scope its role never opens, or no workload role was named."""
+    """A workload asked for a scope its role never opens, or wrote where its scope can't."""
+
+
+class NotFoundError(Exception):
+    """The row isn't there, or the session's scope doesn't reach it: the caller can't tell which.
+
+    Not a `LookupError`, so a `KeyError` or `IndexError` from a bug is never taken for one.
+    """
 
 
 def check_scope(role: str, scope: Scope) -> None:
@@ -102,7 +113,9 @@ def require_scope(session: AsyncSession, *kinds: ScopeKind) -> Scope:
     """The session's scope, if it is one of `kinds`; for functions of one scope, e.g. lookups."""
     scope = scope_of(session)
     if scope.kind not in kinds:
-        raise ScopeNotAllowedError(f"this runs in a {' or '.join(kinds)} scope, not {scope.kind}")
+        names = [k.value for k in kinds]
+        allowed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
+        raise ScopeNotAllowedError(f"this runs in a {allowed} scope, not {scope.kind}")
     return scope
 
 
@@ -138,32 +151,47 @@ class TenantOwned:
         return false()
 
 
-def in_scope(
-    model: type[TenantOwned], session: AsyncSession, *, write: bool = False
-) -> ColumnElement[bool]:
-    """The condition that keeps a query on `model` inside the session's scope.
-
-    Pass `write=True` in an `UPDATE` or `DELETE`: in system scope only the relay writes tenant rows.
-    """
+def in_scope(model: type[TenantOwned], session: AsyncSession) -> ColumnElement[bool]:
+    """The condition that keeps a query on `model` inside the session's scope."""
     scope = scope_of(session)
-    role = session.info.get("role")
-    condition = _tenant_condition(model, scope, role if isinstance(role, str) else None, write)
+    condition = _tenant_condition(model, scope)
     if scope.subject is not None:
         condition = and_(condition, model.reach(scope.subject))
     return condition
 
 
-def _tenant_condition(
-    model: type[TenantOwned], scope: Scope, role: str | None, write: bool
-) -> ColumnElement[bool]:
+def _tenant_condition(model: type[TenantOwned], scope: Scope) -> ColumnElement[bool]:
     # The whole tenant filter, in one place: the isolation suite replaces this function to prove
     # that row-level security alone keeps tenants apart (ADR-0020).
-    if scope.kind in _WITH_TENANT:
+    if scope.kind in TENANT_SCOPES:
         column: Any = getattr(model, model.__tenant_key__)
         condition: ColumnElement[bool] = column == scope.tenant_id
         return condition
-    if scope.kind is ScopeKind.SYSTEM and write and role not in SYSTEM_WRITERS:
-        return false()
     if scope.kind in _ACROSS_TENANTS:
         return true()
     return false()
+
+
+def check_write(scope: Scope, role: str | None, tables: Iterable[FromClause | None]) -> None:
+    """Refuse a write to tenant tables in system scope, unless `role` writes there by design.
+
+    `Database`'s session calls it for every `INSERT`, `UPDATE` and `DELETE` it executes and for
+    every flush, with the tables they touch.
+    """
+    if scope.kind is not ScopeKind.SYSTEM or _writes_tenant_rows_in_system_scope(role):
+        return
+    touched = sorted({t.name for t in tables if t is not None and _is_tenant_table(t)})  # type: ignore[attr-defined]
+    if touched:
+        raise ScopeNotAllowedError(
+            f"{role} writes no tenant rows in system scope ({', '.join(touched)}): find across, "
+            "then act on each item in its tenant's scope"
+        )
+
+
+def _writes_tenant_rows_in_system_scope(role: str | None) -> bool:
+    # The isolation suite replaces this function too, with _tenant_condition.
+    return role in SYSTEM_WRITERS
+
+
+def _is_tenant_table(table: FromClause) -> bool:
+    return getattr(table, "name", None) == "tenants" or "tenant_id" in table.c

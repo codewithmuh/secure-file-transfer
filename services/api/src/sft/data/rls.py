@@ -48,7 +48,8 @@ migration that creates a credential table also runs `lookup_read_sql(table, colu
     )
 
 The function is `SECURITY DEFINER`, owned by `sft_lookup` (which has no `BYPASSRLS`), with its
-`search_path` pinned, and only `sft_api` may execute it. Name tables with their schema in the body.
+`search_path` pinned, and only `sft_api` may execute it. `sft_lookup` holds `CREATE` on `public`
+only while the revision hands it the function. Name tables with their schema in the body.
 Return IDs and status columns only, never a hash or a ciphertext.
 """
 
@@ -164,13 +165,27 @@ def tenant_rls_sql(table: str, *, grants: Mapping[str, str], key: str = "tenant_
 # ---- composite foreign keys (data model 4.2) ----
 
 
+MAX_NAME_BYTES = 63
+"""PostgreSQL's limit on a name. It truncates a longer one silently, so two could collide."""
+
+
+def _constraint_name(name: str) -> str:
+    if len(name.encode()) > MAX_NAME_BYTES:
+        raise ValueError(
+            f"constraint name {name!r} is over {MAX_NAME_BYTES} bytes, which PostgreSQL would "
+            "truncate; shorten the table or column name"
+        )
+    return name
+
+
 def tenant_keys_sql(table: str) -> list[str]:
     """`tenant_id` references `tenants (id)`, and the unique key `(tenant_id, id)` children use."""
     name = identifier(table)
     return [
-        f"ALTER TABLE {name} ADD CONSTRAINT {name}_tenant_id_fkey "
+        f"ALTER TABLE {name} ADD CONSTRAINT {_constraint_name(f'{name}_tenant_id_fkey')} "
         "FOREIGN KEY (tenant_id) REFERENCES tenants (id)",
-        f"ALTER TABLE {name} ADD CONSTRAINT {name}_tenant_id_id_key UNIQUE (tenant_id, id)",
+        f"ALTER TABLE {name} ADD CONSTRAINT {_constraint_name(f'{name}_tenant_id_id_key')} "
+        "UNIQUE (tenant_id, id)",
     ]
 
 
@@ -186,7 +201,7 @@ def tenant_foreign_key_sql(
         raise ValueError(f"ON DELETE {on_delete} would break the tenant key; use CASCADE, RESTRICT")
     name, col = identifier(table), identifier(column)
     sql = (
-        f"ALTER TABLE {name} ADD CONSTRAINT {name}_tenant_id_{col}_fkey "
+        f"ALTER TABLE {name} ADD CONSTRAINT {_constraint_name(f'{name}_tenant_id_{col}_fkey')} "
         f"FOREIGN KEY (tenant_id, {col}) REFERENCES {identifier(parent)} (tenant_id, id)"
     )
     return sql if on_delete is None else f"{sql} ON DELETE {on_delete}"
@@ -225,7 +240,10 @@ def lookup_function_sql(signature: str, *, returns: str, body: str) -> list[str]
         # ignored with only a warning. The new owner keeps them.
         f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC",
         f"GRANT EXECUTE ON FUNCTION {signature} TO {API}",
-        # Changing the owner needs the bootstrap's grants: sft_owner may SET ROLE sft_lookup,
-        # which may create in public.
+        # The new owner must be able to create in the schema, but only for this statement: a
+        # role that kept CREATE on public could plant objects on every pinned search_path
+        # (CVE-2018-1058). sft_owner may SET ROLE sft_lookup and grant CREATE (bootstrap).
+        f"GRANT CREATE ON SCHEMA public TO {LOOKUP}",
         f"ALTER FUNCTION {signature} OWNER TO {LOOKUP}",
+        f"REVOKE CREATE ON SCHEMA public FROM {LOOKUP}",
     ]

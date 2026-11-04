@@ -119,8 +119,10 @@ them. In the API, the app's lifespan creates the `Database` and a route gets it 
 `DATABASE_URL` names the workload's own role, and the pool opens only that role's scopes
 (`sft.data.access.SCOPES_BY_ROLE`, authentication and authorization 7.3): `sft_api` tenant, resource, platform and
 lookup; `sft_jobs` system and tenant; and so on. Any other scope raises `ScopeNotAllowedError` before it reaches the
-database, and a URL naming any other user, a superuser included, is refused at `connect`. A resource scope names its
-subject, the link session's recipient or upload request: `Scope.resource(tenant_id, Subject.recipient(id))`.
+database. A URL naming any other user, a superuser included, is refused at `connect`, and so is one whose query
+could change who logs in (`user`, `options`, `service`, …; TLS settings, `connect_timeout` and `application_name`
+pass); every new connection also checks `current_user`. A resource scope names its subject, the link session's
+recipient or upload request: `Scope.resource(tenant_id, Subject.recipient(id))`.
 
 Every data-access function filters with `in_scope`, never with a tenant of its own, and writes the scope's tenant:
 
@@ -136,6 +138,11 @@ session.add(Widget(id=uuid7(), tenant_id=tenant_of(session), ...))
 
 Every tenant-owned model mixes in `TenantOwned`. Its `reach(subject)` says which rows a link session reaches; the
 default is none. Row-level security keeps tenants apart; within a tenant the resource rule is this layer's alone.
+
+In system scope the session refuses any `INSERT`, `UPDATE`, `DELETE` or flush that touches a tenant table, before it
+reaches the database, unless the role is the relay: a job finds its work across tenants and changes each item in its
+tenant's scope. There is no flag to forget. A row the scope doesn't reach is `NotFoundError`, which the service
+answers with 404.
 
 ### Roles
 
@@ -330,9 +337,10 @@ scopes the role may open. A resource-scope case passes `subject=` to give mine's
 three ways (ADR-0020): as built; with row-level security disabled in a database of its own, so `in_scope` must hold
 alone; and with `in_scope`'s tenant filter removed, so the policies must hold alone. An attempt fails the build if
 its result holds any of theirs' IDs or the marker in their text columns, if any of their rows changed, or if a row of
-another tenant now refers to one of their IDs. A refusal is fine: no row, `None`, a policy, privilege, foreign key or
-read-only error, or a `LookupError`. In system scope, and in lookup scope when the case names it, reading across
-tenants is the point, so only the "nothing changed" checks apply.
+another tenant now refers to one of their IDs. A refusal is fine: no row, `None`, a policy, privilege or foreign key
+error, or the data layer's `NotFoundError` or `ScopeNotAllowedError`; anything else, a `KeyError` included, fails.
+In system scope, and in lookup scope when the case names it, reading across tenants is the point, so only the
+"nothing changed" checks apply.
 
 A new tenant table also gets its rows in `seed_tenant` (`tests/isolation.py`), which seeds as the superuser so the
 code under test never seeds itself. `tests/isolation_fixture.py` holds stand-in tables, a parent with a credential and

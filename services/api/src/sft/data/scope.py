@@ -36,7 +36,8 @@ class ScopeKind(StrEnum):
     """The restore and failover jobs, as `sft_recovery`, never a running service."""
 
 
-_WITH_TENANT = frozenset({ScopeKind.TENANT, ScopeKind.RESOURCE})
+TENANT_SCOPES = frozenset({ScopeKind.TENANT, ScopeKind.RESOURCE})
+"""The scope kinds that set a tenant; every other kind sets none."""
 
 
 class SubjectKind(StrEnum):
@@ -84,9 +85,9 @@ class Scope:
         if self.tenant_id is not None and not isinstance(self.tenant_id, UUID):
             # A tenant comes from a credential row, as a UUID, never as text from a request.
             raise TypeError("tenant_id must be a UUID")
-        if self.kind in _WITH_TENANT and self.tenant_id is None:
+        if self.kind in TENANT_SCOPES and self.tenant_id is None:
             raise ValueError(f"a {self.kind} scope needs a tenant")
-        if self.kind not in _WITH_TENANT and self.tenant_id is not None:
+        if self.kind not in TENANT_SCOPES and self.tenant_id is not None:
             raise ValueError(f"a {self.kind} scope has no tenant")
         if self.subject is not None and not isinstance(self.subject, Subject):
             raise TypeError("subject must be a Subject")

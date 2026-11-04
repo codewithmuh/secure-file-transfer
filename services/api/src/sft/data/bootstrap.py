@@ -8,9 +8,9 @@ and in CI it runs as a superuser. It needs `BOOTSTRAP_DATABASE_URL` and `BOOTSTR
 What it sets up (authentication and authorization 7.3):
 
 - `sft_owner` and `sft_lookup`, which can't log in. `sft_owner` may create tables in `public`.
-  `sft_owner` may also become `sft_lookup` with `SET ROLE`, without inheriting from it, and
-  `sft_lookup` may create in `public`: together they let a migration hand a credential lookup
-  function to `sft_lookup` (`sft.data.rls.lookup_function_sql`).
+  `sft_owner` may also become `sft_lookup` with `SET ROLE`, without inheriting from it, and may
+  grant `CREATE` on `public`: a migration gives it to `sft_lookup` only while it hands over a
+  credential lookup function (`sft.data.rls.lookup_function_sql`).
 - One login role per workload, and `sft_migrate`, with no attributes beyond `LOGIN`: no
   superuser, `CREATEROLE`, `CREATEDB`, replication or `BYPASSRLS`. `sft_migrate` may become
   `sft_owner` with `SET ROLE`, but doesn't inherit its privileges.
@@ -90,9 +90,13 @@ def bootstrap_sql(*, iam_auth: bool) -> list[str]:
         f"GRANT {OWNER} TO {MIGRATE} WITH INHERIT FALSE, SET TRUE",
         "REVOKE CREATE ON SCHEMA public FROM PUBLIC",
         f"GRANT USAGE, CREATE ON SCHEMA public TO {OWNER}",
-        # ALTER FUNCTION … OWNER TO sft_lookup needs both (data model 4.2).
+        # ALTER FUNCTION … OWNER TO sft_lookup: the owner may become sft_lookup, and may give it
+        # CREATE on public for that one statement (sft.data.rls.lookup_function_sql). sft_owner
+        # stays the only role that keeps CREATE there (CVE-2018-1058).
         f"GRANT {LOOKUP} TO {OWNER} WITH INHERIT FALSE, SET TRUE",
-        f"GRANT USAGE, CREATE ON SCHEMA public TO {LOOKUP}",
+        f"GRANT CREATE ON SCHEMA public TO {OWNER} WITH GRANT OPTION",
+        f"GRANT USAGE ON SCHEMA public TO {LOOKUP}",
+        f"REVOKE CREATE ON SCHEMA public FROM {LOOKUP}",
         "DO $$ BEGIN "
         "EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', current_database()); "
         f"EXECUTE format('GRANT CONNECT ON DATABASE %I TO {logins}', current_database()); "

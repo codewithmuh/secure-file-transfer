@@ -287,7 +287,7 @@ async def test_record_refuses_scopes_that_write_no_events(
     database = Database.connect(migrated_db.url(role), pool_size=1)
     try:
         async with database.transaction(scope) as session:
-            with pytest.raises(ValueError, match="tenant, resource or platform scope"):
+            with pytest.raises(ScopeNotAllowedError, match="tenant, resource or platform scope"):
                 await audit.record(session, action="x.y", actor=Actor(ActorType.SYSTEM))
     finally:
         await database.dispose()

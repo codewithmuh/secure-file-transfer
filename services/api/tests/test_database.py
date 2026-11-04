@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import DBAPIError, InvalidRequestError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from pg import ScratchDatabase
 from sft.data import audit
 from sft.data.access import ScopeNotAllowedError
-from sft.data.database import Database, ScopeMissingError, psycopg_url
+from sft.data.database import Database, LoginRoleError, ScopeMissingError, psycopg_url
 from sft.data.models import Tenant
 from sft.data.roles import API, MIGRATE, RECOVERY, RELAY
 from sft.data.scope import Scope, Subject
@@ -125,6 +126,82 @@ async def test_a_role_opens_only_its_own_scopes(scope: Scope) -> None:
     with pytest.raises(ScopeNotAllowedError, match=f"sft_api never opens a {scope.kind} scope"):
         async with database.transaction(scope):
             pass  # pragma: no cover
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "user=postgres",
+        "options=-c%20role%3Dpostgres",
+        "service=admin",
+        "password=x",
+        "sslmode=require&user=postgres",
+    ],
+)
+def test_a_pool_url_may_not_change_who_logs_in(query: str) -> None:
+    # psycopg applies the query after the user name: ?user=postgres would log in as postgres.
+    with pytest.raises(ValueError, match="may not set"):
+        Database.connect(f"postgresql://sft_api@127.0.0.1:1/sft?{query}")
+
+
+def test_a_pool_url_may_carry_tls_and_timeouts() -> None:
+    query = "sslmode=verify-full&sslrootcert=/ca.pem&connect_timeout=5&application_name=sft-api"
+    Database.connect(f"postgresql://sft_api@127.0.0.1:1/sft?{query}")
+
+
+async def first_statement(database: Database) -> None:
+    # A transaction connects at its first statement, not when the block starts.
+    async with database.transaction(Scope.platform()) as session:
+        await session.execute(text("SELECT 1"))
+
+
+async def test_every_new_connection_checks_who_logged_in(migrated_db: ScratchDatabase) -> None:
+    # Whatever the driver does with its arguments, PostgreSQL has the last word on current_user.
+    engine = create_async_engine(
+        psycopg_url(migrated_db.url(API)),
+        pool_size=1,
+        connect_args={"user": "sft_scan"},
+    )
+    database = Database(engine)
+    try:
+        with pytest.raises(
+            LoginRoleError, match=r"logged in as \('sft_scan', 'sft_scan'\), not sft_api"
+        ):
+            await first_statement(database)
+    finally:
+        await database.dispose()
+
+
+class FakeConnection:
+    """A DB-API connection that says who it logged in as, for the check itself."""
+
+    def __init__(self, row: tuple[str, str] | None) -> None:
+        self.row, self.rolled_back = row, False
+
+    def cursor(self) -> "FakeConnection":
+        return self
+
+    def execute(self, statement: str) -> None:
+        assert statement == "SELECT current_user, session_user"
+
+    def fetchone(self) -> tuple[str, str] | None:
+        return self.row
+
+    def close(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+
+@pytest.mark.parametrize("row", [("sft_scan", "sft_scan"), ("postgres", "sft_api"), None])
+def test_the_login_check_refuses_anyone_but_the_urls_role(row: tuple[str, str] | None) -> None:
+    database = Database.connect("postgresql://sft_api@127.0.0.1:1/sft")
+    connection = FakeConnection(row)
+    with pytest.raises(LoginRoleError):
+        database._check_login(connection, None)
+    assert connection.rolled_back  # it leaves no transaction open on the pooled connection
+    database._check_login(FakeConnection(("sft_api", "sft_api")), None)
 
 
 @pytest.mark.parametrize("user", ["postgres", MIGRATE, "sft_owner", "sft_lookup", None])

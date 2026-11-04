@@ -25,7 +25,10 @@ def test_the_owner_can_hand_a_lookup_function_to_sft_lookup() -> None:
     # ALTER FUNCTION … OWNER TO sft_lookup: the owner may become it, and it may create in public.
     statements = bootstrap_sql(iam_auth=False)
     assert f"GRANT {LOOKUP} TO {OWNER} WITH INHERIT FALSE, SET TRUE" in statements
-    assert f"GRANT USAGE, CREATE ON SCHEMA public TO {LOOKUP}" in statements
+    assert f"GRANT CREATE ON SCHEMA public TO {OWNER} WITH GRANT OPTION" in statements
+    # sft_lookup never keeps CREATE on public: each lookup revision lends it for one statement.
+    assert f"REVOKE CREATE ON SCHEMA public FROM {LOOKUP}" in statements
+    assert not [s for s in statements if "CREATE ON SCHEMA public TO sft_lookup" in s]
 
 
 def test_bootstrap_can_run_again(empty_db: ScratchDatabase) -> None:

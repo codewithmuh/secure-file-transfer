@@ -703,9 +703,11 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
      scopes in authentication and authorization 7.3: `sft_api` tenant, resource, platform and lookup; `sft_operator`
      platform and tenant; `sft_scan` and `sft_notify` tenant; `sft_relay` and `sft_archive` system; `sft_jobs` system
      and tenant; `sft_recovery` recovery. Any other scope is refused before it reaches the database, and so is a URL
-     that names any other user, the master user included. In system scope an `UPDATE` or `DELETE` reaches no
-     tenant row (`in_scope(…, write=True)`), except the relay's on `outbox`, so "find across, act within" holds
-     without row-level security too. Work on no tenant's rows, such as the audit partition upkeep, isn't affected.
+     that names any other user, the master user included, or whose query could change who logs in (only TLS
+     settings, a connect timeout and an application name pass). Every new connection checks `current_user` too. In
+     system scope the session refuses any `INSERT`, `UPDATE`, `DELETE` or flush that touches a tenant table, except
+     the relay's on `outbox`, so "find across, act within" holds without row-level security and nothing has to
+     remember a flag. Work on no tenant's rows, such as the audit partition upkeep, isn't affected.
    - **What a scope reaches.** Every query adds `in_scope(Model, session)`: the scope's tenant in tenant and
      resource scope, every tenant in system and recovery scope (the role's grants and policies decide the tables),
      no tenant row in platform and lookup scope. A resource scope carries its subject, the link session's recipient
@@ -714,9 +716,11 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    - **Lookups run in lookup scope.** Each lookup function is called in a transaction of its own in lookup scope,
      and its `lookup_read` policies are `USING (app_scope() = 'lookup')`, so a lookup inside a tenant's transaction
      finds nothing. Like every definer function, they pin `search_path = pg_catalog, public, pg_temp` (the
-     temporary schema last) and name their tables with the schema. The bootstrap job lets `sft_owner` become `sft_lookup`, without
-     inheriting from it, and lets `sft_lookup` create in `public`, which `ALTER FUNCTION … OWNER TO sft_lookup`
-     needs; the migration revokes `PUBLIC`'s `EXECUTE` and grants `sft_api` before it hands the function over.
+     temporary schema last) and name their tables with the schema. The bootstrap job lets `sft_owner` become
+     `sft_lookup`, without inheriting from it, and grant `CREATE` on `public`. `ALTER FUNCTION … OWNER TO
+     sft_lookup` needs the new owner to hold it, so the revision grants it, hands the function over and revokes it
+     again; only `sft_owner` keeps `CREATE` there, which a catalog test checks (CVE-2018-1058). The revision revokes
+     `PUBLIC`'s `EXECUTE` and grants `sft_api` before the hand-over.
 2. **Composite foreign keys.** Every tenant-owned table has a unique key `(tenant_id, id)`, and children reference
    their parent by both columns, for example `files (tenant_id, transfer_id) → transfers (tenant_id, id)`. The database
    itself refuses a row that points at another tenant's parent. This includes `verification_codes`, `link_sessions`,

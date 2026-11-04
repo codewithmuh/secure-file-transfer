@@ -24,7 +24,7 @@ from sqlalchemy import ColumnElement, Connection, delete, false, select, text, u
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped
 
-from pg import ScratchDatabase
+from pg import Sql
 from sft.data.access import TenantOwned, in_scope, require_scope, tenant_of
 from sft.data.rls import (
     lookup_function_sql,
@@ -89,7 +89,7 @@ def token_hash(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
 
 
-def seed(db: ScratchDatabase, tenant_id: uuid.UUID, marker: str) -> dict[str, uuid.UUID]:
+def seed(db: Sql, tenant_id: uuid.UUID, marker: str) -> dict[str, uuid.UUID]:
     rows = {"widget": uuid.uuid4(), "part": uuid.uuid4(), "token": uuid.uuid4()}
     db.sql(
         "INSERT INTO widgets (id, tenant_id, name, token_hash) VALUES (:id, :tenant, :name, :hash)",
@@ -163,16 +163,14 @@ async def list_parts(session: AsyncSession, widget_id: uuid.UUID) -> Sequence[Wi
 
 async def rename_widget(session: AsyncSession, widget_id: uuid.UUID, name: str) -> int:
     result = await session.execute(
-        update(Widget)
-        .where(Widget.id == widget_id, in_scope(Widget, session, write=True))
-        .values(name=name)
+        update(Widget).where(Widget.id == widget_id, in_scope(Widget, session)).values(name=name)
     )
     return int(result.rowcount)  # type: ignore[attr-defined]
 
 
 async def delete_widget(session: AsyncSession, widget_id: uuid.UUID) -> int:
     result = await session.execute(
-        delete(Widget).where(Widget.id == widget_id, in_scope(Widget, session, write=True))
+        delete(Widget).where(Widget.id == widget_id, in_scope(Widget, session))
     )
     return int(result.rowcount)  # type: ignore[attr-defined]
 

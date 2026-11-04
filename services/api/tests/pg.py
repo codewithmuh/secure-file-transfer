@@ -4,6 +4,7 @@ import secrets
 from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Protocol
 
 from sqlalchemy import URL, Connection, text
 
@@ -18,6 +19,13 @@ from sft.data.roles import API, JOBS, LOGIN_ROLES, LOOKUP, MIGRATE, OWNER, RECOV
 # cluster-wide, so they stay, with the password below.
 ADMIN_URL_VARIABLE = "TEST_DATABASE_URL"
 TEST_PASSWORD = "test-only-password"  # noqa: S105 - local and CI test servers only
+
+
+class Sql(Protocol):
+    """Anything that runs a statement as the superuser: a `ScratchDatabase`, or the harness's
+    `Admin`."""
+
+    def sql(self, statement: str, **params: object) -> list[tuple[object, ...]]: ...
 
 
 @dataclass(frozen=True)
@@ -146,13 +154,14 @@ DEFINER_FUNCTIONS = """
            ARRAY(SELECT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END
                    FROM aclexplode(p.proacl) a
                   WHERE a.grantee <> p.proowner AND a.privilege_type = 'EXECUTE')
-      FROM pg_proc p
-     WHERE p.pronamespace = 'public'::regnamespace
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%'
        AND (p.prosecdef OR p.proowner = CAST(:lookup AS regrole))
 """
 
 
 def definer_functions(db: ScratchDatabase) -> list[tuple[object, ...]]:
+    """Definer functions, and anything `sft_lookup` owns, in every schema but PostgreSQL's own."""
     return db.sql(DEFINER_FUNCTIONS, lookup=LOOKUP)
 
 

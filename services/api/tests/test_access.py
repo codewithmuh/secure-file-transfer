@@ -3,6 +3,7 @@
 import uuid
 
 import pytest
+from sqlalchemy import Column, Integer, MetaData, Table
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +12,7 @@ from sft.data.access import (
     ScopeNotAllowedError,
     TenantOwned,
     check_scope,
+    check_write,
     in_scope,
     require_scope,
     scope_of,
@@ -33,8 +35,8 @@ def session_in(scope: Scope | None, role: str | None = None) -> AsyncSession:
     return session
 
 
-def sql(scope: Scope, *, role: str | None = None, write: bool = False) -> str:
-    condition = in_scope(Tenant, session_in(scope, role), write=write)
+def sql(scope: Scope, *, role: str | None = None) -> str:
+    condition = in_scope(Tenant, session_in(scope, role))
     return str(condition.compile(dialect=postgresql.dialect()))
 
 
@@ -61,14 +63,22 @@ def test_only_workload_roles_open_scopes() -> None:
         check_scope("postgres", Scope.system())
 
 
+TENANTS = Tenant.__table__
+CURSOR = Table("audit_archive_cursor", MetaData(), Column("generation", Integer))
+
+
 def test_in_system_scope_only_the_relay_writes_tenant_rows() -> None:
     # Find across, act within: a job changes an item in that item's tenant scope.
-    assert sql(Scope.system(), role=JOBS) == "true"
-    assert sql(Scope.system(), role=JOBS, write=True) == "false"
-    assert sql(Scope.system(), write=True) == "false"
-    assert sql(Scope.system(), role=RELAY, write=True) == "true"  # it marks outbox rows sent
-    assert sql(Scope.tenant(TENANT), role=JOBS, write=True) == "tenants.id = %(id_1)s::UUID"
-    assert sql(Scope.recovery(), role="sft_recovery", write=True) == "true"
+    with pytest.raises(
+        ScopeNotAllowedError, match=r"sft_jobs writes no tenant rows in system scope \(tenants\)"
+    ):
+        check_write(Scope.system(), JOBS, [TENANTS])
+    with pytest.raises(ScopeNotAllowedError, match="writes no tenant rows"):
+        check_write(Scope.system(), None, [TENANTS])
+    check_write(Scope.system(), RELAY, [TENANTS])  # it marks every tenant's outbox rows sent
+    check_write(Scope.system(), JOBS, [CURSOR, None])  # no tenant rows: partition upkeep, cursor
+    check_write(Scope.tenant(TENANT), JOBS, [TENANTS])  # act within
+    check_write(Scope.recovery(), "sft_recovery", [TENANTS])  # its policies decide
 
 
 def test_a_tenant_scope_filters_by_its_tenant() -> None:

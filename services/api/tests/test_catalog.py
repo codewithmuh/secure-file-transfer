@@ -237,6 +237,19 @@ def test_sft_migrate_has_no_privileges_until_it_becomes_the_owner(
     assert rows == [(False, False)]
 
 
+def test_only_the_owner_may_create_in_public(catalog_db: ScratchDatabase) -> None:
+    # public is on every pinned search_path, so a role that may create there could plant a table
+    # or function a definer function would find (CVE-2018-1058).
+    creators = catalog_db.sql(
+        """
+        SELECT CASE a.grantee WHEN 0 THEN 'PUBLIC' ELSE pg_get_userbyid(a.grantee) END
+          FROM pg_namespace n, aclexplode(n.nspacl) a
+         WHERE n.nspname = 'public' AND a.privilege_type = 'CREATE' AND a.grantee <> n.nspowner
+        """
+    )
+    assert creators == [(OWNER,)]
+
+
 def test_foreign_keys_between_tenant_tables_carry_the_tenant(catalog_db: ScratchDatabase) -> None:
     # Row-level security doesn't check foreign keys; a composite key refuses a reference to another
     # tenant's row (data model 4.2, sft.data.rls.tenant_foreign_key_sql).

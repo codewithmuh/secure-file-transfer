@@ -11,7 +11,8 @@ scope the case names and in the tenant-less scopes its role may open, three ways
 After each attempt it fails the build if the result carries anything of theirs (an ID or the
 marker written into their rows), if any of their rows changed, or if any row of another tenant
 now refers to one of their IDs. Refusals are fine: no row, a policy or privilege error, a
-foreign key violation, a read-only transaction, or a `LookupError` from the code.
+foreign key violation, or the data layer's own `NotFoundError` or `ScopeNotAllowedError`. Any
+other exception, a `KeyError` included, fails the case.
 
 Adding a case (README, "The isolation suite"):
 
@@ -28,27 +29,25 @@ A new table also gets its rows in `seed_tenant`, so every case has something of 
 
 from __future__ import annotations
 
-import json
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
 from unittest import mock
 
 import pytest
-from sqlalchemy import URL, inspect, true
+from sqlalchemy import URL, create_engine, inspect, text, true
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 
 import isolation_fixture
-from pg import ScratchDatabase, fresh_database, tenant_tables
+from pg import TENANT_TABLES, ScratchDatabase, Sql, fresh_database
 from sft.data import access
-from sft.data.access import SCOPES_BY_ROLE, ScopeNotAllowedError
-from sft.data.database import Database
+from sft.data.access import SCOPES_BY_ROLE, NotFoundError, ScopeNotAllowedError
+from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
 from sft.data.roles import MIGRATE
 from sft.data.scope import Scope, ScopeKind, Subject
@@ -62,9 +61,9 @@ class Mode(StrEnum):
 
 MODES = tuple(Mode)
 
-# What a refusal looks like from PostgreSQL: a policy or a grant (42501), a foreign key (23503),
-# a read-only transaction (25006). Anything else is a bug, and the case fails with it.
-REFUSED = frozenset({"42501", "23503", "25006"})
+# What a refusal looks like from PostgreSQL: a policy or a grant (42501), a foreign key (23503).
+# Anything else is a bug, and the case fails with it.
+REFUSED = frozenset({"42501", "23503"})
 
 # Scopes that read across tenants by design, when a case names them: a job's find step in system
 # scope, a credential lookup in lookup scope. There the harness checks that nothing changed, not
@@ -175,7 +174,47 @@ def world_database(admin_url: URL, *, rls: bool) -> Iterator[ScratchDatabase]:
         yield db
 
 
-def seed_tenant(db: ScratchDatabase, label: str) -> Seeded:
+class Admin:
+    """The superuser on one database, over one pooled connection the checks share."""
+
+    def __init__(self, db: ScratchDatabase) -> None:
+        self._engine = create_engine(psycopg_url(db.admin), pool_size=1, max_overflow=0)
+        self._tables: list[str] | None = None
+        self._uuid_columns: list[tuple[str, str]] | None = None
+
+    def sql(self, statement: str, **params: object) -> list[tuple[object, ...]]:
+        with self._engine.begin() as connection:
+            result = connection.execute(text(statement), params)
+            return [tuple(row) for row in result] if result.returns_rows else []
+
+    def dispose(self) -> None:
+        self._engine.dispose()
+
+    def tenant_tables(self) -> list[str]:
+        """Read from the catalog once per world: its schema doesn't change while it runs."""
+        if self._tables is None:
+            self._tables = sorted(str(name) for (name,) in self.sql(TENANT_TABLES))
+        return self._tables
+
+    def uuid_columns(self) -> list[tuple[str, str]]:
+        """The uuid columns of tenant tables, other than their own ID and tenant."""
+        if self._uuid_columns is None:
+            owned = set(self.tenant_tables()) - {"tenants"}
+            rows = self.sql(
+                """
+                SELECT c.relname, a.attname FROM pg_class c
+                  JOIN pg_attribute a ON a.attrelid = c.oid
+                 WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p')
+                   AND NOT c.relispartition AND a.attnum > 0 AND NOT a.attisdropped
+                   AND a.atttypid = 'uuid'::regtype AND a.attname NOT IN ('id', 'tenant_id')
+                 ORDER BY 1, 2
+                """
+            )
+            self._uuid_columns = [(str(t), str(c)) for t, c in rows if t in owned]
+        return self._uuid_columns
+
+
+def seed_tenant(db: Sql, label: str) -> Seeded:
     """One tenant and a row in every tenant table, as the superuser.
 
     The superuser path skips the policies and the audit trigger of #50, so seeding is never
@@ -192,46 +231,30 @@ def seed_tenant(db: ScratchDatabase, label: str) -> Seeded:
     return Seeded(tenant_id, marker, rows)
 
 
-def snapshot(db: ScratchDatabase, tenant: Seeded) -> dict[str, list[str]]:
-    """Every row of `tenant`, as the superuser sees it."""
-    rows = {}
-    for table in sorted(tenant_tables(db)):
-        key = "id" if table == "tenants" else "tenant_id"
-        rows[table] = [
-            json.dumps(row, sort_keys=True, default=str)
-            for (row,) in db.sql(
-                # Names from the catalog, not input.
-                f'SELECT to_jsonb(t) FROM "{table}" t WHERE {key} = :tenant ORDER BY 1::text',  # noqa: S608
-                tenant=tenant.tenant_id,
-            )
-        ]
-    return rows
-
-
-def references_to(db: ScratchDatabase, tenant: Seeded) -> list[str]:
-    """Rows of other tenants that hold one of `tenant`'s IDs in a uuid column."""
-    found = []
-    columns = db.sql(
-        """
-        SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid
-         WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p')
-           AND NOT c.relispartition AND a.attnum > 0 AND NOT a.attisdropped
-           AND a.atttypid = 'uuid'::regtype AND a.attname NOT IN ('id', 'tenant_id')
-        """
+def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:
+    """Every row of `tenants`, as the superuser sees it, in one query."""
+    parts = [
+        # Names from the catalog, not input.
+        f"SELECT '{table}' AS t, to_jsonb(x)::text AS r FROM \"{table}\" x "  # noqa: S608
+        f"WHERE {'id' if table == 'tenants' else 'tenant_id'} = ANY(:tenants)"
+        for table in admin.tenant_tables()
+    ]
+    return admin.sql(
+        " UNION ALL ".join(parts) + " ORDER BY 1, 2", tenants=[t.tenant_id for t in tenants]
     )
-    owned = tenant_tables(db)
-    for table, column in columns:
-        if table not in owned or table == "tenants":
-            continue
-        count = db.sql(
-            f'SELECT count(*) FROM "{table}" '  # noqa: S608 - names from the catalog
-            f'WHERE tenant_id <> :tenant AND "{column}" = ANY(:ids)',
-            tenant=tenant.tenant_id,
-            ids=list(tenant.ids()),
-        )[0][0]
-        if count:
-            found.append(f"{table}.{column}")
-    return found
+
+
+def references_to(admin: Admin, tenant: Seeded) -> list[str]:
+    """Rows of other tenants that hold one of `tenant`'s IDs in a uuid column, in one query."""
+    parts = [
+        f"(SELECT '{table}.{column}' FROM \"{table}\" "  # noqa: S608 - names from the catalog
+        f'WHERE tenant_id <> :tenant AND "{column}" = ANY(:ids) LIMIT 1)'
+        for table, column in admin.uuid_columns()
+    ]
+    if not parts:
+        return []
+    rows = admin.sql(" UNION ALL ".join(parts), tenant=tenant.tenant_id, ids=list(tenant.ids()))
+    return sorted(str(name) for (name,) in rows)
 
 
 # ---- running a case ----
@@ -274,9 +297,15 @@ async def pool(db: ScratchDatabase, role: str) -> AsyncIterator[Database]:
         await database.dispose()
 
 
-def _without_tenant_filter() -> Any:
-    """The test hook of ADR-0020: `in_scope` adds no tenant condition at all."""
-    return mock.patch.object(access, "_tenant_condition", return_value=true())
+@contextmanager
+def _without_the_data_layer() -> Iterator[None]:
+    """The test hook of ADR-0020: `in_scope` adds no tenant condition at all, and system scope
+    may write tenant rows, so the policies alone must hold."""
+    with (
+        mock.patch.object(access, "_tenant_condition", return_value=true()),
+        mock.patch.object(access, "_writes_tenant_rows_in_system_scope", return_value=True),
+    ):
+        yield
 
 
 async def _attempt(database: Database, scope: Scope, case: Case, tenants: Tenants) -> object:
@@ -288,7 +317,8 @@ async def _attempt(database: Database, scope: Scope, case: Case, tenants: Tenant
         if state not in REFUSED:
             raise
         return f"refused ({state})"
-    except (LookupError, ScopeNotAllowedError) as exc:
+    except (NotFoundError, ScopeNotAllowedError) as exc:
+        # Only the data layer's own refusals: a KeyError or IndexError is a bug, and fails.
         return f"refused ({type(exc).__name__})"
 
 
@@ -297,30 +327,54 @@ class World:
     """The isolation suite's databases, by mode. `RLS_ALONE` uses the `AS_BUILT` one."""
 
     databases: Mapping[Mode, ScratchDatabase]
+    _admins: dict[str, Admin] = field(default_factory=dict)
 
     def database(self, mode: Mode) -> ScratchDatabase:
         return self.databases[Mode.AS_BUILT if mode is Mode.RLS_ALONE else mode]
 
-    async def check(self, case: Case, mode: Mode) -> None:
+    def admin(self, mode: Mode) -> Admin:
         db = self.database(mode)
-        tenants = Tenants(seed_tenant(db, "mine"), seed_tenant(db, "theirs"))
-        for role, kind, named in case.attempts():
-            where = f"{case.name} as {role} in {kind} scope, {mode}"
-            across = named and kind in _ACROSS
-            # A scope that reads across tenants must change neither.
-            watched = [tenants.theirs, tenants.mine] if across else [tenants.theirs]
-            before = {t.tenant_id: snapshot(db, t) for t in watched}
-            scope = scope_for(kind, case, tenants.mine)
-            hook = _without_tenant_filter() if mode is Mode.RLS_ALONE else nullcontext()
-            async with pool(db, role) as database:
-                with hook:
-                    result = await _attempt(database, scope, case, tenants)
-            if not across:
-                exposed = [tenants.theirs] + ([tenants.mine] if kind in _TENANTLESS else [])
-                for tenant in exposed:
-                    assert not leaks(result, tenant), f"{where}: read {leaks(result, tenant)}"
-            for tenant in watched:
-                assert snapshot(db, tenant) == before[tenant.tenant_id], f"{where}: changed rows"
-            assert not references_to(db, tenants.theirs), (
-                f"{where}: refers to theirs from {references_to(db, tenants.theirs)}"
-            )
+        if db.name not in self._admins:
+            self._admins[db.name] = Admin(db)
+        return self._admins[db.name]
+
+    def close(self) -> None:
+        for admin in self._admins.values():
+            admin.dispose()
+
+    async def check(self, case: Case, mode: Mode) -> None:
+        db, admin = self.database(mode), self.admin(mode)
+        tenants = Tenants(seed_tenant(admin, "mine"), seed_tenant(admin, "theirs"))
+        async with AsyncExitStack() as stack:
+            pools: dict[str, Database] = {}
+            for role, kind, named in case.attempts():
+                if role not in pools:  # one pool per role for the whole check
+                    pools[role] = await stack.enter_async_context(pool(db, role))
+                await self._try(case, mode, admin, pools[role], role, kind, named, tenants)
+
+    async def _try(
+        self,
+        case: Case,
+        mode: Mode,
+        admin: Admin,
+        database: Database,
+        role: str,
+        kind: ScopeKind,
+        named: bool,
+        tenants: Tenants,
+    ) -> None:
+        where = f"{case.name} as {role} in {kind} scope, {mode}"
+        across = named and kind in _ACROSS
+        # A scope that reads across tenants must change neither.
+        watched = [tenants.theirs, tenants.mine] if across else [tenants.theirs]
+        before = snapshot(admin, watched)
+        scope = scope_for(kind, case, tenants.mine)
+        with _without_the_data_layer() if mode is Mode.RLS_ALONE else nullcontext():
+            result = await _attempt(database, scope, case, tenants)
+        if not across:
+            exposed = [tenants.theirs] + ([tenants.mine] if kind in _TENANTLESS else [])
+            for tenant in exposed:
+                assert not leaks(result, tenant), f"{where}: read {leaks(result, tenant)}"
+        assert snapshot(admin, watched) == before, f"{where}: changed rows"
+        referring = references_to(admin, tenants.theirs)
+        assert not referring, f"{where}: refers to theirs from {referring}"

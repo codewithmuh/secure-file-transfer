@@ -111,6 +111,16 @@ def test_tenant_key_names_are_plain_identifiers(arguments: tuple[str, str, str])
         tenant_foreign_key_sql(*arguments)
 
 
+def test_constraint_names_fit_postgresql_without_truncation() -> None:
+    # 63 bytes; a longer name would be cut silently, and two keys could end up with one name.
+    table = "t" * 40
+    assert tenant_keys_sql("t" * 46)[1].split()[5] == "t" * 46 + "_tenant_id_id_key"  # 63 bytes
+    with pytest.raises(ValueError, match="over 63 bytes"):
+        tenant_keys_sql("t" * 47)
+    with pytest.raises(ValueError, match="over 63 bytes"):
+        tenant_foreign_key_sql(table, "parent_widget_id", "widgets")
+
+
 def test_a_child_key_never_sets_its_tenant_null() -> None:
     # SET NULL or SET DEFAULT would also clear tenant_id, which is NOT NULL.
     with pytest.raises(ValueError, match="would break the tenant key"):
@@ -140,7 +150,10 @@ def test_a_lookup_function_is_pinned_owned_by_sft_lookup_and_only_for_the_api() 
         "AS $$ SELECT id, tenant_id FROM public.api_keys WHERE key_hash = p_key_hash $$",
         "REVOKE ALL ON FUNCTION lookup_api_key(p_key_hash bytea) FROM PUBLIC",
         "GRANT EXECUTE ON FUNCTION lookup_api_key(p_key_hash bytea) TO sft_api",
+        # CREATE on public only for the hand-over (CVE-2018-1058).
+        "GRANT CREATE ON SCHEMA public TO sft_lookup",
         "ALTER FUNCTION lookup_api_key(p_key_hash bytea) OWNER TO sft_lookup",
+        "REVOKE CREATE ON SCHEMA public FROM sft_lookup",
     ]
 
 

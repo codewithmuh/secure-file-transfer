@@ -89,4 +89,6 @@ def isolation_world(admin_url: URL) -> Iterator[World]:
         world_database(admin_url, rls=True) as as_built,
         world_database(admin_url, rls=False) as data_layer_alone,
     ):
-        yield World({Mode.AS_BUILT: as_built, Mode.DATA_LAYER_ALONE: data_layer_alone})
+        world = World({Mode.AS_BUILT: as_built, Mode.DATA_LAYER_ALONE: data_layer_alone})
+        yield world
+        world.close()

@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import URL, Connection, insert, select, text
+from sqlalchemy import URL, Connection, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,7 +21,7 @@ from pg import (
     definer_functions,
     foreign_keys_without_tenant,
 )
-from sft.data.access import ScopeNotAllowedError
+from sft.data.access import NotFoundError, ScopeNotAllowedError, in_scope
 from sft.data.rls import policy_sql, tenant_rls_sql
 from sft.data.roles import API, JOBS, SCAN
 from sft.data.scope import Scope, ScopeKind, Subject
@@ -235,10 +235,17 @@ def broken(admin_url: URL) -> Iterator[ScratchDatabase]:
         yield db
 
 
-async def test_a_leaking_policy_fails_when_row_level_security_stands_alone(
-    broken: ScratchDatabase,
-) -> None:
+@pytest.fixture(scope="module")
+def broken_world(broken: ScratchDatabase) -> Iterator[World]:
     world = World({Mode.AS_BUILT: broken})
+    yield world
+    world.close()
+
+
+async def test_a_leaking_policy_fails_when_row_level_security_stands_alone(
+    broken_world: World,
+) -> None:
+    world = broken_world
     case = Case("get", get_their_widget, {API: [TENANT]})
     await world.check(case, Mode.AS_BUILT)  # the data layer still holds
     with pytest.raises(AssertionError, match="read"):
@@ -253,10 +260,10 @@ async def add_a_note_to_their_widget(session: AsyncSession, tenants: Tenants) ->
 
 
 async def test_a_reference_across_tenants_fails_without_a_composite_key(
-    broken: ScratchDatabase,
+    broken: ScratchDatabase, broken_world: World
 ) -> None:
     # Row-level security doesn't check foreign keys: only the composite key would refuse this.
-    world = World({Mode.AS_BUILT: broken})
+    world = broken_world
     with pytest.raises(AssertionError, match=r"refers to theirs from \['widget_notes.widget_id'\]"):
         await world.check(Case("note", add_a_note_to_their_widget, {API: [TENANT]}), Mode.AS_BUILT)
     # And the catalog check fails the build before any test has to try it.
@@ -281,13 +288,79 @@ def test_the_catalog_check_holds_each_kind_to_its_own_rule(admin_url: URL) -> No
 
     with world_database(admin_url, rls=True) as db:
         db.as_owner(loosen)
+        # Outside public too: no schema but PostgreSQL's own is skipped.
+        db.sql("CREATE SCHEMA elsewhere")
+        db.sql(
+            "CREATE FUNCTION elsewhere.peek() RETURNS bigint LANGUAGE sql SECURITY DEFINER "
+            "SET search_path = pg_catalog, public, pg_temp AS $$ SELECT 1::bigint $$"
+        )
         assert sorted(definer_function_problems(db)) == [
             "audit_partition_status(): executable by ['PUBLIC', 'sft_jobs'], not ['sft_jobs']",
+            "elsewhere.peek(): SECURITY DEFINER owned by postgres, neither a lookup owned by "
+            "sft_lookup nor one of the owner's known functions",
             "lookup_widget(bytea): executable by ['sft_api', 'sft_scan'], not sft_api alone",
         ]
 
 
+# ---- in system scope no write reaches a tenant row, whatever the code forgets ----
+
+
+async def rename_all_widgets(session: AsyncSession, tenants: Tenants) -> object:
+    # A job that forgot it is in system scope: in_scope reaches every tenant there.
+    statement = update(fx.Widget).where(in_scope(fx.Widget, session)).values(name="renamed")
+    return (await session.execute(statement)).rowcount  # type: ignore[attr-defined]
+
+
+async def rename_through_the_table(session: AsyncSession, tenants: Tenants) -> object:
+    statement = fx.widgets.update().where(fx.widgets.c.id == tenants.theirs.rows["widget"])
+    return (await session.execute(statement.values(name="renamed"))).rowcount  # type: ignore[attr-defined]
+
+
+async def rename_a_loaded_widget(session: AsyncSession, tenants: Tenants) -> object:
+    widget = await session.get(fx.Widget, tenants.theirs.rows["widget"])
+    assert widget is not None  # system scope reads across tenants
+    widget.name = "renamed"
+    await session.flush()
+    return None
+
+
+@pytest.mark.parametrize(
+    "call", [rename_all_widgets, rename_through_the_table, rename_a_loaded_widget]
+)
+async def test_a_system_scope_write_is_refused_before_the_database(
+    isolation_world: World, call: object
+) -> None:
+    # With row-level security off, nothing but the data layer stands in the way.
+    db = isolation_world.database(Mode.DATA_LAYER_ALONE)
+    theirs = seed_tenant(db, "theirs")
+    tenants = Tenants(seed_tenant(db, "mine"), theirs)
+    async with pool(db, JOBS) as database:
+        with pytest.raises(ScopeNotAllowedError, match="sft_jobs writes no tenant rows"):
+            async with database.transaction(Scope.system()) as session:
+                await call(session, tenants)  # type: ignore[operator]
+    assert db.sql("SELECT name FROM widgets WHERE id = :id", id=theirs.rows["widget"]) == [
+        (theirs.marker,)
+    ]
+
+
 # ---- the harness's own rules ----
+
+
+async def test_a_bug_is_not_taken_for_a_refusal(isolation_world: World) -> None:
+    async def look_up_a_missing_key(session: AsyncSession, tenants: Tenants) -> object:
+        return {}["widget"]
+
+    with pytest.raises(KeyError):
+        await isolation_world.check(
+            Case("bug", look_up_a_missing_key, {API: [TENANT]}), Mode.AS_BUILT
+        )
+
+
+async def test_not_found_is_a_refusal(isolation_world: World) -> None:
+    async def not_found(session: AsyncSession, tenants: Tenants) -> object:
+        raise NotFoundError
+
+    await isolation_world.check(Case("not_found", not_found, {API: [TENANT]}), Mode.AS_BUILT)
 
 
 def test_a_case_names_only_scopes_its_role_opens() -> None:
