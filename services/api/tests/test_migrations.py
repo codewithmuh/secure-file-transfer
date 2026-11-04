@@ -10,7 +10,7 @@ from alembic.script import ScriptDirectory
 
 from pg import ScratchDatabase
 from sft.data.database import sync_engine
-from sft.data.migrate import alembic_config, compatible_with
+from sft.data.migrate import alembic_config, compatible_with, include_name
 from sft.data.models import Base
 from sft.data.rls import tenant_rls_sql
 
@@ -60,7 +60,9 @@ def test_the_models_match_the_migrations(migrated_db: ScratchDatabase) -> None:
     engine = sync_engine(migrated_db.admin)
     try:
         with engine.connect() as connection:
-            context = MigrationContext.configure(connection, opts={"compare_type": True})
+            context = MigrationContext.configure(
+                connection, opts={"compare_type": True, "include_name": include_name}
+            )
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()

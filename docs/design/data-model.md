@@ -20,7 +20,8 @@ columns that carry meaning; every table also has `created_at`, and mutable table
 - **Times** are `timestamptz`, stored in UTC.
 - **States** are `text` columns with a `CHECK` constraint listing the allowed values. Unlike PostgreSQL enums, a value
   can be removed again, which keeps expand-then-contract migrations possible (section 7). States change only in the
-  service layer, inside a transaction that also writes the audit event (architecture 5.2).
+  service layer, inside a transaction that also writes the audit event (architecture 5.2); the database refuses to
+  commit the change otherwise (2.5, fail-closed audit).
 - **Counters that enforce a limit change in one conditional statement**, never read-check-write: download counts and
   grant budgets (2.3), code attempts and recipient lockouts (2.4), and storage reservations (2.5).
 - **Secrets are never stored in plain text.** Session, invitation and operator tokens and API keys are random, and link
@@ -330,13 +331,25 @@ doesn't lock the subject again.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `source_ip`, `user_agent`, `request_id`, `security_critical`, `details` (JSON) | Partitioned by month on `occurred_at`. `tx_id` defaults to `pg_current_xact_id()`. The application role can only insert. `details` holds IDs and enums, never file names or message text (FR-27, NFR-15). |
+| `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `outcome` (success, failure), `source_ip`, `user_agent`, `request_id`, `trace_id`, `security_critical`, `details` (JSON) | Partitioned by UTC month on `occurred_at`; primary key `(id, occurred_at)`, because a partitioned table's keys must include the partition key. The database sets `tx_id` (`pg_current_xact_id()`) and `occurred_at` (`now()`, the transaction's start, which also serves as `created_at`), so code can't backdate an event. The tenant comes from the transaction's scope, and the request and trace IDs from the log context. The application roles can only insert. `action` is a dotted code (`transfer.revoked`), `target_type` a code (`transfer`), and actor and target are IDs. `details` holds IDs, enums, numbers, flags and times only, never free text, so no file name, message, address, token or code can reach it (FR-27, NFR-15). `user_agent` is cut to 512 characters. |
 | `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `archived_at` | One row: the current archive generation, and how far the archive job has got in it. |
 | `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `delay_seconds` asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4). |
 | `processed_messages` | `consumer`, `message_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`), `message_id` is the SHA-256 of `mail.messageId`, `eventType`, the HMAC of the recipient address and the event's timestamp, not the SQS message ID, because SES can publish one event more than once and a bounce can name several recipients. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. |
 | `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
 | `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB) comes from deploy configuration and is the same for every tenant; v1 has no per-tenant overrides (section 10). |
+
+**Fail-closed audit** (NFR-15, architecture 5.2). A change to an audited table can't commit without an audit event in
+the same transaction, and the database enforces it, not only the code that should remember it. Each audited table has
+`audit_required`, a constraint trigger that is `DEFERRABLE INITIALLY DEFERRED`: at commit, for every row a workload
+role inserted, updated or deleted, it checks that `audit_events` has a row with this transaction's `tx_id`; if none
+does, the commit fails and the change rolls back with it. An event in a savepoint that was rolled back doesn't count.
+The table owner (migrations) and the master user are exempt, as they are from row-level security. Each tenant-owned
+table's migration either attaches the trigger, for chosen commands and columns (`tenants`: insert, and updates of
+`status`), or lists the table as not audited with its reason (`NOT_AUDITED` in `sft.data.audit_required`); the CI
+catalog test fails for a table that does neither. The check proves that an audit event was written, not that it
+describes the change: one event satisfies every audited row of its transaction. Changes the trigger doesn't watch, and
+refused requests that change nothing and roll back, are left to the service code and its tests.
 
 **Security-critical records** (NFR-10, architecture 5.2) are written by the API, or the operator API, straight to
 the audit archive in both regions before it answers `2xx`, and a failed write answers `503`: revocations of transfers
@@ -857,6 +870,17 @@ short.
 any row whose month is missing, so audit writes, and with them every fail-closed action, never fail for lack of a
 partition. An alert fires if the next month's partition is missing 7 days before the month ends, or if any row lands in
 the default partition.
+
+- Partitions cover whole UTC months and are named `audit_events_yYYYYmMM`. The migration makes this month's and the
+  next three; after that the job calls `audit_create_partitions(3)`, a `SECURITY DEFINER` function only `sft_jobs` may
+  run. It creates each missing partition on its own and then attaches it, which locks only the new table and the
+  default partition, so inserts into other months don't wait.
+- A month whose rows already sit in the default partition is **blocked**: the function skips it and reports it, and
+  makes the later months. Moving those rows into a new partition is an operator's step in the runbook, so the alert
+  stays on until someone has looked.
+- `audit_partition_status()` returns the rows in the default partition and the months from the current one on with a
+  partition, without a gap. The job exports them as `sft_audit_default_partition_rows` (alert above 0) and
+  `sft_audit_partition_months_covered` (alert below 2 in a month's last 7 days).
 
 Database backups keep 14 days of point-in-time recovery, so deleted rows age out of backups within 14 days. File
 contents are never in database backups.
