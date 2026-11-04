@@ -10,6 +10,11 @@ Every transaction the session begins starts with
 back in the pool carries no tenant to its next user. Nothing here sets them for the session. A
 session without a scope is refused before its first statement reaches the database.
 
+The URL names one workload login role, and the pool opens only the scopes that role may open
+(`sft.data.access.SCOPES_BY_ROLE`). Any other user, the master user or the migration role
+included, is refused at `connect`: a pool that bypassed row-level security, or had no policies of
+its own, would leave the first layer alone.
+
 In AWS the URL names the workload's login role with no password; M4 adds a `do_connect` hook that
 signs a 15-minute IAM token for each new connection, and `sslmode=verify-full` in the URL
 (encryption and keys 2.2, 6.3).
@@ -33,6 +38,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import Session, SessionTransaction
 from sqlalchemy.pool import NullPool
 
+from sft.data.access import check_scope
+from sft.data.roles import WORKLOAD_ROLES
 from sft.data.scope import Scope
 
 _SET_SCOPE = text(
@@ -76,11 +83,18 @@ class Database:
     """The engine and its pool, shared by the whole process. Create one at startup.
 
     Its only ways in are `transaction()` and `dispose()`; the engine stays private, so no code
-    can reach the pool without a scope.
+    can reach the pool without a scope. The pool logs in as one workload role, from its URL, and
+    opens only that role's scopes.
     """
 
     def __init__(self, engine: AsyncEngine) -> None:
+        role = engine.url.username
+        if role is None or role not in WORKLOAD_ROLES:
+            raise ValueError(
+                f"the database URL must name a workload login role, not {role!r} (ADR-0020)"
+            )
         self._engine = engine
+        self._role: str = role
         self._sessions = async_sessionmaker(
             engine,
             sync_session_class=_ScopedSession,
@@ -105,7 +119,10 @@ class Database:
         """A session whose transaction runs in `scope`, committed when the block ends."""
         if not isinstance(scope, Scope):
             raise ScopeMissingError("every transaction runs in a scope (ADR-0020)")
-        async with self._sessions(info={"scope": scope}) as session, session.begin():
+        check_scope(self._role, scope)
+        # The role lets in_scope apply its write rule in system scope (sft.data.access).
+        info = {"scope": scope, "role": self._role}
+        async with self._sessions(info=info) as session, session.begin():
             yield session
 
     async def dispose(self) -> None:

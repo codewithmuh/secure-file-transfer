@@ -697,11 +697,33 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    identity's user must belong to it. For a local sign-in the pool's connection has no tenant, and the tenant is that
    of the identity's user. An issuer string or an email claim never finds a connection, a tenant or a user (2.1). The
    functions are owned by `sft_lookup`, pin their `search_path`, and only `sft_api` may execute them.
+
+   **How the data layer holds the scopes** (`sft.data.access`, #49):
+   - **Who opens which scope.** A pool logs in as one workload role, named in its URL, and opens only that role's
+     scopes in authentication and authorization 7.3: `sft_api` tenant, resource, platform and lookup; `sft_operator`
+     platform and tenant; `sft_scan` and `sft_notify` tenant; `sft_relay` and `sft_archive` system; `sft_jobs` system
+     and tenant; `sft_recovery` recovery. Any other scope is refused before it reaches the database, and so is a URL
+     that names any other user, the master user included. In system scope an `UPDATE` or `DELETE` reaches no
+     tenant row (`in_scope(…, write=True)`), except the relay's on `outbox`, so "find across, act within" holds
+     without row-level security too. Work on no tenant's rows, such as the audit partition upkeep, isn't affected.
+   - **What a scope reaches.** Every query adds `in_scope(Model, session)`: the scope's tenant in tenant and
+     resource scope, every tenant in system and recovery scope (the role's grants and policies decide the tables),
+     no tenant row in platform and lookup scope. A resource scope carries its subject, the link session's recipient
+     or upload request, and each model says what that subject reaches (`TenantOwned.reach`); a model that says
+     nothing is closed to link sessions. Rows written take their tenant from the scope, never from a parameter.
+   - **Lookups run in lookup scope.** Each lookup function is called in a transaction of its own in lookup scope,
+     and its `lookup_read` policies are `USING (app_scope() = 'lookup')`, so a lookup inside a tenant's transaction
+     finds nothing. Like every definer function, they pin `search_path = pg_catalog, public, pg_temp` (the
+     temporary schema last) and name their tables with the schema. The bootstrap job lets `sft_owner` become `sft_lookup`, without
+     inheriting from it, and lets `sft_lookup` create in `public`, which `ALTER FUNCTION … OWNER TO sft_lookup`
+     needs; the migration revokes `PUBLIC`'s `EXECUTE` and grants `sft_api` before it hands the function over.
 2. **Composite foreign keys.** Every tenant-owned table has a unique key `(tenant_id, id)`, and children reference
    their parent by both columns, for example `files (tenant_id, transfer_id) → transfers (tenant_id, id)`. The database
    itself refuses a row that points at another tenant's parent. This includes `verification_codes`, `link_sessions`,
    `member_sessions`, `download_grants`, the ciphertext columns' `data_key_version` (sections 2.1 to 2.4), and every
-   DLP table with its `dlp_key_version` (2.7).
+   DLP table with its `dlp_key_version` (2.7). `sft.data.rls` writes the statements a migration pastes in
+   (`tenant_keys_sql`, `tenant_foreign_key_sql`), and a catalog test fails the build on a foreign key between tenant
+   tables that leaves `tenant_id` out, unless it is one of the exceptions in section 2.
 3. **Row-level security as a second layer**, decided in the
    [authentication and authorization design](../security/authn-authz.md), sections 7.2 to 7.5:
    - **Enabled, not forced.** Every tenant-owned table has row-level security enabled, in every environment, dev and
@@ -763,7 +785,10 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    "not found" fails the build. It also gives two tenants SSO connections with the same issuer string and an identity
    with the same subject in each, signs in through each connection, and checks that each sign-in reaches only its own
    tenant's user. It runs three ways: as built; with row-level security off, so the data-access layer alone must hold;
-   and with the data-access layer's tenant filter removed, so row-level security alone must hold.
+   and with the data-access layer's tenant filter removed, so row-level security alone must hold. Row-level security
+   is off in a database of its own, where every table has it disabled; the tenant filter is removed by replacing the
+   one function that builds it. Each attempt fails if the result holds any of the other tenant's IDs or text, if any
+   of its rows changed, or if a row of another tenant now refers to one of its IDs.
 6. **Storage.** Object keys start with `tenants/{tenant_id}/` in both bucket pairs. S3 objects carry no per-tenant KMS
    encryption context, because S3 Bucket Keys bind KMS to the bucket; cross-tenant protection for files is the
    data-access scope, IAM prefix conditions and tests (encryption and keys 5, 9.1). The prefix lets a tenant move to a

@@ -7,7 +7,7 @@ from sft.core import settings as settings_module
 from sft.data import bootstrap as bootstrap_module
 from sft.data.bootstrap import bootstrap, bootstrap_sql
 from sft.data.database import sync_engine
-from sft.data.roles import LOGIN_ROLES, MIGRATE, OWNER
+from sft.data.roles import LOGIN_ROLES, LOOKUP, MIGRATE, OWNER
 
 
 def test_on_aurora_every_login_role_signs_in_with_iam() -> None:
@@ -19,6 +19,13 @@ def test_locally_there_is_no_rds_iam_and_never_a_password() -> None:
     statements = " ".join(bootstrap_sql(iam_auth=False))
     assert "rds_iam" not in statements
     assert "PASSWORD" not in statements.upper()
+
+
+def test_the_owner_can_hand_a_lookup_function_to_sft_lookup() -> None:
+    # ALTER FUNCTION … OWNER TO sft_lookup: the owner may become it, and it may create in public.
+    statements = bootstrap_sql(iam_auth=False)
+    assert f"GRANT {LOOKUP} TO {OWNER} WITH INHERIT FALSE, SET TRUE" in statements
+    assert f"GRANT USAGE, CREATE ON SCHEMA public TO {LOOKUP}" in statements
 
 
 def test_bootstrap_can_run_again(empty_db: ScratchDatabase) -> None:

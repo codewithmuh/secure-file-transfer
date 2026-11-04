@@ -10,9 +10,11 @@ from sqlalchemy.exc import DBAPIError, InvalidRequestError
 
 from pg import ScratchDatabase
 from sft.data import audit
+from sft.data.access import ScopeNotAllowedError
 from sft.data.database import Database, ScopeMissingError, psycopg_url
 from sft.data.models import Tenant
-from sft.data.scope import Scope
+from sft.data.roles import API, MIGRATE, RECOVERY, RELAY
+from sft.data.scope import Scope, Subject
 
 pytestmark = pytest.mark.anyio
 
@@ -50,7 +52,8 @@ async def test_without_a_tenant_a_workload_role_reads_nothing(
         assert await connection.scalar(text("SELECT count(*) FROM tenants")) == 0
 
 
-@pytest.mark.parametrize("scope", [Scope.system(), Scope.platform(), Scope.lookup()])
+# sft_api never opens a system scope; the isolation suite covers every role's scopes.
+@pytest.mark.parametrize("scope", [Scope.platform(), Scope.lookup()])
 async def test_scopes_without_a_tenant_read_no_tenant_rows(
     api_db: Database, operator_db: Database, scope: Scope
 ) -> None:
@@ -64,7 +67,8 @@ async def test_a_tenant_scope_reads_only_its_own_tenant(
     mine = await create_tenant(operator_db)
     theirs = await create_tenant(operator_db)
     assert await visible_tenants(api_db, Scope.tenant(mine)) == {mine}
-    assert await visible_tenants(api_db, Scope.resource(theirs)) == {theirs}
+    link = Subject.recipient(uuid.uuid4())
+    assert await visible_tenants(api_db, Scope.resource(theirs, link)) == {theirs}
 
 
 async def test_a_tenant_scope_cannot_write_another_tenants_rows(operator_db: Database) -> None:
@@ -94,13 +98,41 @@ async def test_the_api_role_cannot_create_tenants(api_db: Database) -> None:
 
 
 @pytest.mark.parametrize(
-    "scope",
-    [Scope.tenant(uuid.uuid4()), Scope.resource(uuid.uuid4()), Scope.system(), Scope.recovery()],
+    ("role", "scope"),
+    [
+        (API, Scope.tenant(uuid.uuid4())),
+        (API, Scope.resource(uuid.uuid4(), Subject.upload_request(uuid.uuid4()))),
+        (RELAY, Scope.system()),
+        (RECOVERY, Scope.recovery()),
+    ],
 )
-async def test_the_transaction_runs_in_its_scope(api_db: Database, scope: Scope) -> None:
-    async with api_db.transaction(scope) as session:
-        row = (await session.execute(text("SELECT app_scope(), app_tenant_id()"))).one()
+async def test_the_transaction_runs_in_its_scope(
+    migrated_db: ScratchDatabase, role: str, scope: Scope
+) -> None:
+    database = Database.connect(migrated_db.url(role), pool_size=1)
+    try:
+        async with database.transaction(scope) as session:
+            row = (await session.execute(text("SELECT app_scope(), app_tenant_id()"))).one()
+    finally:
+        await database.dispose()
     assert tuple(row) == (scope.kind.value, scope.tenant_id)
+
+
+@pytest.mark.parametrize("scope", [Scope.system(), Scope.recovery()])
+async def test_a_role_opens_only_its_own_scopes(scope: Scope) -> None:
+    # Refused before any connection: nothing listens on port 1 (sft.data.access.SCOPES_BY_ROLE).
+    database = Database.connect("postgresql://sft_api@127.0.0.1:1/sft")
+    with pytest.raises(ScopeNotAllowedError, match=f"sft_api never opens a {scope.kind} scope"):
+        async with database.transaction(scope):
+            pass  # pragma: no cover
+
+
+@pytest.mark.parametrize("user", ["postgres", MIGRATE, "sft_owner", "sft_lookup", None])
+def test_a_pool_logs_in_only_as_a_workload_role(user: str | None) -> None:
+    # The master user bypasses row-level security, and the others have no policies of their own.
+    url = "postgresql://127.0.0.1:1/sft" if user is None else f"postgresql://{user}@127.0.0.1:1/sft"
+    with pytest.raises(ValueError, match="must name a workload login role"):
+        Database.connect(url)
 
 
 async def test_a_pooled_connection_carries_no_scope_after_commit(api_db: Database) -> None:
@@ -152,7 +184,7 @@ async def test_a_session_without_a_scope_never_reaches_the_database(api_db: Data
 
 async def test_a_commit_inside_the_block_ends_it(api_db: Database) -> None:
     # No second transaction can start in the block, so none can run without the scope.
-    async with api_db.transaction(Scope.system()) as session:
+    async with api_db.transaction(Scope.platform()) as session:
         await session.commit()
         with pytest.raises(InvalidRequestError):
             await session.execute(text("SELECT 1"))
@@ -160,7 +192,7 @@ async def test_a_commit_inside_the_block_ends_it(api_db: Database) -> None:
 
 async def test_the_workload_role_settings_apply(api_db: Database) -> None:
     names = ("statement_timeout", "idle_in_transaction_session_timeout", "transaction_timeout")
-    async with api_db.transaction(Scope.system()) as session:
+    async with api_db.transaction(Scope.platform()) as session:
         settings = {name: await session.scalar(text(f"SHOW {name}")) for name in names}
     assert settings == {
         "statement_timeout": "10s",
