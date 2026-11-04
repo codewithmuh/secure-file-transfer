@@ -59,6 +59,9 @@ resource "aws_vpc" "this" {
 # The VPC's default security group, route table and network ACL exist whatever we do. The first two are adopted and
 # emptied, so anything created without naming its own gets no traffic and no route out. The default network ACL stays
 # open: security groups and routes do the filtering (ADR-0021), and a stateless ACL would add rules to keep in step.
+# AWS creates them untagged; their tags, with the provider's default tags (managed-by, project), mark them on the
+# first apply. The deploy role changes them only with actions that need no tag, and never deletes them
+# (terraform-oidc-roles).
 resource "aws_default_security_group" "this" {
   vpc_id = aws_vpc.this.id
 

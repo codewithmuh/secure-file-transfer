@@ -3,8 +3,15 @@
 #
 # Every endpoint policy admits only principals in our organization (aws:PrincipalOrgID) acting on resources in our
 # organization (aws:ResourceOrgID), the data perimeter pattern AWS publishes for VPC endpoints. A pod holding another
-# account's credentials, or writing to another account's bucket, queue or key, fails at the endpoint. The exceptions
-# are AWS-owned resources the platform needs, each named below:
+# account's credentials, or writing to another account's bucket, queue or key, fails at the endpoint.
+#
+# A request that targets no resource, such as ecr:GetAuthorizationToken, sts:GetCallerIdentity or EC2's Describe
+# calls, may carry no aws:ResourceOrgID, and StringEquals on a missing key is false. So each endpoint also lets our
+# principals make its few resourceless read calls, named one by one in unscoped_actions, on the principal check alone.
+# Not StringEqualsIfExists on the resource check: that would also pass a resource whose account is in no organization,
+# which is what an attacker's own bucket or queue looks like (T-53).
+#
+# The other exceptions are AWS-owned resources the platform needs, each named below:
 #   - ECR: the AWS-owned registries that serve the EKS add-ons, the pause image and Bottlerocket's host containers,
 #     pull actions only (ADR-0004, ADR-0007);
 #   - EC2: launching nodes from Bottlerocket's AWS-owned AMIs (Karpenter);
@@ -41,59 +48,69 @@ locals {
   interface_endpoints = merge(
     {
       "sqs" = {
-        service_name   = "com.amazonaws.${var.region}.sqs"
-        service_region = null
-        dns_names      = ["sqs.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.sqs"
+        service_region   = null
+        dns_names        = ["sqs.${var.region}.amazonaws.com"]
+        unscoped_actions = ["sqs:ListQueues"]
       }
       "kms" = {
-        service_name   = "com.amazonaws.${var.region}.kms"
-        service_region = null
-        dns_names      = ["kms.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.kms"
+        service_region   = null
+        dns_names        = ["kms.${var.region}.amazonaws.com"]
+        unscoped_actions = ["kms:ListAliases", "kms:ListKeys"]
       }
       "secretsmanager" = {
-        service_name   = "com.amazonaws.${var.region}.secretsmanager"
-        service_region = null
-        dns_names      = ["secretsmanager.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.secretsmanager"
+        service_region   = null
+        dns_names        = ["secretsmanager.${var.region}.amazonaws.com"]
+        unscoped_actions = ["secretsmanager:ListSecrets"]
       }
       "ecr-api" = {
-        service_name   = "com.amazonaws.${var.region}.ecr.api"
-        service_region = null
-        dns_names      = ["api.ecr.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.ecr.api"
+        service_region   = null
+        dns_names        = ["api.ecr.${var.region}.amazonaws.com"]
+        unscoped_actions = ["ecr:GetAuthorizationToken"]
       }
       "ecr-dkr" = {
-        service_name   = "com.amazonaws.${var.region}.ecr.dkr"
-        service_region = null
-        dns_names      = ["dkr.ecr.${var.region}.amazonaws.com", "*.dkr.ecr.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.ecr.dkr"
+        service_region   = null
+        dns_names        = ["dkr.ecr.${var.region}.amazonaws.com", "*.dkr.ecr.${var.region}.amazonaws.com"]
+        unscoped_actions = ["ecr:GetAuthorizationToken"]
       }
       "sts" = {
-        service_name   = "com.amazonaws.${var.region}.sts"
-        service_region = null
-        dns_names      = ["sts.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.sts"
+        service_region   = null
+        dns_names        = ["sts.${var.region}.amazonaws.com"]
+        unscoped_actions = ["sts:GetCallerIdentity"]
       }
       # SES's API (SESv2), not its SMTP interface.
       "email" = {
-        service_name   = "com.amazonaws.${var.region}.email"
-        service_region = null
-        dns_names      = ["email.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.email"
+        service_region   = null
+        dns_names        = ["email.${var.region}.amazonaws.com"]
+        unscoped_actions = ["ses:GetAccount"]
       }
       "ec2" = {
-        service_name   = "com.amazonaws.${var.region}.ec2"
-        service_region = null
-        dns_names      = ["ec2.${var.region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.region}.ec2"
+        service_region   = null
+        dns_names        = ["ec2.${var.region}.amazonaws.com"]
+        unscoped_actions = ["ec2:Describe*"]
       }
       # EKS Pod Identity: the agent on every node exchanges service account tokens here.
       "eks-auth" = {
-        service_name   = "com.amazonaws.${var.region}.eks-auth"
-        service_region = null
-        dns_names      = ["eks-auth.${var.region}.api.aws"]
+        service_name     = "com.amazonaws.${var.region}.eks-auth"
+        service_region   = null
+        dns_names        = ["eks-auth.${var.region}.api.aws"]
+        unscoped_actions = []
       }
     },
     var.peer_region == null ? {} : {
       # S3 in the other Region: the API's security-critical writes to the other archive, Osaka's deletes (ADR-0021).
       "s3-peer" = {
-        service_name   = "com.amazonaws.${var.peer_region}.s3"
-        service_region = var.peer_region
-        dns_names      = ["s3.${var.peer_region}.amazonaws.com", "*.s3.${var.peer_region}.amazonaws.com"]
+        service_name     = "com.amazonaws.${var.peer_region}.s3"
+        service_region   = var.peer_region
+        dns_names        = ["s3.${var.peer_region}.amazonaws.com", "*.s3.${var.peer_region}.amazonaws.com"]
+        unscoped_actions = []
       }
     },
   )
@@ -141,6 +158,30 @@ data "aws_iam_policy_document" "interface_endpoint" {
       test     = "StringEquals"
       variable = "aws:ResourceOrgID"
       values   = [var.organization_id]
+    }
+  }
+
+  # Calls that target no resource, so carry no aws:ResourceOrgID (see the top of this file). Read-only; the actions
+  # are listed per endpoint in local.interface_endpoints.
+  dynamic "statement" {
+    for_each = length(each.value.unscoped_actions) > 0 ? [1] : []
+
+    content {
+      sid       = "OrganizationPrincipalsCallsWithoutResource"
+      effect    = "Allow"
+      actions   = each.value.unscoped_actions
+      resources = ["*"]
+
+      principals {
+        type        = "*"
+        identifiers = ["*"]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "aws:PrincipalOrgID"
+        values   = [var.organization_id]
+      }
     }
   }
 
@@ -274,9 +315,10 @@ data "aws_iam_policy_document" "s3_gateway" {
     }
   }
 
-  # Image layers, from our registry and the AWS-owned ones, come from ECR's bucket through URLs ECR signs with its own
-  # credentials, so this statement can't name our organization. Reads of that one bucket only (ECR's documented
-  # minimum).
+  # Image layers, from our registry and the AWS-owned ones, come from ECR's bucket through URLs ECR presigns with its
+  # own credentials, so the request's principal is ECR's, never ours, and this statement can't name our organization.
+  # It stays inside T-53: GetObject on that one AWS-owned bucket only (ECR's documented minimum), which can read a
+  # layer ECR has authorized but can't write anything out.
   statement {
     sid       = "EcrImageLayers"
     effect    = "Allow"

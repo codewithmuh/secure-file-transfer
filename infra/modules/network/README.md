@@ -62,14 +62,14 @@ pattern. Statement 1 is on every endpoint; the others only where named.
 
 | Key | Service | Policy |
 |---|---|---|
-| `sqs` | `com.amazonaws.<region>.sqs` | 1 |
-| `kms` | `com.amazonaws.<region>.kms` | 1 |
-| `secretsmanager` | `com.amazonaws.<region>.secretsmanager` | 1 |
-| `ecr-api` | `com.amazonaws.<region>.ecr.api` | 1, 2 |
-| `ecr-dkr` | `com.amazonaws.<region>.ecr.dkr` | 1, 2 |
-| `sts` | `com.amazonaws.<region>.sts` | 1 |
-| `email` | `com.amazonaws.<region>.email` (SES's API) | 1 |
-| `ec2` | `com.amazonaws.<region>.ec2` | 1, 3 |
+| `sqs` | `com.amazonaws.<region>.sqs` | 1, 1a (`sqs:ListQueues`) |
+| `kms` | `com.amazonaws.<region>.kms` | 1, 1a (`kms:ListAliases`, `kms:ListKeys`) |
+| `secretsmanager` | `com.amazonaws.<region>.secretsmanager` | 1, 1a (`secretsmanager:ListSecrets`) |
+| `ecr-api` | `com.amazonaws.<region>.ecr.api` | 1, 1a (`ecr:GetAuthorizationToken`), 2 |
+| `ecr-dkr` | `com.amazonaws.<region>.ecr.dkr` | 1, 1a (`ecr:GetAuthorizationToken`), 2 |
+| `sts` | `com.amazonaws.<region>.sts` | 1, 1a (`sts:GetCallerIdentity`) |
+| `email` | `com.amazonaws.<region>.email` (SES's API) | 1, 1a (`ses:GetAccount`) |
+| `ec2` | `com.amazonaws.<region>.ec2` | 1, 1a (`ec2:Describe*`), 3 |
 | `eks-auth` | `com.amazonaws.<region>.eks-auth` (EKS Pod Identity) | 1 |
 | `s3-peer` | `com.amazonaws.<other region>.s3`, cross-Region | 1 |
 | S3 gateway | `com.amazonaws.<region>.s3`, on the private route tables | 1, 4 |
@@ -77,6 +77,13 @@ pattern. Statement 1 is on every endpoint; the others only where named.
 1. **Organization principals to organization resources.** Any action, only when `aws:PrincipalOrgID` and
    `aws:ResourceOrgID` are both our organization. Another account's credentials, bucket, queue or key fails at the
    endpoint (T-53).
+
+   1a. **Calls without a resource.** A request that targets no resource, such as `ecr:GetAuthorizationToken`, may carry
+   no `aws:ResourceOrgID`, and `StringEquals` on a missing key is false, so statement 1 alone would deny it: no image
+   pull, no node launch. Each endpoint therefore lists its few resourceless read calls (`unscoped_actions` in
+   `endpoints.tf`), which our principals may make on the principal check alone. The resource check is not made
+   `StringEqualsIfExists`: that would also pass a resource whose account is in no organization, which is what an
+   attacker's own bucket or queue looks like. A call missing from a list fails closed, and M4 adds it.
 2. **Pulls from AWS-owned registries.** `ecr:BatchGetImage`, `ecr:GetDownloadUrlForLayer` and
    `ecr:BatchCheckLayerAvailability` on the repositories of 602401143452 (EKS add-ons and the pause image) and
    328549459982 (Bottlerocket's host containers), in ap-northeast-1 and ap-northeast-3, for our organization's
@@ -84,17 +91,22 @@ pattern. Statement 1 is on every endpoint; the others only where named.
    2026-11-04). A new add-on from another registry is added in `endpoints.tf` and in Kyverno's policy (ADR-0007).
 3. **Launches from AWS-owned AMIs.** `ec2:RunInstances` and `ec2:CreateFleet` on images in this Region, for our
    organization's principals, so Karpenter can start Bottlerocket nodes.
-4. **ECR's layer bucket.** `s3:GetObject` on `prod-<region>-starport-layer-bucket/*` for any principal: ECR signs the
-   layer URLs with its own credentials, so the statement can't name our organization. It serves our registry's layers
-   and the AWS-owned registries' alike.
+4. **ECR's layer bucket.** `s3:GetObject` on `prod-<region>-starport-layer-bucket/*` for any principal. ECR presigns
+   each layer URL with its own credentials, so the request's principal is ECR's, not ours, and the statement can't
+   name our organization. It stays inside T-53: reads of that one AWS-owned bucket can fetch a layer ECR has
+   authorized, but can't write anything out. It serves our registry's layers and the AWS-owned registries' alike.
 
 If AWS reports that a service takes no endpoint policy, the plan fails until its key is in `endpoints_without_policy`,
 so an endpoint without a policy is always a recorded decision. The plan reads this from AWS
 (`aws_vpc_endpoint_service`), which settles ADR-0021's open question about SES at the first plan in M4.
 
-No statement admits AWS service principals or federated principals: nothing in the VPC uses
-`AssumeRoleWithWebIdentity` (workloads use EKS Pod Identity, ADR-0004), and AWS services don't call through our
-endpoints.
+No statement admits AWS service principals or federated principals, and AWS services don't call through our
+endpoints. In particular, the STS endpoint denies `sts:AssumeRoleWithWebIdentity`: the caller of that action is
+unauthenticated, so it has no `aws:PrincipalOrgID`. That is by design: workloads get their roles through EKS Pod
+Identity, at the `eks-auth` endpoint, never IRSA (ADR-0004). **Anyone adding IRSA, or any other web identity or SAML
+federation from inside the VPC, must first add a statement for it to the STS endpoint**, like the
+`AllowRequestsToOrgRolesByFederatedPrincipals` statement in AWS's data perimeter examples: federated principals, only
+roles in our organization (`aws:ResourceOrgID`).
 
 ## Security groups
 
@@ -142,8 +154,13 @@ Written from AWS's documentation; only an apply can confirm these.
 - Whether `email` (SES) and `eks-auth` take an endpoint policy. The first plan answers it (above).
 - That nodes pull add-on images through the ECR endpoints with policy 2, and that Karpenter launches Bottlerocket nodes
   through the EC2 endpoint with policy 3 (an AMI's snapshot may also need statement 3).
-- That `aws:ResourceOrgID` holds for actions with no resource, such as `ecr:GetAuthorizationToken` and Describe calls,
-  as AWS's published endpoint policies assume.
+- That statement 1a's lists are complete: every resourceless call the nodes, Karpenter, the VPC CNI, the EBS CSI
+  driver, External Secrets and the application make through the endpoints. A missing one shows as an AccessDenied
+  that names the VPC endpoint in CloudTrail; add it to that endpoint's `unscoped_actions`.
+- That the deploy role's tag-conditioned statement (`terraform-oidc-roles`, deletes and `ModifyVpcEndpoint`) doesn't
+  block the default security group and route table. It shouldn't: Terraform changes them only with revoke, authorize
+  and route actions in the role's untagged statement, scoped to the account's ARNs, and never deletes them. Their
+  `tags`, with the provider's default tags, add `managed-by` and `project` on the first apply anyway.
 - That the cross-Region S3 endpoint accepts private DNS with `private_dns_only_for_inbound_resolver_endpoint = false`,
   and whether describing cross-Region services needs `vpce:AllowMultiRegion` in the plan role.
 - That DNS Firewall's allowlist is complete: run with the rule in `ALERT` instead of `BLOCK` in dev first and read
