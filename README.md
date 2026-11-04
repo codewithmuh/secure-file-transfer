@@ -83,6 +83,7 @@ services of the local stack, their ports and credentials, and how they differ fr
 ```
 .github/                 workflows, Dependabot, CODEOWNERS, issue + PR templates
 .devcontainer/           reproducible dev environment
+infra/                   Terraform for AWS, checked statically and not applied yet (infra/README.md)
 docs/                    PRD, architecture, design notes, API contract, threat model, security design, ADRs, runbooks
 services/api/            API service (FastAPI); the workers will share its codebase
 compose.yaml             local run with production-like hardening

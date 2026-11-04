@@ -1,0 +1,42 @@
+# prod in Tokyo, network layer. The VPC, subnets, NAT gateways, VPC endpoints and Route 53 Resolver DNS Firewall
+# (ADR-0021).
+#
+# Skeleton from #54: providers, backend and conventions only. #56 adds the network module and its call here.
+
+terraform {
+  required_version = "~> 1.17.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "6.71.0"
+    }
+  }
+
+  # Partial backend. The bucket names the account, so it comes from -backend-config at init; the key is this
+  # directory under infra/ (infra/README.md, "State").
+  backend "s3" {
+    key          = "environments/prod/ap-northeast-1/network/terraform.tfstate"
+    region       = "ap-northeast-1"
+    use_lockfile = true
+  }
+}
+
+module "conventions" {
+  source = "../../../../modules/conventions"
+
+  environment = "prod"
+  region      = "ap-northeast-1"
+  account_id  = var.account_id
+  stack       = "environments/prod/ap-northeast-1/network"
+  component   = "network"
+}
+
+provider "aws" {
+  region              = module.conventions.region
+  allowed_account_ids = [var.account_id]
+
+  default_tags {
+    tags = module.conventions.tags
+  }
+}

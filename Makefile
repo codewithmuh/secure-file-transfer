@@ -83,3 +83,12 @@ logs: ## Follow logs of all services
 
 clean: ## Remove build, test and cache artifacts
 	rm -rf $(PY)/.venv $(PY)/.pytest_cache $(PY)/.mypy_cache $(PY)/.ruff_cache $(PY)/.coverage
+
+# Terraform under infra/ (infra/README.md). The tools run from pinned container images, so only Docker is needed.
+.PHONY: infra-fmt infra-check
+
+infra-fmt: ## Format the Terraform under infra/
+	infra/scripts/check.sh fmt-fix
+
+infra-check: ## Check infra/: conventions, fmt, validate, tflint and Trivy (same as CI)
+	infra/scripts/check.sh all
