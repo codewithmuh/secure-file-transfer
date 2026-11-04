@@ -61,7 +61,7 @@ already has the shape, the safety rails and the CI of the finished product.
 
 | Issue | Scope | Acceptance criteria |
 |---|---|---|
-| chore: remove the Go sample and GHCR publishing | Delete `services/api-go`, its CI and release jobs, the GHCR verify command in SECURITY.md, Go entries in `.editorconfig` and `.gitignore` (ADR-0007, ADR-0010) | CI has no Go job; `grep -ri golang` finds nothing outside the ADRs |
+| chore: remove the Go sample | Delete `services/api-go`, its CI job and its release matrix entry, the Go entries in `.editorconfig` and `.gitignore`, and Go in the docs; GHCR publishing stays until M4's ECR push replaces it (ADR-0007, ADR-0010) | CI has no Go job; `grep -ri golang` finds nothing outside the ADRs |
 | feat: API service skeleton | Rename the Python sample to `services/api`; layers `api` (FastAPI routes), `service` (business rules and permission checks), `data` (SQLAlchemy); settings from the environment; the runtime contract (architecture 8) | `/healthz`, `/readyz` and `/metrics` work; mypy strict and ruff pass; the layering is enforced by an import-linter rule |
 | feat: database foundation | Async SQLAlchemy with psycopg 3, Alembic baseline, the migration job, database roles per workload, row-level security scaffolding and the `app.tenant_id` setting (ADR-0011, ADR-0020) | Migrations run up from empty in CI; a role without `app.tenant_id` reads nothing from a tenant table |
 | feat: scoped data access and the isolation suite | Tenant, resource, system and credential-lookup scopes; composite foreign keys; the two-tenant isolation harness (ADR-0003, data model 4.2) | A test that queries another tenant's row through any scope fails the build; the harness is reusable for every later endpoint |
