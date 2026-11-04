@@ -58,7 +58,7 @@ services:
 
   db-passwords: # local only: the login roles' fake password; in AWS they have none (IAM tokens)
     <<: *hardening
-    image: postgres:17.11-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+    image: postgres:18.4-trixie@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
     user: "999:999"
     restart: "no"
     entrypoint: ["psql", "--no-psqlrc", "--quiet", "--set=ON_ERROR_STOP=1", "--file=/passwords.sql"]
@@ -86,7 +86,7 @@ services:
 
   postgres: # Aurora PostgreSQL 17 (ADR-0011)
     <<: *hardening
-    image: postgres:17.11-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+    image: postgres:18.4-trixie@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
     user: "999:999" # postgres; the entrypoint needs no root, so no capabilities either
     environment:
       POSTGRES_DB: sft
@@ -150,7 +150,7 @@ services:
 
   valkey: # ElastiCache Serverless for Valkey (ADR-0014): counters only, nothing persisted
     <<: *hardening
-    image: valkey/valkey:9.0.7-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+    image: valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
     user: "999:1000" # valkey
     # One ACL user with a password stands in for the workload's IAM user and token; the default user is off.
     command:
