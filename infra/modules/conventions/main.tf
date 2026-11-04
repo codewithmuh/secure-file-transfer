@@ -22,6 +22,14 @@ locals {
     key_admin        = "${local.global_name_prefix}-keyadmin"
   }
 
+  # The account's emergency IAM user, for when Identity Center can't be reached (authn-authz 8.4). Bucket and key
+  # policies and the SCPs name it exactly, never by a pattern, so no other user can match it; only Admin may create
+  # or change IAM users (SCP 4).
+  emergency_user = {
+    name = "${local.global_name_prefix}-emergency"
+    path = "/sft-emergency/"
+  }
+
   # IAM Identity Center creates one role per permission set in each account, named AWSReservedSSO_<set>_<suffix>,
   # under /aws-reserved/sso.amazonaws.com/ (with the Identity Center Region in the path outside us-east-1).
   sso_role_arn_prefix = "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/"

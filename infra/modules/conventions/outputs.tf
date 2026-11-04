@@ -56,6 +56,13 @@ output "bootstrap_role_arns" {
   }
 }
 
+output "emergency_user" {
+  description = "Name, path and ARN of the account's emergency IAM user (authn-authz 8.4): sft-<env>-emergency."
+  value = merge(local.emergency_user, {
+    arn = "arn:aws:iam::${var.account_id}:user${local.emergency_user.path}${local.emergency_user.name}"
+  })
+}
+
 output "sso_role_arn_patterns" {
   description = "ArnLike patterns for the Identity Center permission set roles in this account: admin and break_glass."
   value = {

@@ -27,3 +27,8 @@ output "key_admin_role_arn" {
   description = "ARN of the key-admin role, which every key policy in the account names."
   value       = module.key_admin.role_arn
 }
+
+output "emergency_user_arn" {
+  description = "ARN of the account's emergency IAM user, which the maintainer gives a password and a security key."
+  value       = module.emergency_user.user_arn
+}
