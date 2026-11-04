@@ -24,6 +24,29 @@ test: ## Run all tests with the coverage gates (same as CI)
 
 check: lint test ## Everything CI runs before building images
 
+# The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
+# The breaking-change check compares the working tree's contract with the one at the merge base of
+# HEAD and CONTRACT_BASE. OASDIFF_IMAGE is the workflow's: keep the two in step.
+CONTRACT_BASE ?= origin/main
+OASDIFF_IMAGE := tufin/oasdiff:v1.34.1@sha256:67a23cfea7d251e2ae34ee703ac8733c5d96bc2e7b90fd0f4d475ec99367b85f
+
+.PHONY: contract
+contract: ## API contract checks (same as CI): generated spec and breaking changes (needs Docker)
+	cd $(PY) && uv run python -m tools.contract_check
+	@base="$$(git merge-base $(CONTRACT_BASE) HEAD)"; \
+	echo "Breaking-change check: docs/api/openapi.yaml against $(CONTRACT_BASE) at $${base:0:12}"; \
+	status=0; \
+	git show "$$base:docs/api/openapi.yaml" | docker run --rm --interactive --network none --read-only \
+	  --cap-drop ALL --security-opt no-new-privileges --user "$$(id -u):$$(id -g)" \
+	  --volume "$(CURDIR)/docs/api:/contract:ro" $(OASDIFF_IMAGE) \
+	  breaking - /contract/openapi.yaml --fail-on WARN \
+	  --allow-external-refs=false --flatten-allof --flatten-params || status=$$?; \
+	case "$$status" in \
+	  0) echo "No breaking changes." ;; \
+	  1) echo "Breaking: make the change backwards compatible, or the pull request needs the breaking label."; exit 1 ;; \
+	  *) echo "oasdiff couldn't read a contract (exit status $$status)."; exit 1 ;; \
+	esac
+
 scan: ## Secret and vulnerability scans (needs gitleaks and trivy)
 	gitleaks git --redact --no-banner .
 	trivy fs --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .

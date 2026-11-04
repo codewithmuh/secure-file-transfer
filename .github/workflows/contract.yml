@@ -1,0 +1,123 @@
+name: contract
+
+# The API contract checks of ADR-0002 (docs/api/README.md, section 11):
+#
+# - Generated spec: the OpenAPI document the code generates matches docs/api/openapi.yaml for every
+#   operation the code implements (services/api/tools/contract_check.py).
+# - Breaking changes: oasdiff compares the pull request's contract with its base branch's. A breaking
+#   change fails unless the pull request carries the `breaking` label.
+#
+# A workflow of its own, because adding or removing a label must re-run the breaking-change check,
+# and that shouldn't re-run everything in ci.yml. Any label change re-runs both jobs: a job skipped
+# by a condition reports success, which would hide an earlier failure. Both jobs always run and
+# report, so protect-main can require them by name (#59); when the contract hasn't changed, the
+# breaking-change job skips the comparison, not itself.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: contract-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # oasdiff 1.34.1 (Apache-2.0), pinned by digest; keep it in step with the Makefile. Dependabot
+  # doesn't see an image in a run step, so update it by hand, at least 7 days after its release
+  # (threat model T-68).
+  OASDIFF_IMAGE: tufin/oasdiff:v1.34.1@sha256:67a23cfea7d251e2ae34ee703ac8733c5d96bc2e7b90fd0f4d475ec99367b85f
+
+jobs:
+  generated-spec:
+    name: Contract (generated spec)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    defaults:
+      run:
+        working-directory: services/api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: services/api/uv.lock
+      - run: uv sync --locked
+      - name: Compare the generated document with the contract
+        run: uv run python -m tools.contract_check
+
+  breaking-changes:
+    name: Contract (breaking changes)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # the pull request's merge commit and its parents
+          persist-credentials: false
+      - name: Find what changed in the contract
+        id: changes
+        run: |
+          # The checkout is the merge commit GitHub builds for the pull request. Its first parent is
+          # the base branch, so this compares exactly what merging the pull request would change.
+          git rev-parse --verify --quiet HEAD^2 > /dev/null || {
+            echo "::error::Expected the pull request's merge commit, found a commit with one parent."
+            exit 1
+          }
+          mkdir -p "$RUNNER_TEMP/contract"
+          if ! git cat-file -e HEAD^1:docs/api/openapi.yaml 2> /dev/null; then
+            echo "The base branch has no docs/api/openapi.yaml: nothing to compare."
+            echo "compare=false" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet HEAD^1 HEAD -- docs/api/openapi.yaml; then
+            echo "This pull request doesn't change docs/api/openapi.yaml: nothing to compare."
+            echo "compare=false" >> "$GITHUB_OUTPUT"
+          elif [ ! -f docs/api/openapi.yaml ]; then
+            echo "::error::This pull request removes docs/api/openapi.yaml."
+            exit 1
+          else
+            git show HEAD^1:docs/api/openapi.yaml > "$RUNNER_TEMP/contract/base.yaml"
+            cp docs/api/openapi.yaml "$RUNNER_TEMP/contract/pull-request.yaml"
+            echo "compare=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compare with the base branch (oasdiff)
+        if: steps.changes.outputs.compare == 'true'
+        env:
+          BREAKING_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'breaking') }}
+        run: |
+          # The contract comes from the pull request, so oasdiff gets only the two files, read-only,
+          # with no network and no external $refs (SSRF and local file reads).
+          oasdiff() {
+            docker run --rm --network none --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+              --volume "$RUNNER_TEMP/contract:/contract:ro" "$OASDIFF_IMAGE" \
+              breaking /contract/base.yaml /contract/pull-request.yaml --fail-on WARN \
+              --allow-external-refs=false --flatten-allof --flatten-params "$@"
+          }
+          status=0
+          oasdiff --color never > "$RUNNER_TEMP/oasdiff.txt" 2>&1 || status=$?
+          # The report quotes the pull request's text: don't let it run workflow commands.
+          stop="$(openssl rand -hex 16)"
+          echo "::stop-commands::${stop}"
+          cat "$RUNNER_TEMP/oasdiff.txt"
+          echo "::${stop}::"
+          case "$status" in
+            0)
+              echo "No breaking changes."
+              ;;
+            1)
+              oasdiff --format markdown >> "$GITHUB_STEP_SUMMARY" || true
+              if [ "$BREAKING_LABEL" = true ]; then
+                echo "::warning title=Breaking API change::Accepted by the breaking label."
+              else
+                echo "::error title=Breaking API change::Make the change backwards compatible," \
+                  "or add the breaking label if the break is deliberate (docs/api/README.md, section 11.2)."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error title=oasdiff failed::Exit status ${status}: a contract couldn't be read."
+              exit 1
+              ;;
+          esac

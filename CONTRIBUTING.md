@@ -9,9 +9,10 @@ Option A — **Dev Container** (VS Code / Codespaces): open the repo and choose 
 Option B — local: install [uv](https://docs.astral.sh/uv/), [pre-commit](https://pre-commit.com/) and Docker, then:
 
 ```bash
-make setup   # dependencies + git hooks
-make check   # lint, type-check and test everything (what CI runs)
-make up      # run all services locally
+make setup     # dependencies + git hooks
+make check     # lint, type-check and test everything (what CI runs)
+make contract  # the API contract checks (what CI's contract workflow runs)
+make up        # run all services locally
 ```
 
 ## Workflow
@@ -40,6 +41,15 @@ anything else.
 ## Standards
 
 - Tests for every behaviour change; coverage must stay ≥ 80 %.
+- **The API contract leads.** Add or change an operation in `docs/api/openapi.yaml` in the same pull request as the
+  code. Two CI checks hold the two together ([docs/api/README.md](docs/api/README.md#11-checking-the-contract),
+  section 11):
+  - *Generated spec* fails when an operation the code implements is missing from the contract or differs from it.
+    Change the code to match, or fix the contract in the same pull request.
+  - *Breaking changes* fails when the contract changes in a way that breaks clients. Make the change backwards
+    compatible. Only a deliberate break that the rules allow (a change to the draft contract before the first release,
+    or removing an operation after its sunset date) gets the **`breaking`** label, which lets the check pass. Adding or
+    removing the label re-runs it.
 - Record significant decisions as an ADR in `docs/adr/` (copy `0000-template.md`).
 - Update the runbook when you add an alert, and the architecture doc when you add a component.
 - Never commit secrets — use `.env` locally (git-ignored) and a secret manager in the cloud.
