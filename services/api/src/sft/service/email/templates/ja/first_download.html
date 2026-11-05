@@ -1,0 +1,6 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">送信したファイルが、受信者によって初めてダウンロードされました。誰がいつどのファイルをダウンロードしたかは、送信の詳細ページで確認できます。</p>
+{{ button(transfer_url, '送信の詳細を見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

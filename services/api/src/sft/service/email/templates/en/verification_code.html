@@ -1,0 +1,8 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">Enter this code to continue with the link {{ tenant_name }} sent you:</p>
+{{ secret('Verification code', code) }}
+<p style="margin:0 0 16px;">The code is valid for {{ valid_minutes }} minutes and works once. Don't share it: nobody from Secure File Transfer or {{ tenant_name }} will ask you for it.</p>
+<p style="margin:0 0 16px;">If you didn't ask for a code, you can ignore this email.</p>
+{% endblock %}

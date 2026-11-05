@@ -1,0 +1,13 @@
+{# The DLP policy changes a policy-change email lists (PolicyChange). #}
+{% set change_labels = {
+  "rule_added": "ルールが追加されました",
+  "rule_changed": "ルールが変更されました",
+  "rule_removed": "ルールが削除されました",
+  "detector_added": "検出項目またはキーワードリストが追加されました",
+  "detector_changed": "検出項目またはキーワードリストが変更されました",
+  "detector_removed": "検出項目またはキーワードリストが削除されました",
+  "trusted_domains_changed": "信頼済みドメインが変更されました",
+  "mode_changed": "ポリシーのモード（モニターまたは適用）が変更されました",
+  "approvers_changed": "承認者が変更されました",
+  "approval_timeout_changed": "承認の期限が変更されました",
+} %}

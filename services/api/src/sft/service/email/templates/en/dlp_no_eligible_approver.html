@@ -1,0 +1,6 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">A member of {{ tenant_name }} asked for approval of a transfer, but nobody can approve it: a data loss prevention rule needs more approvers than {{ tenant_name }} has besides the sender. Name more approvers in the DLP settings.</p>
+{{ button(dlp_policy_url, 'Open the DLP settings', 'Or copy this address into your browser:') }}
+{% endblock %}

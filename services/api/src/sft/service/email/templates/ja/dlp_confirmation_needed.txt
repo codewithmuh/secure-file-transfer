@@ -1,0 +1,10 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}送信内容の確認が必要です{% endblock %}
+{% block body %}
+{{ tenant_name }}の情報漏えい対策（DLP）のルールに該当したため、送信はあなたの確認待ちです。受信者にはまだ通知されていません。
+
+送信の詳細ページで検出内容を確認し、送信の確定、ファイルの削除、または取り消しを選んでください。
+
+送信内容を確認する：
+{{ transfer_url }}
+{% endblock %}

@@ -1,0 +1,7 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">Your transfer is on hold, and no recipient has been notified. A file couldn't be shared, or a data loss prevention rule of {{ tenant_name }} blocks the transfer. The transfer page shows which file or rule, and why.</p>
+<p style="margin:0 0 16px;">You can remove the file and send the rest, or cancel the transfer.</p>
+{{ button(transfer_url, 'View the transfer', 'Or copy this address into your browser:') }}
+{% endblock %}

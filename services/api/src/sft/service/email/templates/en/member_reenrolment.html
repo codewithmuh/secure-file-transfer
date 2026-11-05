@@ -1,0 +1,8 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">Secure File Transfer is running from its standby region after an outage. To keep using it as a member of {{ tenant_name }}, sign in with the temporary password below, then choose a new password and set up an authenticator app again.</p>
+{{ secret('Your temporary password', temporary_password) }}
+<p style="margin:0 0 16px;">It works for {{ valid_days }} {% if valid_days == 1 %}day{% else %}days{% endif %}. Your transfers and files are not affected. Once the main region is back, you sign in as before.</p>
+{{ button(sign_in_url, 'Sign in', 'Or copy this address into your browser:') }}
+{% endblock %}

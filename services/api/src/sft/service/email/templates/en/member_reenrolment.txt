@@ -1,0 +1,15 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Set up your Secure File Transfer sign-in again{% endblock %}
+{% block body %}
+Secure File Transfer is running from its standby region after an outage. To
+keep using it as a member of {{ tenant_name }}, sign in with the temporary
+password below, then choose a new password and set up an authenticator app
+again.
+
+Your temporary password: {{ temporary_password }}
+
+It works for {{ valid_days }} {% if valid_days == 1 %}day{% else %}days{% endif %}. Your transfers and files are not affected. Once the main region is back, you sign in as before.
+
+Sign in:
+{{ sign_in_url }}
+{% endblock %}

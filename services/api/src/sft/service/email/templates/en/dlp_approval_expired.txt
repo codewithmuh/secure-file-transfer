@@ -1,0 +1,10 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your approval request has expired{% endblock %}
+{% block body %}
+Nobody decided on the approval request for your transfer before it expired,
+and the transfer waits for you again. You can ask for approval again, up to
+3 requests for each transfer, remove files or cancel.
+
+View the transfer:
+{{ transfer_url }}
+{% endblock %}

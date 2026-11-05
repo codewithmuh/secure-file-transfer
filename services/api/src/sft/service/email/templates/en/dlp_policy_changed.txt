@@ -1,0 +1,17 @@
+{% extends "en/_layout.txt" %}
+{% from "en/_labels.txt" import change_labels %}
+{% block subject %}The DLP policy of {{ tenant_name }} has changed{% endblock %}
+{% block body %}
+These changes were made to the data loss prevention policy of
+{{ tenant_name }}:
+
+{% for change in changes %}
+- {{ change_labels[change] }}
+{% endfor %}
+
+The audit log shows who made each change, and when. If you don't recognise a
+change, review it now.
+
+Open the DLP settings:
+{{ dlp_policy_url }}
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}Secure File Transferの確認コード{% endblock %}
+{% block body %}
+{{ tenant_name }}から届いたリンクの手続きを続けるには、次の確認コードを入力してください。
+
+確認コード：{{ code }}
+
+このコードの有効期間は{{ valid_minutes }}分間で、1回だけ使用できます。Secure File Transferや{{ tenant_name }}がコードを尋ねることはありません。誰にも教えないでください。
+
+確認コードを依頼していない場合は、このメールを破棄してください。
+{% endblock %}

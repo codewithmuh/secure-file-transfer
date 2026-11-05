@@ -1,0 +1,8 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{% if file_count == 1 %}A file has{% else %}{{ file_count }} files have{% endif %} arrived on your upload request{% endblock %}
+{% block body %}
+{% if file_count == 1 %}A new file is{% else %}{{ file_count }} new files are{% endif %} ready on your upload request.
+
+View the upload request:
+{{ upload_request_url }}
+{% endblock %}

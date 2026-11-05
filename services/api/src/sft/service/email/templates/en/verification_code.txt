@@ -1,0 +1,13 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your Secure File Transfer verification code{% endblock %}
+{% block body %}
+Enter this code to continue with the link {{ tenant_name }} sent you:
+
+Verification code: {{ code }}
+
+The code is valid for {{ valid_minutes }} minutes and works once. Don't
+share it: nobody from Secure File Transfer or {{ tenant_name }} will ask you
+for it.
+
+If you didn't ask for a code, you can ignore this email.
+{% endblock %}

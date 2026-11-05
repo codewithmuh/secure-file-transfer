@@ -1,0 +1,8 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{% if approved %}Your transfer was approved{% else %}Your transfer was rejected{% endif %}{% endblock %}
+{% block body %}
+{% if approved %}An approver has approved your transfer, and its recipients are being notified.{% else %}An approver has rejected your transfer, so it is on hold. The transfer page shows their comment. You can remove files or cancel the transfer.{% endif %}
+
+View the transfer:
+{{ transfer_url }}
+{% endblock %}

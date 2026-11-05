@@ -1,0 +1,12 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your transfer is on hold{% endblock %}
+{% block body %}
+Your transfer is on hold, and no recipient has been notified. A file
+couldn't be shared, or a data loss prevention rule of {{ tenant_name }}
+blocks the transfer. The transfer page shows which file or rule, and why.
+
+You can remove the file and send the rest, or cancel the transfer.
+
+View the transfer:
+{{ transfer_url }}
+{% endblock %}

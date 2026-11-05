@@ -1,0 +1,6 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{% if file_count == 1 %}A new file is{% else %}{{ file_count }} new files are{% endif %} ready on your upload request.</p>
+{{ button(upload_request_url, 'View the upload request', 'Or copy this address into your browser:') }}
+{% endblock %}

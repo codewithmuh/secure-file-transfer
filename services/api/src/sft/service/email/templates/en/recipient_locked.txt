@@ -1,0 +1,10 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{% if is_transfer %}A recipient{% else %}An uploader{% endif %} has been locked out{% endblock %}
+{% block body %}
+{% if is_transfer %}A recipient of a transfer{% else %}The uploader of an upload request{% endif %} in {{ tenant_name }} entered too many wrong verification codes and has been locked out. Someone else may have the link.
+
+The {% if is_transfer %}sender of the transfer{% else %}owner of the request{% endif %} or a tenant admin can unlock them. Unlocking sends them a new link, and the old one stops working.
+
+{{ 'View the transfer' if is_transfer else 'View the upload request' }}:
+{{ page_url }}
+{% endblock %}

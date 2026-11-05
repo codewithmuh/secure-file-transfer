@@ -1,0 +1,8 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}承認待ちの送信があります（{{ request_count }}件）{% endblock %}
+{% block body %}
+{{ tenant_name }}の情報漏えい対策（DLP）のルールにより、承認が必要な送信が{{ request_count }}件あります。あなたは承認者に指定されています。Webアプリにサインインして内容を確認してください。
+
+承認待ちの一覧を開く：
+{{ approvals_url }}
+{% endblock %}
