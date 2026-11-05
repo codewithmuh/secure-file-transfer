@@ -51,6 +51,9 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+      - name: Dry-run the promotion scripts and build.yml's trigger filters (#107)
+        if: ${{ !cancelled() }}
+        run: .github/scripts/test-promotion.sh
 
   local-stack:
     name: Local stack (up, smoke checks)
@@ -103,9 +106,20 @@ jobs:
         options: >-
           --health-cmd "wget -q -O /dev/null http://127.0.0.1:9324/health"
           --health-interval 2s --health-timeout 5s --health-retries 30
+      # Real Valkey for the rate-limit counters (ADR-0014), at the local stack's version and digest. A
+      # password per run as above; the image's entrypoint appends VALKEY_EXTRA_FLAGS.
+      valkey:
+        image: valkey/valkey:9.0.7-alpine@sha256:2d04268dfa26ab31cfa3fdc538866e76438b2d00e41db41b8cb86d780ac5a416
+        env:
+          VALKEY_EXTRA_FLAGS: --save '' --appendonly no --requirepass vk-${{ github.run_id }}-${{ github.run_attempt }}
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli -a vk-${{ github.run_id }}-${{ github.run_attempt }} --no-auth-warning ping"
+          --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
       TEST_SQS_ENDPOINT_URL: http://127.0.0.1:9324
+      TEST_VALKEY_URL: redis://:vk-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:6379/0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -253,9 +267,11 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
-          # The API needs DATABASE_URL to start, but connects only when a request needs it.
+          # The API needs DATABASE_URL and VALKEY_URL to start, but connects to each only when a
+          # request needs it, so nothing has to listen on these addresses.
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
+            --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi

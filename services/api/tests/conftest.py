@@ -5,11 +5,13 @@ import os
 from collections.abc import AsyncIterator, Callable, Iterator
 
 import pytest
+from prometheus_client import CollectorRegistry
 from sqlalchemy import URL
 
 from isolation import Mode, World, world_database
 from pg import ADMIN_URL_VARIABLE, ScratchDatabase, fresh_database
 from sft.core.logs import JsonFormatter
+from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
 from sft.data.roles import API, MIGRATE, OPERATOR
@@ -92,3 +94,29 @@ def isolation_world(admin_url: URL) -> Iterator[World]:
         world = World({Mode.AS_BUILT: as_built, Mode.DATA_LAYER_ALONE: data_layer_alone})
         yield world
         world.close()
+
+
+# ---- real Valkey ----
+
+# A Valkey URL with credentials, e.g. redis://sft-test:…@127.0.0.1:6379/0. Tests flush its database
+# 0 before each test that uses it, so never point it at a stack you care about.
+VALKEY_URL_VARIABLE = "TEST_VALKEY_URL"
+
+
+@pytest.fixture(scope="session")
+def valkey_url() -> str:
+    raw = os.environ.get(VALKEY_URL_VARIABLE)
+    if not raw:
+        if os.environ.get("CI"):
+            pytest.fail(f"{VALKEY_URL_VARIABLE} must be set in CI")
+        pytest.skip(f"set {VALKEY_URL_VARIABLE} to a Valkey 9 URL with credentials")
+    return raw
+
+
+@pytest.fixture
+async def counter_store(valkey_url: str) -> AsyncIterator[CounterStore]:
+    """A store on the test server, emptied first, with metrics of its own."""
+    store = CounterStore.connect(valkey_url, CounterMetrics.create(CollectorRegistry()))
+    await store._client.flushdb()  # read here only to start each test empty
+    yield store
+    await store.close()

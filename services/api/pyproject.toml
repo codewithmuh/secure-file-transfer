@@ -21,6 +21,8 @@ dependencies = [
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
   "boto3>=1.43.120",
+  # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
+  "valkey>=6.2.0",
 ]
 
 [dependency-groups]
