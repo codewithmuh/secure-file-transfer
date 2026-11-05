@@ -84,7 +84,10 @@ against the nesting limit.
   breaks between two CJK characters are removed as well, because PDF text layers break Japanese words across lines.
 - **Context.** A detector's context keywords count when they appear within 40 characters before or after the match, in
   the same unit, or in the header of the match's column in a CSV file or a sheet. Context keywords are listed in
-  English and Japanese for every detector that uses them.
+  English and Japanese for every detector that uses them. An ASCII keyword counts only as a whole word: no ASCII letter
+  right before it, and none right after it but a plural "s", so "tel" doesn't count in "hotel" or "cell" in
+  "excellent". A digit may follow ("TEL03-…"). Japanese keywords count wherever they appear. The credential keywords
+  are the exception: they also count inside identifiers such as `awsSecretAccessKey`.
 - **Distinct values.** Within one file, a value found twice counts once. The inspector counts distinct values with a
   keyed hash whose key is random per file and lives only in the child process, so nothing that could be matched back to
   a value is ever stored. Across files and transfers, counts add up (FR-48), which overcounts a value that appears in
@@ -102,7 +105,7 @@ Detector IDs are stable; the version of the whole set is the inspection engine v
 | `jp_my_number` | Individual Numbers (マイナンバー, 個人番号) | 12 digits, plain or `NNNN-NNNN-NNNN` or with spaces; the check digit must hold (4.1) | マイナンバー, 個人番号, 番号カード, My Number, Individual Number | High with context; medium when grouped 4-4-4; low otherwise |
 | `jp_corporate_number` | Corporate Numbers (法人番号) | 13 digits; the first digit is a check digit (4.2) | 法人番号, 会社法人等番号, Corporate Number | High with context; low otherwise |
 | `payment_card` | Payment card numbers | 13 to 19 digits, plain or in the network's grouping; Luhn; a known issuer range and a length that range uses (4.3) | カード番号, クレジット, 有効期限, セキュリティコード, card number, expiry, CVV | High with context or an expiry date nearby; medium when grouped; low otherwise |
-| `jp_bank_account` | Japanese bank accounts | A 7-digit account number with an account keyword; for Japan Post Bank a 5-digit symbol and an up to 8-digit number with its keywords. No check digit exists. | 口座番号, 普通, 当座, 預金, 支店, ゆうちょ, 記号, account number | Never without context. Medium with context; high when a valid bank code and branch code are also nearby (4.4) |
+| `jp_bank_account` | Japanese bank accounts | A 7-digit account number with an account keyword; for Japan Post Bank a 5-digit symbol and an up to 8-digit number with its keywords. No check digit exists. | 口座番号, 普通, 当座, 預金, 支店, ゆうちょ, 記号, account number | Never without context. Medium with context. High waits for a bundled bank and branch code list (4.4) |
 | `iban` | International bank account numbers | ISO 13616: country code, two check digits, the country's length; mod 97 = 1 | IBAN, 口座, account | High with context or in groups of four; medium otherwise |
 | `phone_number` | Japanese and international phone numbers | Validated with libphonenumber's metadata (the `phonenumbers` package): Japanese numbers without a country code, others with `+` and a country code (4.5) | 電話, TEL, 携帯, 連絡先, FAX, phone, mobile | High with context; medium when formatted with hyphens, parentheses or `+`; low when bare digits |
 | `email_address` | Email addresses | A dot-atom local part, `@`, and a domain whose last label is in the bundled public suffix list | — | High: the format alone is unambiguous |
@@ -141,10 +144,14 @@ hyphens. An expiry date (`MM/YY` or `MM/YYYY`, or 有効期限 with a date) with
 ### 4.4 Japanese bank accounts
 
 There is no check digit, so this detector rests on context. An account number is 7 digits, often after 普通 or 当座.
-Bank codes (4 digits) and branch codes (3 digits) are checked against the published list of Japanese financial
-institution and branch codes, bundled and refreshed at each release; a valid pair within 80 characters, or in the same
-row of a spreadsheet, raises a match to high. Japan Post Bank accounts are written as a 5-digit symbol starting with 1
-and a number of up to 8 digits, and count only with their keywords.
+Japan Post Bank accounts are written as a 5-digit symbol starting with 1 and a number of up to 8 digits, and count only
+with their keywords; a number that runs on past 8 digits isn't one.
+
+**Not yet: high confidence.** A valid bank code (4 digits) and branch code (3 digits) within 80 characters, or in the
+same row of a spreadsheet, would raise a match to high. That needs the list of Japanese financial institution and
+branch codes, bundled and refreshed at each release. No list is bundled yet: the published one has tens of thousands of
+branches, and its licence for redistribution has to be settled first. Until then a bank account is medium at most,
+which is the confidence the default rule uses (section 6).
 
 ### 4.5 Phone numbers
 
@@ -178,10 +185,14 @@ DLP data key, because keyword lists hold project names and other confidential te
 | Kind | Definition | Matching | Confidence | Limits |
 |---|---|---|---|---|
 | Keyword list (FR-38) | 1 to 1,000 terms of 1 to 100 characters | Normalised as in section 3. A term with any CJK character matches as a substring, with spaces and line breaks between CJK characters removed. A term of ASCII letters and digits matches as a whole word: no ASCII letter or digit right before or after it. | High | At most 50 detectors per tenant in total |
-| Pattern (FR-39) | An RE2 expression of at most 512 characters; optional context keywords; optional minimum match length | On normalised text, case-insensitive if asked | High with context, low without, when context keywords are set; high otherwise | At most 20 patterns per tenant; compiled with an 8 MiB memory budget; refused if it doesn't compile, matches the empty string, or takes more than 50 ms on the 1 MiB test text |
+| Pattern (FR-39) | An RE2 expression of at most 512 characters; optional context keywords; optional minimum match length | On normalised text, case-insensitive if asked | High with context, low without, when context keywords are set; high otherwise | At most 20 patterns per tenant; compiled with an 8 MiB memory budget, every group non-capturing; refused if it doesn't compile, compiles to more than 1,000 RE2 instructions (forward or reverse), or matches the empty string, on its own or anywhere in the 1 MiB test text |
 
 RE2 has no backreferences or lookaround, and runs in time linear in its input, so no pattern can make an inspection
-slow without bound (threat model T-103). `testDlpDetectors` lets an admin try a detector on sample text before saving
+slow without bound (threat model T-103). The save-time checks are deterministic: a pattern is accepted or refused the
+same way on any machine. They bound the size of the program RE2 runs per character, not the time a pattern takes. Only
+a match's span is used, so groups don't capture, and RE2 finds matches with its DFAs alone instead of the slower
+submatch engines. A broad pattern can still make RE2's DFA rebuild its states often on some text. The inspector's CPU
+and time limits (ADR-0022) bound that, and the file is then `partial` with `limit_exceeded`. `testDlpDetectors` lets an admin try a detector on sample text before saving
 it (FR-56).
 
 ## 6. The default policy
@@ -266,8 +277,8 @@ over the same flows. Each release publishes the per-detector table in its releas
 
 ## 9. Versions
 
-The inspection engine version changes with any change to a built-in detector, its data (issuer ranges, bank codes,
-public suffixes, credential patterns) or the extraction code. Each file records the version that inspected it, and each
+The inspection engine version changes with any change to a built-in detector, its data (issuer ranges, public
+suffixes, credential patterns, and the bank code list once there is one) or the extraction code. Each file records the version that inspected it, and each
 release's notes list what changed and the corpus results. A tenant's own detectors are versioned by the DLP policy
 version (data model 2.7). Files aren't re-inspected when either changes (ADR-0022).
 

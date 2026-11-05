@@ -12,7 +12,7 @@ import bisect
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from sft.dlp.detect.normalise import keyword_term, keyword_view, normalise
+from sft.dlp.detect.normalise import keyword_term, keyword_view, normalise, scrub_surrogates
 from sft.dlp.units import TextUnit
 
 LOW, MEDIUM, HIGH = 0, 1, 2
@@ -30,16 +30,48 @@ class Hit:
     preview: str
 
 
+_ASCII_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz")
+
+
+def _whole_word(view: str, term: str) -> bool:
+    """`term` in `view` with no ASCII letter right before it, and after it none but a plural "s".
+
+    A digit may follow: "TEL03-..." and "TEL:03-..." both have the keyword. The view is case-folded,
+    so lower case is enough.
+    """
+    position = view.find(term)
+    while position >= 0:
+        end = position + len(term)
+        if end < len(view) and view[end] == "s":
+            end += 1
+        if (position == 0 or view[position - 1] not in _ASCII_LETTERS) and (
+            end == len(view) or view[end] not in _ASCII_LETTERS
+        ):
+            return True
+        position = view.find(term, position + 1)
+    return False
+
+
 class Keywords:
-    """A set of context keywords, matched on the keyword view."""
+    """A set of context keywords, matched on the keyword view.
 
-    __slots__ = ("terms",)
+    A keyword in ASCII counts only as a whole word, so "tel" isn't in "hotel", "cell" in
+    "excellent" or "phone" in "headphones". Japanese has no word boundaries: any other keyword
+    counts wherever it appears ([DLP] 3). `whole_words=False` makes ASCII keywords substrings too,
+    for long keywords that sit inside identifiers ("awsSecretAccessKey").
+    """
 
-    def __init__(self, terms: Iterable[str]) -> None:
+    __slots__ = ("terms", "whole_words")
+
+    def __init__(self, terms: Iterable[str], *, whole_words: bool = True) -> None:
         self.terms = tuple(sorted({t for t in (keyword_term(term) for term in terms) if t}))
+        self.whole_words = whole_words
 
     def found_in(self, view: str) -> bool:
-        return any(term in view for term in self.terms)
+        return any(
+            _whole_word(view, term) if self.whole_words and term.isascii() else term in view
+            for term in self.terms
+        )
 
 
 class Prepared:
@@ -50,7 +82,7 @@ class Prepared:
     __slots__ = ("_cell_starts", "_cells", "_view", "location", "text")
 
     def __init__(self, unit: TextUnit) -> None:
-        self.location = unit.location[:MAX_LOCATION]
+        self.location = scrub_surrogates(unit.location[:MAX_LOCATION])
         cells: list[tuple[int, int, str]] = []
         if unit.cells:
             parts: list[str] = []

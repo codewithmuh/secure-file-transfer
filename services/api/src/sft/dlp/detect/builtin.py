@@ -248,6 +248,10 @@ def _numbers(unit: Prepared) -> Iterator[Hit]:
     taken: list[tuple[int, int]] = []
     for span in _JAPAN_POST_KEYWORDS.finditer(text):
         symbol, account = span.groups
+        # RE2 has no lookahead: a digit right after means the number runs on past 8 digits, so it
+        # isn't an account number, and the run is left whole for the other detectors.
+        if span.end < len(text) and text[span.end].isdigit():
+            continue
         if symbol is not None and account is not None:
             taken.append((span.start, span.end))
             value = symbol + account
@@ -319,10 +323,25 @@ def _phones(unit: Prepared) -> Iterator[Hit]:
                 index += 1
 
 
+def _starts_an_address(text: str, start: int) -> bool:
+    """Whether a match starts a whole local part, not the tail of an invalid one.
+
+    RE2 finds the leftmost match, so a match right after a local-part character can only follow a
+    dot: ".taro@" or "first..taro@", whose whole local part isn't a dot-atom. Three dots or more
+    are an ellipsis ("Contact...taro@"; NFKC turns "…" into "..."): the address starts after them.
+    """
+    if start == 0 or text[start - 1] not in _EMAIL_LOCAL:
+        return True
+    dots = 0
+    while start - dots > 0 and text[start - dots - 1] == ".":
+        dots += 1
+    return dots >= 3
+
+
 def _emails(unit: Prepared) -> Iterator[Hit]:
     text = unit.text
     for span in _EMAIL.finditer(text):
-        if span.start > 0 and text[span.start - 1] in _EMAIL_LOCAL:
+        if not _starts_an_address(text, span.start):
             continue
         local, domain = text[span.start : span.end].split("@", 1)
         labels = domain.split(".")
