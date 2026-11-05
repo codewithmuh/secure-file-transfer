@@ -1,8 +1,9 @@
 # api
 
 The API service and the workers: FastAPI on uvicorn for the API, asyncio for the workers, Python 3.13 (ADR-0002). They
-share this codebase and image, each with its own entry point (architecture 2). The API has no routes yet; M1 adds the
-first ones from [the API contract](../../docs/api/openapi.yaml). The first worker is the outbox relay (ADR-0013).
+share this codebase and image, each with its own entry point (architecture 2). The API's routes come from [the API
+contract](../../docs/api/openapi.yaml); the member routes (#112) are the first. The first worker is the outbox relay
+(ADR-0013).
 
 ## Layout
 
@@ -13,6 +14,8 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
+    members.py        the member routes: invite, list, read, change and deactivate users (FR-22)
+    caller.py         get_caller, the request's Caller (a placeholder until #113's sessions)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     observability.py  request and trace IDs, the request span, request metrics, one log line per request
     rate_limits.py    rate_limit(bundle): the route dependency; 401 counting and the IP block
@@ -27,6 +30,9 @@ src/sft/
   runtime/      what api and workers both need to run as a pod
     internal.py       /healthz, /readyz, /metrics on the internal port
   service/      business rules and permission checks
+    caller.py         Caller: who is calling and how they signed in; its audit actor and rate-limit keys
+    permissions.py    the permission registry (authn and authz 6.3) and authorize()
+    members.py        the member rules: the last active admin, invitations, role and approver changes
     email/            every email, rendered in English and Japanese as text and HTML (Email below)
     rate_limits/      the limits as data, the limiter and its per-pod fallback
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations; Valkey counters
@@ -34,6 +40,7 @@ src/sft/
     scope.py          Scope: tenant, resource, system, platform, lookup or recovery
     access.py         the rules on top: who opens which scope, in_scope(), TenantOwned
     tenants.py        data-access functions for tenants (one module per table or aggregate)
+    users.py          data-access functions for users and their invitations
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
@@ -408,7 +415,7 @@ in CI the same way. They empty database 0 there before each test, so never point
 
 ```bash
 docker run --detach --name sft-test-valkey --publish 127.0.0.1:56379:6379 \
-  --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.0.7-alpine
+  --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.1.3-alpine
 TEST_VALKEY_URL=redis://:test-only@127.0.0.1:56379/0 uv run pytest
 ```
 

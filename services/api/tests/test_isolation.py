@@ -4,12 +4,16 @@ One case per data-access function, and later per endpoint (delivery plan 2, poin
 is `isolation.py`; the README's "The isolation suite" says how to add a case.
 """
 
+import hashlib
+import uuid
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Tenants
 from sft.data.access import in_scope
-from sft.data.models import ProcessedMessage
+from sft.data.audit import Actor
+from sft.data.models import ActorType, ProcessedMessage, Role
 from sft.data.outbox import (
     Queue,
     Topic,
@@ -23,8 +27,22 @@ from sft.data.processed import record_processed
 from sft.data.roles import API, ARCHIVE, JOBS, NOTIFY, OPERATOR, RELAY, SCAN
 from sft.data.scope import ScopeKind
 from sft.data.tenants import get_tenant
+from sft.data.users import (
+    accept_invitation,
+    change_role,
+    create_invitation,
+    deactivate_user,
+    find_invitation,
+    get_user,
+    get_user_by_email,
+    list_users,
+    lock_active_admins,
+    set_dlp_approver,
+    set_sso_fallback,
+)
 
 TENANT, RESOURCE, SYSTEM = ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.SYSTEM
+LOOKUP = ScopeKind.LOOKUP
 
 cases = Cases()
 
@@ -93,6 +111,80 @@ async def outbox_age(session: AsyncSession, tenants: Tenants) -> object:
 @cases.add(scopes={RELAY: [SYSTEM]})
 async def relay_claims_without_changing_anything(session: AsyncSession, tenants: Tenants) -> object:
     return await claim_due(session, 10)
+
+
+# ---- users (#112) ----
+
+# Every role granted `users`, in every scope it reads them in.
+USER_READERS = {API: [TENANT, RESOURCE], OPERATOR: [TENANT], NOTIFY: [TENANT]}
+# Every role that may change users, and the roles that may not (they must be refused too).
+USER_WRITERS = {API: [TENANT, RESOURCE], OPERATOR: [TENANT], NOTIFY: [TENANT], SCAN: [TENANT]}
+ADMIN = Actor(ActorType.ADMIN, uuid.uuid4())
+
+
+def their_token_hash(tenants: Tenants) -> bytes:
+    # The seed's invitation link is the SHA-256 of this text (isolation.seed_tenant).
+    return hashlib.sha256(str(tenants.theirs.rows["invitation"]).encode()).digest()
+
+
+@cases.add(scopes=USER_READERS)
+async def get_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    return await get_user(session, tenants.theirs.rows["user"], for_update=True)
+
+
+@cases.add(scopes=USER_READERS)
+async def get_another_tenants_user_by_email(session: AsyncSession, tenants: Tenants) -> object:
+    return await get_user_by_email(session, f"{tenants.theirs.marker}@example.test")
+
+
+@cases.add(scopes=USER_READERS)
+async def list_another_tenants_users(session: AsyncSession, tenants: Tenants) -> object:
+    return await list_users(session, limit=100)
+
+
+@cases.add(scopes={API: [TENANT], OPERATOR: [TENANT]})
+async def lock_another_tenants_admins(session: AsyncSession, tenants: Tenants) -> object:
+    return await lock_active_admins(session)
+
+
+@cases.add(scopes=USER_WRITERS)
+async def invite_into_no_other_tenant(session: AsyncSession, tenants: Tenants) -> object:
+    # The tenant is the scope's; the address is new, so only the scope decides where it lands.
+    email = f"new-{uuid.uuid4().hex}@example.test"
+    return await create_invitation(session, email=email, role=Role.ADMIN, actor=ADMIN)
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_another_tenants_invitation(session: AsyncSession, tenants: Tenants) -> object:
+    # Across tenants by design: the lookup must change nothing.
+    return await find_invitation(session, their_token_hash(tenants))
+
+
+@cases.add(scopes=USER_WRITERS)
+async def accept_another_tenants_invitation(session: AsyncSession, tenants: Tenants) -> object:
+    return await accept_invitation(
+        session, tenants.theirs.rows["user"], actor=ADMIN, token_hash=their_token_hash(tenants)
+    )
+
+
+@cases.add(scopes=USER_WRITERS)
+async def promote_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    return await change_role(session, tenants.theirs.rows["user"], Role.ADMIN, actor=ADMIN)
+
+
+@cases.add(scopes=USER_WRITERS)
+async def name_another_tenants_approver(session: AsyncSession, tenants: Tenants) -> object:
+    return await set_dlp_approver(session, tenants.theirs.rows["user"], True, actor=ADMIN)
+
+
+@cases.add(scopes=USER_WRITERS)
+async def name_another_tenants_fallback(session: AsyncSession, tenants: Tenants) -> object:
+    return await set_sso_fallback(session, tenants.theirs.rows["user"], False, actor=ADMIN)
+
+
+@cases.add(scopes=USER_WRITERS)
+async def deactivate_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    return await deactivate_user(session, tenants.theirs.rows["user"], actor=ADMIN)
 
 
 test_isolation = cases.test()

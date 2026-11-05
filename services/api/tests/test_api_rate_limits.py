@@ -60,7 +60,8 @@ def app_with_routes(valkey_url: str, *, trusted_proxies: str = "") -> FastAPI:
     async def me(member: Annotated[Member, Depends(member_session)]) -> dict[str, str]:
         return {"ok": "me"}
 
-    @app.post("/v1/users", dependencies=[rate_limit(TENANT_OPERATION, caller=member_session)])
+    # A stand-in for inviteUser, off the contract's paths: the app serves the real /v1/users.
+    @app.post("/v1/invite", dependencies=[rate_limit(TENANT_OPERATION, caller=member_session)])
     async def invite(
         member: Annotated[Member, Depends(member_session)],
         limiter: Annotated[RateLimiter, Depends(get_rate_limiter)],
@@ -125,8 +126,8 @@ def test_the_caller_keys_come_from_the_authentication_dependency(client: TestCli
 def test_a_handler_applies_the_limits_whose_keys_it_finds(client: TestClient) -> None:
     auth = {"authorization": "Bearer ok"}
     for _ in range(3):  # 3 invitations a day to one address
-        assert client.post("/v1/users", headers=auth).status_code == 200
-    response = client.post("/v1/users", headers=auth)
+        assert client.post("/v1/invite", headers=auth).status_code == 200
+    response = client.post("/v1/invite", headers=auth)
     assert response.status_code == 429
     assert int(response.headers["retry-after"]) > 86000
 

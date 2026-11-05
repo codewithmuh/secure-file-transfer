@@ -9,10 +9,18 @@ from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
 
 from pg import ScratchDatabase
+from sft.data.audit_required import require_audit_sql
 from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, compatible_with, include_name
-from sft.data.models import Base
-from sft.data.rls import grant_sql, policy_sql, tenant_rls_sql
+from sft.data.models import Base, Role, UserStatus, sql_values
+from sft.data.rls import (
+    grant_sql,
+    lookup_function_sql,
+    lookup_read_sql,
+    policy_sql,
+    tenant_keys_sql,
+    tenant_rls_sql,
+)
 
 SCRIPTS = ScriptDirectory.from_config(alembic_config())
 
@@ -85,6 +93,38 @@ def test_the_outbox_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
     assert list(module.PROCESSED_MESSAGES_RLS) == tenant_rls_sql(
         "processed_messages", grants={"sft_scan": "INSERT", "sft_notify": "INSERT"}
     )
+
+
+def test_the_users_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001. Found by its contents, so renumbering the revision doesn't touch this test.
+    [module] = [s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "USERS_RLS")]
+    assert list(module.USERS_KEYS) == tenant_keys_sql("users")
+    assert list(module.USERS_RLS) == tenant_rls_sql(
+        "users",
+        grants={
+            "sft_api": "SELECT, INSERT, UPDATE",
+            "sft_operator": "SELECT, INSERT",
+            "sft_notify": "SELECT",
+        },
+    )
+    assert list(module.LOOKUP_INVITATION) == [
+        *lookup_read_sql(
+            "users", ["id", "tenant_id", "status", "invitation_token_hash", "invitation_expires_at"]
+        ),
+        *lookup_function_sql(
+            "lookup_invitation(p_token_hash bytea)",
+            returns="TABLE (user_id uuid, owner_tenant_id uuid)",
+            body=module.LOOKUP_INVITATION_BODY,
+        ),
+    ]
+    assert require_audit_sql("users") == module.USERS_AUDIT_REQUIRED
+
+
+def test_the_users_checks_list_the_roles_and_statuses_of_the_code() -> None:
+    [script] = [s for s in SCRIPTS.walk_revisions() if hasattr(s.module, "USERS_RLS")]
+    source = Path(str(script.path)).read_text()
+    assert f"role IN {sql_values(Role)}" in source
+    assert f"status IN {sql_values(UserStatus)}" in source
 
 
 def test_the_models_match_the_migrations(migrated_db: ScratchDatabase) -> None:

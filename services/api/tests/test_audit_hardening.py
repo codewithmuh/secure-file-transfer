@@ -115,7 +115,10 @@ def test_column_grants_follow_the_table_rules(migrated_db: ScratchDatabase) -> N
     for table, role, privilege in grants:
         assert privilege in ("SELECT", "INSERT", "UPDATE"), f"{role} has {privilege} on {table}"
         assert role.startswith("sft_")
-        assert role not in ("sft_owner", "sft_migrate", "sft_lookup")
+        assert role not in ("sft_owner", "sft_migrate")
+        if role == "sft_lookup":
+            # The credential lookups read their columns through lookup_read (data model 4.2).
+            assert privilege == "SELECT", f"sft_lookup may {privilege} columns of {table}"
         if table == "audit_events":
             assert privilege == "INSERT", f"{role} may {privilege} columns of audit_events"
         policies = migrated_db.sql(
