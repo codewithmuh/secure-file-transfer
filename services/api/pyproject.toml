@@ -29,6 +29,9 @@ dependencies = [
   "boto3>=1.43.121",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
+  # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
+  "google-re2>=1.1.20251105",
+  "phonenumbers>=9.0.42",
 ]
 
 [dependency-groups]
@@ -85,6 +88,11 @@ strict = true
 mypy_path = "src:."
 packages = ["sft", "tools"]
 
+# google-re2 ships no type information; sft.dlp.detect.regex wraps the few calls it makes.
+[[tool.mypy.overrides]]
+module = ["re2"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]  # so the tests import tools
@@ -92,6 +100,9 @@ addopts = "-q --cov=sft --cov=tools --cov-report=term-missing --cov-fail-under=8
 
 [tool.coverage.run]
 branch = true
+# SQLAlchemy's asyncio runs the driver in greenlets; without this, lines after an await inside a
+# transaction go unmeasured.
+concurrency = ["thread", "greenlet"]
 # Also measure the server started as a real process by the signal tests.
 patch = ["subprocess"]
 
@@ -104,14 +115,14 @@ root_package = "sft"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layers: api | workers -> runtime -> service -> data -> core"
+name = "Layers: api | workers -> runtime -> service -> data | dlp -> core"
 type = "layers"
 containers = ["sft"]
 layers = [
   "api | workers",
   "runtime",
   "service",
-  "data",
+  "data | dlp",
   "core",
 ]
 exhaustive = true
@@ -122,3 +133,18 @@ name = "Only the entry points know about HTTP"
 type = "forbidden"
 source_modules = ["sft.service", "sft.data", "sft.core"]
 forbidden_modules = ["fastapi", "starlette", "uvicorn"]
+
+# `dlp` sits beside `data`: pure code that the service and the inspector both use. The inspector's sandbox reaches no
+# database, counter store, AWS, network or secret (ADR-0022), so the package imports none of their clients and
+# exports no metrics or traces.
+[[tool.importlinter.contracts]]
+name = "The dlp package reaches no database, counter store, AWS, HTTP, metrics or traces"
+type = "forbidden"
+source_modules = ["sft.dlp"]
+forbidden_modules = [
+  "sqlalchemy", "psycopg", "alembic",
+  "valkey",
+  "boto3", "botocore",
+  "fastapi", "starlette", "uvicorn",
+  "prometheus_client", "opentelemetry",
+]
