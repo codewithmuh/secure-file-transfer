@@ -69,8 +69,8 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 
 ## Apply order
 
-Before any of it, the GitHub environments `dev`, `staging`, `prod` and `shared`, each accepting deployments from
-`main` only, so that no deploy role ever exists without the rule its trust relies on (the runbook's step 0, T-71).
+Before any of it, the GitHub environments `dev`, `staging`, `prod`, `shared` and `registry` (the image push role's,
+ADR-0007), each accepting deployments from `main` only, so that no deploy role ever exists without the rule its trust relies on (the runbook's step 0, T-71).
 
 1. `bootstrap/management/ap-northeast-1`, before anything else exists.
 2. `organization`: the budgets first, then the organization, OUs and member accounts, the SCPs, and, once Identity

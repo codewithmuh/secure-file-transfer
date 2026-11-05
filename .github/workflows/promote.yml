@@ -1,0 +1,159 @@
+name: promote
+
+# Promotion to staging and prod, and the gate on every promotion (ADR-0005, architecture 3.3, #107).
+#
+# - `open` (run by hand from main): copies the previous environment's digest into the next one, dev → staging or
+#   staging → prod, and opens the promotion pull request as the bot, so CI runs on it. It only proposes: the pull
+#   request deploys when it merges, and merging the prod pull request is prod's approval.
+# - `promotion-gate` (every pull request, a required check): passes a pull request that doesn't change staging's or
+#   prod's digest. One that does passes only if it changes no other environment's digest and either copies the digest
+#   the previous environment pins on main, with that environment synced, healthy and probed on it, or restores a digest
+#   the environment ran before on main (a revert, which passes at once so a rollback merges within NFR-18's 10
+#   minutes). It reads the pull request's own head commit, so a re-run re-checks the same proposal.
+#
+# Nothing here runs on a push, so a promotion merge starts no build or promotion; build.yml ignores it too. The merge
+# runs only mark-deployed.yml, which tags what main now pins deployed and changes nothing in Git.
+#
+# Variables: see build.yml (ECR_REGISTRY, ECR_PUSH_ROLE_ARN, BOT_APP_CLIENT_ID; secret BOT_APP_PRIVATE_KEY).
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to promote to (it copies the one before it)
+        type: choice
+        options: [staging, prod]
+        required: true
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: promote-${{ github.event_name == 'pull_request' && github.ref || inputs.environment }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  open:
+    name: Open the ${{ inputs.environment }} promotion pull request
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    environment: registry # the push role, to tag the digest deployed; main only (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the push role
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Copy the previous environment's digest
+        id: copy
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          case $TARGET in
+            staging) from=dev ;;
+            prod) from=staging ;;
+            *) echo "::error::unknown environment $TARGET"; exit 1 ;;
+          esac
+          digest=$(.github/scripts/promotion.sh copy "$from" "$TARGET")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          role-session-name: promote-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+      # The digest has landed on main in the previous environment, and mark-deployed.yml tagged it then: normally a
+      # no-op that finds the Git SHA it was built from. It fails for a digest that isn't a build from main.
+      - name: Tag the digest deployed
+        id: tag
+        env:
+          DIGEST: ${{ steps.copy.outputs.digest }}
+        run: |
+          sha=$(.github/scripts/promotion.sh mark-deployed "$DIGEST")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          TARGET: ${{ inputs.environment }}
+          DIGEST: ${{ steps.copy.outputs.digest }}
+          SHA: ${{ steps.tag.outputs.sha }}
+        run: .github/scripts/promotion.sh open-pr "$TARGET" "$DIGEST" "$SHA"
+
+  # Required by name on main (#59), so it runs on every pull request and passes when there is nothing to check.
+  promotion-gate:
+    name: promotion-gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 35 # the health checks wait up to 30 minutes (ADR-0005)
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }} # the head commit, not the merge commit
+          fetch-depth: 0 # each environment's history on the base branch, for reverts
+          persist-credentials: false
+      - name: What the pull request changes in the deploy config
+        id: gate
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          decisions=$(.github/scripts/promotion.sh gate "$BASE" "$HEAD")
+          promotions=""
+          {
+            echo "### promotion-gate"
+            if [[ -z $decisions ]]; then echo "No environment's digest changes: nothing to check."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r env mode prev digest; do
+            [[ -z $env ]] && continue
+            case $mode in
+              # Nothing a pull request can assume reads ECR yet, so whether the digest is there and signed isn't
+              # checked here: admission refuses an unsigned one, and mark-deployed.yml fails on the merge of one that
+              # isn't a build from main (ADR-0007).
+              build) echo "- $env: a new digest; not yet checked against ECR before merge (ADR-0007)." >> "$GITHUB_STEP_SUMMARY" ;;
+              rollback) echo "- $env: restores a digest it ran before (a revert): passes at once." >> "$GITHUB_STEP_SUMMARY" ;;
+              promote)
+                echo "- $env: copies $prev's \`$digest\`; $prev must be synced, healthy and probed on it." >> "$GITHUB_STEP_SUMMARY"
+                promotions+="$env:$prev:$digest "
+                ;;
+            esac
+          done <<< "$decisions"
+          echo "promotions=${promotions% }" >> "$GITHUB_OUTPUT"
+
+      # TODO(ADR-0005, needs AWS): read the previous environment's Argo CD state from the GitHub deployment statuses
+      # that Argo CD notifications post per environment and region (#104), and pass when every application is Synced
+      # and Healthy on the digest; poll for up to 30 minutes. Needs `deployments: read`. Until then a promotion to
+      # staging or prod fails here: neither exists yet, and a gate that passes unchecked would be worse than none.
+      - name: Previous environment synced and healthy in Argo CD
+        if: steps.gate.outputs.promotions != ''
+        env:
+          PROMOTIONS: ${{ steps.gate.outputs.promotions }}
+        run: |
+          for p in $PROMOTIONS; do
+            IFS=: read -r env prev digest <<< "$p"
+            echo "::error::promotion-gate can't yet read $prev's Argo CD health on $digest (TODO, ADR-0005); $env not promoted."
+          done
+          exit 1
+
+      # TODO(ADR-0005, needs AWS): assume the previous environment's plan role through OIDC (it trusts pull requests
+      # only, T-71; add `id-token: write` to this job then) and read the synthetic probe's CloudWatch metric for the
+      # digest; pass when the probe has passed against it. The role ARN comes from a repository variable.
+      - name: Previous environment probed on the digest
+        if: ${{ !cancelled() && steps.gate.outputs.promotions != '' }}
+        env:
+          PROMOTIONS: ${{ steps.gate.outputs.promotions }}
+        run: |
+          for p in $PROMOTIONS; do
+            IFS=: read -r env prev digest <<< "$p"
+            echo "::error::promotion-gate can't yet read $prev's synthetic probe result for $digest (TODO, ADR-0005); $env not promoted."
+          done
+          exit 1

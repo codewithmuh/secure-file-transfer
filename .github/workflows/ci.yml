@@ -51,6 +51,9 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
+      - name: Dry-run the promotion scripts and build.yml's trigger filters (#107)
+        if: ${{ !cancelled() }}
+        run: .github/scripts/test-promotion.sh
 
   local-stack:
     name: Local stack (up, smoke checks)
