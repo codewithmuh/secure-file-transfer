@@ -20,20 +20,20 @@ export function ApiKeysPage() {
   return (
     <PageShell
       title={t('admin.apiKeys')}
-      actions={<Button onClick={() => setShowCreate(true)}><Plus className="mr-2 h-4 w-4" />Create API key</Button>}
+      actions={<Button onClick={() => setShowCreate(true)}><Plus className="mr-2 h-4 w-4" />{t('admin.createApiKey')}</Button>}
     >
       <Card padding={false}>
         {mockKeys.length === 0 ? (
-          <EmptyState icon={Key} title="No API keys" description="Create an API key for automated access." action={<Button onClick={() => setShowCreate(true)}>Create API key</Button>} />
+          <EmptyState icon={Key} title={t('admin.noApiKeys')} description={t('admin.noApiKeysHint')} action={<Button onClick={() => setShowCreate(true)}>{t('admin.createApiKey')}</Button>} />
         ) : (
-          <Table>
+          <Table label={t('admin.apiKeys')}>
             <TableHead>
               <tr>
-                <TableHeader>Name</TableHeader>
-                <TableHeader>Prefix</TableHeader>
-                <TableHeader>Scopes</TableHeader>
+                <TableHeader>{t('common.name')}</TableHeader>
+                <TableHeader>{t('admin.keyPrefix')}</TableHeader>
+                <TableHeader>{t('admin.scopes')}</TableHeader>
                 <TableHeader>{t('common.expiresAt')}</TableHeader>
-                <TableHeader>Last used</TableHeader>
+                <TableHeader>{t('admin.lastUsed')}</TableHeader>
                 <TableHeader>{t('common.actions')}</TableHeader>
               </tr>
             </TableHead>
@@ -50,7 +50,7 @@ export function ApiKeysPage() {
                   <TableCell>{formatDate(key.expires_at)}</TableCell>
                   <TableCell>{key.last_used_at ? formatDate(key.last_used_at) : '—'}</TableCell>
                   <TableCell>
-                    <button className="rounded p-1 text-red-400 hover:bg-red-50 hover:text-red-600">
+                    <button aria-label={t('common.delete')} className="rounded-sm p-1 text-red-600 hover:bg-red-50 hover:text-red-700">
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </TableCell>
@@ -61,14 +61,14 @@ export function ApiKeysPage() {
         )}
       </Card>
 
-      <Dialog open={showCreate} onClose={() => setShowCreate(false)} title="Create API key">
+      <Dialog open={showCreate} onClose={() => setShowCreate(false)} title={t('admin.createApiKey')}>
         <div className="space-y-4">
-          <Input label="Name" placeholder="e.g. CI Pipeline" value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} autoFocus />
-          <p className="text-xs text-gray-500">The secret key will only be shown once. Store it securely.</p>
+          <Input id="api-key-name" label={t('common.name')} placeholder={t('admin.apiKeyNamePlaceholder')} value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} autoFocus />
+          <p className="text-xs text-gray-500">{t('admin.apiKeyShownOnce')}</p>
         </div>
         <div className="mt-6 flex justify-end gap-3">
           <Button variant="secondary" onClick={() => setShowCreate(false)}>{t('common.cancel')}</Button>
-          <Button onClick={() => setShowCreate(false)} disabled={!newKeyName}>Create</Button>
+          <Button onClick={() => setShowCreate(false)} disabled={!newKeyName}>{t('common.create')}</Button>
         </div>
       </Dialog>
     </PageShell>

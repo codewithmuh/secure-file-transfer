@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router';
 import { FullPageSpinner } from '@/components/ui';
 import { finishSignIn } from './memberSession';
 

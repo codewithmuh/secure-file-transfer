@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Navigate, useLocation } from 'react-router-dom';
+import { Navigate, useLocation } from 'react-router';
 import { useAuthStore } from '@/stores/authStore';
 import { FullPageSpinner } from '@/components/ui';
 import { restoreMemberSession } from './memberSession';

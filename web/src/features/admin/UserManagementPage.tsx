@@ -37,13 +37,13 @@ export function UserManagementPage() {
       }
     >
       <Card padding={false}>
-        <Table>
+        <Table label={t('admin.users')}>
           <TableHead>
             <tr>
-              <TableHeader>Email</TableHeader>
+              <TableHeader>{t('common.email')}</TableHeader>
               <TableHeader>{t('admin.role')}</TableHeader>
               <TableHeader>{t('common.status')}</TableHeader>
-              <TableHeader>Added</TableHeader>
+              <TableHeader>{t('admin.added')}</TableHeader>
               <TableHeader>{t('common.actions')}</TableHeader>
             </tr>
           </TableHead>
@@ -61,7 +61,7 @@ export function UserManagementPage() {
                 </TableCell>
                 <TableCell>{formatDate(user.created_at)}</TableCell>
                 <TableCell>
-                  <button className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600">
+                  <button aria-label={t('common.actions')} className="rounded-sm p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-600">
                     <MoreHorizontal className="h-4 w-4" />
                   </button>
                 </TableCell>
@@ -73,10 +73,10 @@ export function UserManagementPage() {
 
       <Dialog open={showInvite} onClose={() => setShowInvite(false)} title={t('admin.inviteUser')}>
         <div className="space-y-4">
-          <Input label="Email address" type="email" placeholder="you@company.com" value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} autoFocus />
+          <Input id="invite-email" label={t('admin.emailAddress')} type="email" placeholder={t('auth.emailPlaceholder')} value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} autoFocus />
           <div>
-            <label className="block text-sm font-medium text-gray-700">{t('admin.role')}</label>
-            <select className="input-field mt-1" value={inviteRole} onChange={(e) => setInviteRole(e.target.value as 'admin' | 'member')}>
+            <label htmlFor="invite-role" className="block text-sm font-medium text-gray-700">{t('admin.role')}</label>
+            <select id="invite-role" className="input-field mt-1" value={inviteRole} onChange={(e) => setInviteRole(e.target.value as 'admin' | 'member')}>
               <option value="member">{t('admin.roleMember')}</option>
               <option value="admin">{t('admin.roleAdmin')}</option>
             </select>

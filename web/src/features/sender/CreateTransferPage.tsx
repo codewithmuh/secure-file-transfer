@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Send, Upload, X, Plus, FileIcon } from 'lucide-react';
 import { PageShell } from '@/components/layout';
@@ -91,6 +91,7 @@ export function CreateTransferPage() {
                   {r.email}
                   <button
                     onClick={() => removeRecipient(r.id)}
+                    aria-label={t('sender.removeRecipient', { email: r.email })}
                     className="rounded-full p-0.5 hover:bg-brand-100"
                   >
                     <X className="h-3 w-3" />
@@ -105,7 +106,7 @@ export function CreateTransferPage() {
                 onChange={(e) => setRecipientInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && addRecipient()}
               />
-              <Button variant="secondary" onClick={addRecipient}>
+              <Button variant="secondary" onClick={addRecipient} aria-label={t('sender.addRecipient')}>
                 <Plus className="h-4 w-4" />
               </Button>
             </div>
@@ -120,7 +121,7 @@ export function CreateTransferPage() {
               onClick={() => fileInputRef.current?.click()}
               className="mt-3 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-gray-300 p-8 text-center transition-colors hover:border-brand-400 hover:bg-brand-50/50"
             >
-              <Upload className="mb-3 h-10 w-10 text-gray-400" />
+              <Upload className="mb-3 h-10 w-10 text-gray-500" />
               <p className="text-sm font-medium text-gray-700">{t('sender.dragDrop')}</p>
               <p className="mt-1 text-xs text-gray-500">{t('sender.maxFileSize')}</p>
               <input
@@ -139,7 +140,7 @@ export function CreateTransferPage() {
                     className="flex items-center justify-between rounded-lg bg-gray-50 p-3"
                   >
                     <div className="flex items-center gap-3">
-                      <FileIcon className="h-5 w-5 text-gray-400" />
+                      <FileIcon className="h-5 w-5 text-gray-500" />
                       <div>
                         <p className="text-sm font-medium text-gray-900">{entry.file.name}</p>
                         <p className="text-xs text-gray-500">{formatFileSize(entry.file.size)}</p>
@@ -147,7 +148,8 @@ export function CreateTransferPage() {
                     </div>
                     <button
                       onClick={() => removeFile(entry.id)}
-                      className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-600"
+                      aria-label={t('common.remove')}
+                      className="rounded-sm p-1 text-gray-500 hover:bg-gray-200 hover:text-gray-600"
                     >
                       <X className="h-4 w-4" />
                     </button>
@@ -167,27 +169,27 @@ export function CreateTransferPage() {
               onChange={(e) => setMessage(e.target.value)}
               maxLength={2000}
             />
-            <p className="mt-1 text-right text-xs text-gray-400">{message.length}/2000</p>
+            <p className="mt-1 text-right text-xs text-gray-500">{message.length}/2000</p>
           </Card>
         </div>
 
         {/* Sidebar */}
         <div className="space-y-6">
           <Card>
-            <CardTitle>Settings</CardTitle>
+            <CardTitle>{t('common.settings')}</CardTitle>
             <div className="mt-3 space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700">{t('sender.expiry')}</label>
-                <select
+                <label htmlFor="expiry" className="block text-sm font-medium text-gray-700">{t('sender.expiry')}</label>
+                <select id="expiry"
                   className="input-field mt-1"
                   value={expiryDays}
                   onChange={(e) => setExpiryDays(e.target.value)}
                 >
-                  <option value="1">1 day</option>
-                  <option value="3">3 days</option>
-                  <option value="7">7 days</option>
-                  <option value="14">14 days</option>
-                  <option value="30">30 days</option>
+                  <option value="1">{t('common.days', { count: 1 })}</option>
+                  <option value="3">{t('common.days', { count: 3 })}</option>
+                  <option value="7">{t('common.days', { count: 7 })}</option>
+                  <option value="14">{t('common.days', { count: 14 })}</option>
+                  <option value="30">{t('common.days', { count: 30 })}</option>
                 </select>
               </div>
               <Input
@@ -195,7 +197,7 @@ export function CreateTransferPage() {
                 type="number"
                 min="1"
                 max="100"
-                placeholder="No limit"
+                placeholder={t('common.noLimit')}
                 value={downloadLimit}
                 onChange={(e) => setDownloadLimit(e.target.value)}
               />
@@ -203,7 +205,7 @@ export function CreateTransferPage() {
           </Card>
 
           <Card>
-            <CardTitle>Summary</CardTitle>
+            <CardTitle>{t('common.summary')}</CardTitle>
             <dl className="mt-3 space-y-2 text-sm">
               <div className="flex justify-between">
                 <dt className="text-gray-500">{t('sender.recipients')}</dt>
@@ -214,7 +216,7 @@ export function CreateTransferPage() {
                 <dd className="font-medium">{files.length}</dd>
               </div>
               <div className="flex justify-between">
-                <dt className="text-gray-500">Total size</dt>
+                <dt className="text-gray-500">{t('common.totalSize')}</dt>
                 <dd className="font-medium">{formatFileSize(totalSize)}</dd>
               </div>
             </dl>

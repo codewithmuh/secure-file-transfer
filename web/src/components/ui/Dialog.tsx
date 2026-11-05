@@ -1,6 +1,7 @@
 import { Fragment, type ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 import { X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 export interface DialogProps {
   open: boolean;
@@ -11,6 +12,7 @@ export interface DialogProps {
 }
 
 export function Dialog({ open, onClose, title, children, className }: DialogProps) {
+  const { t } = useTranslation();
   if (!open) return null;
 
   return (
@@ -31,8 +33,8 @@ export function Dialog({ open, onClose, title, children, className }: DialogProp
               <h2 className="text-lg font-semibold text-gray-900">{title}</h2>
               <button
                 onClick={onClose}
-                className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-500"
-                aria-label="Close"
+                className="rounded-lg p-1.5 text-gray-500 hover:bg-gray-100 hover:text-gray-700"
+                aria-label={t('common.close')}
               >
                 <X className="h-5 w-5" />
               </button>

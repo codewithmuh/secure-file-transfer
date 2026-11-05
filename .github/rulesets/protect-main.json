@@ -41,6 +41,7 @@
           { "context": "Repo checks (workflows, secrets, misconfigurations)", "integration_id": 15368 },
           { "context": "Python (lint, types, layers, tests)", "integration_id": 15368 },
           { "context": "Web app (types, lint, tests, build)", "integration_id": 15368 },
+          { "context": "Web app (accessibility, English and Japanese)", "integration_id": 15368 },
           { "context": "Local stack (up, smoke checks)", "integration_id": 15368 },
           { "context": "Mail adapter (SMTP to Mailpit)", "integration_id": 15368 },
           { "context": "Contract (generated spec)", "integration_id": 15368 },

@@ -1,4 +1,4 @@
-import { NavLink, useLocation } from 'react-router-dom';
+import { NavLink, useLocation } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/stores/authStore';
 import { useUIStore } from '@/stores/uiStore';
@@ -56,15 +56,15 @@ export function Sidebar() {
           <span className="text-lg font-bold text-gray-900">{t('common.appName')}</span>
           <button
             onClick={() => setSidebarOpen(false)}
-            className="rounded-lg p-2 text-gray-400 hover:bg-gray-100"
-            aria-label="Close sidebar"
+            className="rounded-lg p-2 text-gray-500 hover:bg-gray-100"
+            aria-label={t('common.closeSidebar')}
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
         <nav className="flex-1 space-y-1 px-3 py-4">
-          <div className="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+          <div className="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-gray-500">
             {t('sender.transfers')}
           </div>
           {memberLinks.map(({ to, icon: Icon, labelKey }) => (
@@ -89,7 +89,8 @@ export function Sidebar() {
 
           {isAdmin && (
             <>
-              <div className="mb-2 mt-6 px-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
+              {/* No margin of its own: space-y-1 spaces it, as under Tailwind 3 (which overrode mt-6 mb-2). */}
+              <div className="px-3 text-xs font-semibold uppercase tracking-wider text-gray-500">
                 {t('admin.title')}
               </div>
               {adminLinks.map(({ to, icon: Icon, labelKey }) => (

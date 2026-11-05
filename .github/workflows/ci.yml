@@ -242,6 +242,39 @@ jobs:
             exit 1
           fi
 
+  # axe on every page of the built app, in English and Japanese (NFR-22, FR-33, #110). Any WCAG A or AA violation fails
+  # the job. `make web-a11y` runs install, build, `vite preview` and Chromium in the Playwright image pinned in the
+  # Makefile, as it does locally. Skips its steps like the web job above, so it can be a required check (protect-main).
+  web-a11y:
+    name: Web app (accessibility, English and Japanese)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2 # a pull request's merge commit and both its parents, to see what it changes
+          persist-credentials: false
+      - name: Check whether the web app changed
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          # As in the web job: a push to main always runs, and a failing git fails the step.
+          if [[ "$EVENT" != pull_request ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          if grep --quiet --extended-regexp '^(web/|Makefile$|\.github/workflows/ci\.yml$)' <<< "$changed"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing under web/, in the Makefile or in ci.yml changed: the accessibility checks were skipped." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: axe checks on every page (Playwright image, vite preview, mock data)
+        if: steps.changes.outputs.run == 'true'
+        run: make web-a11y
+
   images:
     name: Image ${{ matrix.service }} (build, scan, smoke test)
     needs: [python]

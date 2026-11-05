@@ -1,4 +1,4 @@
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Send, Plus } from 'lucide-react';
 import { PageShell } from '@/components/layout';
@@ -6,16 +6,16 @@ import { Button, Card, Badge, Table, TableHead, TableBody, TableRow, TableHeader
 import { formatDate, formatFileSize } from '@/lib/formatters';
 import type { TransferState, TransferSummary } from '@/api';
 
-const stateBadge: Record<TransferState, { variant: 'default' | 'success' | 'warning' | 'danger' | 'info'; label: string }> = {
-  draft: { variant: 'default', label: 'Draft' },
-  submitted: { variant: 'info', label: 'Submitted' },
-  awaiting_confirmation: { variant: 'warning', label: 'Awaiting confirmation' },
-  pending_approval: { variant: 'warning', label: 'Pending approval' },
-  sent: { variant: 'success', label: 'Sent' },
-  held: { variant: 'warning', label: 'Held' },
-  expired: { variant: 'default', label: 'Expired' },
-  revoked: { variant: 'danger', label: 'Revoked' },
-  cancelled: { variant: 'default', label: 'Cancelled' },
+const stateBadge: Record<TransferState, { variant: 'default' | 'success' | 'warning' | 'danger' | 'info'; labelKey: string }> = {
+  draft: { variant: 'default', labelKey: 'sender.statusDraft' },
+  submitted: { variant: 'info', labelKey: 'sender.statusSubmitted' },
+  awaiting_confirmation: { variant: 'warning', labelKey: 'sender.statusAwaitingConfirmation' },
+  pending_approval: { variant: 'warning', labelKey: 'sender.statusPendingApproval' },
+  sent: { variant: 'success', labelKey: 'sender.statusSent' },
+  held: { variant: 'warning', labelKey: 'sender.statusHeld' },
+  expired: { variant: 'default', labelKey: 'sender.statusExpired' },
+  revoked: { variant: 'danger', labelKey: 'sender.statusRevoked' },
+  cancelled: { variant: 'default', labelKey: 'sender.statusCancelled' },
 };
 
 // Mock data in the contract's shape (`listTransfers` answers `TransferSummary` items); replaced by TanStack Query
@@ -45,7 +45,7 @@ export function TransferListPage() {
           <EmptyState
             icon={Send}
             title={t('common.noResults')}
-            description="No transfers yet."
+            description={t('sender.noTransfers')}
             action={
               <Button onClick={() => navigate('/transfers/new')}>
                 {t('sender.newTransfer')}
@@ -53,14 +53,14 @@ export function TransferListPage() {
             }
           />
         ) : (
-          <Table>
+          <Table label={t('sender.transfers')}>
             <TableHead>
               <tr>
                 <TableHeader>{t('common.status')}</TableHeader>
-                <TableHeader>Created</TableHeader>
+                <TableHeader>{t('common.createdAt')}</TableHeader>
                 <TableHeader>{t('sender.recipients')}</TableHeader>
                 <TableHeader>{t('sender.files')}</TableHeader>
-                <TableHeader>Size</TableHeader>
+                <TableHeader>{t('common.size')}</TableHeader>
                 <TableHeader>{t('common.expiresAt')}</TableHeader>
               </tr>
             </TableHead>
@@ -73,7 +73,7 @@ export function TransferListPage() {
                     onClick={() => navigate(`/transfers/${transfer.id}`)}
                   >
                     <TableCell>
-                      <Badge variant={badge.variant}>{badge.label}</Badge>
+                      <Badge variant={badge.variant}>{t(badge.labelKey)}</Badge>
                     </TableCell>
                     <TableCell>
                       <span className="font-medium text-gray-900">{formatDate(transfer.created_at)}</span>

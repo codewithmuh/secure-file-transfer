@@ -96,9 +96,9 @@ describe('api: types checked against the contract', () => {
   });
 
   it('accepts only contract paths and methods, without the operator API', () => {
-    expectTypeOf<'/transfers'>().toMatchTypeOf<PathsWith<'post'>>();
-    expectTypeOf<'/me'>().not.toMatchTypeOf<PathsWith<'post'>>();
-    expectTypeOf<'/operator/tenants'>().not.toMatchTypeOf<PathsWith<'post'>>();
+    expectTypeOf<'/transfers'>().toExtend<PathsWith<'post'>>();
+    expectTypeOf<'/me'>().not.toExtend<PathsWith<'post'>>();
+    expectTypeOf<'/operator/tenants'>().not.toExtend<PathsWith<'post'>>();
   });
 
   it('rejects calls the contract does not allow', () => {

@@ -67,7 +67,7 @@ export function SignInPage() {
               <div className="w-full border-t border-gray-200" />
             </div>
             <div className="relative flex justify-center text-sm">
-              <span className="bg-white px-4 text-gray-400">or</span>
+              <span className="bg-white px-4 text-gray-500">{t('common.or')}</span>
             </div>
           </div>
 

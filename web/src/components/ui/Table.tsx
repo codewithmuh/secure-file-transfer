@@ -1,8 +1,19 @@
 import { cn } from '@/lib/cn';
 
-export function Table({ children, className }: { children: React.ReactNode; className?: string }) {
+interface TableProps {
+  children: React.ReactNode;
+  className?: string;
+  /** The table's accessible name, translated: what a screen reader announces at the scroll region's tab stop. */
+  label: string;
+}
+
+/**
+ * A table in a horizontally scrollable region. The region is focusable so keyboard users can scroll a wide table
+ * (WCAG 2.1.1), and `label` names it, so the tab stop is announced as, say, "Transfers, region" (WCAG 4.1.2).
+ */
+export function Table({ children, className, label }: TableProps) {
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" tabIndex={0} role="region" aria-label={label}>
       <table className={cn('min-w-full divide-y divide-gray-200', className)}>
         {children}
       </table>

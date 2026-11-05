@@ -23,7 +23,8 @@ const currentMemberSchema: z.ZodType<MemberFields> = z.object({
   csrf_token: z.string().regex(/^[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{43}$/),
 });
 
-const signOutResultSchema: z.ZodType<Schema<'SignOutResult'>> = z.object({ logout_url: z.string().url() });
+/** Only an https logout URL is followed (authn-authz 3.5); anything else, such as `javascript:`, fails the check. */
+const signOutResultSchema: z.ZodType<Schema<'SignOutResult'>> = z.object({ logout_url: z.url({ protocol: /^https$/ }) });
 
 export const SIGN_IN_FAILED_PATH = '/sign-in?error=sign_in_failed';
 
@@ -83,9 +84,7 @@ export async function signOutMember(): Promise<void> {
   try {
     const response = await api.post('/auth/sign-out', { body: { all_sessions: false }, skipAuthRedirect: true });
     const result = signOutResultSchema.safeParse(response.data);
-    if (result.success && new URL(result.data.logout_url).protocol === 'https:') {
-      destination = result.data.logout_url;
-    }
+    if (result.success) destination = result.data.logout_url;
   } catch (error) {
     if (!(axios.isAxiosError(error) && error.response?.status === 401)) throw error;
   }

@@ -4,7 +4,7 @@ import { Search, Download, FileText } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import { Button, Card, Input, Badge, Table, TableHead, TableBody, TableRow, TableHeader, TableCell, EmptyState } from '@/components/ui';
 import { formatDate } from '@/lib/formatters';
-import type { AuditEvent } from '@/api';
+import type { ActorType, AuditEvent } from '@/api';
 
 // Mock data in the contract's shape; replaced by TanStack Query when the API exists.
 const mockEvents: AuditEvent[] = [
@@ -15,13 +15,23 @@ const mockEvents: AuditEvent[] = [
   { id: '5', occurred_at: '2026-11-04T05:00:00Z', actor_type: 'member', actor_id: 'u_1', actor_email: 'admin@company.com', action: 'member.sign_in', target_type: 'user', target_id: 'u_1', source_ip: '192.0.2.10', user_agent: 'Chrome/120', request_id: 'req_5', security_critical: false, details: {} },
 ];
 
-const actionBadge: Record<string, { variant: 'success' | 'info' | 'warning' | 'danger' | 'default'; label: string }> = {
-  'transfer.created': { variant: 'info', label: 'Transfer Created' },
-  'transfer.sent': { variant: 'success', label: 'Transfer Sent' },
-  'transfer.revoked': { variant: 'danger', label: 'Transfer Revoked' },
-  'link.verified': { variant: 'success', label: 'Link Verified' },
-  'file.downloaded': { variant: 'info', label: 'File Downloaded' },
-  'member.sign_in': { variant: 'default', label: 'Sign In' },
+const actionBadge: Record<string, { variant: 'success' | 'info' | 'warning' | 'danger' | 'default'; labelKey: string }> = {
+  'transfer.created': { variant: 'info', labelKey: 'audit.actionTransferCreated' },
+  'transfer.sent': { variant: 'success', labelKey: 'audit.actionTransferSent' },
+  'transfer.revoked': { variant: 'danger', labelKey: 'audit.actionTransferRevoked' },
+  'link.verified': { variant: 'success', labelKey: 'audit.actionLinkVerified' },
+  'file.downloaded': { variant: 'info', labelKey: 'audit.actionFileDownloaded' },
+  'member.sign_in': { variant: 'default', labelKey: 'audit.actionSignIn' },
+};
+
+const actorLabelKey: Record<ActorType, string> = {
+  member: 'audit.actorMember',
+  admin: 'audit.actorAdmin',
+  recipient: 'audit.actorRecipient',
+  uploader: 'audit.actorUploader',
+  api_key: 'audit.actorApiKey',
+  operator: 'audit.actorOperator',
+  system: 'audit.actorSystem',
 };
 
 export function AuditLogPage() {
@@ -47,14 +57,14 @@ export function AuditLogPage() {
       <Card padding={false}>
         <div className="border-b border-gray-200 p-4">
           <div className="relative max-w-sm">
-            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
             <Input placeholder={t('audit.searchPlaceholder')} value={search} onChange={(e) => setSearch(e.target.value)} className="pl-9" />
           </div>
         </div>
         {filtered.length === 0 ? (
           <EmptyState icon={FileText} title={t('common.noResults')} />
         ) : (
-          <Table>
+          <Table label={t('audit.title')}>
             <TableHead>
               <tr>
                 <TableHeader>{t('audit.timestamp')}</TableHeader>
@@ -66,15 +76,15 @@ export function AuditLogPage() {
             </TableHead>
             <TableBody>
               {filtered.map((event) => {
-                const badge = actionBadge[event.action] ?? { variant: 'default' as const, label: event.action };
+                const badge = actionBadge[event.action];
                 return (
                   <TableRow key={event.id}>
                     <TableCell className="whitespace-nowrap">{formatDate(event.occurred_at)}</TableCell>
-                    <TableCell><Badge variant={badge.variant}>{badge.label}</Badge></TableCell>
+                    <TableCell><Badge variant={badge?.variant ?? 'default'}>{badge ? t(badge.labelKey) : event.action}</Badge></TableCell>
                     <TableCell>
                       <div>
                         <p className="text-sm font-medium">{event.actor_email ?? '—'}</p>
-                        <p className="text-xs text-gray-400">{event.actor_type}</p>
+                        <p className="text-xs text-gray-500">{t(actorLabelKey[event.actor_type])}</p>
                       </div>
                     </TableCell>
                     <TableCell>

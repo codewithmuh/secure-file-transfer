@@ -13,6 +13,7 @@ version in `web/.nvmrc`), then:
 make setup      # dependencies + git hooks
 make check      # lint, type-check and test everything (what CI runs)
 make web-check  # only the web app: clean install, types, lint, tests, build
+make web-a11y   # the web app's axe checks in English and Japanese, in the pinned Playwright image (Docker)
 make contract   # the API contract checks (what CI's contract workflow runs)
 make up         # run all services locally
 ```
@@ -40,8 +41,8 @@ make up         # run all services locally
 6. **Merge.** The maintainer squash-merges; the branch is deleted automatically.
 
 The `protect-main` ruleset lives in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It
-requires these checks, each a job that reports on every pull request: Repo checks, Python, Web app, Local stack, Mail
-adapter, both Contract checks, Terraform and `promotion-gate`. The image build runs only when the code it packages
+requires these checks, each a job that reports on every pull request: Repo checks, Python, Web app, Web app
+accessibility, Local stack, Mail adapter, both Contract checks, Terraform and `promotion-gate`. The image build runs only when the code it packages
 changes, so it isn't required. When you rename or add a job, update that file in the same pull request:
 `.github/scripts/check-ruleset.sh`, run in Repo checks, fails if a required check isn't a job that reports on every
 pull request. After the change merges, the maintainer runs `.github/scripts/apply-github-settings.sh` to apply it,
