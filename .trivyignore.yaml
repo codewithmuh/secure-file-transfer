@@ -38,13 +38,3 @@ misconfigurations:
       encryption 3.1), which the data layer creates after the network, so a fresh build applies the network a second
       time with it (infra/README.md, "Apply order"). Trivy sees the default, null. Flow logs are part of T-53's
       detection, with the proxy's byte logs and GuardDuty.
-
-# Secret-scanner exceptions. Same rule: one rule, the exact files, and a reason.
-secrets:
-  - id: gcp-service-account
-    paths:
-      - "**/sft/dlp/detect/credentials.py"
-    statement: >-
-      The DLP detector for Google Cloud service account key files (dlp-detectors.md). Its docstring describes the
-      format it looks for, a JSON type field of service_account next to a private key ID, and that description
-      matches Trivy's rule. The file holds no key; the detector's test keys are built in code at run time (#98).

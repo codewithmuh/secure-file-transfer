@@ -15,9 +15,9 @@ narrowed:
 - This service's API keys: `sft_<env>_<secret>_<check>`, with the CRC-32 checksum of authentication
   and authorization 5.1 (high).
 - Azure storage connection strings with an account key that decodes to 64 bytes (high).
-- Google Cloud service account key files: `"type": "service_account"` and a `"private_key_id"`
-  within the same few units (high). The private key inside is `private_key`'s, and the client email
-  `email_address`'s.
+- Google Cloud service account key files: a `type` field set to `service_account` and a
+  `private_key_id` field within the same few units (high). The private key inside is
+  `private_key`'s, and the client email `email_address`'s.
 
 A finding's preview is the credential's kind, never any of its characters (section 7).
 """
