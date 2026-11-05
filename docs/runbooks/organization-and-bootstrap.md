@@ -63,14 +63,16 @@ region = ap-northeast-1
 
 Each deploy role trusts one GitHub environment of this repository, and only the environment's deployment branch rule
 keeps a pull request or another branch from getting that subject (T-71, ADR-0005). GitHub creates an environment with
-no rules the first time a job names it, so the four environments must exist, with the rule, **before** step 11
-creates the first deploy role. `can_admins_bypass: false` keeps the rule for admins too. prod also waits for a
-reviewer, you; with one maintainer you approve your own deployments, so self-review stays allowed (R-08).
+no rules the first time a job names it, so the environments must exist, with the rule, **before** step 11
+creates the first deploy role. `registry` is the fifth: the shared account's image push role trusts it, and the build,
+promotion and mark-deployed workflows name it (ADR-0007, #107). `can_admins_bypass: false` keeps the rule for admins
+too. prod also waits for a reviewer, you; with one maintainer you approve your own deployments, so self-review stays
+allowed (R-08).
 
 ```bash
 repo=codewithmuh/secure-file-transfer
 
-for env in dev staging shared; do
+for env in dev staging shared registry; do
   gh api --method PUT "repos/$repo/environments/$env" --input - <<'EOF'
 {"can_admins_bypass": false,
  "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
@@ -91,8 +93,8 @@ The `PUT` is safe to repeat and fixes an environment a job already created. The 
 there, which is fine. Then check:
 
 ```bash
-gh api "repos/$repo/environments" --jq '[.environments[].name] | sort'   # ["dev","prod","shared","staging"], no others
-for env in dev staging prod shared; do
+gh api "repos/$repo/environments" --jq '[.environments[].name] | sort'   # ["dev","prod","registry","shared","staging"], no others
+for env in dev staging prod shared registry; do
   gh api "repos/$repo/environments/$env" \
     --jq '{name, can_admins_bypass, deployment_branch_policy, rules: [.protection_rules[].type]}'
   gh api "repos/$repo/environments/$env/deployment-branch-policies" --jq '[.branch_policies[] | {name, type}]'
