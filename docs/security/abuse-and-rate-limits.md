@@ -168,6 +168,7 @@ There are four ways to make the service email someone, and each one is capped:
 | Verification proof | `verification_codes.id` | Its attempts are counted in PostgreSQL |
 | Link session | `link_sessions.id` | Never the cookie value |
 | API key | `api_keys.id` | |
+| Operator | The operator's IAM Identity Center user name, the role session name STS returned (authn-authz 8.2), base32-encoded | Not the operator session: a token lasts 15 minutes, and a new one must not start a fresh count (#111) |
 | Grant | `download_grants.id` (section 5.4) | |
 
 ### 2.2 Limits by endpoint group
@@ -275,7 +276,7 @@ Section 7 explains each cap.
 | Account | 300 requests a minute | App | `429` |
 | API key | 300 requests a minute | App | `429` |
 | Tenant | 1,000 requests a minute (NFR-14), members and API keys together, groups D, F, G, H, I and K included | App | `429` |
-| IP | 100 failed authentications (any `401` except `reauthentication_required`, which a valid session gets on a step-up) in 5 minutes | App | `429` for 15 minutes on every operation, checked before authentication, so a blocked IP never gets a `401` back |
+| IP | 100 failed authentications in 5 minutes. A failed authentication is a credential presented that matches no live one: `401 credentials_invalid`, for an unknown session cookie or bearer token, or two credentials at once. Other `401`s guess nothing and don't count, so an office behind one NAT can't block itself: `authentication_required` (no credential sent, as on every signed-out page load), `session_expired` (a real session that ended) and `reauthentication_required` (a valid session on a step-up) | App | `429` for 15 minutes on every operation, checked before authentication, so a blocked IP never gets a `401` back |
 | IP | 6,000 requests in 5 minutes | WAF `rate-api-ip` | `429`, `Retry-After: 300` |
 
 Safety actions never count against the tenant budget and are never refused by it: `revokeTransfer`,
@@ -296,6 +297,11 @@ runaway automation can't stop an admin from revoking a leaked transfer. The per-
 |---|---|---|---|
 | Tenant | 20 new API keys a day; at most 25 active keys (#23 5.2) | App; PostgreSQL | `429`; `422 validation_failed` |
 | Operator | 30 new tenants an hour | App | `429` |
+
+The operator API applies only this limit, and counts only a tenant that is made, in the transaction that makes it,
+as `inviteUser` counts its invitations. It has no per-IP limit and no failed
+authentication block (H): every request arrives through `kubectl port-forward`, so all operators share one peer
+address, and only an STS request that AWS accepts gets a token (authn-authz 8.2).
 
 **K. Data loss prevention:** the policy, rule and detector writes (`updateDlpPolicy`, `createDlpRule`,
 `updateDlpRule`, `deleteDlpRule`, `createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector`), `testDlpDetectors`,
@@ -480,11 +486,11 @@ That state fails over with the database and is protected by NFR-10.
 | Atomic | Check and increment in one operation per key, never read, check, then write; a request refused by one limit is never counted against a wider one (4.4) |
 | Latency | p99 ≤ 5 ms per check from an API pod; ≤ 10 ms of NFR-2's budget per request |
 | Throughput | 600 operations a second at the burst (capacity A24), 1,200 at 2× design load (NFR-16), and 10× that during an attack without touching PostgreSQL |
-| Keys | IP, account, tenant, invited-email HMAC, subject, link session, API key, grant (2.1) |
+| Keys | IP, account, tenant, invited-email HMAC, subject, link session, API key, operator, grant (2.1) |
 | Consistency | Exact per key on the primary. Losing a few seconds of counts in a cache failover is acceptable. |
 | Durability and regions | None: nothing in the store is needed after a regional failover (4.1). One store per environment and region, nothing replicated; Osaka at its smallest size until a failover. |
 | Failure mode | Fail closed for sign-in and link verification; fail open to a per-pod limiter for the rest, with an alert (4.5) |
-| Data and security | No plain email address, token or cookie value in a key; every key has a TTL of at most 25 hours. TLS, IAM authentication, isolated subnets; reachable only from the API, the sign-in triggers, the scan worker (scan leases, 6.4) and the notification worker (per-address caps, 7.2) |
+| Data and security | No plain email address, token or cookie value in a key; every key has a TTL of at most 25 hours. TLS, IAM authentication, isolated subnets; reachable only from the API, the operator API (group J's tenant limit), the sign-in triggers, the scan worker (scan leases, 6.4) and the notification worker (per-address caps, 7.2) |
 
 ### 4.3 Options
 
@@ -1017,7 +1023,7 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
   `email_suppressions` with `hmac_key_id`, and the recipient's `delivery_state`.
 - **Capacity, done.** The streaming load balancer line (about $243 a month at design load, capacity 5.6); A29 at 11,
   6 and 5 rules, with challenges only on page loads; SES tenant management and the sign-in triggers.
-- **Left for the maintainer:** operator operations to suspend and resume a tenant, per-tenant limit overrides (and
+- **Left for the maintainer:** an operator operation to resume a tenant (`suspendTenant` arrived with #111), per-tenant limit overrides (and
   their `tenant_limit_overrides` table), source address ranges on an API key, a public "report this email" operation,
   and a cap on expiry extensions. The API README and the data model list them as open. Until they exist, a limit
   changes only through deploy config for every tenant, and the runbooks that raise a tenant's quota or suspend a tenant

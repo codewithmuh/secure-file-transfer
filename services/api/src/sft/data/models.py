@@ -26,10 +26,12 @@ from sqlalchemy import (
     ColumnElement,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
+    SmallInteger,
     Text,
     UniqueConstraint,
     func,
@@ -61,16 +63,22 @@ class Base(DeclarativeBase):
 class Tenant(TenantOwned, Base):
     """A customer company (data model 2.1). Every tenant-owned row refers to one.
 
-    The columns for recovery and SSO arrive with their features (M1, M6), each in its own migration.
+    Created by a platform operator (FR-34) with `recovery_contact`, the second contact an operator
+    confirms an admin recovery through; empty only for rows from before revision 0005. The SSO
+    columns arrive with their feature (M6).
     """
 
     __tablename__ = "tenants"
     __tenant_key__ = "id"
-    __table_args__ = (CheckConstraint("status IN ('active', 'suspended')", name="status"),)
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'suspended')", name="status"),
+        CheckConstraint("char_length(recovery_contact) BETWEEN 1 AND 320", name="recovery_contact"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text)
+    recovery_contact: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -79,6 +87,22 @@ class Tenant(TenantOwned, Base):
         # A link session reads its own tenant's row: the sender's company name, and its status,
         # so a suspended tenant's links stop working. The tenant condition in_scope adds is enough.
         return true()
+
+
+class TenantPolicy(TenantOwned, Base):
+    """A tenant's policy, one row per tenant, made with the tenant (data model 2.1, FR-33).
+
+    Revision 0005 brings `default_locale`; the expiry, domain and scanning columns arrive with the
+    policy features (FR-23, FR-24), each with its default, in their own migrations.
+    """
+
+    __tablename__ = "tenant_policies"
+    __table_args__ = (CheckConstraint("default_locale IN ('en', 'ja')", name="default_locale"),)
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    default_locale: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
 class SchemaCompatibility(Base):
@@ -291,3 +315,177 @@ class User(TenantOwned, Base):
     invitation_expires_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class OperatorSession(Base):
+    """An operator token, made from a signed STS request (data model 2.6, authn and authz 8.2).
+
+    A platform table: no tenant, no row-level security, granted to `sft_operator` alone. Both
+    hashes are SHA-256 and unique: of the token, and of the request's signature, so a signed
+    request works once.
+    """
+
+    __tablename__ = "operator_sessions"
+    __table_args__ = (
+        CheckConstraint("aws_account_id ~ '^[0-9]{12}$'", name="aws_account_id"),
+        CheckConstraint("octet_length(token_hash) = 32", name="token_hash"),
+        CheckConstraint("octet_length(signature_hash) = 32", name="signature_hash"),
+        Index("operator_sessions_expires_at_idx", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, unique=True)
+    signature_hash: Mapped[bytes] = mapped_column(LargeBinary, unique=True)
+    aws_account_id: Mapped[str] = mapped_column(Text)
+    operator_name: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime]
+    revoked_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class IdpConnection(TenantOwned, Base):
+    """A way in: one of the platform's user pools (no tenant), or a tenant's SSO provider (M6).
+
+    Found only through the connection lookup, by `provider_name`, never by `issuer` (data model
+    2.1). Link sessions reach none (the default `reach`).
+    """
+
+    __tablename__ = "idp_connections"
+    __table_args__ = (
+        CheckConstraint("kind IN ('local', 'oidc', 'saml')", name="kind"),
+        CheckConstraint("status IN ('active', 'inactive')", name="status"),
+        CheckConstraint("(kind = 'local') = (tenant_id IS NULL)", name="tenant"),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("provider_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tenants.id"))
+    kind: Mapped[str] = mapped_column(Text)
+    provider_name: Mapped[str] = mapped_column(Text)
+    issuer: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class UserIdentity(TenantOwned, Base):
+    """A subject at a connection, mapped to one user (data model 2.1). Found only through the
+    identity lookup, by `(idp_connection_id, subject)`; an email claim never finds one."""
+
+    __tablename__ = "user_identities"
+    __table_args__ = (
+        CheckConstraint("char_length(subject) BETWEEN 1 AND 255", name="subject"),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("idp_connection_id", "subject"),
+        ForeignKeyConstraint(["tenant_id", "user_id"], ["users.tenant_id", "users.id"]),
+        Index("user_identities_tenant_id_user_id_idx", "tenant_id", "user_id"),
+        Index(
+            "user_identities_expires_at_idx",
+            "expires_at",
+            postgresql_where=text("expires_at IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    user_id: Mapped[uuid.UUID]
+    # By ID alone: a pool's connection has no tenant (data model 2).
+    idp_connection_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("idp_connections.id"))
+    subject: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class SessionRevokedReason(StrEnum):
+    """Why a member session ended early (data model 2.4). One list: the migration's CHECK."""
+
+    SIGNED_OUT = "signed_out"
+    SIGN_IN_REPLACED = "sign_in_replaced"
+    """The browser signed in again, so the session cookie it sent before is revoked (3.3)."""
+    SESSION_LIMIT = "session_limit"
+    """An 11th session ended the oldest."""
+    ROLE_CHANGED = "role_changed"
+    DEACTIVATED = "deactivated"
+    SIGNED_OUT_BY_ADMIN = "signed_out_by_admin"
+    SIGN_IN_RESET = "sign_in_reset"
+    TENANT_SUSPENDED = "tenant_suspended"
+
+
+class MemberSession(TenantOwned, Base):
+    """A member's web session (authn and authz 3.2): only the token's SHA-256 is stored.
+
+    `sft.data.member_sessions` reads and writes it. Creating and revoking one commits only with
+    its audit event; `last_seen_at` moves without one. Link sessions reach none.
+    """
+
+    __tablename__ = "member_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "auth_method IN ('passkey', 'password_totp', 'local', 'sso')", name="auth_method"
+        ),
+        CheckConstraint("octet_length(session_hash) = 32", name="session_hash"),
+        CheckConstraint("(revoked_at IS NULL) = (revoked_reason IS NULL)", name="revoked"),
+        CheckConstraint(
+            f"revoked_reason IN {sql_values(SessionRevokedReason)}", name="revoked_reason"
+        ),
+        CheckConstraint(
+            "expires_at > created_at AND expires_at <= created_at + interval '12 hours'",
+            name="expires_at",
+        ),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("session_hash"),
+        ForeignKeyConstraint(["tenant_id", "user_id"], ["users.tenant_id", "users.id"]),
+        Index(
+            "member_sessions_tenant_id_user_id_created_at_idx", "tenant_id", "user_id", "created_at"
+        ),
+        Index("member_sessions_expires_at_idx", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    user_id: Mapped[uuid.UUID]
+    identity_id: Mapped[uuid.UUID]
+    session_hash: Mapped[bytes] = mapped_column(LargeBinary)
+    auth_time: Mapped[datetime]
+    auth_method: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    revoked_at: Mapped[datetime | None]
+    revoked_reason: Mapped[str | None] = mapped_column(Text)
+    created_ip: Mapped[IPv4Address | IPv6Address | None] = mapped_column(INET)
+    user_agent: Mapped[str | None] = mapped_column(Text)
+
+
+class IdempotencyKey(TenantOwned, Base):
+    """What a creating `POST` did, for a retry with the same key (architecture 5.4, data model 2.5).
+
+    `sft.data.idempotency` reads and writes it, in the tenant's scope; the daily job deletes
+    expired rows. It keeps the status and the ID of what was created, never a response body. Link
+    sessions reach none yet (the default `reach`); their operations add it when they land.
+    """
+
+    __tablename__ = "idempotency_keys"
+    __table_args__ = (
+        PrimaryKeyConstraint("caller_type", "caller_id", "key"),
+        CheckConstraint(
+            "caller_type IN ('member', 'api_key', 'recipient', 'uploader')", name="caller_type"
+        ),
+        CheckConstraint("key ~ '^[\\x21-\\x7e]{1,255}$'", name="key"),
+        CheckConstraint("octet_length(request_fingerprint) = 32", name="request_fingerprint"),
+        CheckConstraint("response_status BETWEEN 200 AND 299", name="response_status"),
+        CheckConstraint("expires_at > created_at", name="expires_at"),
+        Index("idempotency_keys_expires_at_idx", "expires_at"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    caller_type: Mapped[str] = mapped_column(Text)
+    caller_id: Mapped[uuid.UUID]
+    key: Mapped[str] = mapped_column(Text)
+    request_fingerprint: Mapped[bytes] = mapped_column(LargeBinary)
+    response_status: Mapped[int] = mapped_column(SmallInteger)
+    resource_type: Mapped[str] = mapped_column(Text)
+    resource_id: Mapped[uuid.UUID]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]

@@ -279,7 +279,7 @@ async def test_deactivation_is_security_critical_and_safe_to_retry(
 async def test_without_a_session_every_member_route_answers_401(
     migrated_db: ScratchDatabase,
 ) -> None:
-    # The placeholder caller of this branch: no credential is accepted until #113 lands.
+    # The real caller dependency (#113): no session cookie, no caller.
     app = create_app()
     limiter = RecordingLimiter()
     app.dependency_overrides[get_rate_limiter] = lambda: limiter
@@ -359,7 +359,7 @@ async def test_every_member_route_counts_against_the_callers_limits(
         tenant_api,
         tenant_api,
         tenant_api,
-        ("G.caller_emails", "G.tenant_invites"),  # once the address is known
+        ("G.caller_emails", "G.address_invites", "G.tenant_invites"),  # once the address is known
         ("H.caller_requests",),  # a safety action never uses the tenant's budget
     ]
     keys = {KeyType.ACCOUNT: str(tenant.admin), KeyType.TENANT: str(tenant.id)}

@@ -1,16 +1,18 @@
 """The public API app: the routes of the API contract, docs/api/openapi.yaml.
 
-The member routes (#112) are the first; each feature registers its own. Probes and metrics live
-on the internal port (internal.py). The interactive docs and the OpenAPI document aren't served
-either: ADR-0002 keeps them off the public load balancer, and CI builds the document from
+Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py) and
+the member routes (#112, members.py). Probes and metrics live on the internal port
+(sft.runtime.internal). The interactive docs and the OpenAPI document aren't served either:
+ADR-0002 keeps them off the public load balancer, and CI builds the document from
 `create_app().openapi()`.
 
-With settings, the app's lifespan opens the database pool and the rate-limit counter store at
-startup, without connecting, and closes them at shutdown, after uvicorn has drained the requests. A
-route reaches them through the `get_database` (dependencies.py) and `get_rate_limiter`
-dependencies, or names its limits with `rate_limit` (rate_limits.py). Without settings there is
-neither: that app is for generating the OpenAPI document and for tests of routes that don't need
-them.
+With settings, the app's lifespan opens the database pool, the rate-limit counter store and the
+sign-in service (its OIDC client and state store) at startup, without connecting, and closes them
+at shutdown, after uvicorn has drained the requests; it also loads the `email-hmac` keyring. A
+route reaches them through the `get_database` and `get_email_keyring` (dependencies.py),
+`get_rate_limiter` and `sign_in_service` (caller.py) dependencies, or names its limits with
+`rate_limit` (rate_limits.py). Without settings there is none of them: that app is for generating
+the OpenAPI document and for tests of routes that don't need them.
 
 FastAPI's own OpenTelemetry support is off: `RequestContextMiddleware` makes the one SERVER span of
 each request, outside FastAPI's error handling, from the attribute allowlist (sft.core.telemetry).
@@ -28,10 +30,11 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import members
+from sft.api import auth, members
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
+from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
@@ -65,9 +68,14 @@ def _lifespan(
         metrics = CounterMetrics.create(registry)
         store = CounterStore.connect(settings.valkey_url.get_secret_value(), metrics)
         app.state.rate_limiter = RateLimiter(store, metrics)
+        app.state.sign_in = auth.open_sign_in(settings, database)
+        app.state.email_keyring = EmailKeyring.from_json(
+            settings.email_hmac_keyring.get_secret_value()
+        )
         try:
             yield
         finally:
+            await app.state.sign_in.aclose()
             await store.close()
             await database.dispose()
 
@@ -90,5 +98,6 @@ def create_app(
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
+    auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)
     members.register(app)  # members, roles and invitations (#112)
     return app

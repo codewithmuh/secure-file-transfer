@@ -21,10 +21,14 @@ make up         # run all services locally
 
 1. **Issue first.** Every change starts as a GitHub issue with the problem, the scope and acceptance criteria. Anything
    bigger than a small fix gets a written plan (scope, design, risks) before code.
-2. **One branch per issue**, from an up-to-date `main`: `<type>/<issue#>-<short-slug>`, e.g. `feat/12-upload-api` or
-   `docs/2-prd`.
-3. **Pull request.** Keep it small and focused. The body closes the issue (`Closes #12`) and says what changed, how it
-   was tested and the risks; the PR template has the sections.
+2. **One branch per issue, or per batch.** Branch from an up-to-date `main`: `<type>/<issue#>-<short-slug>`, e.g.
+   `feat/12-upload-api` or `docs/2-prd`. Three to five related issues from the same area (app, DLP, web or infra) may
+   share one branch and one pull request, named after the first issue. Only one batch is open at a time, and nothing
+   is stacked on unmerged work.
+3. **Pull request.** Keep it focused. The body closes each issue (`Closes #12`, one line per issue) and says what
+   changed, how it was tested and the risks; the PR template has the sections. A batch PR also lists one Conventional
+   Commit line per issue between `BEGIN_COMMIT_OVERRIDE` and `END_COMMIT_OVERRIDE`, so release-please writes a
+   changelog entry for each issue instead of one for the squash commit.
 4. **The PR title is the commit.** Write it as a [Conventional Commit](https://www.conventionalcommits.org/):
    `feat: add share-link expiry`, `fix: reject expired upload links`, `docs: …`. `main` takes squash merges only, the
    squash commit is the PR title with an empty body, and release-please reads it for the version bump and changelog

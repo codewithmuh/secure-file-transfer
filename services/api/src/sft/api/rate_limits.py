@@ -14,12 +14,14 @@ limiter there: `await limiter.check(REQUEST_CODE, keys)` with `limiter = Depends
 Refusals are `sft.core.errors` exceptions, which `sft.api.errors` answers: `429` with
 `Retry-After`, or `503` with `Retry-After: 5` for a fail-closed limit during a store outage.
 
-`CountFailedAuthentications` records every `401` the API answers against the client's IP (group
-H: 100 in 5 minutes block the IP for 15), except `reauthentication_required`: a step-up answers a
-valid session whose sign-in is old, so it guesses nothing, and admins behind one NAT with older
-sessions mustn't block their office. It checks that block before the app runs, so a blocked IP
-gets `429` on every route, before authentication: a bad credential can't get its `401` back and
-keep guessing.
+`CountFailedAuthentications` records every failed authentication against the client's IP (group
+H: 100 in 5 minutes block the IP for 15): a `401 credentials_invalid`, which the API answers only
+when a credential was presented and no live one has it (an unknown session cookie, a bearer token
+it doesn't know). Other `401`s guess nothing, so an office behind one NAT can't block itself with
+them: `authentication_required` (no credential sent, as on every signed-out page load),
+`session_expired` (a real session that ended) and `reauthentication_required` (a step-up). It
+checks the block before the app runs, so a blocked IP gets `429` on every route, before
+authentication: a bad credential can't get its `401` back and keep guessing.
 """
 
 from __future__ import annotations
@@ -98,8 +100,10 @@ def rate_limit(limits: Sequence[Limit], *, caller: Callable[..., Any] | None = N
     return Depends(by_caller)
 
 
-NOT_FAILED_AUTHENTICATIONS = frozenset({"reauthentication_required"})
-"""The `401` codes that don't count against `H_FAILED_AUTH`: the credential was valid."""
+FAILED_AUTHENTICATIONS = frozenset({"credentials_invalid"})
+"""The `401` codes that count against `H_FAILED_AUTH`: a credential was presented, and no live one
+matches it. Every other `401` sent none, or a real one that has ended or is too old for a
+step-up."""
 
 
 class CountFailedAuthentications:
@@ -131,7 +135,7 @@ class CountFailedAuthentications:
             await send(message)
 
         await self.app(scope, receive, watch)
-        if status == 401 and state.get("problem_code") not in NOT_FAILED_AUTHENTICATIONS:
+        if status == 401 and state.get("problem_code") in FAILED_AUTHENTICATIONS:
             await limiter.record(H_FAILED_AUTH, ip)
 
 

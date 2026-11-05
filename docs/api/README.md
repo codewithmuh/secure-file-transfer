@@ -198,7 +198,10 @@ hours with a fingerprint of the **method, the path with its resource IDs filled 
 the response status and the ID of what was created, never the response body. A retry with the same key, method, path and
 body gets the same status, with the response rebuilt from the resource as it is now. The same key with any of them
 different gets `409 idempotency_conflict`, so a key reused with the same body on another transfer is refused, not
-answered with the first transfer.
+answered with the first transfer. A JSON body is compared as JSON: the same members in another order, or other white
+space, are the same body. A retry while the first request is still running gets `409 idempotency_in_progress`
+straight away; retry it once that request has answered. A request that fails keeps no key, so its retry runs afresh.
+A key belongs to its caller: a member (whichever of their sessions sends it), an API key or a link session.
 
 These take no `Idempotency-Key`:
 

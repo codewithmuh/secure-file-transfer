@@ -1,10 +1,12 @@
 import base64
 import hashlib
 import hmac
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from sft.core.keyrings import KeyringError
 from sft.core.pseudonyms import (
     LIMIT_OVERLAP,
     EmailKey,
@@ -61,3 +63,37 @@ def test_a_keyring_needs_one_active_key_with_its_time() -> None:
     with pytest.raises(ValueError, match="exactly one active"):
         EmailKeyring([EmailKey("a", KEY, "verify")])
     assert "kkkk" not in repr(EmailKey("a", KEY, "active"))
+
+
+def test_the_keyring_is_read_from_its_secret() -> None:
+    # The secret's shape (encryption and keys 6.5): the old key verifies for the 25-hour overlap.
+    encoded = base64.b64encode(KEY).decode()
+    newer = base64.b64encode(b"n" * 32).decode()
+    raw = json.dumps(
+        [
+            {"id": "2025", "state": "verify", "key": encoded},
+            {"id": "2026", "state": "active", "key": newer, "activated_at": ACTIVATED.isoformat()},
+            {"id": "2027", "state": "staged", "key": base64.b64encode(b"s" * 32).decode()},
+        ]
+    )
+    keyring = EmailKeyring.from_json(raw)
+    during = keyring.for_limits("a@example.com", ACTIVATED + timedelta(hours=1))
+    assert during.active == email_pseudonym("2026", b"n" * 32, "a@example.com")
+    assert during.overlap == (email_pseudonym("2025", KEY, "a@example.com"),)
+    assert keyring.for_limits("a@example.com", ACTIVATED + LIMIT_OVERLAP).overlap == ()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"id": "a", "state": "active"},  # no activated_at
+        {"id": "a_b", "state": "active", "activated_at": "2026-11-01T00:00:00+00:00"},
+        {"id": "a", "state": "verify", "activated_at": "2026-11-01T00:00:00+00:00"},  # none active
+        {"id": "a", "state": "active", "activated_at": "yesterday"},
+    ],
+)
+def test_a_bad_keyring_is_refused_without_its_key(entry: dict[str, str]) -> None:
+    encoded = base64.b64encode(KEY).decode()
+    with pytest.raises(KeyringError) as caught:
+        EmailKeyring.from_json(json.dumps([{**entry, "key": encoded}]))
+    assert encoded not in str(caught.value)

@@ -116,6 +116,13 @@ EXPECTED: dict[str, dict[str, int]] = {
     "deactivateUser": admin_row(200, step_up=True, item=True),
 }
 
+# The session's own operations read the session cookie itself, not a caller the matrix can put in
+# its place, and two are public. tests/test_signin.py runs them with real sessions: no credential,
+# a bearer, both, a revoked or expired session, a missing CSRF token, and the sign-in refusals.
+COVERED_BY_SIGN_IN_TESTS = frozenset(
+    {"startSignIn", "completeSignIn", "signOut", "getCurrentMember"}
+)
+
 # The problem code each refusal carries.
 CODES = {401: {"authentication_required", "reauthentication_required"}, 404: {"not_found"}}
 
@@ -136,7 +143,7 @@ def test_the_matrix_covers_every_operation_the_app_serves_and_every_caller() -> 
         context.original_route.operation_id  # type: ignore[attr-defined]
         for context in iter_route_contexts(create_app().routes)
     }
-    assert served == set(EXPECTED)
+    assert served == set(EXPECTED) | COVERED_BY_SIGN_IN_TESTS
     for operation, row in EXPECTED.items():
         assert set(row) == set(CALLERS), operation
 

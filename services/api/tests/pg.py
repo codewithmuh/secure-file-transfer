@@ -126,6 +126,11 @@ def tenant_tables(db: ScratchDatabase) -> set[str]:
     return {str(name) for (name,) in db.sql(TENANT_TABLES)}
 
 
+# Foreign keys the data model lets leave `tenant_id` out (data model 2), by constraint name:
+# `user_identities` -> `idp_connections`, whose pool rows have no tenant (revision 0006).
+EXEMPT_FOREIGN_KEYS: frozenset[str] = frozenset({"user_identities_idp_connection_id_fkey"})
+
+
 def foreign_keys_without_tenant(db: ScratchDatabase, exempt: Collection[str] = ()) -> list[str]:
     """Foreign keys that could point a tenant's row at another tenant's (data model 4.2).
 

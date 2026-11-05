@@ -11,7 +11,12 @@ the isolation suite's, which adds the stand-in tables, their composite keys and 
 import pytest
 
 from isolation import Mode, World
-from pg import ScratchDatabase, definer_function_problems, foreign_keys_without_tenant
+from pg import (
+    EXEMPT_FOREIGN_KEYS,
+    ScratchDatabase,
+    definer_function_problems,
+    foreign_keys_without_tenant,
+)
 from sft.data.roles import (
     ALL_ROLES,
     LOGIN_ROLES,
@@ -50,10 +55,6 @@ GRANTS = """
      WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
        AND NOT att.attisdropped AND a.grantee <> c.relowner
 """
-
-# Foreign keys the data model lets leave `tenant_id` out (data model 2), by constraint name: for
-# example `user_identities` → `idp_connections`, whose pool rows have no tenant. None yet.
-EXEMPT_FOREIGN_KEYS: frozenset[str] = frozenset()
 
 
 @pytest.fixture(params=["migrated", "isolation"])

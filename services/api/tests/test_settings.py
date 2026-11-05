@@ -1,3 +1,4 @@
+import base64
 from collections.abc import Callable
 from typing import get_args
 
@@ -5,8 +6,15 @@ import pytest
 from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 
+from api_settings import API_ENV
 from sft.core import settings as settings_module
-from sft.core.settings import BootstrapSettings, MigrationSettings, Settings, load_settings
+from sft.core.settings import (
+    BootstrapSettings,
+    MigrationSettings,
+    OperatorSettings,
+    Settings,
+    load_settings,
+)
 
 ENV_NAMES = (
     "APP_VERSION",
@@ -20,6 +28,10 @@ ENV_NAMES = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "VALKEY_URL",
     "TRUSTED_PROXIES",
+    *(name for name in API_ENV if name != "VALKEY_URL"),
+    "OIDC_DISCOVERY_URL",
+    "OIDC_REVOCATION_URL",
+    "ADMIN_PASSKEY_RULE",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -33,6 +45,8 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     for name in (*ENV_NAMES, *OTHER_ENV_NAMES):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    for name, value in API_ENV.items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv("VALKEY_URL", VALKEY_URL)
     return monkeypatch
 
@@ -54,6 +68,8 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.otel_exporter_otlp_endpoint is None
     assert s.valkey_url.get_secret_value() == VALKEY_URL
     assert s.trusted_proxies == ()
+    assert (s.oidc_discovery_url, s.oidc_revocation_url) == (None, None)
+    assert s.admin_passkey_rule is False
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -106,6 +122,11 @@ def test_an_empty_otlp_endpoint_means_none(clean_env: pytest.MonkeyPatch) -> Non
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-agent:4318"),  # no scheme
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "grpc://otel-agent:4317"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent:4318?x=1"),
+        ("WEB_ORIGIN", "app.sft.test"),  # no scheme
+        ("WEB_ORIGIN", "https://app.sft.test/"),  # a path: an origin has none
+        ("OIDC_ISSUER", "ftp://idp.sft.test"),
+        ("OIDC_CLIENT_ID", "has spaces"),
+        ("OIDC_REDIRECT_URI", "https://api.sft.test/v1/auth/callback#x"),
     ],
 )
 def test_rejects_bad_values(clean_env: pytest.MonkeyPatch, name: str, value: str) -> None:
@@ -124,6 +145,46 @@ def test_the_valkey_url_is_required(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.delenv("VALKEY_URL")
     with pytest.raises(ValidationError, match="valkey_url"):
         Settings()
+
+
+@pytest.mark.parametrize("name", [n for n in API_ENV if n != "VALKEY_URL"])
+def test_every_sign_in_setting_is_required(clean_env: pytest.MonkeyPatch, name: str) -> None:
+    clean_env.delenv(name)
+    with pytest.raises(ValidationError, match=name.lower()):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("CSRF_KEYRING", "not json"),
+        ("CSRF_KEYRING", '[{"id": "a", "state": "verify", "key": "%s"}]'),  # no active key
+        ("EMAIL_HMAC_KEYRING", '[{"id": "a", "state": "active", "key": "%s"}]'),  # no activated_at
+        (
+            "EMAIL_HMAC_KEYRING",
+            '[{"id": "a_b", "state": "active", "key": "%s", '
+            '"activated_at": "2026-01-01T00:00:00Z"}]',
+        ),  # "_" isn't in a pseudonym's key ID
+        (
+            "EMAIL_HMAC_KEYRING",
+            '[{"id": "a", "state": "active", "key": "%s", "activated_at": "2026-01-01T00:00:00"}]',
+        ),  # no time zone
+    ],
+)
+def test_a_bad_keyring_stops_the_api_and_is_never_echoed(
+    clean_env: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    key = base64.b64encode(b"k" * 32).decode()
+    clean_env.setenv(name, value.replace("%s", key))
+    with pytest.raises(ValidationError) as error:
+        Settings()
+    assert [e["loc"] for e in error.value.errors()] == [(name.lower(),)]
+    assert key not in str(error.value.errors(include_input=False))
+
+
+def test_the_operator_api_reads_none_of_the_sign_in_settings() -> None:
+    # It serves no member sign-in (#111), so a missing OIDC setting can't stop it.
+    assert not set(OperatorSettings.model_fields) & {n.lower() for n in API_ENV} - {"valkey_url"}
 
 
 def test_a_bad_valkey_url_is_never_echoed(clean_env: pytest.MonkeyPatch) -> None:
@@ -193,7 +254,9 @@ def secret_fields_with_defaults(model: type[BaseModel]) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("model", [Settings, MigrationSettings, BootstrapSettings])
+@pytest.mark.parametrize(
+    "model", [Settings, OperatorSettings, MigrationSettings, BootstrapSettings]
+)
 def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
     assert secret_fields_with_defaults(model) == []
 
@@ -201,13 +264,24 @@ def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
 @pytest.mark.parametrize(
     ("model", "secrets"),
     [
-        (Settings, ["database_url", "valkey_url"]),
+        (
+            Settings,
+            [
+                "database_url",
+                "valkey_url",
+                "oidc_client_secret",
+                "csrf_keyring",
+                "email_hmac_keyring",
+            ],
+        ),
+        (OperatorSettings, ["database_url", "valkey_url"]),
         (MigrationSettings, ["migration_database_url"]),
         (BootstrapSettings, ["bootstrap_database_url"]),
     ],
 )
-def test_database_urls_are_secrets(model: type[BaseSettings], secrets: list[str]) -> None:
-    # Locally a URL may hold a password, so it is never logged or shown in a repr.
+def test_secret_settings_are_secret_strings(model: type[BaseSettings], secrets: list[str]) -> None:
+    # Locally a URL may hold a password, and the client secret and the keyrings are secrets:
+    # never logged or shown in a repr.
     assert [
         name
         for name, field in model.model_fields.items()

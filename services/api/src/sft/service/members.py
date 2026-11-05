@@ -16,9 +16,10 @@ The rules of the contract's member operations live here:
 - `sso_fallback` needs a tenant that uses SSO, which arrives in M6, so naming a fallback admin is
   `422 validation_failed` for now. `dlp_approver` names only an active user.
 
-Not here yet, each with its issue: a role change and a deactivation also end the user's sessions
-(#113's member sessions), and a demotion or a deactivation revokes the user's API keys (M5); both
-go in the same transaction as the change. The admins' emails about role and approver changes come
+A role change and a deactivation end every session of the user in the same transaction (authn and
+authz 3.3), so the next request of a session signs in again with the new role, or not at all. Not
+here yet: a demotion or a deactivation also revokes the user's API keys (M5), in that transaction
+too. The admins' emails about role and approver changes come
 with the notification worker. Security-critical records reach the archive with the audit archive
 job.
 """
@@ -44,22 +45,26 @@ from sft.core.errors import (
     Unprocessable,
     json_pointer,
 )
-from sft.data import users
+from sft.core.pseudonyms import EmailKeyring
+from sft.data import member_sessions, users
 from sft.data.audit import Origin
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
 from sft.data.scope import Scope
 from sft.service.caller import Caller
+from sft.service.idempotency import IdempotentRequest, Outcome, once
 from sft.service.permissions import authorize
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import INVITE_USER, KeyType
 
 MAX_PAGE: Final = users.MAX_PAGE
 
-INVITE_LIMITS: Final = tuple(lim for lim in INVITE_USER if KeyType.TENANT_EMAIL not in lim.keys)
-"""`INVITE_USER` without the per-address cap, which needs the `email-hmac` keyring the API doesn't
-load yet. Until a re-invitation exists, an address gets one invitation per tenant anyway
-(`409 user_exists`)."""
+INVITE_LIMITS: Final = INVITE_USER
+"""Group G's invitation limits: the caller's emails, the address's 3 a day within the tenant, and
+the tenant's invitations (abuse and rate limits 2.2). The address counts under its pseudonym from
+the `email-hmac` keyring, so the counter store never holds the address (`sft.core.pseudonyms`).
+Until a re-invitation exists, an address gets one invitation per tenant anyway (`409
+user_exists`), so the cap starts to bite once one does."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,24 +111,49 @@ async def invite_user(
     email: str,
     role: Role,
     limiter: RateLimiter,
+    emails: EmailKeyring,
     origin: Origin,
     now: datetime,
-) -> User:
+    idempotency: IdempotentRequest | None = None,
+) -> Outcome[User]:
     """`inviteUser`: a new `invited` user, its audit event and its invitation email.
 
     The invitation limits (abuse and rate limits 2.2, G) count only an invitation that is made:
     after `authorize`, so a member can't use up their tenant's invitations, and after the insert,
     so a `409 user_exists` uses none. A refusal raises inside the transaction, which then writes
     nothing. Only a commit that fails after the count (a database outage) costs one.
+
+    With an `Idempotency-Key`, a retry of the same request gets the first answer, with the user
+    as they are now, and invites no one, audits nothing and charges no invitation limit again
+    (`sft.service.idempotency`).
     """
     authorize(caller, "inviteUser", now=now)
+    scope = _tenant_scope(caller)
+    address = emails.for_limits(users.normalize_email(email), now).within(str(scope.tenant_id))
+    limit_keys = {**caller.rate_limit_keys(), KeyType.TENANT_EMAIL: address}
     try:
-        async with database.transaction(_tenant_scope(caller)) as session:
-            user = await users.create_invitation(
-                session, email=email, role=role, actor=caller.actor(), origin=origin
+        async with database.transaction(scope) as session:
+
+            async def invite() -> User:
+                user = await users.create_invitation(
+                    session, email=email, role=role, actor=caller.actor(), origin=origin
+                )
+                await limiter.check(INVITE_LIMITS, limit_keys)
+                return user
+
+            async def rebuild(user_id: UUID) -> User | None:
+                return await users.get_user(session, user_id)
+
+            return await once(
+                session,
+                caller,
+                idempotency,
+                status=201,
+                resource_type=users.TARGET,
+                create=invite,
+                rebuild=rebuild,
+                resource_id=lambda user: user.id,
             )
-            await limiter.check(INVITE_LIMITS, caller.rate_limit_keys())
-            return user
     except users.UserExistsError as exc:
         raise Conflict("user_exists", "The address is already a user of this tenant.") from exc
 
@@ -251,8 +281,10 @@ async def update_user(
             if demotes_an_admin(user) and list(admins) == [user.id]:
                 raise _last_admin()
             user = await users.change_role(session, user.id, new_role, actor=actor, origin=origin)
-            # Here every session of the user ends, once member sessions exist (#113), and a
-            # demotion revokes the keys they own (M5), in this transaction.
+            await member_sessions.revoke_user_sessions(
+                session, user.id, reason=member_sessions.RevokedReason.ROLE_CHANGED
+            )
+            # Here a demotion also revokes the keys they own (M5), in this transaction.
         if dlp_approver is not None and dlp_approver != user.dlp_approver:
             user = await users.set_dlp_approver(
                 session, user.id, dlp_approver, actor=actor, origin=origin
@@ -277,8 +309,11 @@ async def deactivate_user(
             return user
         if _active_admin(user) and list(admins) == [user.id]:
             raise _last_admin()
-        # Here every session of the user ends (#113) and every key they own is revoked (M5), in
-        # this transaction.
-        return await users.deactivate_user(session, user.id, actor=caller.actor(), origin=origin)
+        # Here every key they own is revoked too (M5), in this transaction.
+        user = await users.deactivate_user(session, user.id, actor=caller.actor(), origin=origin)
+        await member_sessions.revoke_user_sessions(
+            session, user.id, reason=member_sessions.RevokedReason.DEACTIVATED
+        )
+        return user
 
     return await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)

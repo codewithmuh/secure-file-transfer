@@ -32,11 +32,17 @@ dependencies = [
   # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
   "google-re2>=1.1.20251105",
   "phonenumbers>=9.0.42",
+  # Member sign-in (ADR-0016, #113). The OIDC code flow with PKCE is a redirect, one form POST and
+  # one revocation; the security-critical part is the ID token's signature and claims, which joserfc
+  # (BSD-3-Clause, the Authlib author's JOSE library) checks against the pool's published keys. The
+  # cap holds 1.8.0 (2026-11-03) back until it is 7 days old (threat model T-68); lift it then.
+  "joserfc>=1.7.7,<1.8",
+  # The HTTP client for the OIDC discovery, token and revocation calls; the tests use it too.
+  "httpx2>=2.16.0",
 ]
 
 [dependency-groups]
 dev = [
-  "httpx2>=2.16.0",
   "import-linter>=2.15",
   "mypy>=2.4.1",
   "pytest>=9.2.0",

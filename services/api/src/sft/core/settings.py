@@ -5,10 +5,11 @@ the pod spec does. A secret is a `SecretStr` field with no default, so a missing
 process at startup instead of running with a placeholder; a test fails if a secret field gets a
 default. In the cloud, secrets come from AWS Secrets Manager, never from git.
 
-Each entry point reads only the settings it needs: `Settings` for the API, `RelaySettings` for the
-outbox relay (and `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the
-migration job, `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends
-email (the notification worker).
+Each entry point reads only the settings it needs: `Settings` for the API and `OperatorSettings`
+for the operator API (both build on `ServerSettings`), `RelaySettings` for the outbox relay (and
+`WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
+`BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
+notification worker).
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from sft.core.keyrings import CSRF_KEY_ID, EMAIL_KEY_ID, parse_keyring
 from sft.core.logs import configure_logging
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
@@ -91,8 +93,12 @@ class _Traced(_Base):
         return None if value == "" else value
 
 
-class Settings(_Traced):
-    """The API's settings. The field name in capitals is the environment variable."""
+class ServerSettings(_Traced):
+    """What every API app reads: its two listeners, its database role and the counter store.
+
+    The public API (`Settings`) and the operator API (`OperatorSettings`) each add their own. The
+    field name in capitals is the environment variable.
+    """
 
     app_version: str = Field(default="0.0.0", description="Set by the image build.")
     # 127.0.0.1 keeps a laptop run off the network; the image sets BIND_HOST=0.0.0.0.
@@ -147,6 +153,87 @@ class Settings(_Traced):
         return self
 
 
+# An origin (scheme, host and port, no path) and an http(s) URL, for the sign-in settings.
+_ORIGIN = r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?$"
+_HTTP_URL = r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[^\s?#]*)?(\?[^\s#]*)?$"
+
+
+class Settings(ServerSettings):
+    """The public API's settings: the server's, and member sign-in's (ADR-0016; authentication and
+    authorization 2.4 and 3). Locally Keycloak stands in for the Cognito user pool
+    (docs/local-development.md)."""
+
+    web_origin: str = Field(
+        pattern=_ORIGIN,
+        description="The web app's origin, such as https://app.example.com: where sign-in returns, "
+        "and the only Origin an unsafe request may come from (authn-authz 3.4).",
+    )
+    oidc_issuer: str = Field(
+        pattern=_HTTP_URL,
+        description="The user pool's issuer; an ID token's `iss` must equal it.",
+    )
+    oidc_discovery_url: str | None = Field(
+        default=None,
+        pattern=_HTTP_URL,
+        description="Where to read the issuer's OpenID configuration, if not under the issuer: "
+        "locally the stand-in's in-network address, so a container can reach it.",
+    )
+    oidc_client_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    oidc_client_secret: SecretStr = Field(
+        description="The confidential app client's secret (sft/{env}/app/idp-client/<region>).",
+    )
+    oidc_redirect_uri: str = Field(
+        pattern=_HTTP_URL,
+        description="This API's callback, as registered with the app client: .../v1/auth/callback.",
+    )
+    oidc_logout_url: str = Field(
+        pattern=_HTTP_URL,
+        description="The pool's logout URL that signOut returns, so managed login's own cookie "
+        "is cleared too (authn-authz 3.5).",
+    )
+    oidc_revocation_url: str | None = Field(
+        default=None,
+        pattern=_HTTP_URL,
+        description="The token revocation endpoint. Cognito's isn't in its discovery document "
+        "(/oauth2/revoke on the managed login domain); otherwise discovery's is used.",
+    )
+    oidc_provider_name: str = Field(
+        min_length=1,
+        max_length=128,
+        description="This pool's `idp_connections.provider_name`: its pool ID in AWS, "
+        "`local-keycloak` locally. Local sign-ins resolve their connection by it.",
+    )
+    csrf_keyring: SecretStr = Field(
+        description="K_csrf, the keyring CSRF tokens are derived with (sft/{env}/app/csrf-hmac, "
+        "encryption and keys 6.5): a JSON list of keys with `id`, `state` and base64 `key`.",
+    )
+    email_hmac_keyring: SecretStr = Field(
+        description="The keyring of email pseudonyms (sft/{env}/app/email-hmac, encryption and "
+        "keys 6.2): what per-address rate limits count under, so the counters never hold an "
+        "address. Like CSRF_KEYRING, with `activated_at` on the active key.",
+    )
+    admin_passkey_rule: bool = Field(
+        default=False,
+        description="The launch switch of ADR-0016: a local admin acts as an admin only in a "
+        "session signed in with a passkey. Off until both pools issue `amr`.",
+    )
+
+    @field_validator("csrf_keyring")
+    @classmethod
+    def _csrf_keyring(cls, value: SecretStr) -> SecretStr:
+        # Read here, so a bad keyring stops the process at startup; the message holds no key.
+        parse_keyring(value.get_secret_value(), name="CSRF", key_id=CSRF_KEY_ID)
+        return value
+
+    @field_validator("email_hmac_keyring")
+    @classmethod
+    def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
+        parse_keyring(
+            value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
+        )
+        return value
+
+
 _QUEUE_PREFIX = r"^[a-z0-9]+(-[a-z0-9]+)*-$"
 
 
@@ -198,6 +285,44 @@ class RelaySettings(WorkerSettings):
         le=30,
         description="The wait after a batch that wasn't full, before looking for due rows again.",
     )
+
+
+class OperatorSettings(ServerSettings):
+    """The operator API's settings (FR-34, authentication and authorization 8.2).
+
+    The same listeners as the API and none of member sign-in. Its `DATABASE_URL` names
+    `sft_operator`, and it checks operators' signed STS requests against this environment's
+    account and `Operator` role, which Terraform writes into the pod spec.
+    """
+
+    operator_environment: Literal["dev", "staging", "prod"] = Field(
+        description="This environment; the audience operators sign is `operator-api-<env>`.",
+    )
+    operator_aws_account_id: str = Field(
+        pattern=r"^[0-9]{12}$",
+        description="This environment's AWS account. STS must answer with it.",
+    )
+    operator_role_name: str = Field(
+        pattern=r"^AWSReservedSSO_Operator_[0-9a-f]{16}$",
+        description="The IAM role of this account's `Operator` permission set, exactly.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    operator_sts_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="The STS endpoint the API sends signed requests to; by default the "
+        "regional one, `https://sts.<AWS_REGION>.amazonaws.com`. Never taken from a request.",
+    )
+
+    @property
+    def operator_audience(self) -> str:
+        return f"operator-api-{self.operator_environment}"
+
+    @property
+    def sts_endpoint(self) -> str:
+        return (
+            self.operator_sts_endpoint_url or f"https://sts.{self.aws_region}.amazonaws.com"
+        ).rstrip("/")
 
 
 class MigrationSettings(_Base):

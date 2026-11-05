@@ -17,17 +17,22 @@ from datetime import UTC, datetime, timedelta
 import httpx2 as httpx
 from fastapi import FastAPI
 
+from api_settings import EMAIL_HMAC_KEYRING
 from pg import ScratchDatabase
 from sft.api.app import create_app
 from sft.api.caller import get_caller
 from sft.api.rate_limits import get_rate_limiter
 from sft.core.errors import RateLimited, Unauthenticated
 from sft.core.ids import uuid7
+from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
 from sft.data.models import Role
 from sft.data.roles import API
 from sft.service.caller import AuthMethod, Caller
 from sft.service.rate_limits.limits import KeyType, KeyValue, Limit
+
+EMAIL_KEYRING = EmailKeyring.from_json(EMAIL_HMAC_KEYRING)
+"""The `email-hmac` keyring of the apps these tests build, from api_settings."""
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,7 @@ def app_for(
 ) -> FastAPI:
     app = create_app()
     app.state.database = database
+    app.state.email_keyring = EMAIL_KEYRING
     recording = limiter or RecordingLimiter()
 
     def resolve() -> Caller:

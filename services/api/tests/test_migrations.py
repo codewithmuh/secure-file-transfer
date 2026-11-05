@@ -12,12 +12,13 @@ from pg import ScratchDatabase
 from sft.data.audit_required import require_audit_sql
 from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, compatible_with, include_name
-from sft.data.models import Base, Role, UserStatus, sql_values
+from sft.data.models import Base, Role, SessionRevokedReason, UserStatus, sql_values
 from sft.data.rls import (
     grant_sql,
     lookup_function_sql,
     lookup_read_sql,
     policy_sql,
+    tenant_foreign_key_sql,
     tenant_keys_sql,
     tenant_rls_sql,
 )
@@ -146,3 +147,131 @@ def test_the_job_recorded_what_head_serves(migrated_db: ScratchDatabase) -> None
         "SELECT compatible_with FROM schema_compatibility WHERE revision = :head", head=head
     )
     assert rows == [(list(compatible_with(SCRIPTS.get_revision(head))),)]
+
+
+def test_the_operator_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001: if a helper changes on purpose, replace the calls with the old output. Found by
+    # its contents, so renumbering the revision doesn't touch this test.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "TENANTS_DIRECTORY")
+    ]
+    assert list(module.TENANTS_DIRECTORY) == [
+        policy_sql(
+            "operator_directory",
+            "tenants",
+            roles=["sft_operator"],
+            command="SELECT",
+            using="app_scope() = 'platform'",
+        )
+    ]
+    assert list(module.TENANT_POLICIES_RLS) == [
+        tenant_keys_sql("tenant_policies")[0],
+        *tenant_rls_sql("tenant_policies", grants={"sft_operator": "INSERT"}),
+        require_audit_sql("tenant_policies"),
+    ]
+    assert list(module.OPERATOR_SESSIONS_GRANTS) == [
+        grant_sql("operator_sessions", "sft_operator", "SELECT, INSERT")
+    ]
+
+
+def test_the_sign_in_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001. Found by its contents, so renumbering the revision doesn't touch this test.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "MEMBER_SESSIONS_RLS")
+    ]
+    assert list(module.IDP_CONNECTIONS_KEYS) == tenant_keys_sql("idp_connections")
+    assert list(module.IDP_CONNECTIONS_RLS) == [
+        "ALTER TABLE idp_connections ENABLE ROW LEVEL SECURITY",
+        *lookup_read_sql("idp_connections", ["id", "tenant_id", "kind", "provider_name", "status"]),
+        *lookup_function_sql(
+            "lookup_idp_connection(p_provider_name text)",
+            returns="TABLE (connection_id uuid, owner_tenant_id uuid, kind text, status text)",
+            body=module.LOOKUP_IDP_CONNECTION_BODY,
+        ),
+    ]
+    assert require_audit_sql("idp_connections") == module.IDP_CONNECTIONS_AUDIT_REQUIRED
+    assert list(module.USER_IDENTITIES_KEYS) == [
+        *tenant_keys_sql("user_identities"),
+        tenant_foreign_key_sql("user_identities", "user_id", "users"),
+    ]
+    assert list(module.USER_IDENTITIES_RLS) == [
+        "ALTER TABLE user_identities ENABLE ROW LEVEL SECURITY",
+        *lookup_read_sql(
+            "user_identities",
+            ["id", "tenant_id", "user_id", "idp_connection_id", "subject", "expires_at"],
+        ),
+        *lookup_function_sql(
+            "lookup_user_identity(p_idp_connection_id uuid, p_subject text)",
+            returns="TABLE (identity_id uuid, owner_tenant_id uuid, user_id uuid, "
+            "expires_at timestamptz)",
+            body=module.LOOKUP_USER_IDENTITY_BODY,
+        ),
+    ]
+    assert require_audit_sql("user_identities") == module.USER_IDENTITIES_AUDIT_REQUIRED
+    assert list(module.MEMBER_SESSIONS_KEYS) == [
+        *tenant_keys_sql("member_sessions"),
+        tenant_foreign_key_sql("member_sessions", "user_id", "users"),
+    ]
+    enable, api, _, policy = tenant_rls_sql(
+        "member_sessions",
+        grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_operator": "SELECT, UPDATE"},
+    )
+    assert list(module.MEMBER_SESSIONS_RLS) == [
+        enable,
+        api,
+        grant_sql("member_sessions", "sft_operator", "SELECT", columns=["tenant_id", "revoked_at"]),
+        grant_sql(
+            "member_sessions", "sft_operator", "UPDATE", columns=["revoked_at", "revoked_reason"]
+        ),
+        policy,
+    ]
+    assert list(module.LOOKUP_MEMBER_SESSION) == [
+        *lookup_read_sql(
+            "member_sessions", ["id", "tenant_id", "session_hash", "expires_at", "revoked_at"]
+        ),
+        *lookup_function_sql(
+            "lookup_member_session(p_session_hash bytea)",
+            returns="TABLE (session_id uuid, owner_tenant_id uuid, live boolean)",
+            body=module.LOOKUP_MEMBER_SESSION_BODY,
+        ),
+    ]
+    assert (
+        require_audit_sql(
+            "member_sessions", commands=("INSERT", "UPDATE"), update_of=("revoked_at",)
+        )
+        == module.MEMBER_SESSIONS_AUDIT_REQUIRED
+    )
+
+
+def test_the_session_checks_list_the_reasons_of_the_code() -> None:
+    [script] = [s for s in SCRIPTS.walk_revisions() if hasattr(s.module, "MEMBER_SESSIONS_RLS")]
+    tree = ast.parse(Path(str(script.path)).read_text())
+    texts = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant)]
+    assert f"revoked_reason IN {sql_values(SessionRevokedReason)}" in texts
+
+
+def test_the_idempotency_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001. Found by its contents, so renumbering the revision doesn't touch this test.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "IDEMPOTENCY_KEYS_RLS")
+    ]
+    enable, api, _, policy = tenant_rls_sql(
+        "idempotency_keys",
+        grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_jobs": "SELECT, DELETE"},
+    )
+    job_columns = ["tenant_id", "caller_type", "caller_id", "key", "expires_at"]
+    assert list(module.IDEMPOTENCY_KEYS_RLS) == [
+        tenant_keys_sql("idempotency_keys")[0],
+        enable,
+        api,
+        grant_sql("idempotency_keys", "sft_jobs", "SELECT", columns=job_columns),
+        grant_sql("idempotency_keys", "sft_jobs", "DELETE"),
+        policy,
+        policy_sql(
+            "jobs_find",
+            "idempotency_keys",
+            roles=["sft_jobs"],
+            command="SELECT",
+            using="app_scope() = 'system'",
+        ),
+    ]

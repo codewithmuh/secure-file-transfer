@@ -761,6 +761,9 @@ What is deliberately not a secret here:
 
 Each HMAC secret holds a keyring: a JSON list of keys, each with an ID, a state, a creation time and the key. The key
 rotation job is a scheduled job built from the same image, with its own role that may only write the secrets in 6.4.
+The `email-hmac` keyring's active key also carries `activated_at`, when it became active, because its rate-limit
+overlap counts from that moment. The API reads a keyring at startup and refuses to start with a malformed one: an ID
+in the wrong shape, an unknown state, a key under 256 bits, or not exactly one active key.
 
 1. **Stage:** add a new key in state `staged`. Pods load it but don't use it.
 2. **Activate:** after 15 minutes (three refresh intervals), mark it `active`. The old key becomes `verify`, with a

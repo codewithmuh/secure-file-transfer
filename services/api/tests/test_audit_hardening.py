@@ -102,8 +102,28 @@ def test_only_recovery_may_set_tx_id_or_occurred_at(migrated_db: ScratchDatabase
 
 # The columns each credential lookup reads, as sft_lookup (data model 4.2), and nothing else.
 LOOKUP_COLUMNS = {
-    ("users", column, "SELECT")
-    for column in ("id", "tenant_id", "status", "invitation_token_hash", "invitation_expires_at")
+    *(
+        ("users", column, "SELECT")
+        for column in (
+            "id",
+            "tenant_id",
+            "status",
+            "invitation_token_hash",
+            "invitation_expires_at",
+        )
+    ),
+    *(
+        ("idp_connections", column, "SELECT")
+        for column in ("id", "tenant_id", "kind", "provider_name", "status")
+    ),
+    *(
+        ("user_identities", column, "SELECT")
+        for column in ("id", "tenant_id", "user_id", "idp_connection_id", "subject", "expires_at")
+    ),
+    *(
+        ("member_sessions", column, "SELECT")
+        for column in ("id", "tenant_id", "session_hash", "expires_at", "revoked_at")
+    ),
 }
 LOOKUP_GRANTS = {(table, privilege) for table, _, privilege in LOOKUP_COLUMNS}
 

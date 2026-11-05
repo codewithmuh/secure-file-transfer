@@ -32,3 +32,9 @@ def test_ids_made_in_the_same_millisecond_differ() -> None:
 def test_the_time_must_fit(ms: int) -> None:
     with pytest.raises(ValueError, match="48 bits"):
         uuid7(now_ms=ms)
+
+
+def test_ids_made_by_this_process_sort_in_the_order_made() -> None:
+    ids = [uuid7() for _ in range(1_000)]
+    assert ids == sorted(ids)
+    assert all(i.version == 7 and i.variant == uuid.RFC_4122 for i in ids)

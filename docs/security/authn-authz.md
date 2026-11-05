@@ -625,6 +625,8 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `dlp_policy.test` | `testDlpDetectors` | — | Tenant | — | — | — | — | Text only, never stored or logged |
 | `dlp_report.read` | `listDlpDecisions`, `getDlpReport` | — | Tenant | `audit:read` | — | — | — | Counts, IDs and enums only; viewing the report is audited |
 | `operator.tenant.create` | `createTenant` | — | — | — | — | — | Yes | Creates the tenant and invites its first admin; no tenant data returned |
+| `operator.tenant.read` | `listTenants`, `getTenant` | — | — | — | — | — | Yes | The tenant directory (7.2): tenant rows only, never a tenant's users, transfers, files or audit log; audited as a platform event |
+| `operator.tenant.suspend` | `suspendTenant` | — | — | — | — | — | Yes | Ends the tenant's access at once; audited in the tenant's log and as a platform event |
 | `account.sign_out` | `signOut` | Self | Self | — | — | — | — | |
 | `user.sign_out` | `signOutUser` | — | Tenant | — | — | — | — | Security-critical record |
 | `user.reset_sign_in` | `resetUserSignIn` | — | Tenant, step-up | — | — | — | — | Local members only; acts on both pools (2.5) |
@@ -753,7 +755,7 @@ The login roles use IAM database authentication, one per workload (#22).
 | Role | Used by | Scope | Row-level security |
 |---|---|---|---|
 | `sft_api` | API service | Tenant, resource or platform, plus the credential lookup functions | Tenant policy on every table; tenant and platform audit inserts; reads its tenant's audit events |
-| `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts. No column grant on file names or messages. |
+| `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts; in platform scope, the `tenants` rows alone (`operator_directory`, the tenant directory of `listTenants` and `getTenant`); in a tenant's scope, revoking its `member_sessions` when it suspends the tenant (two columns read, the two of a revocation written). No column grant on file names or messages. |
 | `sft_scan` | Scan worker | Tenant, from the message | Tenant policy. For DLP it reads the tenant's DLP policy, rules, detectors and wrapped DLP data keys, recipient domains and known domains, and inserts findings and decisions; no column grant to select finding details or any field ciphertext (data model 4.2). |
 | `sft_notify` | Notification worker | Tenant, from the message | Tenant policy |
 | `sft_relay` | Outbox relay | System | `outbox` only: reads and marks rows of every tenant, in system scope |
