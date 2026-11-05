@@ -25,10 +25,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
-from typing import Any, Final, cast
+from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import Integer, Update, func, insert, select, update
+from sqlalchemy import ARRAY, Float, Integer, Text, Update, Uuid, func, insert, select, update
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -141,6 +141,14 @@ def _payload_from_json(raw: object) -> dict[str, PayloadValue]:
     return out
 
 
+def _trace_from_json(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        raise InvalidMessageError("the trace context maps names to strings")
+    return raw
+
+
 def _trace_context() -> dict[str, str]:
     # OpenTelemetry (ADR-0009) will put a W3C `traceparent` here. Until then the trace ID of the
     # request or message being handled is enough to join the logs of the API and the worker.
@@ -211,7 +219,7 @@ class OutboxMessage:
         """Parse a received body, or raise `InvalidMessageError`; nothing else is trusted."""
         try:
             raw = json.loads(body)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:  # deep nesting raises RecursionError
             raise InvalidMessageError("the body is not JSON") from exc
         if not isinstance(raw, dict) or set(raw) != {
             "id",
@@ -224,10 +232,6 @@ class OutboxMessage:
         topic, trace = raw["topic"], raw["trace_context"]
         if not isinstance(topic, str) or not _TOPIC.fullmatch(topic):
             raise InvalidMessageError("not a topic")
-        if not isinstance(trace, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in trace.items()
-        ):
-            raise InvalidMessageError("the trace context maps names to strings")
         try:
             message_id, tenant_id = UUID(raw["id"]), UUID(raw["tenant_id"])
         except (ValueError, TypeError, AttributeError) as exc:
@@ -237,7 +241,7 @@ class OutboxMessage:
             topic=topic,
             tenant_id=tenant_id,
             payload=_payload_from_json(raw["payload"]),
-            trace_context=cast(dict[str, str], trace),
+            trace_context=_trace_from_json(trace),
         )
 
 
@@ -291,16 +295,22 @@ async def claim_due(session: AsyncSession, limit: int) -> list[DueRow]:
     due = []
     for row in rows:
         error = None
+        payload: dict[str, PayloadValue] = {}
+        trace: dict[str, str] = {}
         try:
             payload = _payload_from_json(row.payload)
         except InvalidMessageError:
-            payload, error = {}, "invalid_payload"
+            error = "invalid_payload"
+        try:
+            trace = _trace_from_json(row.trace_context)
+        except InvalidMessageError:
+            error = error or "invalid_trace_context"
         message = OutboxMessage(
             id=row.id,
             topic=row.topic,
             tenant_id=row.tenant_id,
             payload=payload,
-            trace_context=cast(dict[str, str], row.trace_context),
+            trace_context=trace,
         )
         due.append(DueRow(message, row.attempts, int(row.remaining), error))
     return due
@@ -322,15 +332,30 @@ async def mark_published(session: AsyncSession, ids: Sequence[UUID]) -> None:
         )
 
 
-async def mark_failed(session: AsyncSession, id_: UUID, *, error: str, retry_in: float) -> None:
-    """Record a failed send; the relay tries the row again `retry_in` seconds from now."""
+async def mark_failed(session: AsyncSession, failed: Mapping[UUID, tuple[str, float]]) -> None:
+    """Record failed sends in one UPDATE: each row's error code, and when to try it again.
+
+    `failed` maps a row to (error, seconds until the relay tries it again).
+    """
+    if not failed:
+        return
+    ids = list(failed)
+    rows = (
+        func.unnest(
+            sql_cast(ids, ARRAY(Uuid)),
+            sql_cast([failed[i][0][:200] for i in ids], ARRAY(Text)),
+            sql_cast([float(failed[i][1]) for i in ids], ARRAY(Float)),
+        )
+        .table_valued("id", "error", "retry_in")
+        .render_derived(name="failed")
+    )  # AS failed(id, …)
     await session.execute(
         _scoped_update(session)
-        .where(Outbox.id == id_)
+        .where(Outbox.id == rows.c.id)
         .values(
             attempts=Outbox.attempts + 1,
-            next_attempt_at=func.now() + timedelta(seconds=retry_in),
-            last_error=error[:200],
+            next_attempt_at=func.now() + func.make_interval(0, 0, 0, 0, 0, 0, rows.c.retry_in),
+            last_error=rows.c.error,
         )
     )
 

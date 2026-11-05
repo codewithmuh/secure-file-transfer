@@ -18,10 +18,11 @@ session it is given:
 not at all. A copy of a message already recorded is skipped, so a relay retry, an SQS duplicate or
 a re-publish after a failover does the work once. The message ID is the outbox row's, not SQS's.
 
-`ConsumerLoop` long-polls the queue, deletes each message once it is processed or skipped, and
-leaves a message that failed for SQS to deliver again after its visibility timeout; after 5
-receives the redrive policy moves it to the dead-letter queue, which alerts. `handle` sees
-`receive_count`, so its last attempt can record a terminal state such as `scan_failed` first.
+`ConsumerLoop` long-polls the queue (abandoning the poll at once on shutdown), deletes each message
+once it is processed or skipped, and leaves a message that failed for SQS to deliver again after its
+visibility timeout; after 5 receives the redrive policy moves it to the dead-letter queue, which
+alerts. `handle` sees `receive_count`, so its last attempt can record a terminal state such as
+`scan_failed` first.
 
 A handler whose effect is outside PostgreSQL, such as an email, can't share the transaction; the
 notification worker records the message after the send instead (ADR-0013, data model 2.2).
@@ -45,6 +46,7 @@ from sft.data.database import Database
 from sft.data.outbox import InvalidMessageError, OutboxMessage, Queue
 from sft.data.processed import record_processed
 from sft.data.scope import Scope
+from sft.workers.process import sleep_unless
 from sft.workers.queues import QueueError, Queues, ReceivedMessage
 
 log = logging.getLogger(__name__)
@@ -132,21 +134,42 @@ class ConsumerLoop:
         self.max_messages = max_messages
         self.wait_seconds = wait_seconds
 
-    async def poll_once(self) -> list[Outcome]:
-        """One receive, and every message it returned; the outcome of each."""
-        received = await self.queues.receive(
+    async def receive(self) -> list[ReceivedMessage]:
+        return await self.queues.receive(
             self.consumer.queue, max_messages=self.max_messages, wait_seconds=self.wait_seconds
         )
+
+    async def poll_once(self) -> list[Outcome]:
+        """One receive, and every message it returned; the outcome of each."""
+        return await self.handle_all(await self.receive())
+
+    async def handle_all(self, received: list[ReceivedMessage]) -> list[Outcome]:
+        """Each message on its own: one that fails, or whose delete fails, never stops the rest."""
         return [await self._one(item) for item in received]
 
     async def _one(self, item: ReceivedMessage) -> Outcome:
-        outcome = await self._process(item)
+        try:
+            outcome = await self._process(item)
+        except Exception:
+            # Anything _process didn't expect. The message isn't deleted, so SQS delivers it
+            # again and, after 5 receives, the redrive policy moves it to the dead-letter queue.
+            log.exception("message failed; SQS delivers it again", extra=self._extra())
+            outcome = Outcome.FAILED
         self.metrics.messages.labels(self.consumer.name, outcome).inc()
         if outcome in (Outcome.PROCESSED, Outcome.DUPLICATE):
-            # Deleted only after the commit. A crash before this line redelivers the message,
-            # and the record makes the second delivery a duplicate.
-            await self.queues.delete(self.consumer.queue, item.receipt_handle)
+            # Deleted only after the commit. If the delete fails, or the process dies first, SQS
+            # redelivers the message and the record makes the second delivery a duplicate.
+            try:
+                await self.queues.delete(self.consumer.queue, item.receipt_handle)
+            except QueueError as exc:
+                log.warning(
+                    "delete failed; the message comes back as a duplicate",
+                    extra={**self._extra(), "code": exc.code},
+                )
         return outcome
+
+    def _extra(self) -> dict[str, object]:
+        return {"consumer": self.consumer.name}
 
     async def _process(self, item: ReceivedMessage) -> Outcome:
         try:
@@ -177,11 +200,26 @@ class ConsumerLoop:
         return outcome
 
     async def run(self, stopping: asyncio.Event) -> None:
-        """Poll until `stopping` is set. A long poll in flight finishes first (at most 20 s)."""
+        """Poll until `stopping` is set.
+
+        A long poll in flight is abandoned the moment `stopping` is set, so shutdown never waits
+        for it: messages that poll would have returned stay invisible until their visibility
+        timeout, then come back. A message already being handled finishes first, within the drain.
+        """
         while not stopping.is_set():
+            receive = asyncio.create_task(self.receive())
+            stop = asyncio.create_task(stopping.wait())
+            await asyncio.wait({receive, stop}, return_when=asyncio.FIRST_COMPLETED)
+            stop.cancel()
+            if not receive.done():
+                receive.cancel()
+                with contextlib.suppress(asyncio.CancelledError, QueueError):
+                    await receive
+                return
             try:
-                await self.poll_once()
+                received = receive.result()
             except QueueError as exc:
                 log.warning("receive failed; trying again", extra={"code": exc.code})
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(stopping.wait(), timeout=1.0)
+                await sleep_unless(stopping, 1.0)
+                continue
+            await self.handle_all(received)

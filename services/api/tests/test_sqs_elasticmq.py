@@ -148,6 +148,8 @@ async def test_a_missing_queue_is_a_queue_error(endpoint: str, prefix: str) -> N
         with pytest.raises(QueueError) as caught:
             await adapter.send_batch(Queue.NOTIFY, [OutgoingMessage("a", "x")])
         assert "NonExistentQueue" in caught.value.code or "QueueDoesNotExist" in caught.value.code
+        # A missing queue fails every message alike: not worth re-sending row by row.
+        assert not caught.value.sender_fault
     finally:
         await adapter.close()
 

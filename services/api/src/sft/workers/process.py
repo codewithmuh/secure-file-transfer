@@ -19,6 +19,7 @@ so Kubernetes restarts it; it should catch and retry what it can (database or SQ
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 from collections.abc import Callable, Coroutine
@@ -85,12 +86,12 @@ class WorkerProcess:
         signals = (signal.SIGTERM, signal.SIGINT) if handle_signals else ()
         for sig in signals:
             loop.add_signal_handler(sig, self.handle_signal, sig)
-        internal = asyncio.create_task(self._internal.serve())
+        internal = asyncio.create_task(self._serve_internal())
         try:
             # uvicorn sets a plain `started` flag and offers nothing to await.
             while not self._internal.started and not internal.done():  # noqa: ASYNC110
                 await asyncio.sleep(0.05)
-            if not self._internal.started:  # uvicorn exits with status 3 when it can't bind
+            if not self._internal.started:
                 log.critical("the internal listener could not start")
                 return EXIT_NO_LISTENER
             return await self._run_loop(work)
@@ -100,6 +101,14 @@ class WorkerProcess:
             for sig in signals:
                 loop.remove_signal_handler(sig)
             log.info("stopped")
+
+    async def _serve_internal(self) -> None:
+        # uvicorn calls sys.exit(1) when it can't bind. Caught here, inside the task, so the
+        # SystemExit can't escape the event loop and the process exits with EXIT_NO_LISTENER.
+        try:
+            await self._internal.serve()
+        except SystemExit:
+            log.critical("the internal listener could not bind its port")
 
     async def _run_loop(self, work: WorkLoop) -> int:
         self._loop_task = asyncio.create_task(work(self.stopping))
@@ -138,3 +147,9 @@ class WorkerProcess:
             log.error("the work loop ended without a shutdown")
             return EXIT_FAILED
         return EXIT_OK
+
+
+async def sleep_unless(stopping: asyncio.Event, seconds: float) -> None:
+    """Wait `seconds`, or less if `stopping` is set first: a work loop's pause."""
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(stopping.wait(), timeout=seconds)

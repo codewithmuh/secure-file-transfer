@@ -296,3 +296,56 @@ async def test_a_relay_crash_and_its_duplicate_send_still_give_one_effect(
     assert outcomes == [Outcome.PROCESSED, Outcome.DUPLICATE]
     assert len(consumer.calls) == 1
     assert [row[1] for row in effects(outbox_db)] == [SCAN_TOPIC.name, DEFERRED.name]
+
+
+# ---- the code review of #51 ----
+
+
+async def test_a_failed_delete_does_not_stop_the_other_messages(
+    outbox_db: ScratchDatabase, scan_db: Database, metrics: ConsumerMetrics
+) -> None:
+    queues = FakeQueues()
+    deliver(queues, a_message().body(), a_message().body())
+    queues.fail_delete.add("0")
+    consumer = DeferringConsumer(scan_db)
+    outcomes = await ConsumerLoop(consumer, queues, metrics).poll_once()
+    assert outcomes == [Outcome.PROCESSED, Outcome.PROCESSED]
+    assert queues.deleted == ["1"]
+
+
+async def test_a_body_nested_too_deep_is_invalid_not_a_crash(
+    scan_db: Database, metrics: ConsumerMetrics
+) -> None:
+    queues = FakeQueues()
+    deliver(queues, "[" * 100_000, a_message().body())
+    outcomes = await ConsumerLoop(DeferringConsumer(scan_db), queues, metrics).poll_once()
+    assert outcomes == [Outcome.INVALID, Outcome.PROCESSED]
+
+
+async def test_an_unexpected_error_fails_one_message_not_the_loop(
+    outbox_db: ScratchDatabase, scan_db: Database, metrics: ConsumerMetrics
+) -> None:
+    class Exploding(DeferringConsumer):
+        async def process(self, delivery: Delivery) -> Outcome:
+            raise RecursionError("too deep")
+
+    queues = FakeQueues()
+    deliver(queues, a_message().body())
+    assert await ConsumerLoop(Exploding(scan_db), queues, metrics).poll_once() == [Outcome.FAILED]
+    assert queues.deleted == []
+
+
+async def test_shutdown_abandons_a_long_poll_at_once(
+    scan_db: Database, metrics: ConsumerMetrics
+) -> None:
+    class SlowQueues(FakeQueues):
+        async def receive(self, queue, *, max_messages, wait_seconds):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(3600)  # a 20 s long poll, or a hung one
+            return []
+
+    loop = ConsumerLoop(DeferringConsumer(scan_db), SlowQueues(), metrics)
+    stopping = asyncio.Event()
+    task = asyncio.create_task(loop.run(stopping))
+    await asyncio.sleep(0.1)
+    stopping.set()
+    await asyncio.wait_for(task, timeout=1)

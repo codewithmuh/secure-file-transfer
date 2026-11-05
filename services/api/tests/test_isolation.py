@@ -80,7 +80,7 @@ async def mark_another_tenants_message_published(session: AsyncSession, tenants:
 
 @cases.add(scopes=NOT_THE_RELAY)
 async def mark_another_tenants_message_failed(session: AsyncSession, tenants: Tenants) -> object:
-    await mark_failed(session, tenants.theirs.rows["outbox"], error="isolation", retry_in=1)
+    await mark_failed(session, {tenants.theirs.rows["outbox"]: ("isolation", 1.0)})
     return None
 
 

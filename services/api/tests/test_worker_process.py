@@ -11,7 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 from sft.core.settings import WorkerSettings
-from sft.workers.process import EXIT_FAILED, EXIT_OK, WorkerProcess
+from sft.workers.process import EXIT_FAILED, EXIT_NO_LISTENER, EXIT_OK, WorkerProcess
 
 pytestmark = pytest.mark.anyio
 
@@ -131,4 +131,20 @@ async def test_a_signal_during_startup_never_reports_ready() -> None:
         await stopping.wait()
 
     assert await process.run(loop, handle_signals=False) == EXIT_OK
+    assert not process.readiness.started
+
+
+async def test_a_taken_port_ends_the_worker_with_status_3() -> None:
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        process = WorkerProcess(settings(port=taken.getsockname()[1]))
+        started = False
+
+        async def loop(stopping: asyncio.Event) -> None:
+            nonlocal started
+            started = True
+
+        assert await process.run(loop, handle_signals=False) == EXIT_NO_LISTENER
+    assert not started
     assert not process.readiness.started

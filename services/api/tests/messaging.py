@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -37,6 +38,9 @@ class FakeQueues:
     poison: set[str] = field(default_factory=set)
     calls: int = 0
     outage: str | None = None
+    send_delay: float = 0.0
+    """Seconds each send takes, as a slow SQS would."""
+    fail_delete: set[str] = field(default_factory=set)
     after_send: Callable[[], None] | None = None
     deleted: list[str] = field(default_factory=list)
     receives: dict[str, int] = field(default_factory=dict)
@@ -47,6 +51,8 @@ class FakeQueues:
     ) -> list[SendFailure]:
         assert 1 <= len(messages) <= MAX_BATCH
         self.calls += 1
+        if self.send_delay:
+            await asyncio.sleep(self.send_delay)
         if self.outage:
             raise QueueError(self.outage)
         if any(m.id in self.poison for m in messages):
@@ -78,6 +84,8 @@ class FakeQueues:
         return out
 
     async def delete(self, queue: str, receipt_handle: str) -> None:
+        if receipt_handle in self.fail_delete:
+            raise QueueError("ServiceUnavailable")
         self.deleted.append(receipt_handle)
 
     async def close(self) -> None:

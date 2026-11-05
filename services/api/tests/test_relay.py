@@ -21,6 +21,7 @@ from sft.data.scope import Scope
 from sft.workers.relay import (
     ERROR_PAUSE_SECONDS,
     RETRY_MAX_SECONDS,
+    SEND_BUDGET_SECONDS,
     Relay,
     RelayMetrics,
     retry_delay,
@@ -106,6 +107,7 @@ async def test_a_batch_sends_every_due_row_and_marks_it_published(
     assert (
         registry.get_sample_value("outbox_messages_published_total", {"queue": "scan-small"}) == 1
     )
+    await relay.measure_age()
     assert registry.get_sample_value("outbox_oldest_unpublished_age_seconds") == 0
     # Nothing left: the next batch claims nothing and sends nothing.
     assert await relay.publish_batch() == 0
@@ -364,3 +366,84 @@ async def test_published_rows_are_marked_in_the_relays_transaction(
     [(published_at,)] = outbox_db.sql("SELECT published_at FROM outbox WHERE id = :id", id=written)
     assert published_at is not None
     assert json.loads(queues.bodies()[0])["id"] == str(written)
+
+
+# ---- the code review of #51 ----
+
+
+async def test_the_send_phase_ends_within_its_budget_however_slow_sqs_is(
+    outbox_db: ScratchDatabase, relay_db: Database, queues: FakeQueues, registry: CollectorRegistry
+) -> None:
+    # The claimed rows stay locked while SQS is called, so the relay stops waiting at its budget,
+    # long before the 10 s idle limit would end the transaction (data model 2.5).
+    assert SEND_BUDGET_SECONDS < 10
+    written = {await write(outbox_db) for _ in range(3)}
+    queues.send_delay = 30
+    relay = make_relay(relay_db, queues, registry, send_budget=0.3)
+    started = asyncio.get_running_loop().time()
+    assert await relay.publish_batch() == 3
+    assert asyncio.get_running_loop().time() - started < 2
+    assert unpublished(outbox_db) == written
+    assert {row[0] for row in outbox_db.sql("SELECT last_error FROM outbox")} == {"send_timeout"}
+
+
+async def test_row_by_row_re_sends_are_capped_per_batch(
+    outbox_db: ScratchDatabase, relay_db: Database, queues: FakeQueues, registry: CollectorRegistry
+) -> None:
+    # Two batches of 10, each refused for one bad row; the budget covers only the first split.
+    written = [await write(outbox_db) for _ in range(20)]
+    queues.poison |= {str(written[0]), str(written[10])}
+    relay = make_relay(relay_db, queues, registry, split_budget=10)
+    assert await relay.publish_batch() == 20
+    assert queues.calls == 2 + 10  # two batches, then the first one's rows one by one
+    assert len(queues.sent) == 9
+    assert len(unpublished(outbox_db)) == 11
+
+
+async def test_failed_rows_are_marked_together_each_with_its_error(
+    outbox_db: ScratchDatabase, relay_db: Database, queues: FakeQueues, registry: CollectorRegistry
+) -> None:
+    first, second = await write(outbox_db), await write(outbox_db)
+    queues.refuse |= {str(first): "InvalidParameterValue", str(second): "KmsThrottled"}
+    await make_relay(relay_db, queues, registry).publish_batch()
+    rows = dict(outbox_db.sql("SELECT id, last_error FROM outbox WHERE attempts = 1"))
+    assert rows == {first: "InvalidParameterValue", second: "KmsThrottled"}
+
+
+async def test_a_row_whose_trace_context_breaks_the_contract_fails_alone(
+    outbox_db: ScratchDatabase, relay_db: Database, queues: FakeQueues, registry: CollectorRegistry
+) -> None:
+    outbox_db.sql(
+        "INSERT INTO outbox (id, tenant_id, topic, payload, trace_context, created_at) VALUES "
+        "(gen_random_uuid(), gen_random_uuid(), 'file.scan', '{}', '{\"trace_id\": 5}', "
+        "now() - interval '1 minute')"
+    )
+    good = await write(outbox_db)
+    await make_relay(relay_db, queues, registry).publish_batch()
+    assert sent_ids(queues) == [good]
+    assert {row[0] for row in outbox_db.sql("SELECT last_error FROM outbox")} == {
+        None,
+        "invalid_trace_context",
+    }
+
+
+async def test_the_age_is_measured_even_when_the_batch_fails(
+    outbox_db: ScratchDatabase, relay_db: Database, queues: FakeQueues, registry: CollectorRegistry
+) -> None:
+    await write(outbox_db)
+    outbox_db.sql("UPDATE outbox SET created_at = now() - interval '5 minutes'")
+    relay = make_relay(relay_db, queues, registry, poll_interval=0.05)
+
+    async def broken() -> int:
+        raise RuntimeError("the batch failed")
+
+    relay.publish_batch = broken  # type: ignore[method-assign]
+    stopping = asyncio.Event()
+    task = asyncio.create_task(relay.run(stopping))
+    for _ in range(100):
+        if registry.get_sample_value("outbox_oldest_unpublished_age_seconds"):
+            break
+        await asyncio.sleep(0.05)
+    stopping.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert registry.get_sample_value("outbox_oldest_unpublished_age_seconds") > 290  # type: ignore[operator]

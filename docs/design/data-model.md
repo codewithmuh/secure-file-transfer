@@ -373,8 +373,9 @@ commit, so nothing is skipped; then the cursor moves to `xmin`.
   delete and purge in small batches, one transaction each (section 6). No code holds a transaction open across an S3
   or SES call. Upload completion, for example, runs in three phases with its S3 calls between two short transactions
   (3.1). The outbox relay is the one transaction that spans a call to AWS: it holds its claimed rows' locks while it
-  sends them to SQS (ADR-0013), with a 1-second connect and 3-second read timeout and one retry (8 s at worst), so
-  it stays inside the 10-second idle limit. Migrations are the one exception (section 7). An alert fires when the
+  sends them to SQS (ADR-0013), and stops waiting after a 6-second send budget, per-row re-sends included; a row
+  with no answer by then is tried again later. Its queue URLs are looked up at startup. So it stays inside the
+  10-second idle limit. Migrations are the one exception (section 7). An alert fires when the
   oldest unarchived audit row is more than 2 minutes old (NFR-15).
 - **Restores and failovers reuse transaction IDs.** A point-in-time restore, or a regional failover that loses the
   replica's unreplicated tail, takes the database back in time: transaction IDs used after that point are given out

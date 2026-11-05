@@ -388,7 +388,8 @@ values listed in `sft.data.outbox.TOPICS`; M0 has none, and each feature adds it
 due rows with `FOR UPDATE SKIP LOCKED`, sends them to SQS (10 per call, the calls side by side, each with the delay
 that is left and, on the scan queues, the tenant as the message group), marks the sent rows published, and gives each
 refused row its own backoff (2 s doubling to 5 minutes). If SQS refuses a whole batch for one bad message, the rows go
-one by one, so only that row waits. A crash before the commit loses nothing: the rows stay unpublished and their locks
+one by one (at most 20 rows a batch), so only that row waits. The whole send phase ends within a 6-second budget,
+well inside the 10-second idle limit, and queue URLs are looked up at startup. A crash before the commit loses nothing: the rows stay unpublished and their locks
 end with the connection. A crash after the send sends them twice, which consumers skip. Replicas run side by side.
 Its claim and its marks filter with `in_scope(Outbox, session)`, and every UPDATE starts from one helper in
 `sft.data.outbox`. In system scope the session lets only `sft_relay` write tenant rows (`SYSTEM_WRITERS`), its role
@@ -439,7 +440,7 @@ await process.run(loop.run)
 `Consumer.process` runs `handle` in one transaction in the message's tenant scope, and records
 `(name, outbox ID)` in `processed_messages` first, in the same transaction. A duplicate (an SQS redelivery, a relay
 retry, a re-publish after a failover) finds the record and is skipped, so its work is done once; two copies at the
-same time wait on each other's record. `ConsumerLoop` deletes a message once it is processed or skipped, and leaves one
+same time wait on each other's record. On shutdown `ConsumerLoop` abandons a long poll in flight at once. It deletes a message once it is processed or skipped, and leaves one
 that failed or doesn't parse for SQS to deliver again, until the redrive policy moves it to the dead-letter queue.
 `delivery.receive_count` lets the last attempt record a terminal state first. A handler whose effect is an email
 records after the send instead (ADR-0013); the notification worker does that itself.

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -92,11 +92,19 @@ class Queues(Protocol):
     async def close(self) -> None: ...
 
 
+_QUEUE_MISSING = frozenset(
+    {"QueueDoesNotExist", "AWS.SimpleQueueService.NonExistentQueue", "NonExistentQueue"}
+)
+
+
 def _queue_error(exc: ClientError | BotoCoreError) -> QueueError:
     if isinstance(exc, ClientError):
         code = str(exc.response.get("Error", {}).get("Code", "ClientError"))
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
-        return QueueError(code, sender_fault=status == 400 and "throttl" not in code.lower())
+        # Throttling passes, and a missing queue fails every message alike: neither is about one
+        # message in the batch, so neither is worth sending row by row.
+        whole_queue = "throttl" in code.lower() or code in _QUEUE_MISSING
+        return QueueError(code, sender_fault=status == 400 and not whole_queue)
     return QueueError(type(exc).__name__)
 
 
@@ -140,6 +148,11 @@ class SqsQueues:
             return await loop.run_in_executor(self._executor, functools.partial(fn, **kwargs))
         except (ClientError, BotoCoreError) as exc:
             raise _queue_error(exc) from exc
+
+    async def resolve(self, queues: Iterable[str]) -> None:
+        """Look up and cache the queues' URLs at startup, not inside the relay's first batch."""
+        for queue in queues:
+            await self._url(queue)
 
     async def _url(self, queue: str) -> str:
         if queue not in self._urls:

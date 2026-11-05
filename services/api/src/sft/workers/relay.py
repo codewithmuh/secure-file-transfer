@@ -23,7 +23,6 @@ side by side; `SKIP LOCKED` keeps them off each other's rows.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import random
 import sys
@@ -39,6 +38,7 @@ from sft.data.database import Database
 from sft.data.outbox import (
     TOPICS,
     DueRow,
+    Queue,
     Topic,
     claim_due,
     mark_failed,
@@ -46,7 +46,7 @@ from sft.data.outbox import (
     oldest_unpublished_age,
 )
 from sft.data.scope import Scope
-from sft.workers.process import WorkerProcess
+from sft.workers.process import WorkerProcess, sleep_unless
 from sft.workers.queues import MAX_BATCH, OutgoingMessage, QueueError, Queues, SqsQueues
 
 log = logging.getLogger("sft.workers.relay")  # not __main__ under python -m
@@ -56,6 +56,14 @@ RETRY_BASE_SECONDS = 2.0
 RETRY_MAX_SECONDS = 300.0
 """A row SQS refuses waits 2 s, then 4, 8 … up to 5 minutes between tries. The outbox age alert
 fires at 2 minutes (ADR-0013), long before a row reaches the cap."""
+
+SEND_BUDGET_SECONDS = 6.0
+"""The longest the relay spends on SQS in one batch, while it holds the claimed rows' locks. The
+workload roles end a transaction idle for 10 s (data model 2.5); 6 s leaves the claim and the
+marks the rest. SQS calls never extend it: the relay stops waiting when it runs out."""
+
+SPLIT_BUDGET_ROWS = 20
+"""Rows of one batch that may be re-sent one by one after SQS refused their whole batch."""
 
 ERROR_PAUSE_SECONDS = (1.0, 30.0)
 """The relay's own pause after a batch fails as a whole (the database is down, say): from 1 s,
@@ -95,8 +103,8 @@ class RelayMetrics:
             ),
             oldest_unpublished_age=Gauge(
                 "outbox_oldest_unpublished_age_seconds",
-                "Age of the oldest unpublished outbox row, after the relay's last batch; the "
-                "alert fires above 120 s (ADR-0013).",
+                "Age of the oldest unpublished outbox row, measured on every loop after the "
+                "batch, whether it succeeded or not; the alert fires above 120 s (ADR-0013).",
                 registry=registry,
             ),
             batch_duration=Histogram(
@@ -118,6 +126,8 @@ class Relay:
         topics: Mapping[str, Topic] = TOPICS,
         batch_size: int = 50,
         poll_interval: float = 1.0,
+        send_budget: float = SEND_BUDGET_SECONDS,
+        split_budget: int = SPLIT_BUDGET_ROWS,
     ) -> None:
         self.database = database
         self.queues = queues
@@ -125,6 +135,8 @@ class Relay:
         self.topics = topics
         self.batch_size = batch_size
         self.poll_interval = poll_interval
+        self.send_budget = send_budget
+        self.split_budget = split_budget
 
     async def publish_batch(self) -> int:
         """Claim, send and mark one batch in one transaction; return how many rows it claimed."""
@@ -135,22 +147,32 @@ class Relay:
                 await mark_published(
                     session, [row.message.id for row in due if row.message.id not in failures]
                 )
-                for row in due:
-                    if row.message.id in failures:
-                        await mark_failed(
-                            session,
-                            row.message.id,
-                            error=failures[row.message.id],
-                            retry_in=retry_delay(row.attempts),
-                        )
-                age = await oldest_unpublished_age(session)
-        self.metrics.oldest_unpublished_age.set(age)
+                await mark_failed(
+                    session,
+                    {
+                        row.message.id: (failures[row.message.id], retry_delay(row.attempts))
+                        for row in due
+                        if row.message.id in failures
+                    },
+                )
         return len(due)
 
+    async def measure_age(self) -> None:
+        """Set the outbox age gauge, in a short read of its own, whatever the last batch did."""
+        async with self.database.transaction(Scope.system()) as session:
+            age = await oldest_unpublished_age(session)
+        self.metrics.oldest_unpublished_age.set(age)
+
     async def _send(self, due: list[DueRow]) -> dict[UUID, str]:
-        """Send every claimed row; the rows that failed, with the error code."""
+        """Send every claimed row within the send budget; the rows that failed, with a code.
+
+        The claimed rows stay locked while this runs, so the whole send phase, per-row re-sends
+        included, ends within `send_budget` (6 s), well inside the 10 s a transaction may sit idle
+        (data model 2.5). A row with no answer by then counts as failed (`send_timeout`) and is
+        tried again later; if SQS did take it, a consumer skips the second copy.
+        """
         failures: dict[UUID, str] = {}
-        by_queue: dict[str, list[DueRow]] = {}
+        by_queue: dict[Queue, list[DueRow]] = {}
         for row in due:
             if row.error is not None:
                 failures[row.message.id] = row.error
@@ -171,18 +193,31 @@ class Relay:
                 continue
             by_queue.setdefault(topic.queue, []).append(row)
 
-        calls = []
-        for queue, rows in by_queue.items():
-            fair = self.topics[rows[0].message.topic].queue.fair
-            for start in range(0, len(rows), MAX_BATCH):
-                calls.append((queue, fair, rows[start : start + MAX_BATCH]))
-        # The calls run side by side, so the transaction lasts about as long as the slowest one.
-        results = await asyncio.gather(
-            *(self._send_chunk(queue, fair, rows) for queue, fair, rows in calls)
-        )
-        for (queue, _, rows), result in zip(calls, results, strict=True):
-            sent = len(rows) - len(result)
-            if sent:
+        chunks = [
+            (queue, rows[start : start + MAX_BATCH])
+            for queue, rows in by_queue.items()
+            for start in range(0, len(rows), MAX_BATCH)
+        ]
+        outcome: dict[UUID, str | None] = {}  # None: sent
+        splits = _SplitBudget(self.split_budget)
+        try:
+            async with asyncio.timeout(self.send_budget):
+                # The calls run side by side, so the phase lasts about as long as the slowest.
+                await asyncio.gather(
+                    *(self._send_chunk(queue, rows, outcome, splits) for queue, rows in chunks)
+                )
+        except TimeoutError:
+            log.warning(
+                "SQS didn't answer within the send budget; the rest are tried again later",
+                extra={"budget_seconds": self.send_budget},
+            )
+        for queue, rows in chunks:
+            result = {
+                row.message.id: code
+                for row in rows
+                if (code := outcome.get(row.message.id, "send_timeout")) is not None
+            }
+            if sent := len(rows) - len(result):
                 self.metrics.published.labels(queue).inc(sent)
             if result:
                 self.metrics.failed.labels(queue).inc(len(result))
@@ -197,31 +232,37 @@ class Relay:
             failures.update(result)
         return failures
 
-    async def _send_chunk(self, queue: str, fair: bool, rows: list[DueRow]) -> dict[UUID, str]:
+    async def _send_chunk(
+        self,
+        queue: Queue,
+        rows: list[DueRow],
+        outcome: dict[UUID, str | None],
+        splits: _SplitBudget,
+    ) -> None:
         messages = [
             OutgoingMessage(
                 id=str(row.message.id),
                 body=row.message.body(),
                 delay_seconds=row.remaining_delay,
-                group_id=str(row.message.tenant_id) if fair else None,
+                group_id=str(row.message.tenant_id) if queue.fair else None,
             )
             for row in rows
         ]
         try:
             refused = await self.queues.send_batch(queue, messages)
         except QueueError as exc:
-            if not exc.sender_fault or len(rows) == 1:
-                return {row.message.id: exc.code for row in rows}
-            # SQS refused the whole batch for something in it, such as one message too long. Each
-            # row goes on its own, so only the bad one backs off.
-            results = await asyncio.gather(*(self._send_chunk(queue, fair, [row]) for row in rows))
-            return {key: code for result in results for key, code in result.items()}
+            if exc.sender_fault and len(rows) > 1 and splits.take(len(rows)):
+                # SQS refused the whole batch for something in it, such as one message too
+                # long. Each row goes on its own, so only the bad one backs off; at most
+                # `split_budget` rows a batch, so a storm of bad batches can't stretch the send.
+                await asyncio.gather(
+                    *(self._send_chunk(queue, [row], outcome, splits) for row in rows)
+                )
+                return
+            outcome.update({row.message.id: exc.code for row in rows})
+            return
         codes = {failure.id: failure.code for failure in refused}
-        return {
-            row.message.id: codes[str(row.message.id)]
-            for row in rows
-            if str(row.message.id) in codes
-        }
+        outcome.update({row.message.id: codes.get(str(row.message.id)) for row in rows})
 
     async def run(self, stopping: asyncio.Event) -> None:
         """Publish until `stopping` is set; the batch in hand always finishes first."""
@@ -233,17 +274,36 @@ class Relay:
                 # The database or the network is down. Nothing is lost: the rows wait in the
                 # outbox, and the age alert fires if this goes on.
                 log.exception("outbox batch failed; trying again", extra={"pause_seconds": pause})
-                await _sleep_unless(stopping, pause)
+                claimed = -1
+            await self._measure_age_logged()
+            if claimed < 0:
+                await sleep_unless(stopping, pause)
                 pause = min(pause * 2, ERROR_PAUSE_SECONDS[1])
                 continue
             pause = ERROR_PAUSE_SECONDS[0]
             if claimed < self.batch_size:
-                await _sleep_unless(stopping, self.poll_interval)
+                await sleep_unless(stopping, self.poll_interval)
+
+    async def _measure_age_logged(self) -> None:
+        try:
+            await self.measure_age()
+        except Exception:
+            # The database is down too. The gauge keeps its last value; the relay's own batch
+            # errors and, in M4, a missing scrape alert on it.
+            log.warning("outbox age not measured", exc_info=True)
 
 
-async def _sleep_unless(stopping: asyncio.Event, seconds: float) -> None:
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(stopping.wait(), timeout=seconds)
+class _SplitBudget:
+    """How many rows of one batch may still be re-sent one by one."""
+
+    def __init__(self, rows: int) -> None:
+        self.rows = rows
+
+    def take(self, count: int) -> bool:
+        if count > self.rows:
+            return False
+        self.rows -= count
+        return True
 
 
 async def run_relay(settings: RelaySettings, *, handle_signals: bool = True) -> int:
@@ -257,6 +317,11 @@ async def run_relay(settings: RelaySettings, *, handle_signals: bool = True) -> 
         prefix=settings.sqs_queue_prefix,
         endpoint_url=settings.sqs_endpoint_url,
     )
+    try:
+        # Before any batch, so no claim waits on a cold URL lookup (it would still fit the budget).
+        await queues.resolve(sorted({topic.queue for topic in TOPICS.values()}))
+    except QueueError as exc:
+        log.warning("queue URLs not resolved at startup; looked up later", extra={"code": exc.code})
     relay = Relay(
         database,
         queues,
