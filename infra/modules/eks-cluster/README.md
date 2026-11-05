@@ -71,10 +71,12 @@ name them exactly (#101, #102), and every one carries the workload permissions b
 | `sft-<env>-jobs` | `sft` / `jobs` | List, delete object versions and abort uploads in both files bucket pairs, the only role that deletes; `sft_jobs`. No key |
 | `sft-<env>-archive` | `sft` / `audit-archive` | Write the audit archive; `sft_archive`; audit key through S3 |
 | `sft-<env>-migrate` | `sft` / `migrate` | `sft_migrate` only |
-| `sft-<env>-operator` | `sft-operator` / `operator-api` | Write its audit records to the archive; `sft_operator`; audit key through S3 |
+| `sft-<env>-operator` | `sft-operator` / `operator-api` | Write its audit records to the archive; Valkey as `sft-<env>-operator`, for its rate limits; `sft_operator`; audit key through S3 |
 | `sft-<env>-karpenter` | `karpenter` / `karpenter` | Launch, tag and terminate only instances and launch templates tagged with one of the account's cluster names and a node pool; read Bottlerocket's AMI parameters; read the interruption queue; pass only the Karpenter node role; volume keys through EC2 |
 | `sft-<env>-lb-controller` | `kube-system` / `aws-load-balancer-controller` | TargetGroupBinding only: describe, and register and deregister targets in the environment's target groups. The edge layer owns the load balancer, its target groups and the security group rule |
-| `sft-<env>-external-secrets` | `external-secrets` / `external-secrets` | Read `sft/<env>/platform/*` secrets |
+| `sft-<env>-external-secrets` | `external-secrets` / `external-secrets` | No secret read: only assume the two store roles below (encryption 6.4) |
+| `sft-<env>-external-secrets-platform` | none: assumed by the External Secrets role only | Read `sft/<env>/platform/*`, for the `platform-secrets` store (argocd, monitoring, grafana) |
+| `sft-<env>-external-secrets-app` | none: assumed by the External Secrets role only | Read the API's `csrf-hmac`, `email-hmac` and its Region's `idp-client`, for the `application-secrets` store (`sft` only, #106) |
 | `sft-<env>-kyverno` | `kyverno` / `kyverno-admission-controller`, `kyverno-reports-controller` | Read images and signatures in the organization's `sft/` and `mirror/` repositories; the registry key through ECR |
 | `sft-<env>-vpc-cni`, `sft-<env>-ebs-csi` | `kube-system`, through their EKS add-ons | AWS's managed policies for the two drivers; the EBS driver also the platform key through EC2 |
 | `sft-<env>-eks-cluster` | (EKS) | `AmazonEKSClusterPolicy`; the secrets key through EKS |
@@ -86,7 +88,7 @@ the key policies (#102) name the same roles. clamd, the DLP inspector and the si
 **The workload permissions boundary** `sft-<env>-workload-boundary`, a managed policy under `/sft-bootstrap/` made by
 each account's bootstrap stack (`terraform-oidc-roles`, `permissions-cluster.tf`), caps every role above: the
 services the cluster and its workloads use, in the environment's Regions; IAM reads, service-linked roles and passing
-the Karpenter node role; never an IAM change or `sts:AssumeRole`. The deploy role may create and change only the roles
+the Karpenter node role; never an IAM change, and `sts:AssumeRole` only into the two External Secrets store roles. The deploy role may create and change only the roles
 named above, only with that boundary, may attach only the four AWS managed policies the module uses, and may never assume
 any of them (an explicit deny beats a trust policy that names it), so no apply can mint a role that does more or
 borrow a workload's rights.

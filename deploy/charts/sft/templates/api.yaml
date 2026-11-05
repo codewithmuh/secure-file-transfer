@@ -1,0 +1,133 @@
+{{- include "sft.validate" . }}
+{{- if eq .Values.part "application" }}
+{{- $ctx := dict "root" $ "component" "api" "name" "api" }}
+{{- $w := .Values.api }}
+{{- $c := .Values.cluster }}
+{{- $prefix := include "sft.namePrefix" . }}
+{{- $login := printf "https://%s" $c.cognitoLoginDomain }}
+{{- /*
+The API's settings (sft.core.settings.Settings): member sign-in against this region's user pool (ADR-0016,
+authn-authz 2 and 3), the region's files buckets and key (ADR-0012, #114), and the load balancer's subnets as the only
+trusted proxies (ADR-0002). The client ID and secret and the two keyrings come from the External Secrets Secret.
+*/}}
+{{- $env := merge (dict
+  "WEB_ORIGIN" (printf "https://app.%s" $c.serviceDomain)
+  "OIDC_ISSUER" (printf "https://cognito-idp.%s.amazonaws.com/%s" .Values.region $c.userPoolId)
+  "OIDC_PROVIDER_NAME" $c.userPoolId
+  "OIDC_REDIRECT_URI" (printf "https://api.%s/v1/auth/callback" $c.serviceDomain)
+  "OIDC_LOGOUT_URL" (printf "%s/logout" $login)
+  "OIDC_REVOCATION_URL" (printf "%s/oauth2/revoke" $login)
+  "S3_FILES_BUCKET" (printf "%s-files-%s" $prefix (toString $c.accountId))
+  "S3_LARGE_FILES_BUCKET" (printf "%s-large-files-%s" $prefix (toString $c.accountId))
+  "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
+  "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr) $w.env }}
+{{- $secretEnv := dict "CSRF_KEYRING" "api-secrets" "EMAIL_HMAC_KEYRING" "api-secrets" "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
+# The API service (architecture 2): every HTTP call, behind the load balancer, at least 3 pods across 3 AZs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ include "sft.replicas" (dict "root" $ "replicas" $w.replicas) }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 25%, maxUnavailable: 0 } # zero-downtime deploys (NFR-18)
+  selector:
+    matchLabels:
+      {{- include "sft.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "sft.podCommon" (dict "root" $ "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds) | nindent 6 }}
+      securityContext:
+        {{- include "sft.podSecurityContext" 10001 | nindent 8 }}
+      topologySpreadConstraints: # one per AZ first, then one per node; an AZ loss still schedules (NFR-11)
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "sft.selectorLabels" $ctx | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "sft.selectorLabels" $ctx | nindent 14 }}
+      containers:
+        {{- include "sft.appContainer" (dict "root" $ "name" "api" "module" $w.module "publicPort" 8000 "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "proxyListener" "api" "env" $env "secretEnv" $secretEnv "preStop" true "resources" $w.resources) | nindent 8 }}
+      volumes:
+        {{- include "sft.tmpVolume" . | nindent 8 }}
+---
+# Port 8001 is in the Service only for the target group's health check (ADR-0021); the public listener routes only to
+# 8000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sft.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - { name: http, port: 8000, targetPort: http, protocol: TCP }
+    - { name: internal, port: 8001, targetPort: internal, protocol: TCP }
+---
+# Registers the API pods, by IP, in the target group that the edge stack's load balancer forwards to (#105). The load
+# balancer, its listener and the target group are Terraform's; this only keeps the targets in step with the pods. The
+# group is found by its name, sft-<env>-<region-short>-api, so the cluster-bootstrap stack, which runs before the
+# edge, needs no edge output; the controller's role may register targets only in groups with this prefix (#103).
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  targetGroupName: {{ printf "%s-api" $prefix }}
+  targetType: ip
+  serviceRef:
+    name: api
+    port: 8000
+---
+# The API's secrets (encryption 6.1), from Secrets Manager in this region through the application store, which only
+# this namespace may use (cluster-bootstrap, #104). The keyrings are whole secrets; the user pool client's secret holds
+# client_id and client_secret. One sync wave early, so the Secret exists before the API's pods start.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: api-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  refreshInterval: {{ .Values.secrets.refreshInterval }}
+  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.secrets.store }} }
+  target:
+    name: api-secrets
+    creationPolicy: Owner
+    deletionPolicy: Retain
+  data:
+    - secretKey: CSRF_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/csrf-hmac" .Values.environment }} }
+    - secretKey: EMAIL_HMAC_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/email-hmac" .Values.environment }} }
+    - secretKey: OIDC_CLIENT_ID
+      remoteRef: { key: {{ printf "sft/%s/app/idp-client/%s" .Values.environment .Values.region }}, property: client_id }
+    - secretKey: OIDC_CLIENT_SECRET
+      remoteRef: { key: {{ printf "sft/%s/app/idp-client/%s" .Values.environment .Values.region }}, property: client_secret }
+---
+{{ include "sft.pdb" $ctx }}
+{{- end }}

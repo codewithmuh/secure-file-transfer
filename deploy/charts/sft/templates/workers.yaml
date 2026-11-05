@@ -1,0 +1,26 @@
+{{- if eq .Values.part "application" }}
+{{- /* The queues are sft-<env>-<region-short>-<name> (infra/modules/queues), so the prefix names the region too. */}}
+{{- $queues := dict "SQS_QUEUE_PREFIX" (printf "%s-" (include "sft.namePrefix" .)) }}
+{{- /* The outbox relay (architecture 5.3, #51): publishes outbox rows to SQS. No port but the internal one. */}}
+{{- $relay := .Values.relay }}
+{{- $containers := include "sft.appContainer" (dict "root" $ "name" "relay" "module" $relay.module "databaseRole" $relay.databaseRole "env" (merge (dict) $queues $relay.env) "resources" $relay.resources) }}
+{{ include "sft.deployment" (dict "root" $ "name" "relay" "component" "relay" "replicas" $relay.replicas "serviceAccount" $relay.serviceAccount "grace" $relay.terminationGracePeriodSeconds "containers" $containers) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" "relay" "component" "relay") }}
+---
+{{- /* The notification worker (architecture 2): SES through its endpoint, Cognito's admin API through its listener. */}}
+{{- $notifier := .Values.notifier }}
+{{- /*
+How it sends email (sft.core.settings.MailSettings, ADR-0015): SES in this region, from the environment's sending
+subdomain, linking only to the web app. SES_CONFIGURATION_SET comes with the SES identity's issue, in notifier.env.
+*/}}
+{{- $mail := dict
+  "MAIL_BACKEND" "ses"
+  "MAIL_FROM_ADDRESS" (printf "no-reply@mail.%s" .Values.cluster.serviceDomain)
+  "WEB_APP_URL" (printf "https://app.%s" .Values.cluster.serviceDomain)
+  "SES_REGION" .Values.region }}
+{{- $containers = include "sft.appContainer" (dict "root" $ "name" "notifier" "module" $notifier.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $notifier.env) "resources" $notifier.resources) }}
+{{ include "sft.deployment" (dict "root" $ "name" "notifier" "component" "notifier" "replicas" $notifier.replicas "serviceAccount" $notifier.serviceAccount "grace" $notifier.terminationGracePeriodSeconds "containers" $containers) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" "notifier" "component" "notifier") }}
+{{- end }}

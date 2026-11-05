@@ -1,0 +1,10 @@
+apiVersion: v2
+name: sft
+description: >-
+  The secure file transfer service in one cluster: the API and every worker from one image, with clamd and the DLP
+  inspector beside each scan worker, and the operator API in its own namespace (architecture 2, ADR-0004, ADR-0005).
+type: application
+# The chart's own version. What runs is set by the image digest in each environment's values file, not by this.
+version: 0.1.0
+# Needs Kubernetes 1.30 or later, for the preStop sleep action (architecture 8). No kubeVersion constraint, which
+# would stop tools that render with an older default version (Trivy) from scanning the chart.

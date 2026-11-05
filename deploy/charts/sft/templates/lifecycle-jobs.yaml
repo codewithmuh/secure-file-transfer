@@ -1,0 +1,36 @@
+{{- if eq .Values.part "application" }}
+{{- /*
+The lifecycle jobs (architecture 4.5, 5.2): expiry, deletion in both regions, daily reconciliation, the audit archive
+and audit partition upkeep. Each is a CronJob; a run never overlaps the one before it, and a missed run waits for the
+next. Suspended in the pilot light, where the database is a read-only replica.
+*/}}
+{{- range $name := keys .Values.lifecycleJobs | sortAlpha }}
+{{- $job := index $.Values.lifecycleJobs $name }}
+{{- $env := printf "- name: DATABASE_URL\n  value: %s" (include "sft.databaseUrl" (dict "root" $ "role" $job.databaseRole) | quote) }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" $name) | nindent 4 }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ $.Values.pilotLight }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" (dict "root" $ "component" $name) | nindent 8 }}
+    spec:
+      backoffLimit: 0 # the next scheduled run is the retry; lag alerts cover a failing job (NFR-8, NFR-15)
+      activeDeadlineSeconds: {{ $job.activeDeadlineSeconds }}
+      template:
+        {{- include "sft.jobPod" (dict "root" $ "component" $name "module" $job.module "serviceAccount" $job.serviceAccount "env" $env "resources" $.Values.lifecycleJobResources) | nindent 8 }}
+{{- end }}
+{{- end }}

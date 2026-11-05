@@ -57,6 +57,9 @@ module "terraform_roles" {
   iam_path           = module.conventions.bootstrap_iam_path
   plan_role_name     = module.conventions.bootstrap_role_names.terraform_plan
   deploy_role_name   = module.conventions.bootstrap_role_names.terraform_deploy
+
+  # The shared stack: registry, zone, log archive and organization trail (#105).
+  shared_stack = true
 }
 
 module "key_admin" {

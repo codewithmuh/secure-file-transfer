@@ -965,9 +965,14 @@ data "aws_iam_policy_document" "secrets" {
         roles   = [local.role_arns["db-bootstrap"]]
         secrets = [local.secret_arns.db_master]
       }
-      ExternalSecretsReadsPlatformSecrets = {
-        roles   = [local.role_arns["external-secrets"]]
+      # External Secrets reads through one role per store, never its controller's own (6.4).
+      PlatformSecretStoreReadsPlatformSecrets = {
+        roles   = [local.role_arns["external-secrets-platform"]]
         secrets = [local.secret_arns.platform]
+      }
+      ApplicationSecretStoreReadsApiSecrets = {
+        roles   = [local.role_arns["external-secrets-app"]]
+        secrets = [local.secret_arns.email_hmac, local.secret_arns.csrf_hmac, local.secret_arns.idp_here]
       }
       BreakGlassReadsTheMasterPassword = {
         roles   = var.break_glass_principal_arn_patterns

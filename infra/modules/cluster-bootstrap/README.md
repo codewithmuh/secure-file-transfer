@@ -13,7 +13,7 @@ been applied (infra/README.md).
 | `egress-proxy.tf` | The egress proxy on the `system` nodes, one listener per workload (ADR-0021) |
 | `kyverno.tf` | Kyverno and the `kyverno-policies` chart |
 | `karpenter.tf` | Karpenter and its node pools |
-| `external-secrets.tf` | External Secrets and its Secrets Manager store, scoped to `sft/<env>/platform/` |
+| `external-secrets.tf` | External Secrets and its two Secrets Manager stores (`charts/secret-stores`), each assuming its own role: `platform-secrets` (`sft-<env>-external-secrets-platform`, `sft/<env>/platform/*`, platform namespaces) and `application-secrets` (`sft-<env>-external-secrets-app`, the API's secrets, the `sft` namespace only). The controller's own role reads no secret (encryption 6.4) |
 | `load-balancer-controller.tf` | The AWS Load Balancer Controller |
 | `rbac.tf` | Operator and read-only RBAC for Identity Center roles |
 | `argocd.tf` | Argo CD, SAML sign-in through Identity Center, notifications, and the root Application |
@@ -36,8 +36,18 @@ The job that applies a `cluster-bootstrap` root opens a Systems Manager session 
 tunnel document (modules/eks-cluster, `tunnel.tf`) and passes the local end as `TF_VAR_cluster_api_tunnel_url`; TLS
 still checks the cluster's own name. The deploy role may start that session and nothing else there
 (`terraform-oidc-roles/permissions-cluster-bootstrap.tf`), and the cluster admits it through the cluster layer's
-access entry. The root also reads the cluster layer's outputs and the data layer's `aurora_endpoint` from their
-states. That job is not written yet; no workflow opens the tunnel today.
+access entry. The root also reads the cluster layer's outputs and the data layer's `aurora_endpoint`,
+`valkey_endpoint` and `kms_key_arns` from their states. That job is not written yet; no workflow opens the tunnel today.
+
+## What the root Application hands the application
+
+The root Application renders `deploy/argocd` with `environment`, `region` and the cluster facts no commit may hold
+(#106): the registry host, the database and counter store endpoints, the account ID, the Operator role name, the
+files key ARN, the environment's names in the shared zone (`service_domain`, from `TF_VAR_domain`), and, once the user
+pool exists, its ID and managed login domain (`cognito_user_pool_id`, `cognito_login_domain`). A null input is left
+out, so the application chart's render names what is missing instead of starting pods without it. Kyverno admits the
+application's one third-party image, clamd's, by the digest the roots pass in `additional_mirror_digests`, the same as
+`deploy/charts/sft/values.yaml` (deploy/tests checks both).
 
 ## Tests
 

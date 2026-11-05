@@ -106,6 +106,47 @@ variable "operator_role_name" {
   }
 }
 
+variable "service_domain" {
+  description = "The environment's names in the shared zone (#105): sft.<domain> in prod, <env>.sft.<domain> elsewhere. The application's API and web app names are under it."
+  type        = string
+
+  validation {
+    condition     = can(regex("^([a-z0-9-]+\\.)*sft\\.[a-z0-9.-]+$", var.service_domain))
+    error_message = "service_domain must be sft.<domain> or <env>.sft.<domain>."
+  }
+}
+
+variable "valkey_host" {
+  description = "The counter store's endpoint address in this Region, from the data layer (ADR-0014), handed to the application's Applications."
+  type        = string
+
+  validation {
+    condition     = length(var.valkey_host) > 0
+    error_message = "valkey_host must not be empty: the application chart requires it."
+  }
+}
+
+variable "files_key_arn" {
+  description = "ARN of this Region's files key, from the data layer. The files buckets' policies require uploads to name it by ARN (encryption 3.1)."
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws:kms:ap-northeast-[13]:[0-9]{12}:key/mrk-[0-9a-f]{32}$", var.files_key_arn))
+    error_message = "files_key_arn must be a multi-Region KMS key ARN in Tokyo or Osaka."
+  }
+}
+
+variable "cognito_user_pool_id" {
+  description = "This Region's user pool ID, for member sign-in (ADR-0016). Null until the pool exists; the application part of the chart refuses to render without it."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cognito_user_pool_id == null ? true : can(regex("^ap-northeast-[13]_[0-9A-Za-z]+$", var.cognito_user_pool_id))
+    error_message = "cognito_user_pool_id must be a user pool ID in Tokyo or Osaka."
+  }
+}
+
 variable "argocd_url" {
   description = "Argo CD's URL as people reach it: through the Systems Manager tunnel to localhost (ADR-0021). Sign-in redirects use it."
   type        = string

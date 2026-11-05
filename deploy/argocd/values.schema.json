@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "The root Application's values for one cluster",
+  "type": "object",
+  "required": ["environment", "region", "cluster", "repoURL", "targetRevision"],
+  "properties": {
+    "environment": { "enum": ["dev", "staging", "prod"] },
+    "region": { "enum": ["ap-northeast-1", "ap-northeast-3"] },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry", "databaseHost", "accountId", "operatorRoleName", "serviceDomain", "valkeyHost", "filesKeyArn"],
+      "properties": {
+        "registry": { "type": "string", "pattern": "^[0-9]{12}\\.dkr\\.ecr\\.ap-northeast-[13]\\.amazonaws\\.com$" },
+        "databaseHost": { "type": "string", "minLength": 1 },
+        "accountId": { "type": "string", "pattern": "^[0-9]{12}$" },
+        "operatorRoleName": { "type": "string", "pattern": "^AWSReservedSSO_Operator_[0-9a-f]+$" },
+        "serviceDomain": { "type": "string", "minLength": 1 },
+        "valkeyHost": { "type": "string", "minLength": 1 },
+        "filesKeyArn": { "type": "string", "pattern": "^arn:aws:kms:ap-northeast-[13]:[0-9]{12}:key/mrk-[0-9a-f]{32}$" },
+        "userPoolId": { "type": "string", "pattern": "^(ap-northeast-[13]_[0-9A-Za-z]+)?$" },
+        "cognitoLoginDomain": { "type": "string" }
+      }
+    },
+    "repoURL": { "const": "https://github.com/codewithmuh/secure-file-transfer.git" },
+    "targetRevision": { "const": "main" }
+  }
+}

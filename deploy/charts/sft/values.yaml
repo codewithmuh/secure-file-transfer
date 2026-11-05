@@ -1,0 +1,253 @@
+# Defaults for every cluster. Each cluster's file in deploy/environments/<env>/<region>/values.yaml sets what differs,
+# and the root Argo CD Application, which Terraform makes, supplies `environment`, `region` and `cluster` (facts only
+# Terraform knows, such as account IDs, which are never committed). deploy/README.md explains the layout.
+
+# dev | staging | prod, and ap-northeast-1 (Tokyo) | ap-northeast-3 (Osaka). From the root Application.
+environment: ""
+region: ""
+
+# From the root Application (cluster-bootstrap stack, #104), which reads them from the data layer's state and the
+# stack's own inputs. CI renders with obviously fake ones (deploy/render.sh, deploy/tests/).
+cluster:
+  registry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com: our ECR, the Osaka replica in Osaka (ADR-0007)
+  databaseHost: "" # the Aurora cluster endpoint in this region (ADR-0011)
+  accountId: "" # this environment's account: the files buckets' names, the operator API's token checks (authn-authz 8.2)
+  operatorRoleName: "" # the IAM role of the Operator permission set in this account
+  # The environment's names in the shared zone (edge stack, #105): sft.<domain> in prod, <env>.sft.<domain> elsewhere.
+  # The API is api.<serviceDomain>, the web app app.<serviceDomain>.
+  serviceDomain: ""
+  valkeyHost: "" # the counter store's endpoint in this region (ADR-0014); TLS on 6379
+  filesKeyArn: "" # the files key in this region, which the files buckets' policies require by ARN (encryption 3.1)
+  # Member sign-in (ADR-0016, authn-authz 2): this region's user pool and its managed login domain. Empty until the
+  # user pool's stack exists; the application part refuses to render without them.
+  userPoolId: ""
+  cognitoLoginDomain: ""
+
+# Secrets come from Secrets Manager through External Secrets (encryption 6.4): the cluster-bootstrap stack's store,
+# which only the sft namespace may use, writes them into one Secret that the API reads as environment variables.
+# Nothing secret is in Git or in these values.
+secrets:
+  store: application-secrets
+  refreshInterval: 1h
+
+# Which namespace this release fills: `application` (namespace sft) or `operator` (namespace sft-operator, the
+# operator API alone, authn-authz 8.2). The two Argo CD Applications render the same chart with the same values files.
+part: application
+
+# Osaka's pilot light (architecture 3.2, ADR-0004): every workload at zero replicas, every CronJob suspended and no
+# migration job, because Osaka's database is a read-only replica until a failover. The failover's fencing commit sets
+# it to false here and true in Tokyo.
+pilotLight: false
+
+# The application image: one image for the API and every worker (architecture 2). The digest is the only line the
+# promotion workflow edits, in each cluster's values file (ADR-0005, #107).
+image:
+  repository: sft/app
+  digest: ""
+
+# Third-party images, mirrored by digest into our registry's mirror/ repositories (ADR-0007, T-70). The tag is for
+# readers; only the digest is pulled. It is the image the local stack's clamd runs (compose.yaml).
+clamav:
+  repository: mirror/clamav/clamav
+  tag: 1.5.4-debian
+  digest: sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1
+
+logLevel: info
+
+database:
+  port: 5432
+  name: sft
+  # IAM authentication: the URL names the workload's login role and the host, never a password (encryption 6.3).
+  options: sslmode=verify-full
+
+# Where pods may go (ADR-0021). The CIDRs are per cluster, from the network module's layout (infra/modules/network).
+network:
+  vpcCidr: ""
+  publicSubnetsCidr: "" # the load balancer, which reaches the API pods
+  endpointSubnetsCidr: "" # the interface endpoints, 443
+  isolatedSubnetsCidr: "" # Aurora 5432 and Valkey 6379
+  podIdentityAgent: 169.254.170.23/32 # EKS Pod Identity's credentials endpoint on every node, port 80
+  dns:
+    namespace: kube-system
+    podLabels: { k8s-app: kube-dns }
+  monitoring: # Prometheus scrapes the internal port (ADR-0009)
+    namespace: monitoring
+    podLabels: { app.kubernetes.io/name: prometheus }
+  egressProxy: # one listener per workload (ADR-0021, #104)
+    namespace: egress-proxy
+    host: egress-proxy.egress-proxy.svc.cluster.local
+    podLabels: { app.kubernetes.io/name: egress-proxy }
+    ports: { api: 3128, notifier: 3129, signatureMirror: 3130 }
+
+# Node pools (ADR-0004, #103): main for most workloads, scan for the scan trios, which are tainted. No pod here may
+# run on, or tolerate, the system pool.
+pools:
+  main: { nodeSelector: { sft.io/pool: main }, tolerations: [] }
+  scan:
+    nodeSelector: { sft.io/pool: scan }
+    tolerations: [{ key: sft.io/pool, operator: Equal, value: scan, effect: NoSchedule }]
+
+# How long a preStop hook holds SIGTERM back, so a pod leaves its Service endpoints and the load balancer's targets
+# before the server stops accepting (architecture 8).
+preStopSleepSeconds: 15
+
+# ---- Long-running workloads (Deployments). Every one runs as a non-root user with a read-only root file system, no
+# capabilities, no privilege escalation, the RuntimeDefault seccomp profile and no service account token; Pod
+# Identity gives the ones that call AWS their own role without one (#103). ----
+
+api:
+  replicas: 3
+  module: sft.api
+  serviceAccount: api # Pod Identity: sft-<env>-api
+  databaseRole: sft_api
+  valkeyUser: api # Valkey user sft-<env>-api, IAM-authenticated (ADR-0014)
+  # Download streams get up to 120 s after SIGTERM, then close and resume (abuse 5.7); 15 s of preStop plus 120 s of
+  # drain fit the 150 s grace period of architecture 8.
+  terminationGracePeriodSeconds: 150
+  env:
+    SHUTDOWN_DRAIN_SECONDS: "120"
+    DATABASE_POOL_SIZE: "10"
+  resources: # capacity 4.1
+    requests: { cpu: "1", memory: 1Gi }
+    limits: { memory: 1536Mi }
+
+relay:
+  replicas: 2 # rows are claimed with FOR UPDATE SKIP LOCKED (architecture 5.3)
+  module: sft.workers.relay
+  serviceAccount: relay
+  databaseRole: sft_relay
+  terminationGracePeriodSeconds: 30 # its drain is 15 s
+  env:
+    DATABASE_POOL_SIZE: "2"
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+notifier:
+  replicas: 2
+  module: sft.workers.notify
+  serviceAccount: notifier
+  databaseRole: sft_notify
+  valkeyUser: notify
+  terminationGracePeriodSeconds: 30
+  env: {}
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 768Mi }
+
+# The scan trios (ADR-0019, ADR-0022, capacity 4.2): in each pool a scan worker, a clamd pod and a DLP inspector per
+# scan node, one of each kind per node. Pools split at 100 MB, so large files don't delay small ones.
+scanPools:
+  small: { replicas: 3 }
+  large: { replicas: 2 }
+
+scanWorker:
+  module: sft.workers.scan # SCAN_POOL says which queue it reads
+  serviceAccount: scan-worker
+  databaseRole: sft_scan
+  valkeyUser: scan
+  terminationGracePeriodSeconds: 60
+  env: {}
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+clamd: # third-party, from the clamav image; no identity, ingress only from the scan workers
+  port: 3310
+  terminationGracePeriodSeconds: 30
+  scratch: 4Gi # streamed files and temporary extraction, on the node's volume under the files key
+  resources:
+    requests: { cpu: "1", memory: 4Gi, ephemeral-storage: 5Gi }
+    limits: { memory: 4Gi, ephemeral-storage: 6Gi }
+
+dlpInspector: # our image; no identity, no egress at all, ingress only from the scan workers
+  module: sft.dlp.inspector
+  # One file per connection, on the inspector's own framed protocol (sft.dlp.protocol): no HTTP, so no internal port.
+  port: 8070
+  terminationGracePeriodSeconds: 30
+  scratch: 4Gi
+  resources:
+    requests: { cpu: 1500m, memory: 2560Mi, ephemeral-storage: 4Gi }
+    limits: { memory: 3Gi, ephemeral-storage: 5Gi }
+
+# The private signature mirror (ADR-0019, capacity 3.3): freshclam fetches ClamAV's database through its proxy
+# listener and tests each new database once; a static file server from our image serves it to the clamd pods.
+signatureMirror:
+  replicas: 1
+  port: 8080
+  terminationGracePeriodSeconds: 30
+  resources:
+    freshclam: # loads the database once to test it (capacity 3.3)
+      requests: { cpu: 100m, memory: 1536Mi, ephemeral-storage: 1Gi }
+      limits: { memory: 2Gi, ephemeral-storage: 2Gi }
+    server:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { memory: 128Mi }
+
+operatorApi: # namespace sft-operator, port-forward only, never on a load balancer (authn-authz 8.2)
+  replicas: 1
+  module: sft.api.operator
+  serviceAccount: operator-api
+  databaseRole: sft_operator
+  valkeyUser: operator # its own rate limits (authn-authz 8.2)
+  terminationGracePeriodSeconds: 60 # 15 s of preStop and its 20 s drain
+  env:
+    DATABASE_POOL_SIZE: "2"
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 768Mi }
+
+# ---- Scheduled jobs (architecture 4.5, 5.2). Times are UTC. Each run is a fresh pod that exits; a run never overlaps
+# the one before it. ----
+
+lifecycleJobs:
+  expiry: # records expiry of transfers and upload requests past expires_at
+    schedule: "*/5 * * * *"
+    module: sft.workers.expiry
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    s3: false
+    activeDeadlineSeconds: 240
+  deletion: # deletes every version of due files in both regions; the only workload that deletes objects
+    schedule: "*/5 * * * *"
+    module: sft.workers.deletion
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    s3: true
+    activeDeadlineSeconds: 1800
+  reconciliation: # daily: compares the buckets with the metadata, deletes orphans, aborts stale multipart uploads
+    schedule: "17 3 * * *"
+    module: sft.workers.reconciliation
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    s3: true
+    activeDeadlineSeconds: 7200
+  audit-archive: # copies new audit rows to the Object Lock bucket at least every minute (NFR-15)
+    schedule: "* * * * *"
+    module: sft.workers.audit_archive
+    serviceAccount: audit-archive
+    databaseRole: sft_archive
+    s3: true
+    activeDeadlineSeconds: 300
+  audit-partitions: # daily: keeps three months of partitions ahead and drops expired ones (data model, 5.2)
+    schedule: "41 2 * * *"
+    module: sft.workers.audit_partitions
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    s3: false
+    activeDeadlineSeconds: 900
+
+lifecycleJobResources: # capacity 4.1
+  requests: { cpu: 500m, memory: 1Gi }
+  limits: { memory: 1Gi }
+
+# The migration job: an Argo CD PreSync hook, so a failed or refused migration stops the sync before any pod changes
+# (ADR-0005). The module decides whether to upgrade, do nothing, or skip after a rollback (data model 7).
+migration:
+  module: sft.data.migrate
+  serviceAccount: migrate # Pod Identity: sft-<env>-migrate, which signs the sft_migrate login
+  databaseRole: sft_migrate
+  activeDeadlineSeconds: 900
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 512Mi }

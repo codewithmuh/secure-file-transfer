@@ -1,0 +1,87 @@
+{{- if eq .Values.part "application" }}
+{{- /*
+The scan trios (ADR-0019, ADR-0022, capacity 4.2). Per pool, three Deployments with one pod of each kind on every
+scan node: the scan worker (one per node, any pool), and a clamd pod and a DLP inspector that must sit on a node
+with a worker of their pool and never beside another of their kind. The clamd and inspector Services keep traffic on
+the node (internalTrafficPolicy Local), so each worker streams to the engines beside it, never across nodes or AZs.
+*/}}
+{{- $config := include "sft.clamavConfig" . }}
+{{- $checksum := sha256sum $config }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clamd-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "clamd") | nindent 4 }}
+data:
+  {{- $config | nindent 2 }}
+{{- range $pool := list "small" "large" }}
+{{- $replicas := (index $.Values.scanPools $pool).replicas }}
+{{- $w := $.Values.scanWorker }}
+{{- $workerEnv := merge (dict "SCAN_POOL" $pool "SQS_QUEUE_PREFIX" (printf "%s-" (include "sft.namePrefix" $))) $w.env }}
+{{- $containers := include "sft.appContainer" (dict "root" $ "name" "scan-worker" "module" $w.module "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $workerEnv "resources" $w.resources) }}
+{{- $affinity := include "sft.onePerNode" (dict "component" "scan-worker") }}
+---
+{{ include "sft.deployment" (dict "root" $ "name" (printf "scan-worker-%s" $pool) "component" "scan-worker" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds "containers" $containers "affinity" $affinity) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" (printf "scan-worker-%s" $pool) "component" "scan-worker" "pool" $pool) }}
+{{- /* clamd: the clamav image, no identity; signatures seeded from the image, then kept current from the mirror. */}}
+{{- $c := $.Values.clamd }}
+{{- $clamd := include "sft.clamdContainers" $ }}
+{{- $seed := include "sft.seedSignatures" $ }}
+{{- $volumes := printf "- name: config\n  configMap: { name: clamd-config }\n- name: signatures\n  emptyDir: { sizeLimit: 1Gi }\n- name: run\n  emptyDir: { sizeLimit: 16Mi }\n- name: scratch\n  emptyDir: { sizeLimit: %s }" $c.scratch }}
+{{- $affinity = include "sft.besideWorker" (dict "component" "clamd" "pool" $pool) }}
+---
+{{ include "sft.deployment" (dict "root" $ "name" (printf "clamd-%s" $pool) "component" "clamd" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "clamd" "grace" $c.terminationGracePeriodSeconds "user" 1000 "containers" $clamd "initContainers" $seed "volumes" $volumes "affinity" $affinity "checksum" $checksum) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" (printf "clamd-%s" $pool) "component" "clamd" "pool" $pool) }}
+{{- /*
+The DLP inspector: our image, its own entry point; no identity, no database, no egress (ADR-0022). It speaks only its
+framed protocol, one file per connection, and has no HTTP listener, so it has no internal port. A TCP probe would be
+a malformed request it logs and counts as an inspection error, so it has none: a crashed parent exits and is
+restarted, and a hung one fails the worker's attempt, which is retried (architecture 6).
+*/}}
+{{- $d := $.Values.dlpInspector }}
+{{- $mounts := list (dict "name" "scratch" "mountPath" "/scratch") }}
+{{- $inspectorEnv := dict "INSPECTOR_PORT" $d.port "INSPECTOR_SCRATCH_DIR" "/scratch" }}
+{{- $inspectorPorts := printf "- { name: inspector, containerPort: %v, protocol: TCP }" $d.port }}
+{{- $containers = include "sft.appContainer" (dict "root" $ "name" "dlp-inspector" "module" $d.module "ports" $inspectorPorts "noProbes" true "env" $inspectorEnv "resources" $d.resources "volumeMounts" $mounts) }}
+{{- $volumes = printf "- name: scratch\n  emptyDir: { sizeLimit: %s }" $d.scratch }}
+{{- $affinity = include "sft.besideWorker" (dict "component" "dlp-inspector" "pool" $pool) }}
+---
+{{ include "sft.deployment" (dict "root" $ "name" (printf "dlp-inspector-%s" $pool) "component" "dlp-inspector" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "dlp-inspector" "grace" $d.terminationGracePeriodSeconds "containers" $containers "volumes" $volumes "affinity" $affinity) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" (printf "dlp-inspector-%s" $pool) "component" "dlp-inspector" "pool" $pool) }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clamd
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "clamd") | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "sft.selectorLabels" (dict "component" "clamd") | nindent 4 }}
+  ports:
+    - { name: clamd, port: {{ .Values.clamd.port }}, targetPort: clamd, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dlp-inspector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "dlp-inspector") | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "sft.selectorLabels" (dict "component" "dlp-inspector") | nindent 4 }}
+  ports:
+    - { name: inspector, port: {{ .Values.dlpInspector.port }}, targetPort: inspector, protocol: TCP }
+{{- end }}

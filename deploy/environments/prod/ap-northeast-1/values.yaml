@@ -1,0 +1,27 @@
+# prod Tokyo (architecture 3.1): the idle counts of capacity 4.2.
+# The chart's defaults are in deploy/charts/sft/values.yaml; the root Application adds environment, region and cluster.
+
+# The promotion workflow edits only the digest line (ADR-0005, #107). The all-zeros digest means "never built".
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# Fencing after a failover sets this to true (ADR-0004, T-78).
+pilotLight: false
+
+network: # infra/modules/network: VPC 10.30.0.0/16 (ADR-0021)
+  vpcCidr: 10.30.0.0/16
+  publicSubnetsCidr: 10.30.128.0/21
+  endpointSubnetsCidr: 10.30.144.0/24
+  isolatedSubnetsCidr: 10.30.136.0/21
+
+api:
+  replicas: 3
+relay:
+  replicas: 2
+notifier:
+  replicas: 2
+scanPools:
+  small: { replicas: 3 }
+  large: { replicas: 2 }
+signatureMirror:
+  replicas: 1

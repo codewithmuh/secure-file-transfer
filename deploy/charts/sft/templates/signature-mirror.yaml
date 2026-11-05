@@ -1,0 +1,69 @@
+{{- if eq .Values.part "application" }}
+{{- /*
+The private signature mirror (ADR-0019, ADR-0021, capacity 3.3): the only path from the clamd pods to ClamAV's
+database. freshclam fetches through the mirror's own proxy listener and tests each database once; a static file
+server from our image (Python's http.server, nothing new to mirror or patch) serves the directory read-only.
+*/}}
+{{- $m := .Values.signatureMirror }}
+{{- $ctx := dict "root" $ "component" "signature-mirror" }}
+{{- $config := tpl (.Files.Get "files/freshclam-mirror.conf") . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signature-mirror-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+data:
+  freshclam.conf: |
+    {{- $config | nindent 4 }}
+---
+{{- $containers := printf `
+- name: freshclam
+  image: %s
+  imagePullPolicy: IfNotPresent
+  command: [freshclam, --daemon, --config-file=/etc/clamav/freshclam.conf]
+  resources:%s
+  securityContext:%s
+  volumeMounts:
+    - { name: tmp, mountPath: /tmp }
+    - { name: config, mountPath: /etc/clamav, readOnly: true }
+    - { name: signatures, mountPath: /var/lib/clamav }
+- name: server
+  image: %s
+  imagePullPolicy: IfNotPresent
+  command: [python, -m, http.server, "%v", --bind, 0.0.0.0, --directory, /var/lib/clamav]
+  ports:
+    - { name: mirror, containerPort: %v, protocol: TCP }
+  livenessProbe:
+    tcpSocket: { port: mirror }
+    periodSeconds: 15
+  readinessProbe:
+    tcpSocket: { port: mirror }
+    periodSeconds: 10
+  resources:%s
+  securityContext:%s
+  volumeMounts:
+    - { name: tmp, mountPath: /tmp }
+    - { name: signatures, mountPath: /var/lib/clamav, readOnly: true }`
+  (include "sft.clamavImage" .) (toYaml $m.resources.freshclam | nindent 4) (include "sft.containerSecurityContext" . | nindent 4)
+  (include "sft.appImage" .) $m.port $m.port (toYaml $m.resources.server | nindent 4) (include "sft.containerSecurityContext" . | nindent 4) }}
+{{- $volumes := "- name: config\n  configMap: { name: signature-mirror-config }\n- name: signatures\n  emptyDir: { sizeLimit: 1Gi }" }}
+{{ include "sft.deployment" (dict "root" $ "name" "signature-mirror" "component" "signature-mirror" "replicas" $m.replicas "serviceAccount" "signature-mirror" "grace" $m.terminationGracePeriodSeconds "user" 1000 "containers" (trim $containers) "initContainers" (include "sft.seedSignatures" .) "volumes" $volumes "checksum" (sha256sum $config)) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signature-mirror
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sft.selectorLabels" $ctx | nindent 4 }}
+  ports:
+    - { name: mirror, port: {{ $m.port }}, targetPort: mirror, protocol: TCP }
+---
+{{ include "sft.pdb" (merge (dict "name" "signature-mirror") $ctx) }}
+{{- end }}

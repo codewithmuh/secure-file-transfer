@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sft-apps
+description: >-
+  The Argo CD AppProject and Applications for one cluster (ADR-0005). The root Application, which Terraform's
+  cluster-bootstrap stack makes (#104), renders this chart with the cluster's environment, region and the facts only
+  Terraform knows, and Argo CD then syncs the application chart from main.
+type: application
+version: 0.1.0

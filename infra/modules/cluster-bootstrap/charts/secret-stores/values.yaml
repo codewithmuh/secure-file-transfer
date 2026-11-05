@@ -1,0 +1,18 @@
+# Set by infra/modules/cluster-bootstrap (external-secrets.tf) per cluster.
+environment: "" # dev | staging | prod
+region: "" # ap-northeast-1 | ap-northeast-3
+accountId: "" # this environment's account, quoted
+
+# One store per kind of secret (encryption 6.1, 6.4). Each assumes its own role, sft-<env>-external-secrets-<role>,
+# which the cluster layer creates (modules/eks-cluster) and which may read only that store's secrets; the controller's
+# own role may only assume these two. `namespaces` are the only namespaces whose ExternalSecrets may use the store.
+stores:
+  platform-secrets:
+    role: platform # sft/<env>/platform/*
+    namespaces: [argocd, monitoring, grafana] # Argo CD's notifications key and the observability stack (ADR-0009)
+  application-secrets:
+    role: app # the API's csrf-hmac, email-hmac and this Region's idp-client (#106)
+    namespaces: [sft]
+
+# Further objects, full (apiVersion, kind, metadata, spec): Argo CD's notifications ExternalSecret, when it is on.
+manifests: []
