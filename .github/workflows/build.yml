@@ -107,7 +107,7 @@ jobs:
           role-session-name: build-${{ github.run_id }}-${{ github.run_attempt }}
           aws-region: ap-northeast-1
       - name: Log in to ECR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ${{ vars.ECR_REGISTRY }}
       # Build once: a re-run of this commit finds its finished image (tagged with the Git SHA only after the scan and

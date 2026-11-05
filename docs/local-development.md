@@ -41,7 +41,7 @@ weekly. The configuration files are in [`local/`](../local/).
 | `postgres` | Aurora PostgreSQL 17 ([ADR-0011](adr/0011-database-aurora-global.md)) | `postgres:17.11-trixie` | 5432 | Database `sft` and login `sft`, a superuser standing in for the master user |
 | `s3` | S3 ([ADR-0012](adr/0012-object-storage-s3.md)) | `adobe/s3mock:5.2.3` | 9090 | Created by `s3-init`: `sft-local-files` and `sft-local-large-files` with versioning on; `sft-local-audit-archive` with versioning and Object Lock (governance, 1 day, as in dev) |
 | `sqs` | SQS ([ADR-0013](adr/0013-queues-sqs-outbox.md)) | `softwaremill/elasticmq-native:1.7.1` | 9324 | `sft-local-` plus `scan-small`, `scan-large` and `notify` (work queues) and `signin-events`, `ses-events`, `guardduty-results` and `ses-tenant-status` (intake queues), each with a `-dlq` after 5 receives |
-| `valkey` | ElastiCache Serverless for Valkey ([ADR-0014](adr/0014-rate-limit-counters.md)) | `valkey/valkey:9.0.7-alpine` | 6379 | ACL user `sft-local`; the default user is off |
+| `valkey` | ElastiCache Serverless for Valkey ([ADR-0014](adr/0014-rate-limit-counters.md)) | `valkey/valkey:9.1.3-alpine` | 6379 | ACL user `sft-local`; the default user is off |
 | `mail` | SES ([ADR-0015](adr/0015-email-ses.md)) | `axllent/mailpit:v1.33.0` | 1025 (SMTP), 8025 (web UI and API) | Nothing; it catches every message |
 | `clamd` | The clamd pods ([ADR-0019](adr/0019-malware-scanning-clamav-guardduty.md)) | `clamav/clamav:1.5.4-debian` | 3310 | The signatures built into the pinned image |
 | `oidc` | The Cognito user pool and its app client ([ADR-0016](adr/0016-member-sign-in-cognito.md)) | `quay.io/keycloak/keycloak:26.8.1` | 8180 | Realm `sft`, confidential client `sft-api-local` and a test member, re-imported on every start |
@@ -140,7 +140,8 @@ role with the same password.
   (`{...}`), and test the key builder for it.
 - **A static password over plain TCP.** AWS uses TLS and IAM tokens that last 15 minutes, and closes connections after
   12 hours; the re-authentication path is tested in AWS.
-- Valkey 9.0, a version ElastiCache supports, with nothing persisted, like the counters it holds.
+- Valkey 9.1, with nothing persisted, like the counters it holds. ElastiCache added 9.1 for node-based clusters in June
+  2026; a serverless cache names only the major version (9) and AWS picks the minor, so keep to commands Valkey 9.0 has.
 
 ### Email (Mailpit)
 

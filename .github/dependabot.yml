@@ -30,6 +30,11 @@ updates:
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:
       python: { patterns: ["*"] }
+    ignore:
+      # SQLAlchemy stays on 2.0 (ADR-0002): 2.1 is a deliberate upgrade, not a Dependabot bump. See the note on its pin
+      # in services/api/pyproject.toml. Patch releases of 2.0 still come through.
+      - dependency-name: sqlalchemy
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   # Minor and patch updates in one weekly pull request; each major update gets its own, since it may need code changes.
   # The Node version in web/.nvmrc isn't covered: bump it by hand to the current LTS release.
