@@ -64,9 +64,10 @@ region = ap-northeast-1
 Each deploy role trusts one GitHub environment of this repository, and only the environment's deployment branch rule
 keeps a pull request or another branch from getting that subject (T-71, ADR-0005). GitHub creates an environment with
 no rules the first time a job names it, so the environments must exist, with the rule, **before** step 11
-creates the first deploy role. `registry` is the fifth: the shared account's image push role trusts it, and the build
-and promotion workflows name it (ADR-0007, #107). `can_admins_bypass: false` keeps the rule for admins too. prod also
-waits for a reviewer, you; with one maintainer you approve your own deployments, so self-review stays allowed (R-08).
+creates the first deploy role. `registry` is the fifth: the shared account's image push role trusts it, and the build,
+promotion and mark-deployed workflows name it (ADR-0007, #107). `can_admins_bypass: false` keeps the rule for admins
+too. prod also waits for a reviewer, you; with one maintainer you approve your own deployments, so self-review stays
+allowed (R-08).
 
 ```bash
 repo=codewithmuh/secure-file-transfer

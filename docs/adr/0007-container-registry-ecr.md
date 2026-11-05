@@ -45,20 +45,38 @@ dropped**: ECR is the only registry for our images.
 
 - **Repositories.** `sft/app` holds the one application image (architecture 2); `mirror/…` holds third-party images.
   The shared stack's deploy role creates them with the registry key and immutable tags.
-- **Lifecycle.** The promotion job (ADR-0005) tags every digest it puts into an environment's deploy config
-  `deployed-<git-sha>`, a tag of its own because tags are immutable, before the pull request opens. The highest-priority
-  lifecycle rule selects `deployed-*` with a count no repository reaches, so a deployed image never expires, whichever
-  environment still pins it; only builds never tagged deployed expire, beyond the newest 30 (A40). Signatures, SBOMs
-  and provenance stay with their image. Mirror repositories keep every digest that Git pins. A CI check fails a deploy
-  config that names a digest not in ECR, and a daily check alerts on a pinned digest without its `deployed-` tag.
+- **Lifecycle.** A digest is tagged `deployed-<git-sha>`, a tag of its own because tags are immutable, once its pin
+  lands on `main`: after each change to the deploy config, usually a promotion's merge, `mark-deployed.yml` (#107)
+  tags every digest `main` pins, and `promote.yml` repeats it for the digest it copies, which has already landed in
+  the previous environment. A build whose dev proposal is replaced before it merges is never tagged. The
+  highest-priority lifecycle rule selects `deployed-*` with a count no repository reaches, so a deployed image never
+  expires, whichever environment still pins it; only builds never tagged deployed expire, beyond the newest 30 (A40).
+  Mirror repositories keep every digest that Git pins. A CI check fails a deploy config that names a digest not in
+  ECR, and a daily check alerts on a pinned digest without its `deployed-` tag.
+- **Signatures and attestations under the lifecycle.** cosign v3 (v3.0.6, from `cosign-installer` v4.1.2) stores each
+  signature as a Sigstore bundle in an OCI 1.1 referrer: an untagged artifact whose subject is the image index. ECR's
+  lifecycle never expires a referrer while its subject is kept, and removes it within 24 hours after the subject
+  expires; the SBOM and provenance are manifests inside the index, which ECR won't expire before the index. So the
+  count rule, which also selects untagged images, can't take a kept image's signature or attestations. Tag-based
+  signatures could be taken: cosign's legacy `sha256-<digest>.sig` tags, or the `sha256-<digest>` tag that the OCI
+  referrers fallback writes for a registry without the referrers API, are tagged images the count rule could expire
+  while the image they sign is kept. ECR serves the referrers API, so none should appear; the lifecycle policy
+  ([#105](https://github.com/codewithmuh/secure-file-transfer/issues/105)) still keeps every `sha256-` tag, in a rule
+  above the count rule. The first build milestone checks with the lifecycle preview that no signature or attestation
+  of a kept image is selected, and how many images a build adds to the count.
 - **Build and sign** ([ADR-0005](0005-terraform-github-actions-argo-cd.md)). On every merge to `main` that changes
   code, CI builds once, fails on a critical or high Trivy finding, pushes `sft/app:<git-sha>` through an OIDC role in
   shared that may push only to `sft/*`, and signs the digest. The SBOM (SPDX) and provenance are attached as artifacts
   of that digest; the release-please release links the digest and attaches the SBOM, as the template does today.
-  `build.yml` (#107) pushes the image by digest with no tag, scans that digest, signs it, and only then tags it
-  `<git-sha>`, so the image scanned is the image that runs; a failed scan leaves an untagged, unsigned image that
-  admission refuses and the lifecycle expires. A re-run finds the commit's tag and reuses its digest. The push role
-  trusts only the `registry` GitHub environment, which accepts deployments from `main` only (T-71).
+  `build.yml` (#107) builds for `linux/arm64` only, natively on GitHub's `ubuntu-24.04-arm` runner, because every
+  node pool is Graviton ([capacity](../design/capacity-and-cost.md) 4.1); `ci.yml` builds and smoke-tests the same
+  Dockerfile on x86 before merge, and that image is never pushed. `build.yml` pushes the image by digest with no tag,
+  scans that arm64 image, signs it, verifies the signature as admission will, and only then tags it `<git-sha>`, so
+  the image scanned is the image that runs; a failed scan leaves an untagged, unsigned image that admission refuses
+  and the lifecycle expires. A re-run finds the commit's tag and reuses its digest, but only once `cosign verify`
+  accepts its signature with the identity below. Only that job may request an OIDC token, so nothing else can sign as
+  `build.yml`; the job that opens dev's pull request has the bot's token and no AWS access. The push role trusts only
+  the `registry` GitHub environment, which accepts deployments from `main` only (T-71).
 - **Signing identity.** Admission accepts an `sft/*` image only with a certificate whose identity is this repository's
   build workflow on `main`, issued by GitHub's OIDC issuer. Keyless signing records that identity and the digest in
   the public Rekor log. Kyverno verifies offline, from the bundle stored with the signature and a Sigstore trust root
@@ -66,6 +84,12 @@ dropped**: ECR is the only registry for our images.
   calls Sigstore through the proxy, and a deploy or a failover doesn't depend on reaching it. A scheduled workflow
   compares the pinned root with Sigstore's published one and opens a pull request when it rotates. The first build
   milestone confirms the offline check.
+- **Not yet checked before merge.** No role that a pull request may assume can read the registry: the push role
+  trusts only the `registry` environment, and the plan roles have no ECR permissions. So neither CI nor
+  `promotion-gate` can yet check that a digest in a pull request exists in ECR and is signed, as the lifecycle's CI
+  check above and ADR-0005's fast reverts assume; a hand-edited dev digest passes them. Admission still refuses an
+  unsigned digest, and `mark-deployed.yml` fails on the merge of a digest that isn't a build from `main`. The check
+  needs a read-only registry role that trusts `pull_request` (`ecr:DescribeImages` and pulls on `sft/*`).
 - **Third-party images** (T-70). A mirror workflow copies each image that Git pins, by digest, into `mirror/`, verifies
   the vendor's signature where one is published, and runs Trivy. Admission accepts a mirrored digest with its
   allow-listed vendor identity, or, for a vendor that publishes no signature, the digest reviewed and listed in Git.

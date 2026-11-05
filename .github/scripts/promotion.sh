@@ -14,9 +14,11 @@
 #   promotion.sh should-build BEFORE AFTER AUTHOR BOT
 #                                          true or false: does this push to main build an image?
 #   promotion.sh gate BASE HEAD            what a pull request changes in the deploy config, checked (promotion-gate)
-#   promotion.sh find-build GIT_SHA        the digest tagged GIT_SHA in ECR, or nothing (needs AWS)
+#   promotion.sh pinned                    every digest the work tree pins, without the placeholder (mark-deployed.yml)
+#   promotion.sh find-build GIT_SHA        the digest tagged GIT_SHA in ECR, or nothing if there is none (needs AWS)
 #   promotion.sh tag DIGEST TAG            add TAG to DIGEST in ECR; a no-op if it's already there (needs AWS)
 #   promotion.sh mark-deployed DIGEST      tag DIGEST deployed-<git-sha> so it never expires; prints the git SHA
+#                                          (needs AWS)
 #   promotion.sh open-pr ENV DIGEST GIT_SHA
 #                                          commit ENV's change as the bot and open or update its pull request
 set -euo pipefail
@@ -74,9 +76,10 @@ read_digest() {
 
 # The values files of ENV, one per region, in the work tree or at REF.
 values_files() {
-  local env=$1 ref=${2:-}
+  local env=$1 ref=${2:-} listing
   if [[ -n $ref ]]; then
-    git ls-tree -r --name-only "$ref" -- "deploy/environments/$env/" | grep -E '^deploy/environments/[^/]+/[^/]+/values\.yaml$' || true
+    listing=$(git ls-tree -r --name-only "$ref" -- "deploy/environments/$env/") || die "can't read $ref"
+    grep -E '^deploy/environments/[^/]+/[^/]+/values\.yaml$' <<<"$listing" || true
   else
     for f in deploy/environments/"$env"/*/values.yaml; do
       [[ -f $f ]] && echo "$f"
@@ -165,65 +168,117 @@ cmd_should_build() {
   echo false
 }
 
-# Every digest ENV's values files have ever pinned on the history of REF.
+# Every digest ENV's image block has pinned on main up to REF: read_digest on each region's file at each commit that
+# changed ENV's deploy config, so a digest elsewhere in the file (a mirrored image's, such as clamd's) never counts.
+# First parents only: what main pinned, not what a merged branch pinned on the way. A file that doesn't parse, from
+# before the deploy config had its shape, adds nothing.
 pinned_before() {
-  local env=$1 ref=$2
-  git log --format= -p "$ref" -- "deploy/environments/$env/" |
-    { grep -oE '^[-+]  digest: sha256:[0-9a-f]{64}' || true; } | sed -E 's/^[-+]  digest: //' | sort -u
+  local env=$1 ref=$2 commits commit files f
+  commits=$(git log --first-parent --format=%H "$ref" -- "deploy/environments/$env/")
+  for commit in $commits; do
+    files=$(values_files "$env" "$commit")
+    for f in $files; do
+      git show "$commit:$f" | read_digest "$f" 2>/dev/null || true
+    done
+  done | sort -u
 }
 
-# What promotion-gate decides for a pull request from BASE to HEAD. Prints one line per environment it changes:
-#   <env> build      dev: a new build. CI's checks are dev's gate.
-#   <env> rollback   a digest this environment pinned before (a revert): passes at once (ADR-0005).
+# What promotion-gate decides for a pull request from BASE to HEAD. A pull request may change the digest of one
+# environment at most. Prints nothing if it changes none, or one line:
+#   <env> build      dev: a new digest. Nothing a pull request can assume reads ECR yet, so this isn't checked here
+#                    (ADR-0007): admission refuses an unsigned digest, and mark-deployed.yml fails on the merge of
+#                    one that isn't a build from main.
+#   <env> rollback   a digest this environment pinned before on main (a revert): passes at once (ADR-0005).
 #   <env> promote <previous env> <digest>
-#                    the previous environment's digest: the workflow then checks that environment's health.
-# Fails for anything else: a digest the previous environment doesn't pin, regions that disagree, the placeholder.
+#                    the digest the previous environment pins on main (BASE): the workflow then checks that
+#                    environment's health on it.
+# Fails for anything else: two environments at once, a digest the previous environment doesn't pin on main, regions
+# that disagree, the placeholder.
 cmd_gate() {
-  local base=$1 head=$2 env old new prev prev_digest history fork
+  local base=$1 head=$2 env old new d files fork changed="" target="" prev prev_digest history
   # Only what the pull request itself changes counts: a branch that is merely behind main changes nothing.
   fork=$(git merge-base "$base" "$head") || die "$base and $head share no history"
   for env in $ENVIRONMENTS; do
-    [[ -n $(values_files "$env" "$head") ]] || continue
+    files=$(values_files "$env" "$head")
+    [[ -n $files ]] || continue
     git diff --quiet "$fork" "$head" -- "deploy/environments/$env/" && continue
-    new=$(cmd_get "$env" "$head")
+    d=$(cmd_get "$env" "$head")
     old=$PLACEHOLDER
-    if [[ -n $(values_files "$env" "$base") ]]; then
+    files=$(values_files "$env" "$base")
+    if [[ -n $files ]]; then
       old=$(cmd_get "$env" "$base")
     fi
-    [[ $new == "$old" ]] && continue
-    [[ $new != "$PLACEHOLDER" ]] || die "$env: the placeholder digest can't be deployed"
-    prev=$(previous_env "$env")
-    if [[ -z $prev ]]; then
-      echo "$env build"
-      continue
-    fi
-    history=$(pinned_before "$env" "$base") # into a variable first: grep -q closing the pipe would trip pipefail
-    if grep -qxF "$new" <<<"$history"; then
-      echo "$env rollback"
-    else
-      prev_digest=$(cmd_get "$prev" "$head")
-      [[ $new == "$prev_digest" ]] ||
-        die "$env: $new is neither $prev's digest ($prev_digest) nor one $env ran before; promote only by copying $prev"
-      echo "$env promote $prev $new"
-    fi
+    [[ $d == "$old" ]] && continue
+    [[ $d != "$PLACEHOLDER" ]] || die "$env: the placeholder digest can't be deployed"
+    changed+="${changed:+ }$env"
+    target=$env
+    new=$d
   done
+  [[ -n $changed ]] || return 0
+  [[ $changed != *" "* ]] ||
+    die "the pull request changes the digests of $changed; promote one environment per pull request"
+
+  prev=$(previous_env "$target")
+  if [[ -z $prev ]]; then
+    echo "$target build"
+    return
+  fi
+  history=$(pinned_before "$target" "$base") # into a variable first: grep -q closing the pipe would trip pipefail
+  if grep -qxF "$new" <<<"$history"; then
+    echo "$target rollback"
+    return
+  fi
+  prev_digest=$(cmd_get "$prev" "$base")
+  [[ $new == "$prev_digest" ]] ||
+    die "$target: $new is neither the digest $prev pins on main ($prev_digest) nor one $target ran before;" \
+      "promote only by copying $prev"
+  echo "$target promote $prev $new"
+}
+
+# The digests the work tree pins, every environment's, without the placeholder: what mark-deployed.yml tags once a
+# promotion lands on main.
+cmd_pinned() {
+  local env files digest
+  for env in $ENVIRONMENTS; do
+    files=$(values_files "$env")
+    [[ -n $files ]] || continue
+    digest=$(cmd_get "$env")
+    if [[ $digest != "$PLACEHOLDER" ]]; then
+      echo "$digest"
+    fi
+  done | sort -u
 }
 
 # ---- ECR (needs AWS credentials for the shared account's push role) -------------------------------------------------
 
+# Nothing when no image has the tag; a failure for any other error, so a build never mistakes a denied or failed call
+# for "not built yet".
 cmd_find_build() {
-  local sha=$1
+  local sha=$1 digest errors status=0
   [[ $sha =~ $SHA_RE ]] || die "'$sha' is not a 40-character Git SHA"
-  aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=$sha" \
-    --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true
+  errors=$(mktemp)
+  digest=$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=$sha" \
+    --query 'imageDetails[0].imageDigest' --output text 2>"$errors") || status=$?
+  if [[ $status != 0 ]]; then
+    if grep -q ImageNotFoundException "$errors"; then
+      rm -f "$errors"
+      return
+    fi
+    cat "$errors" >&2
+    rm -f "$errors"
+    die "can't look up $REPOSITORY:$sha in ECR"
+  fi
+  rm -f "$errors"
+  [[ $digest =~ $DIGEST_RE ]] || die "ECR answered '$digest' for $REPOSITORY:$sha, not a digest"
+  echo "$digest"
 }
 
 cmd_tag() {
-  local digest=$1 tag=$2 image tags
+  local digest=$1 tag=$2 image tags manifest media_type
   [[ $digest =~ $DIGEST_RE ]] || die "'$digest' is not sha256:<64 hex>"
   tags=$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageDigest=$digest" \
     --query 'imageDetails[0].imageTags' --output json)
-  if jq -e --arg t "$tag" 'index($t) != null' <<<"$tags" >/dev/null; then
+  if jq -e --arg t "$tag" '(. // []) | index($t) != null' <<<"$tags" >/dev/null; then
     echo "$digest already has tag $tag." >&2
     return
   fi
@@ -233,21 +288,25 @@ cmd_tag() {
     application/vnd.docker.distribution.manifest.list.v2+json application/vnd.docker.distribution.manifest.v2+json \
     --output json)
   [[ $(jq '.images | length' <<<"$image") == 1 ]] || die "$REPOSITORY@$digest is not in ECR"
+  manifest=$(jq -er '.images[0].imageManifest' <<<"$image")
+  media_type=$(jq -er '.images[0].imageManifestMediaType' <<<"$image")
   aws ecr put-image --repository-name "$REPOSITORY" --image-tag "$tag" --image-digest "$digest" \
-    --image-manifest "$(jq -r '.images[0].imageManifest' <<<"$image")" \
-    --image-manifest-media-type "$(jq -r '.images[0].imageManifestMediaType' <<<"$image")" >/dev/null
+    --image-manifest "$manifest" --image-manifest-media-type "$media_type" >/dev/null
   echo "Tagged $REPOSITORY@$digest as $tag." >&2
 }
 
 # ADR-0007's lifecycle keeps every digest tagged deployed-*. One such tag is enough: tags are immutable, and the
-# digest stays protected in whichever environment still pins it.
+# digest stays protected in whichever environment still pins it. Called only for a digest whose pin has landed on
+# main (mark-deployed.yml, and promote.yml for the digest it copies), so a build whose proposal never merges is never
+# tagged and expires.
 cmd_mark_deployed() {
   local digest=$1 tags sha
+  [[ $digest =~ $DIGEST_RE ]] || die "'$digest' is not sha256:<64 hex>"
   tags=$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageDigest=$digest" \
     --query 'imageDetails[0].imageTags' --output json)
-  sha=$(jq -r '[.[] | select(test("^[0-9a-f]{40}$"))][0] // empty' <<<"$tags")
+  sha=$(jq -r '[(. // [])[] | select(test("^[0-9a-f]{40}$"))][0] // empty' <<<"$tags")
   [[ -n $sha ]] || die "$REPOSITORY@$digest has no Git SHA tag: it isn't a finished build from main"
-  if jq -e '[.[] | select(startswith("deployed-"))] | length > 0' <<<"$tags" >/dev/null; then
+  if jq -e '[(. // [])[] | select(startswith("deployed-"))] | length > 0' <<<"$tags" >/dev/null; then
     echo "$digest is already tagged deployed." >&2
   else
     cmd_tag "$digest" "deployed-$sha"
@@ -283,8 +342,10 @@ cmd_open_pr() {
   local -a git_auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth")
   local remote="https://github.com/${GITHUB_REPOSITORY}.git" theirs
 
-  # Builds can finish out of order. If the open proposal was built from a newer commit than ours, keep it.
-  if git "${git_auth[@]}" fetch --quiet --no-tags "$remote" "+refs/heads/$branch:refs/remotes/proposed/$env" 2>/dev/null; then
+  # Builds can finish out of order, so dev keeps an open proposal built from a newer commit than ours. Staging and
+  # prod are promoted by hand: there the digest asked for always replaces the open proposal, an older build included.
+  if [[ $env == dev ]] &&
+    git "${git_auth[@]}" fetch --quiet --no-tags "$remote" "+refs/heads/$branch:refs/remotes/proposed/$env" 2>/dev/null; then
     theirs=$(git log -1 --format=%B "refs/remotes/proposed/$env" | sed -n 's/^Built-From: //p')
     if [[ -n $theirs && $theirs != "$sha" ]] && git merge-base --is-ancestor "$sha" "$theirs" 2>/dev/null; then
       echo "$branch already proposes a build of $theirs, which is newer than $sha; leaving it." >&2
@@ -317,6 +378,7 @@ main() {
     copy) [[ $# -eq 2 ]] || die "usage: copy FROM TO"; cmd_copy "$@" ;;
     should-build) [[ $# -eq 4 ]] || die "usage: should-build BEFORE AFTER AUTHOR BOT"; cmd_should_build "$@" ;;
     gate) [[ $# -eq 2 ]] || die "usage: gate BASE HEAD"; cmd_gate "$@" ;;
+    pinned) [[ $# -eq 0 ]] || die "usage: pinned"; cmd_pinned ;;
     find-build) [[ $# -eq 1 ]] || die "usage: find-build GIT_SHA"; cmd_find_build "$@" ;;
     tag) [[ $# -eq 2 ]] || die "usage: tag DIGEST TAG"; cmd_tag "$@" ;;
     mark-deployed) [[ $# -eq 1 ]] || die "usage: mark-deployed DIGEST"; cmd_mark_deployed "$@" ;;

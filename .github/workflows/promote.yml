@@ -6,12 +6,13 @@ name: promote
 #   staging → prod, and opens the promotion pull request as the bot, so CI runs on it. It only proposes: the pull
 #   request deploys when it merges, and merging the prod pull request is prod's approval.
 # - `promotion-gate` (every pull request, a required check): passes a pull request that doesn't change staging's or
-#   prod's digest. One that does passes only if it copies the previous environment's digest and that environment is
-#   synced, healthy and probed on it, or if it restores a digest the environment ran before (a revert, which passes at
-#   once so a rollback merges within NFR-18's 10 minutes). It reads the pull request's own head commit, so a re-run
-#   re-checks the same proposal.
+#   prod's digest. One that does passes only if it changes no other environment's digest and either copies the digest
+#   the previous environment pins on main, with that environment synced, healthy and probed on it, or restores a digest
+#   the environment ran before on main (a revert, which passes at once so a rollback merges within NFR-18's 10
+#   minutes). It reads the pull request's own head commit, so a re-run re-checks the same proposal.
 #
-# Nothing here runs on a push, so a promotion merge starts no workflow of its own; build.yml ignores it too.
+# Nothing here runs on a push, so a promotion merge starts no build or promotion; build.yml ignores it too. The merge
+# runs only mark-deployed.yml, which tags what main now pins deployed and changes nothing in Git.
 #
 # Variables: see build.yml (ECR_REGISTRY, ECR_PUSH_ROLE_ARN, BOT_APP_CLIENT_ID; secret BOT_APP_PRIVATE_KEY).
 on:
@@ -43,7 +44,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # to tell whether an open proposal was built from a newer commit
           persist-credentials: false
       - name: Copy the previous environment's digest
         id: copy
@@ -55,18 +55,22 @@ jobs:
             prod) from=staging ;;
             *) echo "::error::unknown environment $TARGET"; exit 1 ;;
           esac
-          echo "digest=$(.github/scripts/promotion.sh copy "$from" "$TARGET")" >> "$GITHUB_OUTPUT"
+          digest=$(.github/scripts/promotion.sh copy "$from" "$TARGET")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
           role-session-name: promote-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
           aws-region: ap-northeast-1
-      # dev's promotion tagged it already; this is a no-op then, and fails for a digest that isn't a build from main.
+      # The digest has landed on main in the previous environment, and mark-deployed.yml tagged it then: normally a
+      # no-op that finds the Git SHA it was built from. It fails for a digest that isn't a build from main.
       - name: Tag the digest deployed
         id: tag
         env:
           DIGEST: ${{ steps.copy.outputs.digest }}
-        run: echo "sha=$(.github/scripts/promotion.sh mark-deployed "$DIGEST")" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(.github/scripts/promotion.sh mark-deployed "$DIGEST")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - id: bot
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
@@ -112,7 +116,10 @@ jobs:
           while read -r env mode prev digest; do
             [[ -z $env ]] && continue
             case $mode in
-              build) echo "- $env: a new build; CI's checks are its gate." >> "$GITHUB_STEP_SUMMARY" ;;
+              # Nothing a pull request can assume reads ECR yet, so whether the digest is there and signed isn't
+              # checked here: admission refuses an unsigned one, and mark-deployed.yml fails on the merge of one that
+              # isn't a build from main (ADR-0007).
+              build) echo "- $env: a new digest; not yet checked against ECR before merge (ADR-0007)." >> "$GITHUB_STEP_SUMMARY" ;;
               rollback) echo "- $env: restores a digest it ran before (a revert): passes at once." >> "$GITHUB_STEP_SUMMARY" ;;
               promote)
                 echo "- $env: copies $prev's \`$digest\`; $prev must be synced, healthy and probed on it." >> "$GITHUB_STEP_SUMMARY"

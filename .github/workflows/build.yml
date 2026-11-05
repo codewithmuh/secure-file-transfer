@@ -1,9 +1,14 @@
 name: build
 
-# Build once, on main (ADR-0005, ADR-0007, #107). Every push to main that changes code builds the application image,
-# pushes it by digest to ECR in the shared account, scans it, signs it keylessly with cosign and tags it with its Git
-# SHA, then opens the pull request that pins dev to the new digest. Merging that pull request is the deploy: Argo CD
-# syncs it. Staging and prod are promoted from there by promote.yml.
+# Build once, on main (ADR-0005, ADR-0007, #107). Every push to main that changes code builds the application image
+# for linux/arm64, the only platform the clusters run (every node pool is Graviton, capacity 4.1), natively on an Arm
+# runner; pushes it by digest to ECR in the shared account, scans it, signs it keylessly with cosign and tags it with
+# its Git SHA, then opens the pull request that pins dev to the new digest. Merging that pull request is the deploy:
+# Argo CD syncs it, and mark-deployed.yml tags the digest deployed so the lifecycle keeps it. Staging and prod are
+# promoted from there by promote.yml.
+#
+# Only the image job may request an OIDC token, so only it can get a certificate with this workflow's identity, the
+# one admission accepts. Opening dev's pull request needs nothing but the bot's token.
 #
 # A promotion never starts a build. paths-ignore skips a push that changes only the deploy config (or docs, infra or
 # the web app, which aren't in the image); the filter job repeats that check and skips commits by the promotion bot,
@@ -76,16 +81,22 @@ jobs:
     name: Build, scan, sign and push sft/app
     needs: filter
     if: needs.filter.outputs.build == 'true'
-    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    # Arm, because the nodes are: the image is built natively, and Trivy and cosign check that same arm64 image.
+    # ci.yml's image job builds and smoke-tests the same Dockerfile on x86 before merge; that image is never pushed.
+    runs-on: ubuntu-24.04-arm # pinned: upgrade deliberately, not when GitHub moves "latest"
     timeout-minutes: 30
     environment: registry # the push role's OIDC subject; main only (T-71)
     permissions:
       contents: read
-      id-token: write # OIDC into the push role, and cosign's keyless certificate
+      id-token: write # OIDC into the push role, and cosign's keyless certificate; no other job here has it
     outputs:
       digest: ${{ steps.result.outputs.digest }}
     env:
       IMAGE: ${{ vars.ECR_REGISTRY }}/sft/app
+      PLATFORM: linux/arm64
+      # The identity admission accepts for sft/* (ADR-0007): this workflow on main, through GitHub's OIDC issuer.
+      SIGNER: https://github.com/codewithmuh/secure-file-transfer/.github/workflows/build.yml@refs/heads/main
+      SIGNER_ISSUER: https://token.actions.githubusercontent.com
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,10 +111,13 @@ jobs:
         with:
           registry: ${{ vars.ECR_REGISTRY }}
       # Build once: a re-run of this commit finds its finished image (tagged with the Git SHA only after the scan and
-      # the signature) and reuses it instead of building a second digest.
+      # the signature) and reuses it instead of building a second digest. find-build fails on any error but "no such
+      # tag", so a denied call never passes for "not built yet".
       - name: Look for a finished build of this commit
         id: earlier
-        run: echo "digest=$(.github/scripts/promotion.sh find-build "$GITHUB_SHA" | grep -E '^sha256:' || true)" >> "$GITHUB_OUTPUT"
+        run: |
+          digest=$(.github/scripts/promotion.sh find-build "$GITHUB_SHA")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         if: steps.earlier.outputs.digest == ''
       # Pushed by digest with no tag: until it has passed the scan and been signed, nothing names it, Kyverno refuses
@@ -115,29 +129,43 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: services/api
+          platforms: ${{ env.PLATFORM }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           build-args: APP_VERSION=${{ github.sha }}
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=api # written only by ci.yml's runs: pull request caches never reach main
+          # Its own scope, read and written only by this job on main: pull request caches never reach main, and
+          # ci.yml's cache holds x86 layers.
+          cache-from: type=gha,scope=api-arm64
+          cache-to: type=gha,mode=max,scope=api-arm64
       - name: Scan the pushed image for vulnerabilities
         if: steps.earlier.outputs.digest == ''
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_PLATFORM: ${{ env.PLATFORM }} # the arm64 image in the index, not Trivy's default platform
         with:
           scan-type: image
           image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1" # NFR-13: the image stays untagged and unsigned, and expires
+      # cosign v3 stores the signature as an OCI 1.1 referrer of the digest, which ECR's lifecycle never expires
+      # while the image is kept (ADR-0007).
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        if: steps.earlier.outputs.digest == ''
-      # The certificate names this workflow on main, the identity Kyverno accepts for sft/* (ADR-0007):
-      # https://github.com/codewithmuh/secure-file-transfer/.github/workflows/build.yml@refs/heads/main
+      # The certificate names this workflow on main, the identity Kyverno accepts for sft/* (ADR-0007).
       - name: Sign the digest (keyless, through GitHub OIDC)
         if: steps.earlier.outputs.digest == ''
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      # A new build is checked the way admission will check it. An earlier build is reused only if it is signed by
+      # this workflow on main: anyone else who could tag a digest with this commit's SHA can't make it pass.
+      - name: Verify the signature admission checks
+        env:
+          DIGEST: ${{ steps.build.outputs.digest || steps.earlier.outputs.digest }}
+        run: |
+          cosign verify --certificate-identity "$SIGNER" --certificate-oidc-issuer "$SIGNER_ISSUER" \
+            "${IMAGE}@${DIGEST}" > /dev/null
       - name: Tag the digest with its Git SHA
         if: steps.earlier.outputs.digest == ''
         env:
@@ -153,31 +181,21 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "Built \`sft/app@$digest\` from $GITHUB_SHA." >> "$GITHUB_STEP_SUMMARY"
 
+  # No OIDC token and no AWS: it can't sign, and it doesn't tag the digest deployed. A proposal that never merges
+  # leaves its build untagged, to expire; mark-deployed.yml tags the digest once the merge lands it on main (ADR-0007).
   promote-dev:
     name: Open the dev promotion pull request
     needs: image
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
     timeout-minutes: 10
-    environment: registry # the push role, to tag the digest deployed
     permissions:
       contents: read
-      id-token: write # OIDC into the push role
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main # the proposal is one change on top of the latest main
           fetch-depth: 0 # to tell whether an open proposal was built from a newer commit
           persist-credentials: false
-      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
-          role-session-name: promote-dev-${{ github.run_id }}-${{ github.run_attempt }}
-          aws-region: ap-northeast-1
-      # Before the pull request opens, so the digest can't expire while dev pins it (ADR-0007).
-      - name: Tag the digest deployed
-        env:
-          DIGEST: ${{ needs.image.outputs.digest }}
-        run: .github/scripts/promotion.sh mark-deployed "$DIGEST"
       - name: Pin dev to the digest
         env:
           DIGEST: ${{ needs.image.outputs.digest }}

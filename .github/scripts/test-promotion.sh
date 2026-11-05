@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Dry run of the promotion logic (#107): .github/scripts/promotion.sh against a throwaway Git repository with the
-# deploy config's shape (#106), and the trigger filters of build.yml. Needs only bash, git and awk: no GitHub, no AWS.
+# deploy config's shape (#106), the trigger filters and permissions of the workflows, and the GitHub and ECR commands
+# against stand-ins for gh and aws. Needs only bash, git, awk and jq: no GitHub, no AWS.
 # CI runs it in the repo-checks job; run it locally from the repository root.
 set -euo pipefail
 
@@ -8,9 +9,11 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 promotion="$root/.github/scripts/promotion.sh"
 build_yml="$root/.github/workflows/build.yml"
 promote_yml="$root/.github/workflows/promote.yml"
+mark_yml="$root/.github/workflows/mark-deployed.yml"
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+work=$(mktemp -d)  # the repository
+other=$(mktemp -d) # the stand-ins, and a clone for open-pr
+trap 'rm -rf "$work" "$other"' EXIT
 
 passed=0
 failed=0
@@ -30,6 +33,24 @@ expect_fail() { # NAME COMMAND...
   shift
   if "$@" >/dev/null 2>&1; then not_ok "$name: expected a failure"; else ok "$name"; fi
 }
+expect_fail_with() { # NAME MESSAGE COMMAND...: fails, and says MESSAGE
+  local name=$1 message=$2 errors
+  shift 2
+  if errors=$("$@" 2>&1 >/dev/null); then
+    not_ok "$name: expected a failure"
+  elif [[ $errors == *"$message"* ]]; then
+    ok "$name"
+  else
+    not_ok "$name: expected '$message', got '$errors'"
+  fi
+}
+jobs_with() { # FILE PATTERN: the jobs of a workflow with a line that matches PATTERN
+  awk -v pattern="$2" '
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^  [A-Za-z0-9_-]+:/ { job = $1; sub(/:$/, "", job); next }
+    in_jobs && job != "" && $0 ~ pattern { print job }
+  ' "$1" | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
 
 p() { "$promotion" "$@"; }
 
@@ -37,6 +58,7 @@ zeros=sha256:0000000000000000000000000000000000000000000000000000000000000000
 d1=sha256:1111111111111111111111111111111111111111111111111111111111111111
 d2=sha256:2222222222222222222222222222222222222222222222222222222222222222
 d3=sha256:3333333333333333333333333333333333333333333333333333333333333333
+d4=sha256:4444444444444444444444444444444444444444444444444444444444444444
 decoy=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 bot="sft-promotion[bot]"
 
@@ -73,8 +95,10 @@ initial=$(git rev-parse HEAD)
 echo "# Reading and writing the digest"
 expect_eq "get: the placeholder before the first build" "$zeros" "$(p get dev)"
 expect_eq "get at a ref" "$zeros" "$(p get staging HEAD)"
+expect_eq "pinned: nothing before the first build" "" "$(p pinned)"
 p set dev "$d1"
 expect_eq "set: dev pins the new digest" "$d1" "$(p get dev)"
+expect_eq "pinned: every digest pinned, without the placeholder or the other block's" "$d1" "$(p pinned)"
 expect_eq "set: changes exactly one line" "1" "$(git diff --numstat | awk '{ print $1 }')"
 if grep -qF "  digest: $d1 # promotion edits only this line" deploy/environments/dev/ap-northeast-1/values.yaml; then
   ok "set: keeps the line's comment"
@@ -159,6 +183,37 @@ if ! grep -qE '^  push:' "$promote_yml"; then
 else
   not_ok "promote.yml: never runs on a push"
 fi
+# mark-deployed.yml runs on a promotion merge, so it must never write to Git or open a pull request.
+if grep -qE '^      - "deploy/environments/\*\*"$' "$mark_yml" && grep -qE '^    branches: \[main\]$' "$mark_yml" &&
+  ! grep -qE '^  (pull_request|pull_request_target|workflow_run|workflow_dispatch):' "$mark_yml" &&
+  ! grep -qE 'contents: write|pull-requests: write|open-pr|create-github-app-token' "$mark_yml"; then
+  ok "mark-deployed.yml: runs on a deploy config change on main, and only tags"
+else
+  not_ok "mark-deployed.yml: runs on a deploy config change on main, and only tags"
+fi
+
+echo "# What the workflows may do"
+expect_eq "build.yml: only the image job can get an OIDC token, so only it can sign" "image" \
+  "$(jobs_with "$build_yml" 'id-token: write')"
+expect_eq "build.yml: the image is built on Arm" "image" "$(jobs_with "$build_yml" 'runs-on: ubuntu-24.04-arm')"
+# shellcheck disable=SC2016 # the workflow's own text, not shell expansions
+if grep -qF 'PLATFORM: linux/arm64' "$build_yml" && grep -qF 'platforms: ${{ env.PLATFORM }}' "$build_yml" &&
+  grep -qF 'TRIVY_PLATFORM: ${{ env.PLATFORM }}' "$build_yml"; then
+  ok "build.yml: builds and scans linux/arm64, the nodes' platform"
+else
+  not_ok "build.yml: builds and scans linux/arm64, the nodes' platform"
+fi
+# shellcheck disable=SC2016 # as above
+if grep -qF 'cosign verify --certificate-identity "$SIGNER"' "$build_yml" &&
+  grep -qF "DIGEST: \${{ steps.build.outputs.digest || steps.earlier.outputs.digest }}" "$build_yml"; then
+  ok "build.yml: verifies the signature of a new build and of a reused one"
+else
+  not_ok "build.yml: verifies the signature of a new build and of a reused one"
+fi
+expect_eq "build.yml: tags no build deployed (only mark-deployed.yml and promote.yml do, once a pin has landed)" "" \
+  "$(grep -E 'promotion\.sh (mark-deployed|tag .*deployed)' "$build_yml" || true)"
+expect_eq "workflows: no command's output read inside echo, where its failure is lost" "" \
+  "$(grep -nE 'echo "[^"]*\$\(' "$build_yml" "$promote_yml" "$mark_yml" || true)"
 
 echo "# promotion-gate"
 git reset --quiet --hard "$initial"
@@ -211,11 +266,151 @@ p copy staging prod >/dev/null
 commit "$bot" "prod d3"
 expect_eq "gate: prod copies staging" "prod promote staging $d3" "$(p gate "$main2" HEAD)"
 
-git switch --quiet -c pr-prod-from-dev "$main2"
+git switch --quiet -c pr-decoy "$main2"
+p set prod "$decoy" # the digest of the file's other block, as clamd's mirror would be
+commit maintainer "prod on the other block's digest"
+expect_fail_with "gate: a digest from another block of the file is no rollback" "nor one prod ran before" \
+  p gate "$main2" HEAD
+
+git switch --quiet -c pr-two "$main2"
+p set dev "$d1"
+p set staging "$d1"
+commit maintainer "dev and staging back to d1"
+expect_fail_with "gate: one pull request changes one environment's digest" "one environment per pull request" \
+  p gate "$main2" HEAD
+
+# main moves on: dev takes d2 (main3), a branch copies it to staging, then dev takes d4 (main4).
+git switch --quiet -c main-later "$main2"
 p set dev "$d2"
+commit "$bot" "dev d2"
+main3=$(git rev-parse HEAD)
+git switch --quiet -c pr-stale "$main3"
+p copy dev staging >/dev/null
+commit "$bot" "staging d2"
+expect_eq "gate: staging copies the digest dev pins on main" "staging promote dev $d2" "$(p gate "$main3" HEAD)"
+git switch --quiet main-later
+p set dev "$d4"
+commit "$bot" "dev d4"
+main4=$(git rev-parse HEAD)
+expect_fail_with "gate: the previous environment's digest is read on main, not on the branch" \
+  "neither the digest dev pins on main ($d4)" p gate "$main4" pr-stale
+
+git switch --quiet -c pr-prod-from-dev "$main3"
 p set prod "$d2"
 commit maintainer "prod skips staging"
-expect_fail "gate: prod can't skip staging" p gate "$main2" HEAD
+expect_fail_with "gate: prod can't skip staging" "neither the digest staging pins on main ($d3)" p gate "$main3" HEAD
+
+# A branch pins staging to d2, then d4, and is merged with a merge commit: main went from d3 to d4, never d2.
+git switch --quiet -c side "$main2"
+p set staging "$d2"
+commit maintainer "staging d2 on a branch"
+p set staging "$d4"
+commit maintainer "staging d4 on the branch"
+git switch --quiet -c main-merged "$main2"
+git merge --quiet --no-ff --no-edit side
+merged=$(git rev-parse HEAD)
+git switch --quiet -c pr-side-digest "$merged"
+p set staging "$d2"
+commit maintainer "staging d2"
+expect_fail_with "gate: a digest only a merged branch pinned is no rollback" "nor one staging ran before" \
+  p gate "$merged" HEAD
+
+echo "# open-pr and the ECR commands, against stand-ins for gh and aws"
+mkdir -p "$other/bin"
+cat >"$other/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+# Stands in for the GitHub CLI: logs each call and answers what open-pr asks.
+echo "gh $*" >>"$STUB_LOG"
+case $1 in
+  api) echo 41898282 ;; # the bot's user ID
+  pr) if [[ $2 == list && -f $STUB_DIR/open-pr ]]; then cat "$STUB_DIR/open-pr"; fi ;;
+esac
+EOF
+cat >"$other/bin/aws" <<'EOF'
+#!/usr/bin/env bash
+# Stands in for the AWS CLI: logs each call and answers from the files in $STUB_DIR.
+echo "aws $*" >>"$STUB_LOG"
+case "$2 $*" in
+  "describe-images "*imageTag=*)
+    case $(cat "$STUB_DIR/find") in
+      missing) echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2; exit 254 ;;
+      denied) echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation" >&2; exit 254 ;;
+      *) cat "$STUB_DIR/find" ;;
+    esac
+    ;;
+  "describe-images "*) cat "$STUB_DIR/tags" ;;
+  "batch-get-image "*)
+    echo '{"images": [{"imageManifest": "{}", "imageManifestMediaType": "application/vnd.oci.image.index.v1+json"}]}'
+    ;;
+esac
+EOF
+chmod +x "$other/bin/gh" "$other/bin/aws"
+export PATH="$other/bin:$PATH" STUB_DIR="$other" STUB_LOG="$other/calls"
+built=0123456789abcdef0123456789abcdef01234567 # a Git SHA
+
+echo "$d1" >"$other/find"
+expect_eq "find-build: the digest tagged with the commit" "$d1" "$(p find-build "$built")"
+echo missing >"$other/find"
+expect_eq "find-build: nothing when no image has the tag" "" "$(p find-build "$built")"
+echo denied >"$other/find"
+expect_fail_with "find-build: any other error fails, never 'not built yet'" "can't look up" p find-build "$built"
+
+echo "[\"$built\"]" >"$other/tags"
+: >"$STUB_LOG"
+expect_eq "mark-deployed: prints the Git SHA the digest was built from" "$built" "$(p mark-deployed "$d1" 2>/dev/null)"
+expect_eq "mark-deployed: tags the digest deployed-<git-sha>" "1" \
+  "$(grep -c -- "put-image .*--image-tag deployed-$built --image-digest $d1" "$STUB_LOG")"
+echo "[\"$built\", \"deployed-$built\"]" >"$other/tags"
+: >"$STUB_LOG"
+p mark-deployed "$d1" >/dev/null 2>&1
+expect_eq "mark-deployed: a no-op for a digest already tagged deployed" "0" "$(grep -c put-image "$STUB_LOG" || true)"
+echo null >"$other/tags"
+expect_fail_with "mark-deployed: refuses a digest that isn't a build from main" "no Git SHA tag" p mark-deployed "$d1"
+
+# open-pr against a bare repository standing in for GitHub; Git's insteadOf sends the https URL there.
+git init --quiet --bare "$other/github/codewithmuh/sft.git"
+git clone --quiet "$work" "$other/clone"
+git -C "$other/clone" config commit.gpgsign false
+open_pr() { # ENV DIGEST GIT_SHA, in the clone
+  (cd "$other/clone" &&
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.$other/github/.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/" \
+      GH_TOKEN=test BOT_SLUG=sft-promotion GITHUB_REPOSITORY=codewithmuh/sft "$promotion" open-pr "$@" >/dev/null 2>&1)
+}
+on_main() { # DIGEST-SETTING ARGS...: the clone back on main2, then `promotion.sh set ARGS`
+  git -C "$other/clone" switch --quiet --discard-changes --detach "$main2"
+  (cd "$other/clone" && "$promotion" set "$@")
+}
+proposed() { # ENV: the Git SHA the open proposal for ENV was built from, and the digest it pins
+  local github="$other/github/codewithmuh/sft.git" branch="refs/heads/promote/$1" sha digest
+  sha=$(git --git-dir="$github" log -1 --format=%B "$branch" | sed -n 's/^Built-From: //p')
+  digest=$(git --git-dir="$github" show "$branch:deploy/environments/$1/ap-northeast-1/values.yaml" |
+    sed -n '/^image:/,/^[^ ]/s/^  digest: \(sha256:[0-9a-f]*\).*/\1/p')
+  echo "$sha $digest"
+}
+rm -f "$other/open-pr"
+: >"$STUB_LOG"
+git -C "$other/clone" switch --quiet --detach "$main2"
+open_pr dev "$d3" "$main2"
+expect_eq "open-pr: nothing to propose when main already pins the digest" "" "$(cat "$STUB_LOG")"
+
+on_main dev "$d2"
+open_pr dev "$d2" "$main2"
+expect_eq "open-pr: proposes dev's new digest as the bot" "$main2 $d2" "$(proposed dev)"
+echo 7 >"$other/open-pr" # the pull request is open now
+on_main dev "$d1"
+open_pr dev "$d1" "$main1"
+expect_eq "open-pr: dev keeps a proposal built from a newer commit" "$main2 $d2" "$(proposed dev)"
+
+rm -f "$other/open-pr"
+on_main staging "$d2"
+open_pr staging "$d2" "$main2"
+echo 8 >"$other/open-pr"
+: >"$STUB_LOG"
+on_main staging "$d1"
+open_pr staging "$d1" "$main1"
+expect_eq "open-pr: a promotion by hand replaces staging's proposal, even with an older build" "$main1 $d1" \
+  "$(proposed staging)"
+expect_eq "open-pr: and updates its open pull request" "1" "$(grep -c '^gh pr edit 8 ' "$STUB_LOG")"
 
 echo
 echo "$passed passed, $failed failed"

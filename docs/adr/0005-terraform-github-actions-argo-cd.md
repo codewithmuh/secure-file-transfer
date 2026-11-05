@@ -72,8 +72,8 @@
   ([ADR-0008](0008-web-app-s3-cloudfront.md)). release-please still writes versions and the changelog; a release
   points at digests already built from `main` and never rebuilds.
 - **Bot pull requests** use the GitHub App token from
-  [#6](https://github.com/codewithmuh/secure-file-transfer/issues/6), so CI runs on them; the promotion job also tags
-  each digest it puts into a deploy config as deployed, which keeps it from expiring (ADR-0007).
+  [#6](https://github.com/codewithmuh/secure-file-transfer/issues/6), so CI runs on them. Each digest is tagged
+  deployed once its pin lands on `main`, which keeps it from expiring (ADR-0007).
 - **What the gate reads.** Argo CD's notifications controller records each application's sync, health and image
   digests as a GitHub deployment status for its environment and region (named apart from the GitHub environments the
   apply roles trust), through a GitHub App limited to deployments, over the egress proxy
@@ -81,7 +81,8 @@
   metric, which `promotion-gate` reads through the previous environment's plan role. The job waits up to 30 minutes and
   can be re-run.
 - **Fast reverts.** For a pull request that touches only `deploy/`, CI skips the code jobs but still reports the
-  required checks as passed, and checks that every digest exists in ECR and is signed. `promotion-gate` passes a revert
+  required checks as passed, and checks that every digest exists in ECR and is signed (not yet: no role a pull request
+  may assume reads the registry, ADR-0007). `promotion-gate` passes a revert
   at once when every digest it restores is one that environment ran before, from its deployment history. A revert then
   merges within minutes, inside NFR-18's 10 minutes.
 - **Bootstrap exceptions.** Each account's bootstrap stack (a state bucket and tfstate key per region, the OIDC
