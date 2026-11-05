@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 2
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1161,7 +1161,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pyyaml" },
     { name = "ruff" },
-    { name = "types-boto3", extra = ["sesv2"] },
+    { name = "types-boto3", extra = ["sesv2", "sqs"] },
     { name = "types-pyyaml" },
 ]
 
@@ -1187,7 +1187,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.17" },
-    { name = "types-boto3", extras = ["sesv2"], specifier = ">=1.43.120" },
+    { name = "types-boto3", extras = ["sesv2", "sqs"], specifier = ">=1.43.120" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20260906" },
 ]
 
@@ -1277,6 +1277,9 @@ wheels = [
 sesv2 = [
     { name = "types-boto3-sesv2" },
 ]
+sqs = [
+    { name = "types-boto3-sqs" },
+]
 
 [[package]]
 name = "types-boto3-sesv2"
@@ -1285,6 +1288,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/2b/0d/30710951e9fa817750009fde1f836f53000257480a328a815449a88aae85/types_boto3_sesv2-1.43.110.tar.gz", hash = "sha256:f9c98e42c646d625f5a371ceb472508ff955a3c499c454180d7dff27cfdaa973", size = 49843, upload-time = "2026-10-08T22:26:43.884Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cd/14/017be5e7583bd30b0dfb5c9d6975328b52b8f3e632f86a6dcbfa37736164/types_boto3_sesv2-1.43.110-py3-none-any.whl", hash = "sha256:3b6fe34fd32807fe786053ca59b6720f5b9fe7a7cd41451795f9f9c1728f12ec", size = 55655, upload-time = "2026-10-08T22:26:41.529Z" },
+]
+
+[[package]]
+name = "types-boto3-sqs"
+version = "1.43.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/79/be/353e9d04a06a48227af527d7e1da5c580f562b87d8b400532e8fe4eac498/types_boto3_sqs-1.43.0.tar.gz", hash = "sha256:a699170d774fb5dfab8d7881e02f102e07706cbfc44874825d4d6ddee77edf61", size = 23183, upload-time = "2026-04-29T23:07:09.111Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/39/c6/6e7daea77680793a1410f134869008f8199ef3c3277c1d6144460cbfd536/types_boto3_sqs-1.43.0-py3-none-any.whl", hash = "sha256:c23e43a13822208d26a946c991ebf9b4ba7194dec5b5537fd4eb850a2a5c25a7", size = 33398, upload-time = "2026-04-29T23:07:06.97Z" },
 ]
 
 [[package]]

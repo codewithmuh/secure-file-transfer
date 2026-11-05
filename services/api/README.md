@@ -1,8 +1,8 @@
 # api
 
-The API service: FastAPI on uvicorn, Python 3.13 (ADR-0002). The workers will join this codebase and image with their
-own entry points (architecture 2). It has no API routes yet; M1 adds the first ones from
-[the API contract](../../docs/api/openapi.yaml).
+The API service and the workers: FastAPI on uvicorn for the API, asyncio for the workers, Python 3.13 (ADR-0002). They
+share this codebase and image, each with its own entry point (architecture 2). The API has no routes yet; M1 adds the
+first ones from [the API contract](../../docs/api/openapi.yaml). The first worker is the outbox relay (ADR-0013).
 
 ## Layout
 
@@ -14,11 +14,16 @@ src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
-    internal.py       /healthz, /readyz, /metrics on the internal port
     observability.py  request and trace IDs, request metrics, one log line per request
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
-  (workers/)    later, beside api: asyncio workers that use the service layer without HTTP
+  workers/      beside api: asyncio workers that use the service layer without HTTP
+    relay.py          the outbox relay: python -m sft.workers.relay
+    consumer.py       Consumer, the idempotent consumer base class, and ConsumerLoop
+    queues.py         SQS behind a thin adapter (boto3 in a thread pool)
+    process.py        WorkerProcess: probes, SIGTERM and the drain for every worker
+  runtime/      what api and workers both need to run as a pod
+    internal.py       /healthz, /readyz, /metrics on the internal port
   service/      business rules and permission checks
     email/            every email, rendered in English and Japanese as text and HTML (Email below)
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations
@@ -31,13 +36,17 @@ src/sft/
     rls.py            grants and row-level security policies, for migrations
     audit.py          audit events, written in the transaction of the change; partition upkeep
     audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
+    outbox.py         the transactional outbox: enqueue(), the message contract, the relay's queries
+    processed.py      processed-message records, which make consumers idempotent
     migrations/       the Alembic revisions; migrate.py is the migration job
     mail/             the mail adapter: SES API v2 in AWS, SMTP to Mailpit locally (Email below)
-  core/         settings and logging, used by every layer
+  core/         settings, logging and UUIDv7 IDs, used by every layer
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
 ```
 
-`service`, `data` and `core` never import FastAPI, Starlette or uvicorn.
+`api` and `workers` never import each other. `service`, `data` and `core` never import FastAPI, Starlette or uvicorn;
+`runtime` sits between them and the entry points, so both entry points share the probes without either knowing the
+other.
 
 ## Run and check
 
@@ -403,3 +412,110 @@ A new tenant table also gets its rows in `seed_tenant` (`tests/isolation.py`), w
 code under test never seeds itself. `tests/isolation_fixture.py` holds stand-in tables, a parent with a credential and
 a child, that prove the harness, the composite keys and the lookup mechanism until the real tables arrive;
 `tests/test_isolation_harness.py` breaks each layer in turn and checks that the suite fails.
+
+## Workers
+
+Each worker runs from the same image as the API with its own command, logs in as its own database role, and has one
+port, the internal one (`/healthz`, `/readyz`, `/metrics`). `WorkerProcess` gives every worker the runtime contract
+(architecture 8): ready once its loop starts, never checking dependencies; on SIGTERM, readiness fails, the batch in
+hand gets `SHUTDOWN_DRAIN_SECONDS` (15) to finish and is cancelled after that, and the process exits 0. A loop that
+fails exits 1, so Kubernetes restarts the pod.
+
+### The transactional outbox
+
+A service function hands work to a worker by writing an outbox row in its own transaction (architecture 5.3):
+
+```python
+from sft.data.outbox import enqueue
+
+async with database.transaction(Scope.tenant(tenant_id)) as session:
+    ...  # the state change and its audit event
+    await enqueue(session, SCAN_SMALL_FILE, {"file_id": file.id})
+    await enqueue(session, RESCAN, {"file_id": file.id}, delay=timedelta(seconds=30))
+```
+
+The message commits with the change or not at all. The tenant is the transaction's own. The payload takes UUIDs (or
+lists of them) only, so a token, a code, an address or a file name can't reach a queue (T-49); the worker re-reads the
+rest. A delay holds the message back by up to 15 minutes, counted from the write. Topics are `Topic(name, queue)`
+values listed in `sft.data.outbox.TOPICS`; M0 has none, and each feature adds its own with the queue that carries it.
+
+### The outbox relay
+
+`python -m sft.workers.relay`, as `sft_relay`. In one short transaction per batch it claims up to `RELAY_BATCH_SIZE`
+due rows with `FOR UPDATE SKIP LOCKED`, sends them to SQS (10 per call, the calls side by side, each with the delay
+that is left and, on the scan queues, the tenant as the message group), marks the sent rows published, and gives each
+refused row its own backoff (2 s doubling to 5 minutes). If SQS refuses a whole batch for one bad message, the rows go
+one by one (at most 20 rows a batch), so only that row waits. The whole send phase ends within a 6-second budget,
+well inside the 10-second idle limit, and queue URLs are looked up at startup. A crash before the commit loses nothing: the rows stay unpublished and their locks
+end with the connection. A crash after the send sends them twice, which consumers skip. Replicas run side by side.
+Its claim and its marks filter with `in_scope(Outbox, session)`, and every UPDATE starts from one helper in
+`sft.data.outbox`. In system scope the session lets only `sft_relay` write tenant rows (`SYSTEM_WRITERS`), its role
+opens no other scope, and its policies match system scope alone. The isolation suite checks that no other role reads
+or marks a row.
+
+| Metric | Meaning |
+|---|---|
+| `outbox_oldest_unpublished_age_seconds` | Age of the oldest unpublished row after the last batch; ADR-0013 alerts above 120 s |
+| `outbox_messages_published_total{queue}` | Rows sent and marked published |
+| `outbox_publish_failures_total{queue}` | Sends refused or failed; `queue="unknown"` for a topic the relay doesn't know |
+| `outbox_relay_batch_duration_seconds` | One batch: claim, send and mark |
+
+Settings, besides `LOG_LEVEL`, `APP_VERSION`, `BIND_HOST`, `INTERNAL_PORT` (8001) and `SHUTDOWN_DRAIN_SECONDS` (15):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATABASE_URL` | none, required | `sft_relay`'s URL; a secret |
+| `DATABASE_POOL_SIZE` | `2` | Connections per process |
+| `SQS_QUEUE_PREFIX` | none, required | The environment's queue names: `sft-dev-` gives `sft-dev-notify` |
+| `SQS_ENDPOINT_URL` | none | Local only, for ElasticMQ; in AWS the SDK finds SQS's endpoint |
+| `AWS_REGION` | `ap-northeast-1` | |
+| `RELAY_BATCH_SIZE` | `50` | Rows per transaction (1 to 100) |
+| `RELAY_POLL_INTERVAL_SECONDS` | `1.0` | The wait after a batch that wasn't full |
+
+In AWS the pod's IAM role is the SQS identity; locally ElasticMQ takes any credentials, and Compose gives obviously fake
+ones.
+
+### Idempotent consumers
+
+```python
+from sft.workers.consumer import Consumer, ConsumerLoop, ConsumerMetrics, Delivery
+
+
+class ScanConsumer(Consumer):
+    name = "scan-small"  # its processed_messages key: never rename it
+    queue = Queue.SCAN_SMALL
+
+    async def handle(self, session: AsyncSession, delivery: Delivery) -> None:
+        file_id = delivery.message.payload["file_id"]
+        ...  # re-read the file in this tenant's scope and act; raise to have SQS deliver it again
+
+
+loop = ConsumerLoop(ScanConsumer(database), SqsQueues.create(..., read_timeout=25), metrics)
+await process.run(loop.run)
+```
+
+`Consumer.process` runs `handle` in one transaction in the message's tenant scope, and records
+`(name, outbox ID)` in `processed_messages` first, in the same transaction. A duplicate (an SQS redelivery, a relay
+retry, a re-publish after a failover) finds the record and is skipped, so its work is done once; two copies at the
+same time wait on each other's record. On shutdown `ConsumerLoop` abandons a long poll in flight at once. It deletes a message once it is processed or skipped, and leaves one
+that failed or doesn't parse for SQS to deliver again, until the redrive policy moves it to the dead-letter queue.
+`delivery.receive_count` lets the last attempt record a terminal state first. A handler whose effect is an email
+records after the send instead (ADR-0013); the notification worker does that itself.
+
+### SQS client
+
+`SqsQueues` (`src/sft/workers/queues.py`) wraps boto3, the only code that touches it, so tests use an in-memory fake
+and the integration tests use ElasticMQ. boto3 is synchronous, so each call runs in a small thread pool the adapter
+owns. aiobotocore, the async alternative, pins botocore a few releases behind boto3, and the service needs boto3 anyway
+(M4's IAM database tokens); the relay's load, about one call a second, is far too light for threads to matter.
+
+### Tests against ElasticMQ
+
+The adapter's integration tests and the relay's entry-point tests need an ElasticMQ URL in `TEST_SQS_ENDPOINT_URL`.
+They make their own queues under a fresh prefix and delete them. As with PostgreSQL, they are skipped locally without
+it and fail in CI, where ElasticMQ is a service container on the Python job.
+
+```bash
+docker run --detach --name sft-test-elasticmq --publish 127.0.0.1:59324:9324 softwaremill/elasticmq-native:1.7.1
+TEST_SQS_ENDPOINT_URL=http://127.0.0.1:59324 TEST_DATABASE_URL=… uv run pytest
+```

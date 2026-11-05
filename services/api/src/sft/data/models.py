@@ -179,3 +179,46 @@ class AuditEvent(Base):
     trace_id: Mapped[str | None] = mapped_column(Text)
     security_critical: Mapped[bool] = mapped_column(server_default=text("false"))
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'"))
+
+
+class Outbox(TenantOwned, Base):
+    """A message to hand to a worker, written with the change that causes it (data model 2.5).
+
+    `sft.data.outbox` writes and reads it; the relay publishes each row to SQS (ADR-0013).
+    """
+
+    __tablename__ = "outbox"
+    __table_args__ = (
+        CheckConstraint("delay_seconds BETWEEN 0 AND 900", name="delay_seconds"),
+        CheckConstraint("attempts >= 0", name="attempts"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload"),
+        CheckConstraint("jsonb_typeof(trace_context) = 'object'", name="trace_context"),
+        Index(
+            "outbox_unpublished_idx",
+            "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    topic: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    trace_context: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    delay_seconds: Mapped[int] = mapped_column(server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    published_at: Mapped[datetime | None]
+    attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ProcessedMessage(TenantOwned, Base):
+    """A message a consumer has handled, so a second delivery is skipped (data model 2.5)."""
+
+    __tablename__ = "processed_messages"
+
+    consumer: Mapped[str] = mapped_column(Text, primary_key=True)
+    message_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    processed_at: Mapped[datetime] = mapped_column(server_default=func.now())

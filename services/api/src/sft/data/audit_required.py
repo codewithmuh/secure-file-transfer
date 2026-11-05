@@ -57,8 +57,11 @@ AuditedCommand = Literal["INSERT", "UPDATE", "DELETE"]
 NOT_AUDITED: Final[dict[str, str]] = {
     # Tenant-owned tables whose changes need no audit event, each with the reason. Add a table here
     # in the migration's PR, or give it `require_audit` there; the catalog test checks one or the
-    # other. For example, the outbox: enqueueing a message isn't an action of its own, the change
-    # that enqueues it is audited.
+    # other.
+    "outbox": "Enqueueing a message isn't an action of its own: the change that enqueues it is "
+    "audited in the same transaction, and the relay only marks rows sent (ADR-0013).",
+    "processed_messages": "Recording a delivery isn't an action of its own: the handler's change "
+    "in the same transaction is audited where it is security-relevant (ADR-0013).",
 }
 
 

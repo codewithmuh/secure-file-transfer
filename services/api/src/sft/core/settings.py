@@ -5,9 +5,10 @@ the pod spec does. A secret is a `SecretStr` field with no default, so a missing
 process at startup instead of running with a placeholder; a test fails if a secret field gets a
 default. In the cloud, secrets come from AWS Secrets Manager, never from git.
 
-Each entry point reads only the settings it needs: `Settings` for the API (and later the workers),
-`MigrationSettings` for the migration job, `BootstrapSettings` for the database bootstrap job,
-`MailSettings` for whatever sends email (the notification worker).
+Each entry point reads only the settings it needs: `Settings` for the API, `RelaySettings` for the
+outbox relay (and `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the
+migration job, `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends
+email (the notification worker).
 """
 
 from __future__ import annotations
@@ -98,6 +99,59 @@ class Settings(_Base):
         if self.public_port == self.internal_port:
             raise ValueError("PUBLIC_PORT and INTERNAL_PORT must differ")
         return self
+
+
+_QUEUE_PREFIX = r"^[a-z0-9]+(-[a-z0-9]+)*-$"
+
+
+class WorkerSettings(_Base):
+    """What every worker reads: its probes, its database role and SQS (architecture 8)."""
+
+    app_version: str = Field(default="0.0.0", description="Set by the image build.")
+    bind_host: str = "127.0.0.1"
+    internal_port: int = Field(
+        default=8001,
+        ge=1,
+        le=65535,
+        description="Probes and metrics; a worker has no other port.",
+    )
+    shutdown_drain_seconds: int = Field(
+        default=15,
+        ge=1,
+        le=60,
+        description="How long the work in hand gets to finish after SIGTERM.",
+    )
+    database_url: PostgresUrl = Field(
+        description="The workload's own login role, never the migration role or the master user.",
+    )
+    database_pool_size: int = Field(default=2, ge=1, le=20)
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    sqs_queue_prefix: str = Field(
+        pattern=_QUEUE_PREFIX,
+        description="Names the environment's queues: `sft-dev-` makes `sft-dev-notify`. Required.",
+    )
+    sqs_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for ElasticMQ. In AWS the SDK finds SQS's VPC endpoint itself.",
+    )
+
+
+class RelaySettings(WorkerSettings):
+    """The outbox relay's settings (ADR-0013)."""
+
+    relay_batch_size: int = Field(
+        default=50,
+        ge=1,
+        le=100,
+        description="Rows claimed per transaction; sent in batches of 10, one call per queue.",
+    )
+    relay_poll_interval_seconds: float = Field(
+        default=1.0,
+        ge=0.05,
+        le=30,
+        description="The wait after a batch that wasn't full, before looking for due rows again.",
+    )
 
 
 class MigrationSettings(_Base):
