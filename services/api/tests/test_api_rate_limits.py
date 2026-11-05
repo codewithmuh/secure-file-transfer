@@ -1,5 +1,6 @@
 """Rate limits over HTTP: the route dependency, 429 and 503, counting 401s, and client IPs."""
 
+import json
 from collections.abc import Callable, Iterator, Mapping
 from ipaddress import ip_network
 from typing import Annotated
@@ -15,6 +16,7 @@ from sft.api.app import create_app
 from sft.api.client_ip import rate_limit_ip
 from sft.api.rate_limits import get_rate_limiter, rate_limit
 from sft.core.settings import Settings
+from sft.data.counters import gcra_split
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import (
     INVITE_USER,
@@ -23,6 +25,7 @@ from sft.service.rate_limits.limits import (
     KeyType,
     KeyValue,
 )
+from sft.service.rate_limits.local import fallback_limit
 
 TENANT = "11111111-1111-4111-8111-111111111111"
 ACCOUNT = "22222222-2222-4222-8222-222222222222"
@@ -40,11 +43,12 @@ def member_session(request: Request) -> Member:
     return Member()
 
 
-def app_with_routes(valkey_url: str) -> FastAPI:
+def app_with_routes(valkey_url: str, *, trusted_proxies: str = "") -> FastAPI:
     app = create_app(
         Settings(
             database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"),
             valkey_url=SecretStr(valkey_url),
+            trusted_proxies=trusted_proxies,  # type: ignore[arg-type]  # split by its validator
         )
     )
 
@@ -72,10 +76,14 @@ def app_with_routes(valkey_url: str) -> FastAPI:
     return app
 
 
-@pytest.fixture
-def client(valkey_url: str) -> Iterator[TestClient]:
+def flush(valkey_url: str) -> None:
     with valkey.Valkey.from_url(valkey_url) as empty:  # type: ignore[no-untyped-call]
         empty.flushdb()
+
+
+@pytest.fixture
+def client(valkey_url: str) -> Iterator[TestClient]:
+    flush(valkey_url)
     with TestClient(app_with_routes(valkey_url)) as client:
         yield client
 
@@ -87,11 +95,12 @@ def down() -> Iterator[TestClient]:
 
 
 def until_refused(send: Callable[[], Response], limit: int) -> Response:
-    """Send until refused: at least `limit` pass; real time lets a few more through (GCRA)."""
-    for sent in range(limit + 50):
+    """Send until refused: at least the burst passes; real time lets a few more through (GCRA)."""
+    burst = gcra_split(limit)[0]
+    for sent in range(burst + 50):
         response = send()
         if response.status_code != 200:
-            assert sent >= limit
+            assert sent >= burst
             return response
     raise AssertionError("never refused")
 
@@ -100,7 +109,7 @@ def test_over_the_limit_is_a_429_problem(client: TestClient) -> None:
     response = until_refused(lambda: client.post("/v1/auth/sign-in"), 60)
     assert response.status_code == 429
     assert response.headers["content-type"] == "application/problem+json"
-    assert response.headers["retry-after"] == "1"
+    assert response.headers["retry-after"] in ("1", "2")  # the rest of a 2 s interval
     body = response.json()
     assert body["code"] == "rate_limited"
     assert body["status"] == 429
@@ -122,13 +131,43 @@ def test_a_handler_applies_the_limits_whose_keys_it_finds(client: TestClient) ->
     assert int(response.headers["retry-after"]) > 86000
 
 
-def test_100_failed_authentications_block_the_ip(client: TestClient) -> None:
+def test_100_failed_authentications_block_the_ip_on_every_route(client: TestClient) -> None:
     for _ in range(100):
         assert client.get("/v1/me").status_code == 401
-    # Now even a valid member from that IP waits 15 minutes.
-    response = client.get("/v1/me", headers={"authorization": "Bearer ok"})
+    # The block is checked before authentication: the 101st bad credential gets no 401 to learn
+    # from, and a valid member, another route or no route at all from that IP waits 15 minutes.
+    for response in (
+        client.get("/v1/me"),
+        client.get("/v1/me", headers={"authorization": "Bearer wrong"}),
+        client.get("/v1/me", headers={"authorization": "Bearer ok"}),
+        client.post("/v1/auth/sign-in"),
+        client.get("/v1/nowhere"),
+    ):
+        assert response.status_code == 429
+        assert response.headers["retry-after"] == "900"
+        assert response.headers["content-type"] == "application/problem+json"
+        assert response.json()["code"] == "rate_limited"
+
+
+def test_failed_authentications_block_per_pod_when_the_store_is_down(down: TestClient) -> None:
+    for _ in range(fallback_limit(100)):
+        assert down.get("/v1/me").status_code == 401
+    response = down.get("/v1/me")
     assert response.status_code == 429
     assert response.headers["retry-after"] == "900"
+
+
+def test_clients_behind_the_load_balancer_are_blocked_apart(valkey_url: str) -> None:
+    flush(valkey_url)
+    app = app_with_routes(valkey_url, trusted_proxies="10.0.0.0/20")
+    # The load balancer's address as a dual-stack socket gives it, and entries with a port.
+    with TestClient(app, client=("::ffff:10.0.1.5", 50000)) as balancer:
+        guesser = {"x-forwarded-for": "198.51.100.1, 203.0.113.9:4321"}
+        for _ in range(100):
+            assert balancer.get("/v1/me", headers=guesser).status_code == 401
+        assert balancer.get("/v1/me", headers=guesser).status_code == 429
+        member = {"x-forwarded-for": "203.0.113.10:5555", "authorization": "Bearer ok"}
+        assert balancer.get("/v1/me", headers=member).status_code == 200
 
 
 def test_sign_in_fails_closed_when_the_store_is_down(down: TestClient) -> None:
@@ -139,8 +178,9 @@ def test_sign_in_fails_closed_when_the_store_is_down(down: TestClient) -> None:
 
 
 def test_tenant_calls_carry_on_per_pod_when_the_store_is_down(down: TestClient) -> None:
-    auth = {"authorization": "Bearer ok"}  # a third of 300
-    assert until_refused(lambda: down.get("/v1/me", headers=auth), 100).status_code == 429
+    auth = {"authorization": "Bearer ok"}
+    response = until_refused(lambda: down.get("/v1/me", headers=auth), fallback_limit(300))
+    assert response.status_code == 429
 
 
 def test_an_app_without_settings_has_no_limiter() -> None:
@@ -193,12 +233,43 @@ def request_from(peer: str | None, *forwarded: str) -> Request:
         # IPv6 counts per /64; an IPv4-mapped address as IPv4.
         ("2001:db8:1:2:3:4:5:6", (), "2001:db8:1:2::/64"),
         ("::ffff:198.51.100.4", (), "198.51.100.4"),
+        ("10.0.1.5", ("2001:db8:1:2::9",), "2001:db8:1:2::/64"),
+        ("10.0.1.5", ("1.1.1.1, ::ffff:203.0.113.9",), "203.0.113.9"),
+        # The load balancer's own address IPv4-mapped, as a dual-stack socket gives it: trusted.
+        ("::ffff:10.0.1.5", ("203.0.113.9",), "203.0.113.9"),
+        ("::ffff:198.51.100.4", ("203.0.113.9",), "198.51.100.4"),
+        # An entry with a port.
+        ("10.0.1.5", ("203.0.113.9:4321",), "203.0.113.9"),
+        ("10.0.1.5", ("[2001:db8:1:2::9]:4321",), "2001:db8:1:2::/64"),
+        ("10.0.1.5", ("[2001:db8:1:2::9]",), "2001:db8:1:2::/64"),
+        # Not an address and a port: unusable, so the load balancer's own address.
+        ("10.0.1.5", ("203.0.113.9:http",), "10.0.1.5"),
+        ("10.0.1.5", ("203.0.113.9:65536",), "10.0.1.5"),
+        ("10.0.1.5", ("203.0.113.9:",), "10.0.1.5"),
+        ("10.0.1.5", ("[2001:db8::9]4321",), "10.0.1.5"),
+        ("10.0.1.5", ("[2001:db8::9",), "10.0.1.5"),
         (None, (), "unknown"),
         ("testclient", (), "unknown"),
     ],
 )
 def test_client_ip(peer: str | None, forwarded: tuple[str, ...], expected: str) -> None:
     assert rate_limit_ip(request_from(peer, *forwarded), LB) == expected
+
+
+def test_a_trusted_proxy_without_a_usable_entry_is_logged_without_addresses(
+    json_logs: Callable[[], list[dict[str, object]]],
+) -> None:
+    rate_limit_ip(request_from("10.0.1.5"), LB)
+    rate_limit_ip(request_from("10.0.1.5", "203.0.113.9:http"), LB)
+    rate_limit_ip(request_from("10.0.1.5", "203.0.113.9"), LB)  # usable
+    rate_limit_ip(request_from("198.51.100.4"), LB)  # not from the load balancer
+    lines = json_logs()
+    assert [(line["level"], line["reason"]) for line in lines] == [
+        ("warning", "missing"),
+        ("warning", "unreadable"),
+    ]
+    for address in ("10.0.1.5", "203.0.113.9", "198.51.100.4"):
+        assert address not in json.dumps(lines)
 
 
 def test_problem_errors_carry_their_detail_and_retry_after() -> None:

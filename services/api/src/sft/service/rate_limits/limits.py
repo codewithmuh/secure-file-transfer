@@ -7,8 +7,8 @@ sees the failure records it (`RateLimiter.record`).
 
 The bundles at the end are what one operation applies, narrowest first (abuse design 2.4, 4.4): the
 caller's own keys, then IP, then the invited address, then the tenant. A route names its bundle in
-one line (`sft.api.rate_limits`). Every number is a starting value, changed only through deploy
-config, for every tenant at once.
+one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every request. Every
+number is a starting value, changed only through deploy config, for every tenant at once.
 
 This page carries the limits of the routes that exist now or arrive in M1 (groups B, G for
 `inviteUser`, H and J), and group A, whose per-link and per-address keys and fail-closed mode the
@@ -82,7 +82,12 @@ _VALUE = re.compile(r"[A-Za-z0-9._:/=-]{1,200}")
 
 @dataclass(frozen=True)
 class Rate:
-    """At most `limit` requests in any `period_seconds`, with an exact wait (GCRA)."""
+    """At most `limit` requests in any `period_seconds`, with an exact wait (GCRA).
+
+    A fresh key admits a burst of `limit // 2 + 1` at once, then `(limit + 1) // 2` per period,
+    evenly spaced, so no window (t - period, t] holds more than `limit` (`gcra_split` in
+    `sft.data.counters`). A `cost` above the burst is never admitted.
+    """
 
     limit: int
     period_seconds: int
@@ -201,9 +206,13 @@ SIGN_IN_START = (B_START,)
 SIGN_IN_CALLBACK = (B_CALLBACK,)
 INVITATION_SIGN_IN = (B_INVITATION,)
 
-TENANT_OPERATION = (H_CALLER, H_FAILED_AUTH, H_TENANT)
+EVERY_REQUEST = (H_FAILED_AUTH,)
+"""Before routing and authentication, on every request of the public API: an IP blocked after 100
+failed authentications gets `429` for whatever it sends, so a key guesser is stopped too."""
+
+TENANT_OPERATION = (H_CALLER, H_TENANT)
 """Every member and API key operation, `GET /me` and sign-out included."""
-SAFETY_ACTION = (H_CALLER, H_FAILED_AUTH)
+SAFETY_ACTION = (H_CALLER,)
 """`revokeTransfer`, `revokeUploadRequest`, `revokeApiKey`, `deactivateUser`, `unlockRecipient`,
 `unlockUploader`, `rejectTransfer`: never counted against, nor refused by, the tenant's budget."""
 

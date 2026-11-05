@@ -14,8 +14,10 @@ from sft.data.counters import (
     CounterStore,
     CounterStoreUnavailableError,
     Verdict,
+    gcra_split,
 )
-from sft.service.rate_limits.local import LocalCounters
+from sft.service.rate_limits.limits import ALL, Rate
+from sft.service.rate_limits.local import LocalCounters, fallback_limit
 
 pytestmark = pytest.mark.anyio
 
@@ -23,24 +25,37 @@ T0 = 1_800_000_000_000  # a fixed time in ms; the scripts take the time from the
 
 
 async def rate(store: CounterStore, now: int, *, cost: int = 1, peek: bool = False) -> Verdict:
+    # 3 in 3 s: a burst of 2, then one every 1.5 s.
     return await store.rate(
         "rl:T.rate:ip:192.0.2.1", now_ms=now, limit=3, period_ms=3000, cost=cost, peek=peek
     )
 
 
-async def test_rate_admits_the_limit_then_gives_the_exact_wait(counter_store: CounterStore) -> None:
-    assert [(await rate(counter_store, T0)).allowed for _ in range(3)] == [True] * 3
-    assert await rate(counter_store, T0) == Verdict(False, 1000)
-    # One request's worth of the period later, one more fits.
-    assert await rate(counter_store, T0 + 999) == Verdict(False, 1)
-    assert (await rate(counter_store, T0 + 1000)).allowed
-    assert not (await rate(counter_store, T0 + 1000)).allowed
+def test_gcra_split() -> None:
+    # Burst plus rate is one more than the limit: a window (t - period, t] holds burst + rate - 1.
+    assert [gcra_split(limit) for limit in (1, 2, 3, 60, 61)] == [
+        (1, 1),
+        (2, 1),
+        (2, 2),
+        (31, 30),
+        (31, 31),
+    ]
+
+
+async def test_rate_admits_its_burst_then_gives_the_exact_wait(counter_store: CounterStore) -> None:
+    assert [(await rate(counter_store, T0)).allowed for _ in range(2)] == [True] * 2
+    assert await rate(counter_store, T0) == Verdict(False, 1500)
+    # One interval later, one more fits: the third in [T0, T0 + 3000).
+    assert await rate(counter_store, T0 + 1499) == Verdict(False, 1)
+    assert (await rate(counter_store, T0 + 1500)).allowed
+    assert await rate(counter_store, T0 + 1500) == Verdict(False, 1500)
 
 
 async def test_rate_rolls_over_and_expires(counter_store: CounterStore) -> None:
-    for _ in range(3):
+    for _ in range(2):
         await rate(counter_store, T0)
-    assert [(await rate(counter_store, T0 + 3000)).allowed for _ in range(4)] == [True] * 3 + [
+    # Once the burst has drained, the whole burst again.
+    assert [(await rate(counter_store, T0 + 3000)).allowed for _ in range(3)] == [True] * 2 + [
         False
     ]
     ttl = await counter_store._client.pttl("rl:T.rate:ip:192.0.2.1")
@@ -50,19 +65,84 @@ async def test_rate_rolls_over_and_expires(counter_store: CounterStore) -> None:
 async def test_a_refused_or_peeked_request_counts_nothing(counter_store: CounterStore) -> None:
     for _ in range(3):
         assert (await rate(counter_store, T0, peek=True)).allowed
-    for _ in range(3):
+    for _ in range(2):
         await rate(counter_store, T0)
     for _ in range(5):
         await rate(counter_store, T0)  # refused
-    assert (await rate(counter_store, T0 + 1000)).allowed
+    assert (await rate(counter_store, T0 + 1500)).allowed
 
 
 async def test_rate_cost(counter_store: CounterStore) -> None:
-    assert (await rate(counter_store, T0, cost=2)).allowed
-    assert await rate(counter_store, T0, cost=2) == Verdict(False, 1000)
-    assert (await rate(counter_store, T0, cost=1)).allowed
-    # More than the whole limit at once is never admitted.
-    assert not (await rate(counter_store, T0 + 10_000, cost=4)).allowed
+    assert (await rate(counter_store, T0, cost=2)).allowed  # the whole burst at once
+    assert await rate(counter_store, T0, cost=1) == Verdict(False, 1500)
+    assert await rate(counter_store, T0, cost=2) == Verdict(False, 3000)
+    assert (await rate(counter_store, T0 + 1500, cost=1)).allowed
+    # More than the burst at once is never admitted, even on a fresh key.
+    assert not (await rate(counter_store, T0 + 100_000, cost=3)).allowed
+
+
+def most_in_any_window(times: list[int], window_ms: int) -> int:
+    """The most of `times`, in order, that any window (t - window, t] holds."""
+    most = first = 0
+    for last, at in enumerate(times):
+        while times[first] <= at - window_ms:
+            first += 1
+        most = max(most, last - first + 1)
+    return most
+
+
+STEADY = range(T0, T0 + 150_000, 50)
+"""A request every 50 ms for two and a half minutes."""
+
+
+async def test_a_steady_stream_gets_the_burst_then_at_most_the_limit_per_period(
+    counter_store: CounterStore,
+) -> None:
+    # 60 a minute (NFR-14's link steps): a burst of 31, then one every 2 s.
+    admitted = []
+    for now in STEADY:
+        verdict = await counter_store.rate(
+            "rl:T.steady:ip:x", now_ms=now, limit=60, period_ms=60_000, cost=1, peek=False
+        )
+        if verdict.allowed:
+            admitted.append(now)
+    assert admitted[:32] == [T0 + 50 * i for i in range(31)] + [T0 + 2000]
+    assert most_in_any_window(admitted, 60_000) == 60
+
+
+def test_the_per_pod_limiter_holds_a_steady_stream_to_the_limit_too() -> None:
+    local = LocalCounters()
+    admitted = [
+        now
+        for now in STEADY
+        if local.rate("k", now_ms=now, limit=60, period_ms=60_000, cost=1, peek=False).allowed
+    ]
+    assert admitted[:31] == [T0 + 50 * i for i in range(31)]
+    assert most_in_any_window(admitted, 60_000) == 60
+
+
+@pytest.mark.parametrize(
+    "limit",
+    sorted(
+        {x.rule.limit for x in ALL if isinstance(x.rule, Rate)}
+        | {fallback_limit(x.rule.limit) for x in ALL if isinstance(x.rule, Rate)}
+        | {1, 2, 3, 7}
+    ),
+)
+def test_every_rate_admits_exactly_its_limit_in_any_period(limit: int) -> None:
+    # A client that asks again the moment it may, for three periods, gets the limit in every
+    # window of one period and never more. Each table value, its per-pod third, and a few odd ones.
+    local = LocalCounters()
+    period = 60_000
+    admitted, now = [], T0
+    while now < T0 + 3 * period:
+        verdict = local.rate("k", now_ms=now, limit=limit, period_ms=period, cost=1, peek=False)
+        if verdict.allowed:
+            admitted.append(now)
+        else:
+            now += verdict.wait_ms
+    assert admitted[: gcra_split(limit)[0]] == [T0] * gcra_split(limit)[0]
+    assert most_in_any_window(admitted, period) == limit
 
 
 async def log(
@@ -154,15 +234,18 @@ async def test_the_scripts_match_the_per_pod_limiter(counter_store: CounterStore
         now += rng.choice((0, 0, 1, 50, 400, 1500, 4000))
         kind = rng.choice(("rate", "hit", "peek", "record"))
         if kind == "rate":
+            # 5 in 2 s has an interval of 666,667 µs: not a whole millisecond.
+            limit = rng.choice((1, 4, 5))
             args = {
                 "now_ms": now,
-                "limit": 4,
+                "limit": limit,
                 "period_ms": 2000,
                 "cost": rng.choice((1, 2)),
                 "peek": rng.random() < 0.2,
             }
-            got = await counter_store.rate("rl:T.r:ip:x", **args)  # type: ignore[arg-type]
-            want = local.rate("rl:T.r:ip:x", **args)  # type: ignore[arg-type]
+            key = f"rl:T.r{limit}:ip:x"
+            got = await counter_store.rate(key, **args)  # type: ignore[arg-type]
+            want = local.rate(key, **args)  # type: ignore[arg-type]
         else:
             # A limit always has the same block, so each key keeps its own.
             key, block = rng.choice((("rl:T.l:ip:x", 0), ("rl:T.b:ip:x", 7000)))

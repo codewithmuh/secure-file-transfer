@@ -235,8 +235,8 @@ def _headers_of(error: ProblemError) -> dict[str, str]:
 # casts say so to mypy, since Starlette types every handler as taking any Exception.
 
 
-async def _problem_error(_: Request, exc: Exception) -> JSONResponse:
-    error = cast(ProblemError, exc)
+def problem_for(error: ProblemError) -> JSONResponse:
+    """The answer to a `ProblemError`, for code outside the handlers, such as a middleware."""
     return problem_response(
         status_of(error),
         cast(ProblemCode, error.code),  # each class takes only its own codes
@@ -246,6 +246,10 @@ async def _problem_error(_: Request, exc: Exception) -> JSONResponse:
         attempts_remaining=error.attempts_remaining,
         headers=_headers_of(error),
     )
+
+
+async def _problem_error(_: Request, exc: Exception) -> JSONResponse:
+    return problem_for(cast(ProblemError, exc))
 
 
 # ---- requests FastAPI can't validate ----

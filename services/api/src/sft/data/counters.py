@@ -5,7 +5,9 @@ so a check and its increment are one atomic step and every script works in clust
 script can't reach keys in different hash slots:
 
 - `rate`: GCRA, the generic cell rate algorithm, for request rates. The key holds the theoretical
-  arrival time; `limit` requests fit in `period`, and the answer gives the exact wait.
+  arrival time, and the answer gives the exact wait. It is sized so that any window
+  (t - period, t] admits at most `limit` requests (`gcra_split`): a burst of about half the limit,
+  then the rest evenly spaced.
 - `log`: a sliding log in a sorted set, for small event quotas (codes per address or link, failures
   per IP). Exact over the window. A `record` can also start a block for a fixed time.
 
@@ -38,25 +40,25 @@ CALL_TIMEOUT_SECONDS = 0.05
 BREAKER_ERRORS = 5
 BREAKER_SECONDS = 10.0
 
-# KEYS[1] the key; ARGV now (ms), interval (ms per request: period / limit), period (ms), cost,
-# peek ("1": answer without counting). Returns {allowed, wait in ms}. The arrival time is kept to
-# a microsecond.
+# KEYS[1] the key; ARGV now (ms), interval (µs per request at the sustained rate), burst (µs: the
+# burst's size times the interval), cost, peek ("1": answer without counting). Returns {allowed,
+# wait in ms}. Times are whole microseconds, which Lua's doubles hold exactly, so a key admits at
+# most what `gcra_split` promises, never one more through rounding.
 _RATE = """
-local now = tonumber(ARGV[1])
+local now = tonumber(ARGV[1]) * 1000
 local interval = tonumber(ARGV[2])
-local period = tonumber(ARGV[3])
+local burst = tonumber(ARGV[3])
 local cost = tonumber(ARGV[4])
 local tat = tonumber(redis.call('GET', KEYS[1])) or now
 if tat < now then tat = now end
 local new_tat = tat + interval * cost
-local allow_at = new_tat - period
--- Within a millisecond counts as on time: `interval` is rarely exact in binary floating point.
-if allow_at - now >= 1 then
-  return {0, math.ceil(allow_at - now)}
+local allow_at = new_tat - burst
+if allow_at > now then
+  return {0, math.ceil((allow_at - now) / 1000)}
 end
 if ARGV[5] ~= '1' then
-  local ttl = math.max(1, math.ceil(new_tat - now))
-  redis.call('SET', KEYS[1], string.format('%.3f', new_tat), 'PX', ttl)
+  local ttl = math.ceil((new_tat - now) / 1000)
+  redis.call('SET', KEYS[1], string.format('%.0f', new_tat), 'PX', ttl)
 end
 return {1, 0}
 """
@@ -115,6 +117,27 @@ if mode == 'hit' then
 end
 return {1, 0}
 """
+
+
+def gcra_split(limit: int) -> tuple[int, int]:
+    """GCRA's burst and its sustained rate per period, for at most `limit` in any period.
+
+    A fresh key admits `burst` requests at once, then `rate` per period, one each period / rate.
+    A window (t - period, t], the sliding log's window, then holds at most burst + rate - 1 =
+    `limit` requests, and a client that sends as fast as it is let gets exactly that many. Sizing
+    both as `limit` would let 2 x limit - 1 through. A cost above the burst is never admitted.
+    """
+    return limit // 2 + 1, (limit + 1) // 2
+
+
+def gcra_shape(limit: int, period_ms: int) -> tuple[int, int]:
+    """GCRA's interval and burst for `limit` per period, in whole microseconds.
+
+    The interval is rounded up, so a key is never faster than its rate.
+    """
+    burst, rate = gcra_split(limit)
+    interval = -(-period_ms * 1000 // rate)
+    return interval, burst * interval
 
 
 class CounterStoreUnavailableError(Exception):
@@ -207,13 +230,8 @@ class CounterStore:
     async def rate(
         self, key: str, *, now_ms: int, limit: int, period_ms: int, cost: int, peek: bool
     ) -> Verdict:
-        args: list[str | int] = [
-            now_ms,
-            repr(period_ms / limit),
-            period_ms,
-            cost,
-            "1" if peek else "0",
-        ]
+        interval, burst = gcra_shape(limit, period_ms)
+        args: list[str | int] = [now_ms, interval, burst, cost, "1" if peek else "0"]
         return _verdict(await self._call(lambda: self._rate(keys=[key], args=args)))
 
     async def log(

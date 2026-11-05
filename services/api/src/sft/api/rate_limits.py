@@ -14,8 +14,10 @@ limiter there: `await limiter.check(REQUEST_CODE, keys)` with `limiter = Depends
 Refusals are `sft.core.errors` exceptions, which `sft.api.errors` answers: `429` with
 `Retry-After`, or `503` with `Retry-After: 5` for a fail-closed limit during a store outage.
 
-`CountFailedAuthentications` records every `401` the API answers against the client's IP
-(group H: 100 in 5 minutes block the IP for 15).
+`CountFailedAuthentications` records every `401` the API answers against the client's IP (group
+H: 100 in 5 minutes block the IP for 15). It checks that block before the app runs, so a blocked
+IP gets `429` on every route, before authentication: a bad credential can't get its `401` back
+and keep guessing.
 """
 
 from __future__ import annotations
@@ -29,8 +31,16 @@ from fastapi import Depends, FastAPI, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sft.api.client_ip import rate_limit_ip
+from sft.api.errors import problem_for
+from sft.core.errors import ProblemError
 from sft.service.rate_limits import RateLimiter
-from sft.service.rate_limits.limits import H_FAILED_AUTH, KeyType, KeyValue, Limit
+from sft.service.rate_limits.limits import (
+    EVERY_REQUEST,
+    H_FAILED_AUTH,
+    KeyType,
+    KeyValue,
+    Limit,
+)
 
 log = logging.getLogger(__name__)
 
@@ -55,8 +65,11 @@ def _trusted(request: Request) -> Sequence[IPv4Network | IPv6Network]:
 
 
 def client_ip(request: Request) -> str:
-    """The value per-IP limits count per, by ADR-0002's rule."""
-    return rate_limit_ip(request, _trusted(request))
+    """The value per-IP limits count per, by ADR-0002's rule; worked out once per request."""
+    ip = getattr(request.state, "client_ip", None)
+    if not isinstance(ip, str):
+        ip = request.state.client_ip = rate_limit_ip(request, _trusted(request))
+    return ip
 
 
 def rate_limit(limits: Sequence[Limit], *, caller: Callable[..., Any] | None = None) -> Any:
@@ -84,14 +97,22 @@ def rate_limit(limits: Sequence[Limit], *, caller: Callable[..., Any] | None = N
 
 
 class CountFailedAuthentications:
-    """Records each `401` against the client's IP, once the response has started."""
+    """Refuses a blocked IP before the app runs, and records each `401` against the client's IP."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        request = Request(scope) if scope["type"] == "http" else None
+        limiter = getattr(request.app.state, "rate_limiter", None) if request else None
+        if request is None or not isinstance(limiter, RateLimiter):
             await self.app(scope, receive, send)
+            return
+        ip = client_ip(request)
+        try:
+            await limiter.check(EVERY_REQUEST, {KeyType.IP: ip})
+        except ProblemError as refused:
+            await problem_for(refused)(scope, receive, send)
             return
         status = 0
 
@@ -103,12 +124,9 @@ class CountFailedAuthentications:
 
         await self.app(scope, receive, watch)
         if status == 401:
-            request = Request(scope)
-            limiter = getattr(request.app.state, "rate_limiter", None)
-            if isinstance(limiter, RateLimiter):
-                await limiter.record(H_FAILED_AUTH, client_ip(request))
+            await limiter.record(H_FAILED_AUTH, ip)
 
 
 def install_rate_limits(app: FastAPI) -> None:
-    """Count failed authentications. The limiter itself opens with the app's lifespan."""
+    """Count failed authentications and refuse blocked IPs. The limiter opens with the lifespan."""
     app.add_middleware(CountFailedAuthentications)

@@ -13,7 +13,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from sft.data.counters import LogMode, Verdict
+from sft.data.counters import LogMode, Verdict, gcra_shape
 
 FALLBACK_DIVISOR = 3
 
@@ -25,7 +25,7 @@ def fallback_limit(limit: int) -> int:
 @dataclass
 class _Entry:
     expires_ms: float
-    tat: float = 0.0
+    tat_us: int = 0
     scores: list[float] = field(default_factory=list)
     blocked_until: float = 0.0
 
@@ -41,14 +41,18 @@ class LocalCounters:
     def rate(
         self, key: str, *, now_ms: int, limit: int, period_ms: int, cost: int, peek: bool
     ) -> Verdict:
+        # In whole microseconds, as the script counts.
+        interval, burst = gcra_shape(limit, period_ms)
+        now = now_ms * 1000
         entry = self._live(key, now_ms)
-        tat = max(entry.tat if entry else now_ms, now_ms)
-        new_tat = round(tat + period_ms / limit * cost, 3)  # as the script keeps it
-        allow_at = new_tat - period_ms
-        if allow_at - now_ms >= 1:  # within a millisecond is on time, as in the script
-            return Verdict(False, math.ceil(allow_at - now_ms))
+        tat = max(entry.tat_us if entry else now, now)
+        new_tat = tat + interval * cost
+        allow_at = new_tat - burst
+        if allow_at > now:
+            return Verdict(False, math.ceil((allow_at - now) / 1000))
         if not peek:
-            self._put(key, _Entry(expires_ms=new_tat, tat=new_tat), now_ms)
+            expires_ms = now_ms + math.ceil((new_tat - now) / 1000)
+            self._put(key, _Entry(expires_ms=expires_ms, tat_us=new_tat), now_ms)
         return Verdict(True, 0)
 
     def log(

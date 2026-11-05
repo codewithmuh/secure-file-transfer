@@ -16,7 +16,7 @@ src/sft/
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     internal.py       /healthz, /readyz, /metrics on the internal port
     observability.py  request and trace IDs, request metrics, one log line per request
-    rate_limits.py    rate_limit(bundle): the route dependency; 401 counting
+    rate_limits.py    rate_limit(bundle): the route dependency; 401 counting and the IP block
     client_ip.py      the client's address by ADR-0002's rule
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
@@ -332,10 +332,12 @@ each operation's bundle is listed there, narrowest first. A route applies its bu
 tenant. Limits on keys a handler finds itself (a link's subject, an invited address as `EmailPseudonyms`) run there:
 `await limiter.check(REQUEST_CODE, keys)`, with `limiter = Depends(get_rate_limiter)`. A refusal is `429 rate_limited`
 with `Retry-After`; while Valkey is unavailable, groups A and B answer `503` with `Retry-After: 5` and the rest count
-in the pod at a third of each limit (abuse design 4.5). Every `401` counts against the client's IP (group H).
+in the pod at a third of each limit (abuse design 4.5). Every `401` counts against the client's IP (group H), and an
+IP blocked after 100 of them gets `429` on every route, checked before routing and authentication.
 
 The counter store (`sft/data/counters.py`) runs GCRA for rates and a sliding log for small quotas, one Lua script per
-key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). The client is
+key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). A rate of N per period admits a
+burst of N // 2 + 1, then the rest evenly spaced, so no window of one period holds more than N. The client is
 [valkey-py](https://github.com/valkey-io/valkey-py), the Valkey project's asyncio client: pure Python, the redis-py
 API, standalone and cluster clients, and a credential provider for the IAM tokens of M4.
 

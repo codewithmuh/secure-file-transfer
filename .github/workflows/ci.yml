@@ -223,9 +223,11 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
-          # The API needs DATABASE_URL to start, but connects only when a request needs it.
+          # The API needs DATABASE_URL and VALKEY_URL to start, but connects to each only when a
+          # request needs it, so nothing has to listen on these addresses.
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
+            --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi

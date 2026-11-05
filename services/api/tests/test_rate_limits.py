@@ -8,7 +8,7 @@ from prometheus_client import CollectorRegistry
 
 from sft.core.errors import RateLimited, ServiceUnavailable
 from sft.core.pseudonyms import EmailPseudonyms
-from sft.data.counters import CounterMetrics, CounterStore
+from sft.data.counters import CounterMetrics, CounterStore, gcra_split
 from sft.service.rate_limits import RateLimiter, RateLimitStoreUnavailable, limits
 from sft.service.rate_limits.limits import (
     ALL,
@@ -55,6 +55,11 @@ def keys_for(limit: Limit) -> dict[KeyType, str | EmailPseudonyms]:
 def period(limit: Limit) -> int:
     rule = limit.rule
     return rule.period_seconds if isinstance(rule, Rate) else rule.window_seconds
+
+
+def at_once(rule: Rate | Quota, value: int) -> int:
+    """How many requests a fresh key admits at the same instant, for a limit of `value`."""
+    return gcra_split(value)[0] if isinstance(rule, Rate) else value
 
 
 @pytest.fixture
@@ -120,15 +125,19 @@ def test_bundles_run_narrowest_first() -> None:
         KeyType.TENANT_EMAIL: 2,
         KeyType.TENANT: 3,
     }
-    for bundle in (
+    bundles = (
         limits.REQUEST_CODE,
         limits.TENANT_OPERATION,
         limits.SAFETY_ACTION,
         limits.INVITE_USER,
-    ):
+    )
+    for bundle in bundles:
         ranks = [rank[limit.keys[0]] for limit in bundle]
         assert ranks == sorted(ranks)
     assert limits.H_TENANT not in limits.SAFETY_ACTION
+    # The failed-authentication block runs before authentication, on every request, not in a bundle.
+    assert limits.EVERY_REQUEST == (limits.H_FAILED_AUTH,)
+    assert all(limits.H_FAILED_AUTH not in bundle for bundle in bundles)
 
 
 def test_store_keys() -> None:
@@ -154,19 +163,23 @@ def test_a_missing_key_is_a_programming_error() -> None:
 @pytest.mark.parametrize(
     "limit", [limit for limit in ALL if not limit.counts_failures], ids=lambda limit: limit.id
 )
-async def test_each_limit_admits_its_value_then_refuses_then_rolls_over(
+async def test_each_limit_admits_at_once_what_it_may_then_refuses_then_rolls_over(
     limiter: RateLimiter, clock: Clock, metrics: CounterMetrics, limit: Limit
 ) -> None:
-    keys = keys_for(limit)
-    for _ in range(limit.rule.limit):
+    # A rate's burst, or a quota's whole limit; test_counters checks a rate over a whole period.
+    rule, keys = limit.rule, keys_for(limit)
+    for _ in range(at_once(rule, rule.limit)):
         await limiter.check([limit], keys)
     with pytest.raises(RateLimited) as refused:
         await limiter.check([limit], keys)
     wait = refused.value.retry_after
-    if isinstance(limit.rule, Rate):
-        assert wait == math.ceil(limit.rule.period_seconds / limit.rule.limit)
+    if isinstance(rule, Rate):
+        burst, rate = gcra_split(rule.limit)
+        assert wait == math.ceil(rule.period_seconds / rate)  # one interval
+        drained = math.ceil(rule.period_seconds * burst / rate)  # the burst is free again
     else:
         assert wait == period(limit)  # every entry came at the same instant
+        drained = period(limit)
     key_type = limit.keys[0].value
     assert metrics.rejections.labels(limit.group.value, key_type)._value.get() == 1  # type: ignore[attr-defined]
     clock.now += wait - 1
@@ -174,8 +187,8 @@ async def test_each_limit_admits_its_value_then_refuses_then_rolls_over(
         await limiter.check([limit], keys)
     clock.now += 1
     await limiter.check([limit], keys)
-    clock.now += period(limit)  # the whole window later, the full limit again
-    for _ in range(limit.rule.limit):
+    clock.now += drained
+    for _ in range(at_once(rule, rule.limit)):
         await limiter.check([limit], keys)
 
 
@@ -200,26 +213,30 @@ async def test_each_failure_quota_refuses_once_full(
 
 
 async def test_401s_block_an_ip_for_15_minutes(limiter: RateLimiter, clock: Clock) -> None:
-    keys = {KeyType.IP: IP, KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
+    keys = {KeyType.IP: IP}
     for _ in range(100):
         await limiter.record(limits.H_FAILED_AUTH, IP)
     clock.now += 299  # failures still in the window, and the block runs from the 100th
     with pytest.raises(RateLimited) as refused:
-        await limiter.check(limits.TENANT_OPERATION, keys)
+        await limiter.check(limits.EVERY_REQUEST, keys)
     assert refused.value.retry_after == 900 - 299
     clock.now += 301  # the window is empty, the block still holds
     with pytest.raises(RateLimited):
-        await limiter.check(limits.TENANT_OPERATION, keys)
+        await limiter.check(limits.EVERY_REQUEST, keys)
     clock.now += 300
-    await limiter.check(limits.TENANT_OPERATION, keys)
+    await limiter.check(limits.EVERY_REQUEST, keys)
 
 
 async def test_rate_cost_counts_recipient_emails(limiter: RateLimiter) -> None:
+    # 200 an hour: a burst of 101 recipient emails, then one every 36 s.
     keys = {KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
-    await limiter.check([limits.G_CALLER_EMAILS], keys, cost=150)
     await limiter.check([limits.G_CALLER_EMAILS], keys, cost=50)
+    await limiter.check([limits.G_CALLER_EMAILS], keys, cost=51)
     with pytest.raises(RateLimited):
         await limiter.check([limits.G_CALLER_EMAILS], keys, cost=1)
+    other = {KeyType.API_KEY: "44444444-4444-4444-8444-444444444444", KeyType.TENANT: TENANT}
+    with pytest.raises(RateLimited):  # more than the burst is never admitted
+        await limiter.check([limits.G_CALLER_EMAILS], other, cost=102)
     with pytest.raises(ValueError, match="one event"):
         await limiter.check([limits.J_TENANTS], keys_for(limits.J_TENANTS), cost=2)
     with pytest.raises(ValueError, match="at least 1"):
@@ -233,7 +250,7 @@ async def test_a_refused_request_leaves_wider_limits_unchanged(
     limiter: RateLimiter, counter_store: CounterStore
 ) -> None:
     keys = {KeyType.IP: IP, KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
-    for _ in range(300):
+    for _ in range(gcra_split(300)[0]):  # the member's burst
         await limiter.check(limits.TENANT_OPERATION, keys)
     tenant_key = limits.H_TENANT.store_key(KeyType.TENANT, TENANT)
     before = await counter_store._client.get(tenant_key)
@@ -309,7 +326,7 @@ async def test_fail_open_limits_count_per_pod_at_a_third(
     down: RateLimiter, clock: Clock, limit: Limit
 ) -> None:
     keys = keys_for(limit)
-    for _ in range(fallback_limit(limit.rule.limit)):
+    for _ in range(at_once(limit.rule, fallback_limit(limit.rule.limit))):
         await down.check([limit], keys)
     with pytest.raises(RateLimited):
         await down.check([limit], keys)
@@ -320,11 +337,10 @@ async def test_fail_open_limits_count_per_pod_at_a_third(
 async def test_failures_are_recorded_per_pod_during_an_outage(
     down: RateLimiter, clock: Clock
 ) -> None:
-    keys = {KeyType.IP: IP, KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
     for _ in range(fallback_limit(100)):
         await down.record(limits.H_FAILED_AUTH, IP)
     with pytest.raises(RateLimited) as refused:
-        await down.check(limits.TENANT_OPERATION, keys)
+        await down.check(limits.EVERY_REQUEST, {KeyType.IP: IP})
     assert refused.value.retry_after == 900
     with pytest.raises(ValueError, match="doesn't count failures"):
         await down.record(limits.H_TENANT, TENANT)
