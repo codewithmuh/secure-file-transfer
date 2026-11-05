@@ -2007,8 +2007,8 @@ export interface paths {
          *     characters, in English or Japanese; terms match whatever their full-width or half-width form and case, and
          *     Japanese terms match without word boundaries (FR-38). A **pattern** is an RE2 expression of at most 512
          *     characters, with optional context keywords and a minimum match length (FR-39); it is refused if it doesn't
-         *     compile, matches the empty string, or takes more than 50 ms on the test text (`422 validation_failed`, with a
-         *     pointer to the field). A tenant has at most 50 detectors, at most 20 of them patterns.
+         *     compile, compiles to more than 1,000 RE2 instructions, or matches the empty string, on its own or anywhere in
+         *     the test text (`422 validation_failed`, with a pointer to the field). A tenant has at most 50 detectors, at most 20 of them patterns.
          *
          *     The definition is stored encrypted with the tenant's DLP data key, and the audit record names the detector,
          *     never its terms. A new detector applies to files inspected from then on (ADR-0022). Audit, notice and

@@ -347,6 +347,29 @@ def private_key_lines(rng: random.Random, label: str, valid: bool = True) -> tup
     return lines, body.hex()
 
 
+LEGACY_CIPHERS = {"AES-128-CBC": 16, "AES-256-CBC": 16, "DES-EDE3-CBC": 8}
+
+
+def legacy_encrypted_key_lines(
+    rng: random.Random, label: str, cipher: str = "AES-128-CBC", valid: bool = True
+) -> tuple[list[str], str]:
+    """A fake PEM block encrypted the old OpenSSL way (Proc-Type and DEK-Info headers), and its
+    canonical value. The body is random bytes, as ciphertext looks: a whole number of cipher blocks,
+    or one byte short when `valid` is false.
+    """
+    block = LEGACY_CIPHERS[cipher]
+    body = rng.randbytes(block * rng.randint(8, 40) - (0 if valid else 1))
+    lines = [
+        f"-----BEGIN {label}{_PRIVATE}-----",
+        "Proc-Type: 4,ENCRYPTED",
+        f"DEK-Info: {cipher},{rng.randbytes(block).hex().upper()}",
+        "",
+        *_wrap(base64.b64encode(body).decode(), 64),
+        f"-----END {label}{_PRIVATE}-----",
+    ]
+    return lines, body.hex()
+
+
 def pgp_key_lines(rng: random.Random) -> tuple[list[str], str]:
     body = bytes([0x95]) + rng.randbytes(rng.randint(200, 500))
     encoded = base64.b64encode(body).decode()
@@ -892,17 +915,21 @@ def _credential_positives(rng: random.Random, count: int) -> list[Document]:
 def _private_key_positives(rng: random.Random, count: int) -> list[Document]:
     docs = []
     for index in range(count):
-        kind = rng.choice(("pem", "pem", "pem", "pgp", "putty"))
+        kind = rng.choice(("pem", "pem", "pem", "legacy", "pgp", "putty"))
         if kind == "pem":
             label = rng.choice(PEM_LABELS)
             lines, value = private_key_lines(rng, label)
+        elif kind == "legacy":
+            label = rng.choice(("RSA ", "EC ", "DSA "))
+            cipher = rng.choice(sorted(LEGACY_CIPHERS))
+            lines, value = legacy_encrypted_key_lines(rng, label, cipher)
         elif kind == "pgp":
             lines, value = pgp_key_lines(rng)
         else:
             lines, value = putty_key_lines(rng)
         layout = (
             rng.choice(("text", "lines", "flat"))
-            if kind == "pem"
+            if kind in ("pem", "legacy")
             else rng.choice(("text", "lines"))
         )
         expected = [Expected("private_key", value, "high")]

@@ -36,17 +36,33 @@ class Regex:
     __slots__ = ("_compiled",)
 
     def __init__(
-        self, expression: str, *, case_insensitive: bool = False, max_mem: int = DEFAULT_MAX_MEM
+        self,
+        expression: str,
+        *,
+        case_insensitive: bool = False,
+        never_capture: bool = False,
+        max_mem: int = DEFAULT_MAX_MEM,
     ) -> None:
         options = re2.Options()
         options.max_mem = max_mem
         options.log_errors = False
         options.case_sensitive = not case_insensitive
+        # Every group non-capturing: RE2 then finds a match's span with its DFAs alone, and never
+        # runs the slower submatch engines.
+        options.never_capture = never_capture
         try:
             self._compiled: Any = re2.compile(expression, options)
-        except re2.error:
-            # The error's message quotes the expression, which may be a tenant's: drop it.
+        except (re2.error, UnicodeEncodeError):
+            # The error's message quotes the expression, which may be a tenant's: drop it. A lone
+            # surrogate can't be encoded for RE2 at all.
             raise RegexError("the expression doesn't compile in RE2") from None
+
+    @property
+    def program_size(self) -> int:
+        """The larger of RE2's forward and reverse program sizes: what each character of input
+        costs it, at worst.
+        """
+        return max(int(self._compiled.programsize), int(self._compiled.reverseprogramsize))
 
     def finditer(self, text: str) -> Iterator[Span]:
         for match in self._compiled.finditer(text):
@@ -78,7 +94,7 @@ class RegexSet:
             for expression in expressions:
                 self._set.Add(expression)
             self._set.Compile()
-        except re2.error:
+        except (re2.error, UnicodeEncodeError):
             # The error's message quotes the expression, a tenant's confidential term: drop it.
             raise RegexError(
                 "the expressions don't compile in RE2, or are past their budget"

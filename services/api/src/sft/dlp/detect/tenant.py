@@ -7,8 +7,10 @@ after it. All of a tenant's terms go into one RE2 set, so a unit is read once wh
 terms.
 
 Patterns are RE2 expressions of at most 512 characters with an 8 MiB memory budget, matched on the
-normalised text. `validate` adds the save-time checks of FR-56: no empty match, and at most 50 ms on
-the 1 MiB test text.
+normalised text with every group non-capturing (only a match's span is used), and with an RE2
+program of at most 1,000 instructions. `validate` adds the save-time check of FR-56: no empty match
+anywhere in the 1 MiB test text. Every check is deterministic: none times anything, so a pattern is
+accepted or refused the same way on any machine.
 
 Errors name the rule that failed, never the term or the expression: both are the tenant's
 confidential data.
@@ -18,10 +20,9 @@ from __future__ import annotations
 
 import functools
 import re
-import time
 from collections.abc import Iterator, Sequence
 
-from sft.dlp.detect.normalise import has_cjk, keyword_term
+from sft.dlp.detect.normalise import has_cjk, keyword_term, scrub_surrogates
 from sft.dlp.detect.prepared import HIGH, LOW, Hit, Keywords, Prepared
 from sft.dlp.detect.regex import Regex, RegexError, RegexSet
 from sft.dlp.units import CUSTOM_PREFIX, KeywordList, Pattern, TenantDetector
@@ -32,8 +33,9 @@ MAX_TERMS = 1000
 MAX_TERM_LENGTH = 100
 MAX_EXPRESSION_LENGTH = 512
 MAX_CONTEXT_KEYWORDS = 100
-MAX_PATTERN_TIME = 0.050
-"""Seconds a pattern may take on the 1 MiB test text ([DLP] 5)."""
+MAX_PROGRAM_SIZE = 1000
+"""RE2 instructions a pattern may compile to, forward or reverse ([DLP] 5). RE2's work per character
+grows with it; our own largest pattern (email addresses) has about 530."""
 
 # The keyword set holds up to 50,000 terms of up to 100 characters.
 _KEYWORD_SET_MAX_MEM = 64 << 20
@@ -73,9 +75,13 @@ class _CompiledPattern:
         if not 0 <= pattern.min_length <= MAX_EXPRESSION_LENGTH:
             raise DetectorError("invalid_min_length", pattern.id)
         try:
-            self.regex = Regex(pattern.expression, case_insensitive=pattern.case_insensitive)
+            self.regex = Regex(
+                pattern.expression, case_insensitive=pattern.case_insensitive, never_capture=True
+            )
         except RegexError:
             raise DetectorError("does_not_compile", pattern.id) from None
+        if self.regex.program_size > MAX_PROGRAM_SIZE:
+            raise DetectorError("too_complex", pattern.id)
         if self.regex.fullmatch(""):
             raise DetectorError("matches_empty_string", pattern.id)
         self.detector = CUSTOM_PREFIX + pattern.id
@@ -127,7 +133,8 @@ class TenantDetectors:
                 if not 0 < len(listed.strip()) <= MAX_TERM_LENGTH or not term:
                     raise DetectorError("invalid_term", detector.id)
                 expressions.append(_term_expression(term))
-                self._terms.append((CUSTOM_PREFIX + detector.id, term, listed.strip()[:64]))
+                preview = scrub_surrogates(listed.strip()[:64])
+                self._terms.append((CUSTOM_PREFIX + detector.id, term, preview))
         try:
             self._set = RegexSet(expressions, max_mem=_KEYWORD_SET_MAX_MEM) if expressions else None
         except RegexError:
@@ -144,8 +151,8 @@ class TenantDetectors:
 
 @functools.cache
 def _test_text() -> str:
-    """The 1 MiB test text a pattern must get through in 50 ms: mixed Japanese, English, digits and
-    marks.
+    """The 1 MiB test text a pattern must not match empty anywhere in: mixed Japanese, English,
+    digits and marks.
     """
     sample = (
         "顧客一覧 株式会社サンプル 電話 03-0000-0000 Order ORD-2026-000123 version 1.2.3 "
@@ -156,15 +163,11 @@ def _test_text() -> str:
 
 
 def validate(detector: TenantDetector) -> None:
-    """The save-time checks of a tenant detector (FR-56): raises DetectorError, or returns."""
-    TenantDetectors([detector])
-    if not isinstance(detector, Pattern):
-        return
-    compiled = _CompiledPattern(detector)
-    text = _test_text()
-    started = time.perf_counter()
-    for span in compiled.regex.finditer(text):
-        if span.start == span.end:
+    """The save-time checks of a tenant detector (FR-56): raises DetectorError, or returns.
+
+    The pattern is compiled once, by TenantDetectors, and its compiled form reused here.
+    """
+    for compiled in TenantDetectors([detector])._patterns:
+        # An expression that can match empty somewhere, such as `\b`, though not on its own.
+        if any(span.start == span.end for span in compiled.regex.finditer(_test_text())):
             raise DetectorError("matches_empty_string", detector.id)
-    if time.perf_counter() - started > MAX_PATTERN_TIME:
-        raise DetectorError("too_slow", detector.id)

@@ -113,6 +113,9 @@ class _Scanner:
             self._record(hit, prepared.location)
 
     def findings(self) -> list[Finding]:
+        # Secrets still waiting for a key ID count on their own now.
+        for hit, location in self._credentials.flush():
+            self._record(hit, location)
         return [self._tallies[name].finding(name) for name in sorted(self._tallies)]
 
 

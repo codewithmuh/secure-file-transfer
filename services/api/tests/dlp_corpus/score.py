@@ -92,8 +92,10 @@ def score(
         scanner = _Scanner(tenant)
         for unit in document.units:
             scanner.feed(unit)
+        # Ends the file as every caller does: the findings also count what was still waiting.
+        findings = scanner.findings()
         if leaks is not None:
-            shown = repr(scanner.findings())
+            shown = repr(findings)
             if any(
                 e.value in shown
                 for e in document.expected

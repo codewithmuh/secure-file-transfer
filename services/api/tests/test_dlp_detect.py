@@ -28,7 +28,7 @@ from sft.dlp.detect import (
     validate,
 )
 from sft.dlp.detect.normalise import keyword_term, keyword_view, normalise
-from sft.dlp.detect.prepared import Hit
+from sft.dlp.detect.prepared import Hit, Keywords
 from sft.dlp.detect.regex import Regex, RegexError, RegexSet
 
 
@@ -188,6 +188,17 @@ def test_bank_accounts_need_their_keywords(rng: random.Random) -> None:
     assert finding.counts["medium"] == 1  # one account, not also a 7-digit one
 
 
+def test_a_japan_post_number_ends_at_a_digit_boundary(rng: random.Random) -> None:
+    # Nine digits after 番号 aren't a Japan Post account, and the run isn't cut to eight.
+    symbol = "1" + g._digits(rng, 4)
+    assert found(f"記号 {symbol} 番号 {g._digits(rng, 9)}", "jp_bank_account") is None
+    # The whole run stays visible to the other detectors.
+    my_number = g.my_number(rng)
+    findings = {f.detector: f for f in inspect_text(f"マイナンバー 記号 {symbol} 番号 {my_number}")}
+    assert "jp_bank_account" not in findings
+    assert findings["jp_my_number"].counts["high"] == 1
+
+
 def test_drivers_licences_need_context_and_rise_with_the_check_digit(rng: random.Random) -> None:
     value = g.licence(rng)
     assert level(f"運転免許証番号 第{value}号", "jp_drivers_licence") == "high"
@@ -226,6 +237,26 @@ def test_phone_numbers(rng: random.Random) -> None:
     assert found("+1 555 12", "phone_number") is None
 
 
+def test_ascii_context_keywords_count_only_as_whole_words(rng: random.Random) -> None:
+    number = g.jp_phone(rng)
+    bare = g.phonenumbers.format_number(number, g.phonenumbers.PhoneNumberFormat.NATIONAL).replace(
+        "-", ""
+    )
+    for inside in ("hotel", "excellent", "headphones", "Intel"):
+        assert level(f"{inside} {bare}", "phone_number") == "low", inside
+    for word in ("TEL", "Tel:", "TEL.", "phones:", "Cell", "(phone)", "電話", "携帯番号"):
+        assert level(f"{word} {bare}", "phone_number") == "high", word
+    # A digit may follow an ASCII keyword, and a plural "s"; no other letter may.
+    tel = Keywords(("TEL",))
+    for view in ("tel03-", "tels:", "(tel)"):
+        assert tel.found_in(keyword_view(view)), view
+    for view in ("telex", "hotel"):
+        assert not tel.found_in(keyword_view(view)), view
+    # The credential keywords also count inside identifiers.
+    secret = g.aws_secret(rng)
+    assert scan(*lines(f"awsSecretAccessKey={secret}"))["cloud_credential"].counts["medium"] == 1
+
+
 def test_emails(rng: random.Random) -> None:
     finding = found("連絡先はsample.user1@example.co.jpまで。", "email_address")
     assert finding is not None
@@ -234,6 +265,20 @@ def test_emails(rng: random.Random) -> None:
     assert found("End: a@example.com.Next sentence", "email_address") is not None
     for text in ("user@localhost", "pkg@1.2.3", "@handle", "x@example.invalidtld"):
         assert found(text, "email_address") is None
+
+
+def test_an_email_after_an_ellipsis_but_not_after_an_invalid_local_part() -> None:
+    for text in (
+        "Contact...taro@example.com",
+        "Contact\u2026taro@example.com",
+        "...taro@example.com",
+    ):
+        finding = found(text, "email_address")
+        assert finding is not None, text
+        assert finding.previews == ("t***@example.com",)
+    # The tail of a local part that isn't a dot-atom isn't an address.
+    for text in ("first..taro@example.com", ".taro@example.com", "x .taro@example.com"):
+        assert found(text, "email_address") is None, text
     # Case doesn't make a second value.
     assert found("A@EXAMPLE.COM a@example.com", "email_address") == Finding(
         "email_address", {"low": 0, "medium": 0, "high": 1}, ("message",), ("A***@example.com",)
@@ -277,6 +322,55 @@ def test_pem_private_keys_in_every_layout(rng: random.Random, label: str) -> Non
         assert "private key" in finding.previews[0].lower()
 
 
+def test_a_stray_begin_does_not_hide_the_key_after_it(rng: random.Random) -> None:
+    key_lines, _ = g.private_key_lines(rng, "RSA ")
+    for stray in (
+        g.private_key_lines(rng, "")[0][:1],  # a BEGIN line alone
+        g.private_key_lines(rng, "EC ")[0][:-1],  # a block cut before its END
+        g.pgp_key_lines(rng)[0][:3],
+        g.putty_key_lines(rng)[0][:4],
+    ):
+        for units in (
+            list(lines(*stray, *key_lines)),
+            [TextUnit("page 1", "\n".join([*stray, *key_lines]))],
+            [TextUnit("page 1", " ".join([*stray, *key_lines]))],
+        ):
+            finding = scan(*units)["private_key"]
+            assert finding.counts["high"] == 1
+            assert finding.previews == ("RSA private key",)
+    # A BEGIN inside a block restarts it, and the key that follows still counts once.
+    two = g.private_key_lines(rng, "EC ")[0]
+    assert scan(*lines(*key_lines, *two))["private_key"].counts["high"] == 2
+
+
+@pytest.mark.parametrize("cipher", sorted(g.LEGACY_CIPHERS))
+@pytest.mark.parametrize("label", ["RSA ", "EC ", "DSA "])
+def test_keys_encrypted_the_old_openssl_way(rng: random.Random, label: str, cipher: str) -> None:
+    # The body is ciphertext, so it rarely starts with a SEQUENCE: a run of them proves it doesn't
+    # need to.
+    for _ in range(20):
+        key_lines, _value = g.legacy_encrypted_key_lines(rng, label, cipher)
+        for units in (
+            list(lines(*key_lines)),
+            [TextUnit("page 1", "\n".join(key_lines))],
+            [TextUnit("page 1", " ".join(key_lines))],
+            [TextUnit("line 1", '"key": "' + "\\n".join(key_lines) + '\\n"')],
+        ):
+            finding = scan(*units)["private_key"]
+            assert finding.counts["high"] == 1
+            assert finding.previews == (f"Encrypted {label}private key",)
+
+
+def test_legacy_encrypted_keys_need_whole_cipher_blocks_and_an_iv(rng: random.Random) -> None:
+    short, _ = g.legacy_encrypted_key_lines(rng, "RSA ", "AES-128-CBC", valid=False)
+    assert "private_key" not in scan(*lines(*short))
+    key_lines, _ = g.legacy_encrypted_key_lines(rng, "RSA ")
+    bad_iv = [
+        line.split(",")[0] + ",ABC" if line.startswith("DEK-Info:") else line for line in key_lines
+    ]
+    assert "private_key" not in scan(*lines(*bad_iv))
+
+
 def test_pgp_and_putty_private_keys(rng: random.Random) -> None:
     pgp, _ = g.pgp_key_lines(rng)
     assert scan(*lines(*pgp))["private_key"].previews == ("PGP private key",)
@@ -312,6 +406,17 @@ def test_aws_keys(rng: random.Random) -> None:
         *lines("[default]", f"aws_access_key_id={key_id}", f"aws_secret_access_key={secret}")
     )
     assert file["cloud_credential"].counts == {"low": 0, "medium": 0, "high": 1}
+    reverse = scan(
+        *lines("[default]", f"aws_secret_access_key={secret}", f"aws_access_key_id={key_id}")
+    )
+    assert reverse["cloud_credential"].counts == {"low": 0, "medium": 0, "high": 1}
+    assert reverse["cloud_credential"].previews == ("AWS access key ID with its secret",)
+    # Too far apart, they are two credentials; the secret counts where it was.
+    apart = scan(*lines(f"aws_secret_access_key={secret}", "a", "b", "c", "d", f"key {key_id}"))[
+        "cloud_credential"
+    ]
+    assert apart.counts == {"low": 0, "medium": 2, "high": 0}
+    assert apart.locations == ("line 1", "line 6")
     anchored = scan(*lines(f"aws_secret_access_key: {secret}"))["cloud_credential"]
     assert anchored.counts["medium"] == 1
     assert anchored.previews == ("AWS secret access key",)
@@ -437,14 +542,62 @@ def test_errors_never_quote_the_definition() -> None:
     assert unknown.value.reason == "unknown_kind"
 
 
-def test_save_time_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_save_time_validation() -> None:
     validate(Pattern("p-1", r"PRJ-[0-9]{4}"))
     validate(KeywordList("k-1", ("見本",)))
     with pytest.raises(DetectorError, match="matches_empty_string"):
         validate(Pattern("p-2", r"\b"))
-    monkeypatch.setattr("sft.dlp.detect.tenant.MAX_PATTERN_TIME", -1.0)
-    with pytest.raises(DetectorError, match="too_slow"):
-        validate(Pattern("p-3", r"[a-z]+"))
+
+
+def test_validation_is_deterministic() -> None:
+    # A simple pattern that matches very often on the test text is accepted on any machine: nothing
+    # is timed.
+    validate(Pattern("p-1", r"[0-9]{3}"))
+    validate(Pattern("p-2", r"(PRJ|案件)-([0-9]{4})"))
+    # What decides is the size of RE2's program, which is the same everywhere.
+    for expression in (r"\w{1,1000}", r"(.{0,60}){1,8}z"):
+        with pytest.raises(DetectorError) as error:
+            validate(Pattern("p-3", expression))
+        assert error.value.reason == "too_complex"
+
+
+def test_tenant_patterns_report_spans_without_capturing() -> None:
+    grouped = Pattern("p-1", r"(PRJ)-([0-9]{4})")
+    assert found("PRJ-1234", "custom:p-1", (grouped,)) == Finding(
+        "custom:p-1", {"low": 0, "medium": 0, "high": 1}, ("message",), ("****1234",)
+    )
+
+
+def test_validation_compiles_a_pattern_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    compiled: list[str] = []
+
+    class Counting(Regex):
+        def __init__(self, expression: str, **options: bool) -> None:
+            compiled.append(expression)
+            super().__init__(expression, **options)
+
+    monkeypatch.setattr("sft.dlp.detect.tenant.Regex", Counting)
+    validate(Pattern("p-1", r"PRJ-[0-9]{4}"))
+    assert compiled == [r"PRJ-[0-9]{4}"]
+
+
+def test_lone_surrogates_neither_stop_a_scan_nor_move_offsets() -> None:
+    text = "\ud800連絡先 sample.user1@example.co.jp \udfff"
+    assert len(normalise(text)) == len(text)
+    assert normalise("\ud800a") == "\ufffda"
+    finding = found(text, "email_address")
+    assert finding is not None
+    assert finding.previews == ("s***@example.co.jp",)
+    s = new_scanner([KeywordList("k-1", ("見本\udc00",))])
+    s.feed(TextUnit("sheet \udc80", "見本\udc00 です"))
+    (keywords,) = s.findings()
+    assert keywords.locations == ("sheet \ufffd",)
+    assert keywords.previews == ("見本\ufffd",)
+    with pytest.raises(DetectorError) as error:
+        validate(Pattern("p-1", "x\ud800"))
+    assert error.value.reason == "does_not_compile"
+    with pytest.raises(RegexError):
+        RegexSet(["\ud800"], max_mem=1 << 20)
 
 
 def test_the_regex_wrapper() -> None:

@@ -4,11 +4,13 @@ The patterns follow the gitleaks rules for the same formats (MIT, written for RE
 narrowed:
 
 - AWS access key IDs: a known four-letter prefix and 16 base32 characters. Medium alone; high with a
-  secret access key within 200 characters, in the same unit or the next few (a credentials file puts
-  them on two lines).
+  secret access key within 200 characters, in the same unit or within 3 units either way (a
+  credentials file puts them on two lines, in either order).
 - AWS secret access keys: 40 base64 characters with upper case, lower case and a digit, anchored by
   a secret-key keyword within 40 characters, or within 200 characters of a key ID. A hex hash has
-  one case only, so it never passes. A key ID with its secret counts as one credential.
+  one case only, so it never passes. A key ID with its secret counts as one credential. An anchored
+  secret with no key ID yet waits up to 3 units for one, so a secret written before its key ID
+  pairs too; one still alone then, or at the end of the file (`flush`), counts on its own.
 - GitHub tokens: `ghp_`, `gho_`, `ghu_`, `ghs_` and `ghr_` with their CRC-32 checksum (high); a
   token whose checksum fails isn't one. Fine-grained `github_pat_` tokens have no published
   checksum: medium.
@@ -35,11 +37,13 @@ CLOUD_CREDENTIAL = "cloud_credential"
 
 _AWS_KEY_ID = Regex(r"(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}")
 _AWS_SECRET = Regex(r"[A-Za-z0-9/+]{40}")
+# Substrings: these keywords sit inside identifiers such as "awsSecretAccessKey".
 _AWS_SECRET_CONTEXT = Keywords(
     (
         *("aws_secret_access_key", "secret_access_key", "secretaccesskey", "aws_secret"),
         *("secret access key", "シークレットアクセスキー", "シークレットキー"),
-    )
+    ),
+    whole_words=False,
 )
 _GITHUB = Regex(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}")
 _GITHUB_PAT = Regex(r"github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59}")
@@ -55,6 +59,8 @@ _RECENT_UNITS = 3
 """
 _GCP_UNITS = 30
 _PAIR = "AWS access key ID with its secret"
+_UNPAIRED = "AWS secret access key"
+_MAX_PENDING = 16
 
 _WORD = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 _BASE64 = _WORD | frozenset("+/")
@@ -83,12 +89,29 @@ class CredentialDetector:
         self._key_ids: deque[tuple[int, str, str]] = deque(maxlen=16)
         self._gcp_type: tuple[int, str] | None = None
         self._gcp_ids: deque[tuple[int, str, str]] = deque(maxlen=16)
+        # Anchored secrets still waiting for a key ID that follows them: (unit number, secret,
+        # location).
+        self._pending: deque[tuple[int, str, str]] = deque()
 
     def feed(self, unit: Prepared, number: int) -> Iterator[tuple[Hit, str]]:
         text = unit.text
         yield from ((hit, unit.location) for hit in self._tokens(text))
+        yield from self._expire(number)
         yield from self._aws(unit, number)
         yield from self._gcp(unit, number)
+
+    def flush(self) -> Iterator[tuple[Hit, str]]:
+        """The secrets still waiting at the end of the file, each on its own."""
+        while self._pending:
+            _, secret, location = self._pending.popleft()
+            yield Hit(CLOUD_CREDENTIAL, MEDIUM, secret, _UNPAIRED), location
+
+    def _expire(self, number: int) -> Iterator[tuple[Hit, str]]:
+        while self._pending and (
+            number - self._pending[0][0] > _RECENT_UNITS or len(self._pending) > _MAX_PENDING
+        ):
+            _, secret, location = self._pending.popleft()
+            yield Hit(CLOUD_CREDENTIAL, MEDIUM, secret, _UNPAIRED), location
 
     def _tokens(self, text: str) -> Iterator[Hit]:
         for span in _GITHUB.finditer(text):
@@ -141,6 +164,10 @@ class CredentialDetector:
             paired.update(near)
             if near:
                 yield Hit(CLOUD_CREDENTIAL, HIGH, key_id, _PAIR), unit.location
+            elif self._pending:
+                # An anchored secret a few units back, written before its key ID.
+                self._pending.pop()
+                yield Hit(CLOUD_CREDENTIAL, HIGH, key_id, _PAIR), unit.location
             else:
                 yield Hit(CLOUD_CREDENTIAL, MEDIUM, key_id, "AWS access key ID"), unit.location
         # A key ID a few units back pairs with an anchored secret here: a credentials file's two
@@ -153,8 +180,8 @@ class CredentialDetector:
                 _, key_id, location = recent[-1]
                 yield Hit(CLOUD_CREDENTIAL, HIGH, key_id, _PAIR), location
             else:
-                secret = text[start : start + 40]
-                yield Hit(CLOUD_CREDENTIAL, MEDIUM, secret, "AWS secret access key"), unit.location
+                # It may yet pair with a key ID that follows: wait (see _expire and flush).
+                self._pending.append((number, text[start : start + 40], unit.location))
         for _, key_id in ids:
             self._key_ids.append((number, key_id, unit.location))
 

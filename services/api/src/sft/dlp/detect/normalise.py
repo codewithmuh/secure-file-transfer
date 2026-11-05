@@ -2,7 +2,8 @@
 
 Two views of a unit's text:
 
-- `normalise`: Unicode NFKC, then the dashes and spaces between digits made uniform. Case is kept,
+- `normalise`: lone surrogates replaced, Unicode NFKC, then the dashes and spaces between digits
+  made uniform. Case is kept,
   because some formats are case-sensitive (access key IDs, tokens, base64 bodies, machine-readable
   zones). Full-width digits and letters become ASCII and half-width katakana becomes full-width, so
   a My Number typed in full-width digits matches like any other.
@@ -37,9 +38,19 @@ _CJK_CHAR = re.compile(f"[{CJK}]")
 _SPACE_BETWEEN_CJK = re.compile(f"(?<=[{CJK}])[^\\S\t]+(?=[{CJK}])")
 
 
+# A Python string can hold a surrogate code point on its own (decoded with "surrogateescape", or a
+# JSON "\ud800" escape). It can't be encoded as UTF-8, so RE2 and the hash would both fail on it.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def scrub_surrogates(text: str) -> str:
+    """Each lone surrogate as U+FFFD, one character for one, so offsets don't move."""
+    return _SURROGATE.sub("\ufffd", text)
+
+
 def normalise(text: str) -> str:
     """NFKC, with dashes and runs of spaces between digits made uniform. Keeps case."""
-    text = unicodedata.normalize("NFKC", text)
+    text = unicodedata.normalize("NFKC", scrub_surrogates(text))
     text = _DASH_BETWEEN_DIGITS.sub("-", text)
     return _SPACES_BETWEEN_DIGITS.sub(" ", text)
 
