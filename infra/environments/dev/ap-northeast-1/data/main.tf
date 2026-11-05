@@ -2,8 +2,8 @@
 # store and the environment's KMS keys (ADR-0011 to ADR-0014, ADR-0017). dev and staging also keep their audit archive
 # here; prod keeps it in the retained stack (encryption 8.4).
 #
-# #101 fills this file, variables.tf and outputs.tf: Aurora, the counter store and the queues. #102 adds the keys and
-# buckets in their own files.
+# #101 fills this file, variables.tf and outputs.tf: Aurora, the counter store and the queues, through
+# modules/data-stack, which holds what every data root shares. #102 adds the keys and buckets in their own files.
 #
 # dev's shape (capacity 5.3): one db.t4g.medium writer with no global database, the counter store and the queues.
 
@@ -45,93 +45,21 @@ provider "aws" {
   }
 }
 
-# The network stack of this environment and Region (infra/modules/network/outputs.tf): its subnets and security
-# groups. Its state is in the same bucket, under its directory's key (infra/README.md, "State").
-data "terraform_remote_state" "network" {
-  backend = "s3"
+module "data" {
+  source = "../../../../modules/data-stack"
 
-  config = {
-    bucket = module.conventions.state_bucket_name
-    key    = "environments/dev/ap-northeast-1/network/terraform.tfstate"
-    region = module.conventions.region
-  }
-}
+  account_id  = var.account_id
+  conventions = module.conventions
 
-locals {
   # The environment's keys (encryption 4.1). Until #102 merges they come in as a variable; then this line becomes
   # module.kms.key_arns, the keys module in kms.tf.
   kms_key_arns = var.kms_key_arns
 
-  network             = data.terraform_remote_state.network.outputs
-  isolated_subnet_ids = [for az in local.network.availability_zone_ids : local.network.isolated_subnet_ids[az]]
-
-  # The data stores admit the main and scan node groups and nothing else (ADR-0021); network policies narrow them to
-  # the workloads that use each store.
-  data_store_clients = {
-    main_nodes = local.network.security_group_ids.main_nodes
-    scan_nodes = local.network.security_group_ids.scan_nodes
+  aurora = {
+    cluster_role          = "standalone"
+    instance_class        = "db.t4g.medium"
+    backup_retention_days = 7
   }
-
-  # Workload roles, named like their PostgreSQL login roles, at path / (encryption 4.3). The cluster layer creates
-  # them after this stack, so policies here match them by ARN, never by an existing principal.
-  role_arn_prefix = "arn:aws:iam::${var.account_id}:role/${module.conventions.global_name_prefix}-"
-}
-
-module "aurora" {
-  source = "../../../../modules/aurora"
-
-  name_prefix    = module.conventions.name_prefix
-  cluster_role   = "standalone"
-  engine_version = "17.10"
-
-  instance_class                 = "db.t4g.medium"
-  instance_availability_zone_ids = [local.network.availability_zone_ids[0]]
-
-  vpc_id                    = local.network.vpc_id
-  subnet_ids                = local.isolated_subnet_ids
-  client_security_group_ids = local.data_store_clients
-
-  kms_key_arn      = local.kms_key_arns.database
-  logs_kms_key_arn = local.kms_key_arns.logs
-
-  backup_retention_days = 7
-  deletion_protection   = !var.teardown
-  skip_final_snapshot   = var.teardown
-
   master_password_version = var.master_password_version
-  master_secret = {
-    name                    = "sft/dev/db/master"
-    kms_key_arn             = local.kms_key_arns.secrets
-    reader_role_arn         = "${local.role_arn_prefix}db-bootstrap"
-    break_glass_arn_like    = module.conventions.sso_role_arn_patterns.break_glass
-    writer_role_arn         = module.conventions.bootstrap_role_arns.terraform_deploy
-    recovery_window_in_days = var.teardown ? 0 : 7
-  }
-}
-
-module "valkey" {
-  source = "../../../../modules/valkey"
-
-  name_prefix      = module.conventions.name_prefix
-  user_name_prefix = module.conventions.global_name_prefix
-
-  vpc_id                    = local.network.vpc_id
-  subnet_ids                = local.isolated_subnet_ids
-  client_security_group_ids = local.data_store_clients
-
-  kms_key_arn = local.kms_key_arns.platform
-}
-
-module "queues" {
-  source = "../../../../modules/queues"
-
-  name_prefix = module.conventions.name_prefix
-  kms_key_arn = local.kms_key_arns.platform
-
-  senders = {
-    relay_role_arn           = "${local.role_arn_prefix}relay"
-    signin_trigger_role_arn  = "${local.role_arn_prefix}signin-trigger"
-    events_delivery_role_arn = "${local.role_arn_prefix}events-delivery"
-    ses_events_topic_arn     = "arn:aws:sns:${module.conventions.region}:${var.account_id}:${module.conventions.name_prefix}-ses-events"
-  }
+  teardown                = var.teardown
 }

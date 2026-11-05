@@ -149,9 +149,9 @@ variable "master_username" {
 
 variable "master_password_version" {
   description = <<-EOT
-    Version of the master password. Raising it in a reviewed change sends a new random password to the cluster and
-    the secret through write-only arguments, so it never reaches the plan or the state; the runbook does that after
-    every use and every 90 days (encryption 6.3). Ignored by the secondary.
+    Version of the master password. Raising it in a reviewed change writes a new random password to the secret, and
+    the cluster takes it from there, both through write-only arguments, so it never reaches the plan or the state; the
+    runbook does that after every use and every 90 days (encryption 6.3). Ignored by the secondary.
   EOT
   type        = number
   default     = 1
@@ -166,8 +166,9 @@ variable "master_secret" {
   description = <<-EOT
     The master password's secret, sft/<env>/db/master (encryption 6.1), for the standalone and primary clusters; null
     for the secondary. kms_key_arn is the secrets key; replica_kms_key_arn is the Osaka copy of it for the read-only
-    replica, or null for none (dev, or a fresh build before Osaka's keys exist). Only the database bootstrap job and
-    BreakGlass may read it, and only the deploy role may write it.
+    replica, or null for none (dev, or a fresh build before Osaka's keys exist). Only the database bootstrap job,
+    BreakGlass and the deploy role (at apply, to set the cluster's password from it) may read it, and only the deploy
+    role may change it.
   EOT
   type = object({
     name                    = string

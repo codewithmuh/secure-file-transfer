@@ -11,22 +11,15 @@ variable "account_id" {
 variable "kms_key_arns" {
   description = <<-EOT
     This Region's keys by class (encryption 4.1), until #102 merges and module.kms.key_arns replaces this variable:
-    database (Aurora), logs (its log group), secrets (the master password) and platform (queues and the counter
-    store). Each is a multi-Region key; in Osaka, the replica.
+    database (Aurora), logs (its log group) and platform (queues and the counter store). Each is the Osaka replica of
+    a multi-Region key; modules/data-stack checks them. Osaka has no master secret of its own, so no secrets key here:
+    Tokyo's data stack replicates the secret under it (master_secret_replica_kms_key_arn).
   EOT
   type = object({
     database = string
     logs     = string
-    secrets  = string
     platform = string
   })
-
-  validation {
-    condition = alltrue([
-      for arn in values(var.kms_key_arns) : can(regex("^arn:aws:kms:ap-northeast-3:[0-9]{12}:key/mrk-[0-9a-f]{32}$", arn))
-    ])
-    error_message = "Each key must be a multi-Region key ARN in ap-northeast-3."
-  }
 }
 
 variable "teardown" {

@@ -1,7 +1,7 @@
 # One Region's Aurora PostgreSQL cluster (ADR-0011): standalone in dev, the primary of the global database in Tokyo,
 # its secondary in Osaka. Encrypted with the Region's database key, reachable only from the node groups the caller
-# names, IAM database authentication for every workload, TLS only, and the master password set through write-only
-# arguments into Secrets Manager, so it never reaches the plan or the state (encryption 6.3).
+# names, IAM database authentication for every workload, TLS only, and the master password kept in Secrets Manager and
+# moved only through write-only arguments, so it never reaches the plan or the state (encryption 6.3).
 
 locals {
   engine             = "aurora-postgresql"
@@ -15,8 +15,22 @@ locals {
   writer_availability_zone_id  = var.instance_availability_zone_ids[0]
   reader_availability_zone_ids = toset(slice(var.instance_availability_zone_ids, 1, length(var.instance_availability_zone_ids)))
 
-  # The cluster's two forms (below) are one cluster: whichever exists.
-  cluster = one(concat(aws_rds_cluster.standalone[*], aws_rds_cluster.global_member[*]))
+  # The cluster's two forms (below) are one cluster: whichever exists. Attribute by attribute, never the whole
+  # resource: a function over the resource object marks its whole result sensitive (aws_rds_cluster has sensitive
+  # arguments), which would make every output below sensitive and the roots' outputs fail to plan.
+  cluster = {
+    id                  = one(concat(aws_rds_cluster.standalone[*].id, aws_rds_cluster.global_member[*].id))
+    arn                 = one(concat(aws_rds_cluster.standalone[*].arn, aws_rds_cluster.global_member[*].arn))
+    cluster_identifier  = one(concat(aws_rds_cluster.standalone[*].cluster_identifier, aws_rds_cluster.global_member[*].cluster_identifier))
+    cluster_resource_id = one(concat(aws_rds_cluster.standalone[*].cluster_resource_id, aws_rds_cluster.global_member[*].cluster_resource_id))
+    endpoint            = one(concat(aws_rds_cluster.standalone[*].endpoint, aws_rds_cluster.global_member[*].endpoint))
+    reader_endpoint     = one(concat(aws_rds_cluster.standalone[*].reader_endpoint, aws_rds_cluster.global_member[*].reader_endpoint))
+    port                = one(concat(aws_rds_cluster.standalone[*].port, aws_rds_cluster.global_member[*].port))
+  }
+
+  # The password the cluster gets: the one the secret holds, read back below, never the generator's. Null for the
+  # secondary, which has none of its own.
+  master_password = local.has_master ? jsondecode(one(ephemeral.aws_secretsmanager_secret_version.master[*].secret_string)).password : null
 
   log_group_name = "/aws/rds/cluster/${local.cluster_identifier}/postgresql"
 
@@ -129,8 +143,18 @@ resource "aws_cloudwatch_log_data_protection_policy" "postgresql" {
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The master password: generated for this run only, sent to the cluster and the secret through write-only arguments.
-# It changes only when master_password_version does.
+# The master password has one source, the secret (encryption 6.3). Aurora can't manage it for a global database, so:
+#
+# 1. A new random password goes into the secret, through a write-only argument, only when master_password_version
+#    changes (or the version was never written). The generator runs in every plan and apply, and its value is
+#    discarded unless the secret version is being written.
+# 2. The cluster gets the password by reading that secret version back, never from the generator. If an apply stops
+#    between the two, the next one reads the same version again and sends the cluster the same password, so the
+#    cluster and the secret can't drift apart.
+#
+# The read-back happens only at apply, by the deploy role: its secret_id carries substr(timestamp(), 0, 0), which is
+# empty but unknown until apply, so Terraform defers the read to the apply stage and the plan role never reads the
+# value. The secret's policy lets the deploy role read it for this (below).
 # ---------------------------------------------------------------------------------------------------------------------
 
 ephemeral "aws_secretsmanager_random_password" "master" {
@@ -138,6 +162,13 @@ ephemeral "aws_secretsmanager_random_password" "master" {
 
   password_length     = 40
   exclude_punctuation = true
+}
+
+ephemeral "aws_secretsmanager_secret_version" "master" {
+  count = local.has_master ? 1 : 0
+
+  secret_id  = "${aws_secretsmanager_secret.master[0].arn}${substr(timestamp(), 0, 0)}"
+  version_id = aws_secretsmanager_secret_version.master[0].version_id
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -167,7 +198,7 @@ resource "aws_rds_cluster" "standalone" {
   database_name      = var.database_name
 
   master_username            = var.master_username
-  master_password_wo         = ephemeral.aws_secretsmanager_random_password.master[0].random_password
+  master_password_wo         = local.master_password
   master_password_wo_version = var.master_password_version
 
   iam_database_authentication_enabled = true
@@ -225,7 +256,7 @@ resource "aws_rds_cluster" "global_member" {
   # The secondary takes its database and its master user from the primary.
   database_name              = local.primary ? var.database_name : null
   master_username            = local.primary ? var.master_username : null
-  master_password_wo         = local.primary ? ephemeral.aws_secretsmanager_random_password.master[0].random_password : null
+  master_password_wo         = local.master_password
   master_password_wo_version = local.primary ? var.master_password_version : null
 
   iam_database_authentication_enabled = true
@@ -358,12 +389,16 @@ resource "aws_secretsmanager_secret" "master" {
 }
 
 # Identity policies alone would let any role with secretsmanager:GetSecretValue on * read it. This denies reading to
-# everyone but the bootstrap job and BreakGlass, and writing to everyone but the deploy role (encryption 6.4).
+# everyone but the bootstrap job, BreakGlass and the deploy role (which reads it back at apply, above), and every
+# change to the secret, its value, its policy and its replicas to everyone but the deploy role (encryption 6.4). Without
+# the policy and replication actions here, a principal with broad Secrets Manager rights could drop this policy, or
+# promote the Osaka replica out from under it, and then read the value. The deny matches the deploy role by ARN, so a
+# re-created deploy role can still repair the policy.
 data "aws_iam_policy_document" "master_secret" {
   count = var.master_secret == null ? 0 : 1
 
   statement {
-    sid       = "ReadOnlyByBootstrapJobAndBreakGlass"
+    sid       = "ReadOnlyByBootstrapJobBreakGlassAndDeployRole"
     effect    = "Deny"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = ["*"]
@@ -376,7 +411,7 @@ data "aws_iam_policy_document" "master_secret" {
     condition {
       test     = "ArnNotEquals"
       variable = "aws:PrincipalArn"
-      values   = [var.master_secret.reader_role_arn]
+      values   = [var.master_secret.reader_role_arn, var.master_secret.writer_role_arn]
     }
 
     condition {
@@ -391,8 +426,17 @@ data "aws_iam_policy_document" "master_secret" {
     effect = "Deny"
     actions = [
       "secretsmanager:CancelRotateSecret",
+      "secretsmanager:DeleteResourcePolicy",
+      "secretsmanager:DeleteSecret",
+      "secretsmanager:PutResourcePolicy",
       "secretsmanager:PutSecretValue",
+      "secretsmanager:RemoveRegionsFromReplication",
+      "secretsmanager:ReplicateSecretToRegions",
+      "secretsmanager:RestoreSecret",
       "secretsmanager:RotateSecret",
+      "secretsmanager:StopReplicationToReplica",
+      "secretsmanager:TagResource",
+      "secretsmanager:UntagResource",
       "secretsmanager:UpdateSecret",
       "secretsmanager:UpdateSecretVersionStage",
     ]
