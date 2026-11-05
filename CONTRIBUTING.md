@@ -35,7 +35,15 @@ make up         # run all services locally
    their own PRs, and this repo has one maintainer.
 6. **Merge.** The maintainer squash-merges; the branch is deleted automatically.
 
-The `protect-main` ruleset blocks direct pushes, force-pushes and deletion of `main`. Until
+The `protect-main` ruleset lives in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It
+requires these checks, each a job that reports on every pull request: Repo checks, Python, Web app, Local stack, Mail
+adapter, both Contract checks, Terraform and `promotion-gate`. The image build runs only when the code it packages
+changes, so it isn't required. When you rename or add a job, update that file in the same pull request:
+`.github/scripts/check-ruleset.sh`, run in Repo checks, fails if a required check isn't a job that reports on every
+pull request. After the change merges, the maintainer runs `.github/scripts/apply-github-settings.sh` to apply it,
+along with CodeQL default setup.
+
+The ruleset also blocks direct pushes, force-pushes and deletion of `main`. Until
 [#6](https://github.com/codewithmuh/secure-file-transfer/issues/6) lands, the repository admin can bypass the rules
 when merging a pull request. That exists only for release-please's Release PRs, which get no CI run; don't use it for
 anything else.
