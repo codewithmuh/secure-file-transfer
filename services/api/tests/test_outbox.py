@@ -6,12 +6,14 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from sqlalchemy import insert, select, text
 from sqlalchemy.exc import DBAPIError
 
 from messaging import clear_messaging, pool
 from pg import ScratchDatabase
-from sft.core.logs import bind_context
 from sft.data.access import ScopeNotAllowedError
 from sft.data.audit import Actor, Target, record
 from sft.data.database import Database
@@ -63,7 +65,7 @@ def test_a_message_body_round_trips() -> None:
         topic="file.scan",
         tenant_id=uuid.uuid4(),
         payload={"file_id": uuid.uuid4(), "recipient_ids": (uuid.uuid4(), uuid.uuid4())},
-        trace_context={"trace_id": "ab" * 16},
+        trace_context={"traceparent": f"00-{'ab' * 16}-{'cd' * 8}-01"},
     )
     body = message.body()
     assert set(json.loads(body)) == {"id", "topic", "tenant_id", "payload", "trace_context"}
@@ -168,9 +170,10 @@ async def test_the_message_commits_with_the_change_that_causes_it(
             target=Target("tenant", tenant_id),
         )
         message_id = await enqueue(session, TOPIC, {"file_id": file_id})
-    assert rows(outbox_db) == [
-        (message_id, tenant_id, "file.scan", {"file_id": str(file_id)}, {}, 0, None)
-    ]
+    [(*row, trace_context, delay, published)] = rows(outbox_db)
+    assert row == [message_id, tenant_id, "file.scan", {"file_id": str(file_id)}]
+    assert (delay, published) == (0, None)
+    assert set(trace_context) == {"traceparent"}  # its create span's (the trace test below)
     assert message_id.version == 7
 
 
@@ -192,14 +195,26 @@ async def test_a_change_that_rolls_back_leaves_no_message(outbox_db: ScratchData
 
 
 @pytest.mark.anyio
-async def test_the_trace_id_travels_with_the_message(outbox_db: ScratchDatabase) -> None:
-    bind_context(request_id="req_1", trace_id="cd" * 16)
-    try:
+async def test_the_message_carries_the_trace_context_of_its_create_span(
+    outbox_db: ScratchDatabase, spans: InMemorySpanExporter
+) -> None:
+    with trace.get_tracer(__name__).start_as_current_span("request") as request:
         async with pool(outbox_db, API) as api, api.transaction(Scope.tenant(uuid.uuid4())) as s:
-            await enqueue(s, TOPIC, {"file_id": uuid.uuid4()})
-    finally:
-        bind_context(request_id=None, trace_id=None)
-    assert rows(outbox_db)[0][4] == {"trace_id": "cd" * 16}
+            message_id = await enqueue(s, TOPIC, {"file_id": uuid.uuid4()})
+    [create] = [span for span in spans.get_finished_spans() if span.kind == SpanKind.PRODUCER]
+    assert create.name == "create scan-small"
+    assert create.parent is not None
+    assert create.parent.span_id == request.get_span_context().span_id
+    assert create.context is not None
+    ids = create.context
+    traceparent = f"00-{ids.trace_id:032x}-{ids.span_id:016x}-{int(ids.trace_flags):02x}"
+    assert rows(outbox_db)[0][4] == {"traceparent": traceparent}
+    assert create.attributes == {
+        "messaging.system": "aws_sqs",
+        "messaging.operation.type": "create",
+        "messaging.destination.name": "scan-small",
+        "messaging.message.id": str(message_id),
+    }
 
 
 @pytest.mark.anyio

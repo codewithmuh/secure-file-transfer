@@ -74,7 +74,24 @@ class _Base(BaseSettings):
         return value.lower() if isinstance(value, str) else value
 
 
-class Settings(_Base):
+class _Traced(_Base):
+    """What every long-running workload reads to export its traces: the API and the workers."""
+
+    otel_exporter_otlp_endpoint: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^/?#\s]+(/[^?#\s]*)?$",
+        description="The collector's OTLP/HTTP base URL; spans go to <endpoint>/v1/traces. "
+        "Unset: traces are made for the logs and messages but not exported (ADR-0009).",
+    )
+
+    @field_validator("otel_exporter_otlp_endpoint", mode="before")
+    @classmethod
+    def _empty_endpoint_is_unset(cls, value: object) -> object:
+        # A chart that renders the variable empty means "don't export", not a bad URL.
+        return None if value == "" else value
+
+
+class Settings(_Traced):
     """The API's settings. The field name in capitals is the environment variable."""
 
     app_version: str = Field(default="0.0.0", description="Set by the image build.")
@@ -133,8 +150,8 @@ class Settings(_Base):
 _QUEUE_PREFIX = r"^[a-z0-9]+(-[a-z0-9]+)*-$"
 
 
-class WorkerSettings(_Base):
-    """What every worker reads: its probes, its database role and SQS (architecture 8)."""
+class WorkerSettings(_Traced):
+    """What every worker reads: its probes, its database role, SQS, traces (architecture 8)."""
 
     app_version: str = Field(default="0.0.0", description="Set by the image build.")
     bind_host: str = "127.0.0.1"

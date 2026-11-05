@@ -17,6 +17,7 @@ ENV_NAMES = (
     "SHUTDOWN_DRAIN_SECONDS",
     "DATABASE_URL",
     "DATABASE_POOL_SIZE",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
     "VALKEY_URL",
     "TRUSTED_PROXIES",
 )
@@ -50,6 +51,7 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.shutdown_drain_seconds == 20
     assert s.database_url.get_secret_value() == DATABASE_URL
     assert s.database_pool_size == 5
+    assert s.otel_exporter_otlp_endpoint is None
     assert s.valkey_url.get_secret_value() == VALKEY_URL
     assert s.trusted_proxies == ()
 
@@ -63,6 +65,7 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("SHUTDOWN_DRAIN_SECONDS", "30")
     clean_env.setenv("DATABASE_URL", "postgresql://sft_api@db:5432/sft?sslmode=verify-full")
     clean_env.setenv("DATABASE_POOL_SIZE", "10")
+    clean_env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent.observability:4318")
     clean_env.setenv("VALKEY_URL", "rediss://sft-api@cache.example:6379")
     clean_env.setenv("TRUSTED_PROXIES", "10.0.0.0/20, 10.0.16.0/20")
     s = Settings()
@@ -73,8 +76,14 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     assert s.shutdown_drain_seconds == 30
     assert s.database_url.get_secret_value().endswith("sslmode=verify-full")
     assert s.database_pool_size == 10
+    assert s.otel_exporter_otlp_endpoint == "http://otel-agent.observability:4318"
     assert s.valkey_url.get_secret_value().startswith("rediss://")
     assert [str(n) for n in s.trusted_proxies] == ["10.0.0.0/20", "10.0.16.0/20"]
+
+
+def test_an_empty_otlp_endpoint_means_none(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    assert Settings().otel_exporter_otlp_endpoint is None
 
 
 @pytest.mark.parametrize(
@@ -94,6 +103,9 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
         ("TRUSTED_PROXIES", "10.0.0.1/8"),  # host bits set: a typo, not a network
         ("DATABASE_POOL_SIZE", "0"),
         ("DATABASE_POOL_SIZE", "51"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-agent:4318"),  # no scheme
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "grpc://otel-agent:4317"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent:4318?x=1"),
     ],
 )
 def test_rejects_bad_values(clean_env: pytest.MonkeyPatch, name: str, value: str) -> None:

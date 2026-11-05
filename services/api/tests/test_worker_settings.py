@@ -20,6 +20,7 @@ OPTIONAL = (
     "SQS_ENDPOINT_URL",
     "RELAY_BATCH_SIZE",
     "RELAY_POLL_INTERVAL_SECONDS",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
 )
 
 
@@ -41,6 +42,7 @@ def test_defaults(env: pytest.MonkeyPatch) -> None:
     assert (s.bind_host, s.internal_port, s.shutdown_drain_seconds) == ("127.0.0.1", 8001, 15)
     assert (s.database_pool_size, s.aws_region, s.sqs_endpoint_url) == (2, "ap-northeast-1", None)
     assert (s.relay_batch_size, s.relay_poll_interval_seconds) == (50, 1.0)
+    assert s.otel_exporter_otlp_endpoint is None
 
 
 def test_reads_the_environment(env: pytest.MonkeyPatch) -> None:
@@ -48,9 +50,16 @@ def test_reads_the_environment(env: pytest.MonkeyPatch) -> None:
     env.setenv("AWS_REGION", "ap-northeast-3")
     env.setenv("RELAY_BATCH_SIZE", "10")
     env.setenv("RELAY_POLL_INTERVAL_SECONDS", "0.25")
+    env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent.observability:4318")
     s = RelaySettings()
     assert (s.sqs_endpoint_url, s.aws_region) == ("http://sqs:9324", "ap-northeast-3")
     assert (s.relay_batch_size, s.relay_poll_interval_seconds) == (10, 0.25)
+    assert s.otel_exporter_otlp_endpoint == "http://otel-agent.observability:4318"
+
+
+def test_an_empty_otlp_endpoint_means_none(env: pytest.MonkeyPatch) -> None:
+    env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+    assert RelaySettings().otel_exporter_otlp_endpoint is None
 
 
 @pytest.mark.parametrize(
@@ -65,6 +74,7 @@ def test_reads_the_environment(env: pytest.MonkeyPatch) -> None:
         ("RELAY_BATCH_SIZE", "0"),
         ("RELAY_POLL_INTERVAL_SECONDS", "0"),
         ("SHUTDOWN_DRAIN_SECONDS", "61"),
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-agent:4318"),
         ("DATABASE_URL", "mysql://x"),
     ],
 )

@@ -20,6 +20,10 @@ checks that PostgreSQL agrees on `current_user`, whatever the driver did with th
 In system scope the session refuses any write to a tenant table, unless the role is the relay
 (`sft.data.access.check_write`): find across, act within.
 
+Every statement through `Database` gets a CLIENT span, a child of the request's or message's span,
+named like `SELECT sft`, with the SQL text: its bound parameters, never their values. A failed
+statement's span carries the error's type, never its message, which can quote a value.
+
 In AWS the URL names the workload's login role with no password; M4 adds a `do_connect` hook that
 signs a 15-minute IAM token for each new connection, and `sslmode=verify-full` in the URL
 (encryption and keys 2.2, 6.3).
@@ -31,8 +35,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import Span, SpanKind, StatusCode
 from sqlalchemy import Connection, Engine, create_engine, event, inspect, text
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL, ExceptionContext, ExecutionContext, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncEngine,
@@ -79,6 +85,65 @@ def sync_engine(url: str | URL, **options: Any) -> Engine:
     It has no scope: it is never used for the application's queries, which go through `Database`.
     """
     return create_engine(psycopg_url(url), poolclass=NullPool, **options)
+
+
+_tracer = trace.get_tracer(__name__)
+_SPAN = "_sft_span"  # where a statement's span waits on its execution context
+
+
+def _trace_statements(engine: Engine) -> None:
+    """Give every statement on `engine` a span (module docstring)."""
+    url = engine.url
+    base: dict[str, str | int] = {"db.system.name": "postgresql"}
+    if url.database:
+        base["db.namespace"] = url.database
+    if url.host:
+        base["server.address"] = url.host
+    if url.port:
+        base["server.port"] = url.port
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def start(
+        conn: Connection,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: ExecutionContext | None,
+        executemany: bool,
+    ) -> None:
+        if context is None:
+            return
+        operation = statement.split(maxsplit=1)[0].upper() if statement.strip() else "SQL"
+        span = _tracer.start_span(
+            f"{operation} {url.database}" if url.database else operation,
+            kind=SpanKind.CLIENT,
+            attributes={**base, "db.operation.name": operation, "db.query.text": statement},
+        )
+        setattr(context, _SPAN, span)
+
+    @event.listens_for(engine, "after_cursor_execute")
+    def end(
+        conn: Connection,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: ExecutionContext | None,
+        executemany: bool,
+    ) -> None:
+        span: Span | None = getattr(context, _SPAN, None)
+        if span is not None:
+            delattr(context, _SPAN)
+            span.end()
+
+    @event.listens_for(engine, "handle_error")
+    def fail(exception_context: ExceptionContext) -> None:
+        context = exception_context.execution_context
+        span: Span | None = getattr(context, _SPAN, None)
+        if span is not None:
+            delattr(context, _SPAN)
+            span.set_attribute("error.type", type(exception_context.original_exception).__name__)
+            span.set_status(StatusCode.ERROR)
+            span.end()
 
 
 class _ScopedSession(Session):
@@ -157,6 +222,7 @@ class Database:
             # A connection that died while idle, after a failover say, is replaced, not handed out.
             pool_pre_ping=True,
         )
+        _trace_statements(engine.sync_engine)
         return cls(engine)
 
     @asynccontextmanager

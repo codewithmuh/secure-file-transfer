@@ -26,6 +26,11 @@ alerts. `handle` sees `receive_count`, so its last attempt can record a terminal
 
 A handler whose effect is outside PostgreSQL, such as an email, can't share the transaction; the
 notification worker records the message after the send instead (ADR-0013, data model 2.2).
+
+Each message that parses is handled in a `process <queue>` CONSUMER span, the child of the span
+that wrote the message (its `trace_context`, ADR-0009), so the API request's trace runs on through
+the queue to the handler's own SQL, and the handler's log lines carry that trace ID. The span
+carries the consumer, the queue and the outbox ID, never the payload or the tenant.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ from typing import ClassVar
 from prometheus_client import CollectorRegistry, Counter
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sft.core.logs import bind_context
+from sft.core.telemetry import continued_trace, mark_error, messaging_attributes
 from sft.data.database import Database
 from sft.data.outbox import InvalidMessageError, OutboxMessage, Queue
 from sft.data.processed import record_processed
@@ -156,16 +161,6 @@ class ConsumerLoop:
             log.exception("message failed; SQS delivers it again", extra=self._extra())
             outcome = Outcome.FAILED
         self.metrics.messages.labels(self.consumer.name, outcome).inc()
-        if outcome in (Outcome.PROCESSED, Outcome.DUPLICATE):
-            # Deleted only after the commit. If the delete fails, or the process dies first, SQS
-            # redelivers the message and the record makes the second delivery a duplicate.
-            try:
-                await self.queues.delete(self.consumer.queue, item.receipt_handle)
-            except QueueError as exc:
-                log.warning(
-                    "delete failed; the message comes back as a duplicate",
-                    extra={**self._extra(), "code": exc.code},
-                )
         return outcome
 
     def _extra(self) -> dict[str, object]:
@@ -181,7 +176,6 @@ class ConsumerLoop:
                 extra={"consumer": self.consumer.name, "error": str(exc)},
             )
             return Outcome.INVALID
-        bind_context(request_id=None, trace_id=message.trace_context.get("trace_id"))
         extra = {
             "consumer": self.consumer.name,
             "outbox_id": str(message.id),
@@ -189,14 +183,34 @@ class ConsumerLoop:
             "tenant_id": str(message.tenant_id),
             "receive_count": item.receive_count,
         }
-        try:
-            outcome = await self.consumer.process(Delivery(message, item.receive_count))
-            log.info(f"message {outcome}", extra=extra)
-        except Exception:
-            log.exception("message failed; SQS delivers it again", extra=extra)
-            outcome = Outcome.FAILED
-        finally:
-            bind_context(request_id=None, trace_id=None)
+        queue = self.consumer.queue.value
+        attributes = {
+            **messaging_attributes("process", queue),
+            "messaging.consumer.group.name": self.consumer.name,
+            "messaging.message.id": str(message.id),
+        }
+        # The work, its log lines and the delete all run in the message's own trace (module
+        # docstring); the trace ID stays bound to the logs only while the span is open.
+        with continued_trace(
+            message.trace_context, f"process {queue}", attributes=attributes
+        ) as span:
+            try:
+                outcome = await self.consumer.process(Delivery(message, item.receive_count))
+                log.info(f"message {outcome}", extra=extra)
+            except Exception as exc:
+                log.exception("message failed; SQS delivers it again", extra=extra)
+                mark_error(span, type(exc).__qualname__)
+                return Outcome.FAILED
+            if outcome in (Outcome.PROCESSED, Outcome.DUPLICATE):
+                # Deleted only after the commit. If the delete fails, or the process dies first,
+                # SQS redelivers the message and the record makes the second delivery a duplicate.
+                try:
+                    await self.queues.delete(self.consumer.queue, item.receipt_handle)
+                except QueueError as exc:
+                    log.warning(
+                        "delete failed; the message comes back as a duplicate",
+                        extra={**extra, "code": exc.code},
+                    )
         return outcome
 
     async def run(self, stopping: asyncio.Event) -> None:

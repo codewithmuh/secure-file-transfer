@@ -18,6 +18,12 @@ A crash anywhere before the commit loses nothing: the rows stay unpublished and 
 with the connection, so this relay or another sends them again. A crash after the send and before
 the commit sends them twice, which consumers expect (`sft.workers.consumer`). Several replicas run
 side by side; `SKIP LOCKED` keeps them off each other's rows.
+
+Traces (ADR-0009): each batch is a `relay batch` span, with its claim, its marks and one `send
+<queue>` PRODUCER span per SQS call under it, and each call's own AWS span under that. A batch
+carries messages from many traces, so it belongs to none of them: each send span links to the
+`create` span of every message it carries. The message bodies keep the trace context their rows
+were written with, so a consumer's span is the child of that `create` span, not of the relay's.
 """
 
 from __future__ import annotations
@@ -30,10 +36,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from uuid import UUID
 
+from opentelemetry.trace import SpanKind
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, RelaySettings, load_settings
+from sft.core.telemetry import (
+    configure_tracing,
+    link_to,
+    mark_error,
+    messaging_attributes,
+    traced,
+)
 from sft.data.database import Database
 from sft.data.outbox import (
     TOPICS,
@@ -50,6 +64,8 @@ from sft.workers.process import WorkerProcess, sleep_unless
 from sft.workers.queues import MAX_BATCH, OutgoingMessage, QueueError, Queues, SqsQueues
 
 log = logging.getLogger("sft.workers.relay")  # not __main__ under python -m
+
+SERVICE_NAME = "sft-relay"
 
 
 RETRY_BASE_SECONDS = 2.0
@@ -140,9 +156,10 @@ class Relay:
 
     async def publish_batch(self) -> int:
         """Claim, send and mark one batch in one transaction; return how many rows it claimed."""
-        with self.metrics.batch_duration.time():
+        with self.metrics.batch_duration.time(), traced("relay batch") as span:
             async with self.database.transaction(Scope.system()) as session:
                 due = await claim_due(session, self.batch_size)
+                span.set_attribute("messaging.batch.message_count", len(due))
                 failures = await self._send(due) if due else {}
                 await mark_published(
                     session, [row.message.id for row in due if row.message.id not in failures]
@@ -159,8 +176,9 @@ class Relay:
 
     async def measure_age(self) -> None:
         """Set the outbox age gauge, in a short read of its own, whatever the last batch did."""
-        async with self.database.transaction(Scope.system()) as session:
-            age = await oldest_unpublished_age(session)
+        with traced("relay outbox age"):
+            async with self.database.transaction(Scope.system()) as session:
+                age = await oldest_unpublished_age(session)
         self.metrics.oldest_unpublished_age.set(age)
 
     async def _send(self, due: list[DueRow]) -> dict[UUID, str]:
@@ -242,25 +260,38 @@ class Relay:
         messages = [
             OutgoingMessage(
                 id=str(row.message.id),
+                # The trace context the row was written with, unchanged (module docstring).
                 body=row.message.body(),
                 delay_seconds=row.remaining_delay,
                 group_id=str(row.message.tenant_id) if queue.fair else None,
             )
             for row in rows
         ]
-        try:
-            refused = await self.queues.send_batch(queue, messages)
-        except QueueError as exc:
-            if exc.sender_fault and len(rows) > 1 and splits.take(len(rows)):
-                # SQS refused the whole batch for something in it, such as one message too
-                # long. Each row goes on its own, so only the bad one backs off; at most
-                # `split_budget` rows a batch, so a storm of bad batches can't stretch the send.
-                await asyncio.gather(
-                    *(self._send_chunk(queue, [row], outcome, splits) for row in rows)
-                )
+        links = [link for row in rows if (link := link_to(row.message.trace_context)) is not None]
+        attributes = {
+            **messaging_attributes("send", queue.value),
+            "messaging.batch.message_count": len(rows),
+        }
+        with traced(
+            f"send {queue.value}", kind=SpanKind.PRODUCER, attributes=attributes, links=links
+        ) as span:
+            try:
+                refused = await self.queues.send_batch(queue, messages)
+            except QueueError as exc:
+                mark_error(span, exc.code)
+                if exc.sender_fault and len(rows) > 1 and splits.take(len(rows)):
+                    # SQS refused the whole batch for something in it, such as one message too
+                    # long. Each row goes on its own, so only the bad one backs off; at most
+                    # `split_budget` rows a batch, so a storm of bad batches can't stretch the
+                    # send.
+                    await asyncio.gather(
+                        *(self._send_chunk(queue, [row], outcome, splits) for row in rows)
+                    )
+                    return
+                outcome.update({row.message.id: exc.code for row in rows})
                 return
-            outcome.update({row.message.id: exc.code for row in rows})
-            return
+            if refused:
+                mark_error(span, refused[0].code)
         codes = {failure.id: failure.code for failure in refused}
         outcome.update({row.message.id: codes.get(str(row.message.id)) for row in rows})
 
@@ -341,7 +372,14 @@ def main() -> int:
     if settings is None:
         return EXIT_BAD_SETTINGS
     configure_logging(settings.log_level)
-    return asyncio.run(run_relay(settings))
+    tracing = configure_tracing(
+        SERVICE_NAME, settings.app_version, settings.otel_exporter_otlp_endpoint
+    )
+    try:
+        return asyncio.run(run_relay(settings))
+    finally:
+        # After the drain: export the spans still buffered, waiting a few seconds at most.
+        tracing.shutdown()
 
 
 if __name__ == "__main__":

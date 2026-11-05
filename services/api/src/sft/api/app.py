@@ -9,6 +9,12 @@ startup, without connecting, and closes them at shutdown, after uvicorn has drai
 route reaches them through the `get_database` and `get_rate_limiter` dependencies, or names its
 limits with `rate_limit` (rate_limits.py). Without settings there is neither: that app is for
 generating the OpenAPI document and for tests of routes that don't need them.
+
+FastAPI's own OpenTelemetry support is off: `RequestContextMiddleware` makes the one SERVER span of
+each request, outside FastAPI's error handling, from the attribute allowlist (sft.core.telemetry).
+FastAPI's span would be a second root for the same request, record its path and query string,
+which can hold a link token, and take `tracestate` and baggage from the caller; its OTel logs would
+carry exception messages (ADR-0009, T-49).
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
 from sft.api.errors import register_error_handlers
@@ -25,6 +32,14 @@ from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
 from sft.service.rate_limits import RateLimiter
+
+_NO_FASTAPI_TELEMETRY: TelemetryConfig = {
+    "tracing": False,
+    "metrics": False,
+    "logs": False,
+    "operation_spans": False,
+    "auto_configure": False,
+}
 
 # The contract's `info`, so the document generated from the code compares with it (ADR-0002).
 API_TITLE = "secure-file-transfer API"
@@ -74,6 +89,7 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
         lifespan=None if settings is None else _lifespan(settings, registry or CollectorRegistry()),
+        telemetry=_NO_FASTAPI_TELEMETRY,
     )
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)

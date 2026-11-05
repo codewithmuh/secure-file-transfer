@@ -14,7 +14,7 @@ src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
-    observability.py  request and trace IDs, request metrics, one log line per request
+    observability.py  request and trace IDs, the request span, request metrics, one log line per request
     rate_limits.py    rate_limit(bundle): the route dependency; 401 counting and the IP block
     client_ip.py      the client's address by ADR-0002's rule
     server.py         both listeners in one process, and the graceful shutdown
@@ -44,9 +44,10 @@ src/sft/
     migrations/       the Alembic revisions; migrate.py is the migration job
     counters.py       Valkey: the rate-limit counter scripts, with a timeout and a rest after failures
     mail/             the mail adapter: SES API v2 in AWS, SMTP to Mailpit locally (Email below)
-  core/         settings, logging and UUIDv7 IDs, used by every layer
+  core/         settings, logging, tracing and UUIDv7 IDs, used by every layer
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
     pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
+    telemetry.py      OpenTelemetry setup, the span attribute allowlist, trace context for messages
 ```
 
 `api` and `workers` never import each other. `service`, `data` and `core` never import FastAPI, Starlette or uvicorn;
@@ -88,6 +89,7 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `DATABASE_POOL_SIZE` | `5` | Connections per process, with no overflow (1 to 50) |
 | `VALKEY_URL` | none, required | The rate-limit counter store with its credentials, `redis://`, `rediss://`, `valkey://` or `valkeys://`; a secret |
 | `TRUSTED_PROXIES` | empty | Our load balancer's subnets, comma-separated; only their requests have the client address read from `X-Forwarded-For` (ADR-0002) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | The collector's OTLP/HTTP base URL, e.g. `http://<node>:4318`; spans go to `<endpoint>/v1/traces`. Unset or empty: nothing is exported |
 
 Whatever sends email (the notification worker) also reads `MailSettings`:
 
@@ -113,12 +115,30 @@ Architecture section 8, as built here:
   routing mistake on the public side can't expose them and probe traffic stays out of the request metrics. The docs
   pages and the OpenAPI document aren't served at all (ADR-0002); `create_app().openapi()` generates the document.
 - **Logs.** One JSON line per event on stdout. Every line logged while a request runs carries its `request_id`, which
-  the service always generates (`req_…`, also sent as `X-Request-Id`), and its `trace_id`, from a valid W3C
-  `traceparent` header or new. Requests are logged by route template, never with query strings.
+  the service always generates (`req_…`, also sent as `X-Request-Id`), and its `trace_id`, the trace ID of the
+  request's span. Requests are logged by route template, never with query strings.
+- **Traces.** OpenTelemetry (ADR-0009, `src/sft/core/telemetry.py`). Each request is one SERVER span, named by
+  route template (`GET /v1/transfers/{transfer_id}`); it continues the caller's trace when the request has exactly
+  one valid `traceparent`, and starts a new one otherwise. Every SQL statement is a CLIENT span under it, with the
+  SQL text but never the parameter values, and so is every call of a boto3 client passed to `trace_aws_client`.
+  The service records every span; the collector gateway's tail sampling decides what is kept, so a caller's
+  "not sampled" flag is ignored. Only the attributes in `ALLOWED_ATTRIBUTES` are exported; never paths, query
+  strings, headers, client addresses or exception messages (T-49, T-88). A caller's `tracestate` and baggage are
+  dropped. FastAPI's own telemetry is off, so a request has one span, not two. Probes and scrapes on the internal
+  port aren't traced.
+- **Trace context in messages.** `enqueue()` writes each outbox message in a `create <queue>` PRODUCER span under
+  the current one and stores that span's `{"traceparent": "00-…"}` in the message's `trace_context`. The relay sends
+  it on in the body unchanged, and `ConsumerLoop` handles the message in a `process <queue>` CONSUMER span that
+  continues it (`continued_trace`), so the API request, the queue and the worker share one trace, and the worker's
+  log lines carry that trace ID (architecture 5.3). The relay's batches are traces of their own, linked to the
+  messages they carry (The outbox relay, below). Message spans carry the queue, the consumer and the outbox ID, never
+  the tenant or the payload.
 - **Metrics.** `http_requests_total` and `http_request_duration_seconds` by method, route template and status, with
-  bucket edges at 0.3 s and 1 s for NFR-2, plus the process and Python metrics.
+  bucket edges at 0.3 s and 1 s for NFR-2, plus the process and Python metrics. Metrics stay with the Prometheus
+  client, scraped from `/metrics`; the OpenTelemetry SDK carries traces only, so nothing is counted twice.
 - **Shutdown.** On SIGTERM or SIGINT, `/readyz` answers 503, the public listener closes, in-flight requests get up to
-  `SHUTDOWN_DRAIN_SECONDS`, the internal listener closes, and the process exits 0. uvicorn closes the public listener
+  `SHUTDOWN_DRAIN_SECONDS`, the internal listener closes, the spans still buffered are exported (a few seconds at
+  most), and the process exits 0. uvicorn closes the public listener
   the moment the signal arrives, so the app can't keep accepting while the load balancer catches up. In Kubernetes,
   a `preStop` sleep in the pod spec holds the signal back for that time (`src/sft/api/server.py` has the details).
   Ctrl+C during the drain (a second SIGINT) cuts it short and cancels in-flight requests, as in uvicorn; a repeated
@@ -493,6 +513,12 @@ Its claim and its marks filter with `in_scope(Outbox, session)`, and every UPDAT
 opens no other scope, and its policies match system scope alone. The isolation suite checks that no other role reads
 or marks a row.
 
+Each batch is a `relay batch` span, with its claim and marks under it and a `send <queue>` PRODUCER span for each
+SQS call, which links to the `create` span of every message the call carries: a batch holds messages from many
+traces, so it belongs to none of them. An idle batch is a small trace too, with `messaging.batch.message_count` 0.
+The age measurement is a `relay outbox age` span. A send that SQS refuses, in whole or in part, is an error span with
+SQS's code as its `error.type`.
+
 | Metric | Meaning |
 |---|---|
 | `outbox_oldest_unpublished_age_seconds` | Age of the oldest unpublished row after the last batch; ADR-0013 alerts above 120 s |
@@ -511,6 +537,7 @@ Settings, besides `LOG_LEVEL`, `APP_VERSION`, `BIND_HOST`, `INTERNAL_PORT` (8001
 | `AWS_REGION` | `ap-northeast-1` | |
 | `RELAY_BATCH_SIZE` | `50` | Rows per transaction (1 to 100) |
 | `RELAY_POLL_INTERVAL_SECONDS` | `1.0` | The wait after a batch that wasn't full |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | As for the API: spans go to `<endpoint>/v1/traces`; unset or empty, nothing is exported |
 
 In AWS the pod's IAM role is the SQS identity; locally ElasticMQ takes any credentials, and Compose gives obviously fake
 ones.
@@ -540,14 +567,19 @@ retry, a re-publish after a failover) finds the record and is skipped, so its wo
 same time wait on each other's record. On shutdown `ConsumerLoop` abandons a long poll in flight at once. It deletes a message once it is processed or skipped, and leaves one
 that failed or doesn't parse for SQS to deliver again, until the redrive policy moves it to the dead-letter queue.
 `delivery.receive_count` lets the last attempt record a terminal state first. A handler whose effect is an email
-records after the send instead (ADR-0013); the notification worker does that itself.
+records after the send instead (ADR-0013); the notification worker does that itself. Each message that parses is
+handled, and deleted, in its own `process <queue>` span, the child of the message's `create` span; a failure marks
+it as an error with the exception's type, never its message.
 
 ### SQS client
 
 `SqsQueues` (`src/sft/workers/queues.py`) wraps boto3, the only code that touches it, so tests use an in-memory fake
 and the integration tests use ElasticMQ. boto3 is synchronous, so each call runs in a small thread pool the adapter
 owns. aiobotocore, the async alternative, pins botocore a few releases behind boto3, and the service needs boto3 anyway
-(M4's IAM database tokens); the relay's load, about one call a second, is far too light for threads to matter.
+(M4's IAM database tokens); the relay's load, about one call a second, is far too light for threads to matter. Each
+call runs in a copy of the caller's context, so its AWS span (`trace_aws_client`) is the child of the span it was made
+in. A long poll (`ReceiveMessage`) gets no span: it lasts up to 20 s with or without a message, and the gateway keeps
+every slow trace.
 
 ### Tests against ElasticMQ
 

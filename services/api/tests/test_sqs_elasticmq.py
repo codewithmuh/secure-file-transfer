@@ -22,6 +22,11 @@ from collections.abc import AsyncIterator, Iterator
 
 import boto3
 import pytest
+from opentelemetry import trace
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from prometheus_client import CollectorRegistry
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -207,6 +212,48 @@ async def test_a_message_resent_by_the_relay_is_processed_once(
     assert await queues.receive(Queue.SCAN_SMALL, max_messages=10, wait_seconds=0) == []
 
 
+@pytest.mark.anyio
+async def test_one_trace_runs_through_elasticmq_with_each_sqs_call_under_its_span(
+    migrated_db: ScratchDatabase, queues: SqsQueues, spans: InMemorySpanExporter
+) -> None:
+    clear_messaging(migrated_db)
+    with trace.get_tracer(__name__).start_as_current_span("request") as request:
+        async with (
+            pool(migrated_db, API) as api,
+            api.transaction(Scope.tenant(uuid.uuid4())) as session,
+        ):
+            await enqueue(session, SCAN_TOPIC, {"file_id": uuid.uuid4()})
+    async with pool(migrated_db, RELAY) as relay_db:
+        relay = Relay(relay_db, queues, RelayMetrics.create(CollectorRegistry()), topics=TOPICS)
+        assert await relay.publish_batch() == 1
+    async with pool(migrated_db, SCAN) as scan_db:
+        metrics = ConsumerMetrics.create(CollectorRegistry())
+        loop = ConsumerLoop(RecordingConsumer(scan_db), queues, metrics, wait_seconds=1)
+        outcomes: list[Outcome] = []
+        for _ in range(10):
+            outcomes += await loop.poll_once()
+            if outcomes:
+                break
+    assert outcomes == [Outcome.PROCESSED]
+
+    def named(name: str) -> ReadableSpan:
+        [span] = [s for s in spans.get_finished_spans() if s.name == name]
+        assert span.context is not None
+        return span
+
+    send, process = named("send scan-small"), named("process scan-small")
+    sent, deleted = named("SQS.SendMessageBatch"), named("SQS.DeleteMessage")
+    # The message's trace is the request's, through a real SQS round trip.
+    assert process.context.trace_id == request.get_span_context().trace_id  # type: ignore[union-attr]
+    # Each SQS call is a child of the span it was made in, across the adapter's thread pool.
+    assert (sent.kind, sent.parent.span_id) == (SpanKind.CLIENT, send.context.span_id)  # type: ignore[union-attr]
+    assert deleted.parent.span_id == process.context.span_id  # type: ignore[union-attr]
+    assert sent.attributes is not None
+    assert sent.attributes["http.response.status_code"] == 200
+    # A long poll makes no span of its own (sft.workers.queues).
+    assert not [s for s in spans.get_finished_spans() if s.name == "SQS.ReceiveMessage"]
+
+
 # ---- the entry point, as a process ----
 
 
@@ -282,6 +329,49 @@ def test_the_relay_process_runs_and_stops_cleanly_on_sigterm(
     assert "ready" in messages
     assert messages[-1] == "stopped"
     assert all("local-fake" not in line for line in output.splitlines())
+
+
+def test_the_relay_process_exports_its_spans_and_flushes_them_at_shutdown(
+    migrated_db: ScratchDatabase,
+    endpoint: str,
+    prefix: str,
+    collector: tuple[str, list[tuple[str, bytes]]],
+) -> None:
+    clear_messaging(migrated_db)
+    otlp, received = collector
+    port = free_port()
+    env = relay_env(migrated_db, endpoint, prefix, port)
+    process = subprocess.Popen(
+        [sys.executable, "-m", "sft.workers.relay"],
+        env={**env, "OTEL_EXPORTER_OTLP_ENDPOINT": otlp, "APP_VERSION": "7.7.7"},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def batches() -> float:
+        for line in get(port, "/metrics")[1].decode().splitlines():
+            if line.startswith("outbox_relay_batch_duration_seconds_count"):
+                return float(line.split()[-1])
+        return 0.0
+
+    try:
+        wait_for(lambda: batches() >= 1)
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=20) == 0
+    finally:
+        process.kill()
+    exported = [
+        (resource_spans.resource, span)
+        for _, body in received
+        for resource_spans in ExportTraceServiceRequest.FromString(body).resource_spans
+        for scope_spans in resource_spans.scope_spans
+        for span in scope_spans.spans
+    ]
+    names = {span.name for _, span in exported}
+    assert {"relay batch", "relay outbox age"} <= names
+    resource, _ = exported[0]
+    attributes = {a.key: a.value.string_value for a in resource.attributes}
+    assert (attributes["service.name"], attributes["service.version"]) == ("sft-relay", "7.7.7")
 
 
 def test_the_relay_process_exits_2_on_bad_settings() -> None:

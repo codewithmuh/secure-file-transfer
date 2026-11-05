@@ -14,11 +14,18 @@ cost anything, and a consumer's 20-second long poll holds one thread, not the lo
 
 Timeouts are short and retries few, so a call ends well inside the 10 seconds a transaction may sit
 idle (data model 2.5): the relay holds its claimed rows' locks across the send.
+
+Each call is a CLIENT span (`sft.core.telemetry.trace_aws_client`) under the span it was made in:
+the thread pool runs it in a copy of the caller's context, as `asyncio.to_thread` would. A long
+poll (`ReceiveMessage`) has none: it lasts up to 20 s with or without a message and would make a
+slow trace of its own every time, which the gateway keeps (ADR-0009). A message's trace goes on
+in the consumer's span instead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +35,8 @@ from typing import TYPE_CHECKING, Protocol
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+
+from sft.core.telemetry import trace_aws_client
 
 if TYPE_CHECKING:
     from types_boto3_sqs.client import SQSClient
@@ -140,12 +149,15 @@ class SqsQueues:
             max_pool_connections=threads,
         )
         client = boto3.session.Session().client("sqs", endpoint_url=endpoint_url, config=config)
+        trace_aws_client(client, untraced={"ReceiveMessage"})
         return cls(client, prefix, threads=threads)
 
     async def _call[T](self, fn: Callable[..., T], /, **kwargs: object) -> T:
         loop = asyncio.get_running_loop()
+        # In the caller's context, so the call's span is a child of the caller's (module docstring).
+        call = functools.partial(contextvars.copy_context().run, fn, **kwargs)
         try:
-            return await loop.run_in_executor(self._executor, functools.partial(fn, **kwargs))
+            return await loop.run_in_executor(self._executor, call)
         except (ClientError, BotoCoreError) as exc:
             raise _queue_error(exc) from exc
 

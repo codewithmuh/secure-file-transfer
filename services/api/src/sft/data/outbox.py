@@ -14,6 +14,11 @@ A message is the contract of ADR-0013: its topic, its outbox ID, its tenant, the
 act on and the trace context, nothing more. The payload accepts only UUIDs, so a link token, a
 code, an email address or a file name can't reach a queue (threat model T-49): a worker re-reads
 everything else from PostgreSQL in the message's tenant scope.
+
+The trace context is the W3C `traceparent` of the message's own `create` span, a child of the
+request's or message's span that wrote it (ADR-0009, architecture 5.3). The relay sends it on in
+the body unchanged, and the consumer's span is that span's child, so one trace runs from the API
+request through the queue to the worker.
 """
 
 from __future__ import annotations
@@ -28,12 +33,13 @@ from enum import StrEnum
 from typing import Any, Final
 from uuid import UUID
 
+from opentelemetry.trace import SpanKind
 from sqlalchemy import ARRAY, Float, Integer, Text, Update, Uuid, func, insert, select, update
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
-from sft.core.logs import trace_id_var
+from sft.core.telemetry import current_trace_context, messaging_attributes, traced
 from sft.data.access import in_scope, tenant_of
 from sft.data.models import Outbox
 
@@ -45,7 +51,6 @@ MAX_IDS: Final = 100
 
 _KEY = re.compile(r"[a-z][a-z0-9_]{0,62}")
 _TOPIC = re.compile(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+")
-_TRACE_ID = re.compile(r"[0-9a-f]{32}")
 
 PayloadValue = UUID | Sequence[UUID]
 Payload = Mapping[str, PayloadValue]
@@ -149,13 +154,6 @@ def _trace_from_json(raw: object) -> dict[str, str]:
     return raw
 
 
-def _trace_context() -> dict[str, str]:
-    # OpenTelemetry (ADR-0009) will put a W3C `traceparent` here. Until then the trace ID of the
-    # request or message being handled is enough to join the logs of the API and the worker.
-    trace_id = trace_id_var.get()
-    return {"trace_id": trace_id} if trace_id and _TRACE_ID.fullmatch(trace_id) else {}
-
-
 def _delay_seconds(delay: timedelta) -> int:
     if delay < timedelta(0) or delay > MAX_DELAY:
         raise ValueError("a delay is between 0 and 15 minutes (SQS's limit, ADR-0013)")
@@ -175,19 +173,27 @@ async def enqueue(
     another tenant. `delay` holds the message back: no consumer receives it before the transaction
     started plus `delay`, at most 15 minutes. The ID is what a consumer records in
     `processed_messages`, so a re-sent copy is recognised.
+
+    The message gets a `create` span under the current one, and carries that span's trace context
+    (module docstring); outside any span its trace starts here.
     """
     tenant_id = tenant_of(session)  # the scope's tenant; refuses system and platform scopes
     message_id = uuid7()
-    await session.execute(
-        insert(Outbox).values(
-            id=message_id,
-            tenant_id=tenant_id,
-            topic=topic.name,
-            payload=_payload_json(payload),
-            trace_context=_trace_context(),
-            delay_seconds=_delay_seconds(delay),
+    attributes = {
+        **messaging_attributes("create", topic.queue.value),
+        "messaging.message.id": str(message_id),
+    }
+    with traced(f"create {topic.queue.value}", kind=SpanKind.PRODUCER, attributes=attributes):
+        await session.execute(
+            insert(Outbox).values(
+                id=message_id,
+                tenant_id=tenant_id,
+                topic=topic.name,
+                payload=_payload_json(payload),
+                trace_context=current_trace_context(),  # this span's: IDs only
+                delay_seconds=_delay_seconds(delay),
+            )
         )
-    )
     return message_id
 
 

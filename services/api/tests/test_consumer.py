@@ -252,10 +252,15 @@ async def test_the_trace_id_from_the_message_is_on_the_handlers_log_lines(
 ) -> None:
     queues = FakeQueues()
     message = a_message()
+    traceparent = f"00-{'ef' * 16}-{'01' * 8}-01"
     deliver(
         queues,
         OutboxMessage(
-            message.id, message.topic, message.tenant_id, message.payload, {"trace_id": "ef" * 16}
+            message.id,
+            message.topic,
+            message.tenant_id,
+            message.payload,
+            {"traceparent": traceparent},
         ).body(),
     )
     await ConsumerLoop(DeferringConsumer(scan_db), queues, metrics).poll_once()

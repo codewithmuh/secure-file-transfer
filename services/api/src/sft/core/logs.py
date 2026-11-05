@@ -2,8 +2,8 @@
 
 Every line logged while a request or a message is handled carries its `request_id` and `trace_id`.
 They live in context variables, so code in any layer gets them without passing them around: the
-API sets them per request, and the workers will set them per message from the trace context in
-the outbox (architecture 5.3).
+API sets them per request from the request's span, and `continued_trace` (sft.core.telemetry) sets
+the trace ID per message from the trace context in the outbox (architecture 5.3).
 
 Never log file names, message text, email addresses, tokens, codes, cookies, `Authorization`
 headers or query strings (ADR-0009, architecture 5.5).

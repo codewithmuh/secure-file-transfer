@@ -15,6 +15,12 @@ dependencies = [
   # The binary wheel bundles libpq, so the slim image needs no system packages.
   "psycopg[binary]>=3.3.6",
   "alembic>=1.20.1",
+  # Traces (ADR-0009). The SDK and the exporter release in step with opentelemetry-api, which
+  # FastAPI already needs, so all three move together: pinned, not bumped one at a time.
+  "opentelemetry-api==1.45.1",
+  "opentelemetry-sdk==1.45.1",
+  # OTLP over HTTP/protobuf to the node's collector; the gRPC exporter would add grpcio.
+  "opentelemetry-exporter-otlp-proto-http==1.45.1",
   # Email (#100): Jinja2 renders the fixed templates with autoescaping (sft.service.email).
   "jinja2>=3.1.6",
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
