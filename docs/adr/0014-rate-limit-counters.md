@@ -29,10 +29,12 @@ Keep the counters in **ElastiCache Serverless for Valkey**, one cache per enviro
 rate-based rules** in front for coarse per-IP floods. PostgreSQL keeps the security state.
 
 - **Scope.** Counters, leases and sign-in state only. Every key has a TTL of at most 25 hours and looks like
-  `rl:{group}:{key type}:{value}`, where the value is an ID, an HMAC or an IPv4 address, never an email address,
-  token or cookie value.
+  `rl:{group}.{limit}:{key type}:{value}`, where the value is an ID, an HMAC or an IP address (an IPv6 /64), never
+  an email address, token or cookie value.
 - **Algorithms** (abuse design 4.4): GCRA for request rates; a sliding log for small quotas such as codes per address;
-  a sorted set of leases for concurrent streams and scans. Limits run narrowest first, one script per key.
+  a sorted set of leases for concurrent streams and scans. Limits run narrowest first, one script per key. GCRA admits
+  a burst of ⌊N/2⌋ + 1 requests for a limit of N per period, then ⌈N/2⌉ per period, evenly spaced, so no window of
+  one period holds more than N.
 - **Access.** IAM authentication over TLS for four workloads only, each with its own role, through a security group
   open to them:
   - the API;

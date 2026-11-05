@@ -1,4 +1,5 @@
-"""Data layer: PostgreSQL through SQLAlchemy 2.0 with async sessions (ADR-0002, ADR-0011).
+"""Data layer: PostgreSQL through SQLAlchemy 2.0 with async sessions (ADR-0002, ADR-0011), and the
+rate-limit counters in Valkey (ADR-0014).
 
 No query runs without an explicit scope: a tenant, a single resource reached through a verified
 link, or a named system job (ADR-0003, architecture 5.1). Row-level security is the second layer
@@ -19,6 +20,8 @@ behind it (ADR-0020).
   describes (FR-27); partition upkeep for the lifecycle job.
 - `audit_required`: generates the fail-closed trigger a migration pastes in, `require_audit_sql`:
   a change to the table commits only with an audit event in its transaction (NFR-15).
+- `counters`: the rate-limit counter store in Valkey (ADR-0014): GCRA and sliding-log scripts,
+  one key each, with a 50 ms timeout and a rest after repeated failures.
 - `migrations`: the Alembic revisions. `migrate` runs them: the migration job
   (`python -m sft.data.migrate`).
 

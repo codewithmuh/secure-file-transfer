@@ -269,7 +269,7 @@ Starting limits from the abuse design:
 | Audit | `searchAuditEvents`, `exportAuditEvents` | 60 searches a minute per tenant; 10 exports an hour, 1 at a time. An API key: 1 export an hour, at most 100,000 events (`422 export_too_large`). |
 | Keys and tenants | `createApiKey`, `createTenant` | 20 new keys a day and at most 25 active per tenant; 30 new tenants an hour per operator. |
 | DLP | The DLP policy, rule and detector writes, `testDlpDetectors`, `confirmTransfer`, `approveTransfer`, `rejectTransfer`, `getTransferDlp`, `getFileInspection`, `getDlpReport`, `listDlpDecisions` | 100 policy changes a day per tenant; 30 detector tests a minute per admin, 16,384 characters each; 3 approval requests per transfer (`409 approval_limit_reached`); 120 approval decisions an hour per approver; 600 reads of finding details an hour per member; 60 report reads a minute per tenant. `rejectTransfer`, like a revocation, never counts against the tenant's budget. |
-| Other tenant calls | Everything else for members and API keys | 300 a minute per member and per key; 100 failed authentications in 5 minutes block an IP for 15 minutes. |
+| Other tenant calls | Everything else for members and API keys | 300 a minute per member and per key; 100 failed authentications in 5 minutes block an IP from every operation for 15 minutes. |
 
 **The WAF** also limits by IP address before a request reaches the API: 100 link-step requests a minute and 6,000
 requests in 5 minutes for the whole API. Its `429` has a fixed `Retry-After` (60 or 300) and the same problem fields,

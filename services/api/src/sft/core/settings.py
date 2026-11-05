@@ -19,12 +19,13 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     AfterValidator,
     Field,
+    IPvAnyNetwork,
     SecretStr,
     ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sft.core.logs import configure_logging
 
@@ -45,6 +46,19 @@ def _postgres_url(value: SecretStr) -> SecretStr:
 # A PostgreSQL URL. In AWS it names the login role and has no password: the role signs in with IAM
 # database authentication (encryption and keys 6.3). Locally it may hold a fake password.
 PostgresUrl = Annotated[SecretStr, AfterValidator(_postgres_url)]
+
+_VALKEY_SCHEMES = ("redis://", "rediss://", "valkey://", "valkeys://")
+
+
+def _valkey_url(value: SecretStr) -> SecretStr:
+    if not value.get_secret_value().startswith(_VALKEY_SCHEMES):
+        raise ValueError("must start with redis://, rediss://, valkey:// or valkeys://")
+    return value
+
+
+# A Valkey URL with its credentials: locally the ACL user and its fake password; in AWS `rediss://`
+# and the workload's user, whose IAM token M4 signs per connection (ADR-0014).
+ValkeyUrl = Annotated[SecretStr, AfterValidator(_valkey_url)]
 
 
 # Pods set enableServiceLinks: false, so Service variables can't clash with these (architecture 8).
@@ -92,6 +106,21 @@ class Settings(_Base):
         le=50,
         description="Connections per process, with no overflow, so the total is predictable.",
     )
+    valkey_url: ValkeyUrl = Field(
+        description="The rate-limit counter store, with its credentials (ADR-0014).",
+    )
+    trusted_proxies: Annotated[tuple[IPvAnyNetwork, ...], NoDecode] = Field(
+        default=(),
+        description="Our load balancer's subnets, comma-separated. Only a request from them has "
+        "its client address taken from X-Forwarded-For (ADR-0002); empty locally.",
+    )
+
+    @field_validator("trusted_proxies", mode="before")
+    @classmethod
+    def _split_networks(cls, value: object) -> object:
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
 
     @model_validator(mode="after")
     def _ports_differ(self) -> Self:

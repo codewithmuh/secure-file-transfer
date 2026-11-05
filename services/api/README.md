@@ -15,6 +15,8 @@ src/sft/
     app.py            the public app (the API routes)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     observability.py  request and trace IDs, request metrics, one log line per request
+    rate_limits.py    rate_limit(bundle): the route dependency; 401 counting and the IP block
+    client_ip.py      the client's address by ADR-0002's rule
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
   workers/      beside api: asyncio workers that use the service layer without HTTP
@@ -25,7 +27,8 @@ src/sft/
   runtime/      what api and workers both need to run as a pod
     internal.py       /healthz, /readyz, /metrics on the internal port
   service/      business rules and permission checks
-  data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations
+    rate_limits/      the limits as data, the limiter and its per-pod fallback
+  data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations; Valkey counters
     database.py       the pool, and Database.transaction(scope), the only way to open a transaction
     scope.py          Scope: tenant, resource, system, platform, lookup or recovery
     access.py         the rules on top: who opens which scope, in_scope(), TenantOwned
@@ -38,8 +41,10 @@ src/sft/
     outbox.py         the transactional outbox: enqueue(), the message contract, the relay's queries
     processed.py      processed-message records, which make consumers idempotent
     migrations/       the Alembic revisions; migrate.py is the migration job
+    counters.py       Valkey: the rate-limit counter scripts, with a timeout and a rest after failures
   core/         settings, logging and UUIDv7 IDs, used by every layer
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
+    pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
 ```
 
 `api` and `workers` never import each other. `service`, `data` and `core` never import FastAPI, Starlette or uvicorn;
@@ -56,12 +61,13 @@ against the stack's database (`docker compose stop api` first: it holds the port
 ```bash
 cd services/api
 uv sync
-DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft uv run python -m sft.api
+DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft \
+  VALKEY_URL=redis://sft-local:local-only-valkey-password@127.0.0.1:6379/0 uv run python -m sft.api
 curl -s localhost:8001/readyz   # API on 127.0.0.1:8000, probes and metrics on 127.0.0.1:8001
 ```
 
-The API needs `DATABASE_URL` to start, but opens no connection until a request needs one, and `/readyz` never checks
-the database: an outage mustn't take every pod out of the load balancer at once.
+The API needs `DATABASE_URL` and `VALKEY_URL` to start, but opens no connection until a request needs one, and
+`/readyz` checks neither: an outage mustn't take every pod out of the load balancer at once.
 
 ## Settings
 
@@ -78,6 +84,8 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `SHUTDOWN_DRAIN_SECONDS` | `20` | How long in-flight requests get after SIGTERM (1 to 120) |
 | `DATABASE_URL` | none, required | The workload's own login role, `postgresql://` or `postgresql+psycopg://`; a secret |
 | `DATABASE_POOL_SIZE` | `5` | Connections per process, with no overflow (1 to 50) |
+| `VALKEY_URL` | none, required | The rate-limit counter store with its credentials, `redis://`, `rediss://`, `valkey://` or `valkeys://`; a secret |
+| `TRUSTED_PROXIES` | empty | Our load balancer's subnets, comma-separated; only their requests have the client address read from `X-Forwarded-For` (ADR-0002) |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
 `BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
@@ -319,7 +327,30 @@ for a month that has none; the lifecycle job's step, `sft.service.audit_partitio
 three months ahead and exports `sft_audit_default_partition_rows`, `sft_audit_partition_months_covered` and
 `sft_audit_partition_last_success_timestamp_seconds`.
 
-### Tests against PostgreSQL
+## Rate limits
+
+The limits of the abuse design (section 2.2) are data in `sft/service/rate_limits/limits.py`, one `Limit` per row, and
+each operation's bundle is listed there, narrowest first. A route applies its bundle in one line:
+
+```python
+@router.post("/v1/auth/sign-in", dependencies=[rate_limit(SIGN_IN_START)])
+@router.get("/v1/me", dependencies=[rate_limit(TENANT_OPERATION, caller=member_session)])
+```
+
+`caller` is the route's authentication dependency; its result's `rate_limit_keys()` gives the account, API key or
+tenant. Limits on keys a handler finds itself (a link's subject, an invited address as `EmailPseudonyms`) run there:
+`await limiter.check(REQUEST_CODE, keys)`, with `limiter = Depends(get_rate_limiter)`. A refusal is `429 rate_limited`
+with `Retry-After`; while Valkey is unavailable, groups A and B answer `503` with `Retry-After: 5` and the rest count
+in the pod at a third of each limit (abuse design 4.5). Every `401` counts against the client's IP (group H), and an
+IP blocked after 100 of them gets `429` on every route, checked before routing and authentication.
+
+The counter store (`sft/data/counters.py`) runs GCRA for rates and a sliding log for small quotas, one Lua script per
+key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). A rate of N per period admits a
+burst of N // 2 + 1, then the rest evenly spaced, so no window of one period holds more than N. The client is
+[valkey-py](https://github.com/valkey-io/valkey-py), the Valkey project's asyncio client: pure Python, the redis-py
+API, standalone and cluster clients, and a credential provider for the IAM tokens of M4.
+
+### Tests against PostgreSQL and Valkey
 
 The data layer's tests need a PostgreSQL 17 superuser URL in `TEST_DATABASE_URL`. They make their own databases there
 and drop them afterwards; the roles, which are cluster-wide, stay. In CI it is a service container on the Python job.
@@ -331,6 +362,15 @@ there by accident. While the local stack runs (`make up`), `make test` sets it t
 docker run --detach --name sft-test-postgres --publish 127.0.0.1:55432:5432 \
   --env POSTGRES_PASSWORD=test-only postgres:17.11-trixie
 TEST_DATABASE_URL=postgresql://postgres:test-only@127.0.0.1:55432/postgres uv run pytest
+```
+
+The rate-limit tests need a Valkey 9 URL with credentials in `TEST_VALKEY_URL`, skipped locally without it and failing
+in CI the same way. They empty database 0 there before each test, so never point it at the local stack's Valkey.
+
+```bash
+docker run --detach --name sft-test-valkey --publish 127.0.0.1:56379:6379 \
+  --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.0.7-alpine
+TEST_VALKEY_URL=redis://:test-only@127.0.0.1:56379/0 uv run pytest
 ```
 
 ### The isolation suite

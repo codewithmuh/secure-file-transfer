@@ -54,8 +54,8 @@ def _config(app: ASGIApp, host: str, port: int, *, drain: int) -> uvicorn.Config
         timeout_graceful_shutdown=drain,
         # Each request runs in a fresh context, so its IDs can't leak into another's logs.
         reset_contextvars=True,
-        # The client address is the socket peer until the client-IP rule of ADR-0002 (trust only
-        # our load balancer's X-Forwarded-For entry) is built.
+        # The client address is the socket peer; sft.api.client_ip applies ADR-0002's rule (trust
+        # only our load balancer's X-Forwarded-For entry) where the address is used.
         proxy_headers=False,
         server_header=False,
         access_log=False,  # RequestContextMiddleware logs each request
@@ -68,7 +68,9 @@ class ApiServer:
         self.settings = settings
         self.readiness = Readiness()
         self.metrics = HttpMetrics.create()
-        public_app = RequestContextMiddleware(app or create_app(settings), self.metrics)
+        public_app = RequestContextMiddleware(
+            app or create_app(settings, registry=self.metrics.registry), self.metrics
+        )
         internal_app = create_internal_app(self.readiness, self.metrics.registry)
         self._public = Server(
             _config(
