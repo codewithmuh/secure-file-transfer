@@ -411,7 +411,7 @@ in CI the same way. They empty database 0 there before each test, so never point
 
 ```bash
 docker run --detach --name sft-test-valkey --publish 127.0.0.1:56379:6379 \
-  --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.0.7-alpine
+  --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.1.3-alpine
 TEST_VALKEY_URL=redis://:test-only@127.0.0.1:56379/0 uv run pytest
 ```
 
