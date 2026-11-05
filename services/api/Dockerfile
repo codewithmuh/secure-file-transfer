@@ -37,4 +37,6 @@ EXPOSE 8000 8001
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD ["python", "-c", "import os, sys, urllib.request; port = os.environ.get('INTERNAL_PORT', '8001'); sys.exit(urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz', timeout=2).status != 200)"]
 # On SIGTERM: readiness fails, in-flight requests get up to 20 s, exit 0 (src/sft/api/server.py).
+# The workers run from this image with another command, e.g. the outbox relay:
+# `python -m sft.workers.relay` (probes and metrics on INTERNAL_PORT only, src/sft/workers/).
 CMD ["python", "-m", "sft.api"]

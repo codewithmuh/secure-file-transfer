@@ -15,6 +15,9 @@ dependencies = [
   # The binary wheel bundles libpq, so the slim image needs no system packages.
   "psycopg[binary]>=3.3.6",
   "alembic>=1.20.1",
+  # The AWS SDK. It is synchronous, so the workers call it in a thread pool of their own
+  # (sft.workers.queues, ADR-0002); M4's IAM database tokens are signed with it too.
+  "boto3>=1.43.120",
 ]
 
 [dependency-groups]
@@ -26,6 +29,7 @@ dev = [
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17",
+  "types-boto3[sqs]>=1.43.120",
   "types-pyyaml>=6.0.12.20260906",
 ]
 
@@ -81,18 +85,20 @@ branch = true
 patch = ["subprocess"]
 
 # The layers of ADR-0002, checked by `lint-imports` (make lint, CI). A layer may import the layers below it, never
-# the ones above. `workers` is optional until the first worker exists; it sits beside `api`, and neither imports the
-# other. `exhaustive` fails the check when a new subpackage of `sft` isn't placed in a layer.
+# the ones above. `workers` sits beside `api`, and neither imports the other; `runtime` holds what both entry points
+# need to run as a pod (the probes and metrics listener). `exhaustive` fails the check when a new subpackage of `sft`
+# isn't placed in a layer.
 [tool.importlinter]
 root_package = "sft"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layers: api | workers -> service -> data -> core"
+name = "Layers: api | workers -> runtime -> service -> data -> core"
 type = "layers"
 containers = ["sft"]
 layers = [
-  "api | (workers)",
+  "api | workers",
+  "runtime",
   "service",
   "data",
   "core",
@@ -101,7 +107,7 @@ exhaustive = true
 broken_contract_guidance = "Move the shared code down to the lowest layer that needs it (ADR-0002)."
 
 [[tool.importlinter.contracts]]
-name = "Only the api layer knows about HTTP"
+name = "Only the entry points know about HTTP"
 type = "forbidden"
 source_modules = ["sft.service", "sft.data", "sft.core"]
 forbidden_modules = ["fastapi", "starlette", "uvicorn"]

@@ -82,6 +82,30 @@ services:
     depends_on:
       db-passwords: { condition: service_completed_successfully }
 
+  relay: # the outbox relay (ADR-0013): the same image, another entry point
+    <<: *hardening
+    build:
+      context: ./services/api
+      args: { APP_VERSION: local }
+    command: ["python", "-m", "sft.workers.relay"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Its own login role, which reads and marks outbox rows in system scope only (ADR-0020).
+      DATABASE_URL: ${RELAY_DATABASE_URL:-postgresql://sft_relay@postgres:5432/sft}
+      # ElasticMQ stands in for SQS; its queues are sft-local-scan-small, -scan-large and -notify.
+      SQS_ENDPOINT_URL: ${SQS_ENDPOINT_URL:-http://sqs:9324}
+      SQS_QUEUE_PREFIX: sft-local-
+      # ElasticMQ checks no credentials, but the SDK wants some: obviously fake, local only.
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    # 8001 inside: /healthz, /readyz and /metrics. A worker has no other port.
+    ports: ["127.0.0.1:8011:8001"]
+    stop_grace_period: 25s # more than the 15 s drain
+    # It needs the database bootstrapped and migrated too; those jobs join Compose in #79.
+    depends_on:
+      postgres: { condition: service_healthy }
+      sqs: { condition: service_healthy }
+
   # ---- Local stack: AWS stand-ins, pinned by version and digest. Ports bind to 127.0.0.1 only. ----
 
   postgres: # Aurora PostgreSQL 17 (ADR-0011)
