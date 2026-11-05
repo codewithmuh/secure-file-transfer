@@ -18,9 +18,12 @@ ENV_NAMES = (
     "DATABASE_URL",
     "DATABASE_POOL_SIZE",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "VALKEY_URL",
+    "TRUSTED_PROXIES",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
+VALKEY_URL = "redis://sft-api:local-only@127.0.0.1:6379/0"
 
 Logs = Callable[[], list[dict[str, object]]]
 
@@ -30,6 +33,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     for name in (*ENV_NAMES, *OTHER_ENV_NAMES):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("VALKEY_URL", VALKEY_URL)
     return monkeypatch
 
 
@@ -48,6 +52,8 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.database_url.get_secret_value() == DATABASE_URL
     assert s.database_pool_size == 5
     assert s.otel_exporter_otlp_endpoint is None
+    assert s.valkey_url.get_secret_value() == VALKEY_URL
+    assert s.trusted_proxies == ()
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -60,6 +66,8 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.setenv("DATABASE_URL", "postgresql://sft_api@db:5432/sft?sslmode=verify-full")
     clean_env.setenv("DATABASE_POOL_SIZE", "10")
     clean_env.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-agent.observability:4318")
+    clean_env.setenv("VALKEY_URL", "rediss://sft-api@cache.example:6379")
+    clean_env.setenv("TRUSTED_PROXIES", "10.0.0.0/20, 10.0.16.0/20")
     s = Settings()
     assert s.app_version == "1.4.0"
     assert s.log_level == "debug"
@@ -69,6 +77,8 @@ def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
     assert s.database_url.get_secret_value().endswith("sslmode=verify-full")
     assert s.database_pool_size == 10
     assert s.otel_exporter_otlp_endpoint == "http://otel-agent.observability:4318"
+    assert s.valkey_url.get_secret_value().startswith("rediss://")
+    assert [str(n) for n in s.trusted_proxies] == ["10.0.0.0/20", "10.0.16.0/20"]
 
 
 def test_an_empty_otlp_endpoint_means_none(clean_env: pytest.MonkeyPatch) -> None:
@@ -88,6 +98,9 @@ def test_an_empty_otlp_endpoint_means_none(clean_env: pytest.MonkeyPatch) -> Non
         ("SHUTDOWN_DRAIN_SECONDS", "121"),
         ("DATABASE_URL", "mysql://sft_api@db/sft"),
         ("DATABASE_URL", "postgresql+asyncpg://sft_api@db/sft"),
+        ("VALKEY_URL", "http://cache:6379"),
+        ("TRUSTED_PROXIES", "10.0.0.0/33"),
+        ("TRUSTED_PROXIES", "10.0.0.1/8"),  # host bits set: a typo, not a network
         ("DATABASE_POOL_SIZE", "0"),
         ("DATABASE_POOL_SIZE", "51"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-agent:4318"),  # no scheme
@@ -105,6 +118,19 @@ def test_the_database_url_is_required(clean_env: pytest.MonkeyPatch) -> None:
     clean_env.delenv("DATABASE_URL")
     with pytest.raises(ValidationError, match="database_url"):
         Settings()
+
+
+def test_the_valkey_url_is_required(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.delenv("VALKEY_URL")
+    with pytest.raises(ValidationError, match="valkey_url"):
+        Settings()
+
+
+def test_a_bad_valkey_url_is_never_echoed(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("VALKEY_URL", "http://sft:hunter2@cache:6379")
+    with pytest.raises(ValidationError) as error:
+        Settings()
+    assert "hunter2" not in str(error.value.errors(include_input=False))
 
 
 def test_a_bad_database_url_is_never_echoed(clean_env: pytest.MonkeyPatch) -> None:
@@ -175,7 +201,7 @@ def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
 @pytest.mark.parametrize(
     ("model", "secrets"),
     [
-        (Settings, ["database_url"]),
+        (Settings, ["database_url", "valkey_url"]),
         (MigrationSettings, ["migration_database_url"]),
         (BootstrapSettings, ["bootstrap_database_url"]),
     ],

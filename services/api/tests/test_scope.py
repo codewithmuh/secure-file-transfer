@@ -4,15 +4,43 @@ from pathlib import Path
 
 import pytest
 
-from sft.data.scope import Scope, ScopeKind
+from sft.data.scope import Scope, ScopeKind, Subject, SubjectKind
 
 TENANT = uuid.UUID("0190f5c4-0000-7000-8000-000000000001")
+LINK = Subject.recipient(uuid.UUID("0190f5c4-0000-7000-8000-000000000002"))
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 
 
 def test_tenant_and_resource_scopes_carry_their_tenant() -> None:
     assert Scope.tenant(TENANT).settings() == {"scope": "tenant", "tenant_id": str(TENANT)}
-    assert Scope.resource(TENANT).settings() == {"scope": "resource", "tenant_id": str(TENANT)}
+    # The subject stays in the data layer: PostgreSQL enforces the tenant boundary only.
+    assert Scope.resource(TENANT, LINK).settings() == {
+        "scope": "resource",
+        "tenant_id": str(TENANT),
+    }
+
+
+def test_a_resource_scope_names_its_subject() -> None:
+    scope = Scope.resource(TENANT, Subject.upload_request(LINK.id))
+    assert scope.subject == Subject(SubjectKind.UPLOAD_REQUEST, LINK.id)
+    with pytest.raises(ValueError, match="needs a subject"):
+        Scope(ScopeKind.RESOURCE, TENANT)
+
+
+@pytest.mark.parametrize("kind", [k for k in ScopeKind if k is not ScopeKind.RESOURCE])
+def test_only_a_resource_scope_has_a_subject(kind: ScopeKind) -> None:
+    tenant = TENANT if kind is ScopeKind.TENANT else None
+    with pytest.raises(ValueError, match="has no subject"):
+        Scope(kind, tenant, LINK)
+
+
+def test_a_subject_is_typed() -> None:
+    with pytest.raises(TypeError, match="Subject"):
+        Scope(ScopeKind.RESOURCE, TENANT, "recipient")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="SubjectKind"):
+        Subject("recipient", LINK.id)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="UUID"):
+        Subject.recipient(str(LINK.id))  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -32,7 +60,7 @@ def test_other_scopes_set_no_tenant(scope: Scope, kind: str) -> None:
 @pytest.mark.parametrize("kind", [ScopeKind.TENANT, ScopeKind.RESOURCE])
 def test_a_tenant_scope_needs_a_tenant(kind: ScopeKind) -> None:
     with pytest.raises(ValueError, match="needs a tenant"):
-        Scope(kind)
+        Scope(kind, subject=LINK)
 
 
 @pytest.mark.parametrize(

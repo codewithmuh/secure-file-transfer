@@ -1,0 +1,54 @@
+name: mark-deployed
+
+# Keeps every image an environment has deployed (ADR-0007, #107). When a change to the deploy config lands on main,
+# usually the merge of a promotion pull request, this tags each digest main now pins `deployed-<git-sha>`, and ECR's
+# lifecycle never expires an image with that tag. Builds are tagged only here, once their pin has landed, so a build
+# whose dev proposal was replaced by a newer one is never tagged and expires beyond the newest 30 (A40).
+#
+# It changes nothing in Git and opens no pull request, so it can't start a build or a promotion. Its OIDC identity is
+# this workflow, not build.yml, so the certificate it could get is not one admission accepts. A digest that isn't a
+# finished build from main (no Git SHA tag) fails the run.
+#
+# Until the shared account exists, ECR_PUSH_ROLE_ARN is unset and the job is skipped. Variables: see build.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/environments/**"
+
+permissions: {}
+
+# In order, never cancelled: a run waiting here is replaced by a newer one, which tags what main pins then.
+concurrency:
+  group: mark-deployed
+  cancel-in-progress: false
+
+jobs:
+  mark-deployed:
+    name: Tag what main pins as deployed
+    if: vars.ECR_PUSH_ROLE_ARN != ''
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    environment: registry # the push role's OIDC subject; main only (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the push role
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.ECR_PUSH_ROLE_ARN }}
+          role-session-name: mark-deployed-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+      - name: Tag every digest main pins
+        run: |
+          digests=$(.github/scripts/promotion.sh pinned)
+          echo "### mark-deployed" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -z $digests ]]; then echo "No environment pins a build yet." >> "$GITHUB_STEP_SUMMARY"; fi
+          while read -r digest; do
+            [[ -z $digest ]] && continue
+            sha=$(.github/scripts/promotion.sh mark-deployed "$digest")
+            echo "- \`sft/app@$digest\`, built from $sha, is tagged deployed." >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$digests"

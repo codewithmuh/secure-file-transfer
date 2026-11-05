@@ -804,8 +804,10 @@ across tenants fails to decrypt.
 Work for the workers is written to an outbox table in the same transaction as the change that causes it. The outbox
 relay publishes rows to SQS and marks them sent. Delivery is at least once, so every consumer is idempotent: it records
 the message ID it processed and skips duplicates. The trace context travels in the message, so one trace covers the
-API call, the queue and the worker: the message holds `{"traceparent": "00-…"}` from the span that wrote it, and
-the consumer's span is that span's child. Messages carry IDs, never link tokens or codes.
+API call, the queue and the worker: the message holds the `{"traceparent": "00-…"}` of the `create` span that wrote
+it, a child of the request's span; the relay sends it on unchanged, and the consumer's span is that span's child. A
+relay batch carries messages from many traces, so it is a trace of its own, linked to each of them. Messages carry
+IDs, never link tokens or codes.
 
 After a regional failover, every outbox message from the last 24 hours that has no processed-message record is
 published again. That recovers work that was sitting in Tokyo's queues when the region failed (section 7); consumers

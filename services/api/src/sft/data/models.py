@@ -7,6 +7,9 @@ never import this module: each migration keeps the schema of its own time.
 Conventions (data model 1): IDs are UUIDv7 made by the application, times are `timestamptz`,
 states are `text` with a `CHECK` constraint. Constraint and index names follow PostgreSQL's own
 pattern, so names in migrations, errors and the catalog agree.
+
+Every tenant-owned model mixes in `TenantOwned` (`sft.data.access`), which names its tenant column
+and what a link session's subject reaches, so `in_scope` can filter it.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any
 from sqlalchemy import (
     ARRAY,
     CheckConstraint,
+    ColumnElement,
     DateTime,
     Index,
     MetaData,
@@ -27,11 +31,15 @@ from sqlalchemy import (
     Text,
     func,
     text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB
 from sqlalchemy.dialects.postgresql.base import ischema_names
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import UserDefinedType
+
+from sft.data.access import TenantOwned
+from sft.data.scope import Subject
 
 NAMING_CONVENTION = {
     "pk": "%(table_name)s_pkey",
@@ -47,13 +55,14 @@ class Base(DeclarativeBase):
     type_annotation_map = {datetime: DateTime(timezone=True)}  # noqa: RUF012
 
 
-class Tenant(Base):
+class Tenant(TenantOwned, Base):
     """A customer company (data model 2.1). Every tenant-owned row refers to one.
 
     The columns for recovery and SSO arrive with their features (M1, M6), each in its own migration.
     """
 
     __tablename__ = "tenants"
+    __tenant_key__ = "id"
     __table_args__ = (CheckConstraint("status IN ('active', 'suspended')", name="status"),)
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -61,6 +70,12 @@ class Tenant(Base):
     status: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A link session reads its own tenant's row: the sender's company name, and its status,
+        # so a suspended tenant's links stop working. The tenant condition in_scope adds is enough.
+        return true()
 
 
 class SchemaCompatibility(Base):
@@ -164,3 +179,46 @@ class AuditEvent(Base):
     trace_id: Mapped[str | None] = mapped_column(Text)
     security_critical: Mapped[bool] = mapped_column(server_default=text("false"))
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'"))
+
+
+class Outbox(TenantOwned, Base):
+    """A message to hand to a worker, written with the change that causes it (data model 2.5).
+
+    `sft.data.outbox` writes and reads it; the relay publishes each row to SQS (ADR-0013).
+    """
+
+    __tablename__ = "outbox"
+    __table_args__ = (
+        CheckConstraint("delay_seconds BETWEEN 0 AND 900", name="delay_seconds"),
+        CheckConstraint("attempts >= 0", name="attempts"),
+        CheckConstraint("jsonb_typeof(payload) = 'object'", name="payload"),
+        CheckConstraint("jsonb_typeof(trace_context) = 'object'", name="trace_context"),
+        Index(
+            "outbox_unpublished_idx",
+            "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    topic: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    trace_context: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    delay_seconds: Mapped[int] = mapped_column(server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    published_at: Mapped[datetime | None]
+    attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    next_attempt_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ProcessedMessage(TenantOwned, Base):
+    """A message a consumer has handled, so a second delivery is skipped (data model 2.5)."""
+
+    __tablename__ = "processed_messages"
+
+    consumer: Mapped[str] = mapped_column(Text, primary_key=True)
+    message_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    processed_at: Mapped[datetime] = mapped_column(server_default=func.now())

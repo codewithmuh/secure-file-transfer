@@ -13,11 +13,12 @@ from sqlalchemy.exc import DBAPIError
 from pg import ScratchDatabase
 from sft.core.logs import bind_context
 from sft.data import audit
+from sft.data.access import ScopeNotAllowedError
 from sft.data.audit import Actor, ActorType, Origin, Outcome, Target
 from sft.data.database import Database
 from sft.data.models import Tenant
-from sft.data.roles import ARCHIVE, SCAN
-from sft.data.scope import Scope
+from sft.data.roles import API, ARCHIVE, JOBS, RECOVERY, SCAN
+from sft.data.scope import Scope, Subject
 
 pytestmark = pytest.mark.anyio
 
@@ -215,7 +216,8 @@ async def test_an_event_takes_its_tenant_from_the_scope(
 ) -> None:
     tenant_id = await new_tenant(operator_db)
     target = Target("transfer", uuid.uuid4())
-    async with api_db.transaction(Scope.resource(tenant_id)) as session:
+    link = Subject.recipient(uuid.uuid4())
+    async with api_db.transaction(Scope.resource(tenant_id, link)) as session:
         await audit.record(
             session,
             action="transfer.downloaded",
@@ -256,24 +258,39 @@ async def test_platform_events_have_no_tenant_and_need_platform_scope(
         )
     assert events_for(migrated_db, target.id) == [("sign_in.refused", None)]
 
-    # A transaction that forgot its tenant can't pass one off as a platform event (ADR-0020).
-    for scope in (Scope.system(), Scope.lookup()):
-        with pytest.raises(DBAPIError) as refused:
-            async with api_db.transaction(scope) as session:
-                await session.execute(
-                    text(
-                        "INSERT INTO audit_events (id, actor_type, action, outcome) "
-                        "VALUES (gen_random_uuid(), 'system', 'x.y', 'success')"
+    # A transaction that forgot its tenant can't pass one off as a platform event (ADR-0020):
+    # not the API's lookup scope, nor a lifecycle job's system scope (sft_api never opens one).
+    jobs_db = Database.connect(migrated_db.url(JOBS), pool_size=1)
+    try:
+        for database, scope in ((api_db, Scope.lookup()), (jobs_db, Scope.system())):
+            with pytest.raises(DBAPIError) as refused:
+                async with database.transaction(scope) as session:
+                    await session.execute(
+                        text(
+                            "INSERT INTO audit_events (id, actor_type, action, outcome) "
+                            "VALUES (gen_random_uuid(), 'system', 'x.y', 'success')"
+                        )
                     )
-                )
-        assert sqlstate(refused) == INSUFFICIENT_PRIVILEGE
+            assert sqlstate(refused) == INSUFFICIENT_PRIVILEGE
+    finally:
+        await jobs_db.dispose()
 
 
-@pytest.mark.parametrize("scope", [Scope.system(), Scope.lookup(), Scope.recovery()])
-async def test_record_refuses_scopes_that_write_no_events(api_db: Database, scope: Scope) -> None:
-    async with api_db.transaction(scope) as session:
-        with pytest.raises(ValueError, match="tenant, resource or platform scope"):
-            await audit.record(session, action="x.y", actor=Actor(ActorType.SYSTEM))
+@pytest.mark.parametrize(
+    ("role", "scope"),
+    [(JOBS, Scope.system()), (API, Scope.lookup()), (RECOVERY, Scope.recovery())],
+)
+async def test_record_refuses_scopes_that_write_no_events(
+    migrated_db: ScratchDatabase, role: str, scope: Scope
+) -> None:
+    # Each scope opened by a role that may open it (sft.data.access.SCOPES_BY_ROLE).
+    database = Database.connect(migrated_db.url(role), pool_size=1)
+    try:
+        async with database.transaction(scope) as session:
+            with pytest.raises(ScopeNotAllowedError, match="tenant, resource or platform scope"):
+                await audit.record(session, action="x.y", actor=Actor(ActorType.SYSTEM))
+    finally:
+        await database.dispose()
 
 
 async def test_record_takes_an_actor(api_db: Database) -> None:
@@ -299,8 +316,19 @@ async def test_who_reads_audit_events(
     async with archive_db.transaction(Scope.system()) as session:
         everyone = set(await session.scalars(text("SELECT tenant_id FROM audit_events")))
     assert {mine, theirs} <= everyone
-    async with archive_db.transaction(Scope.tenant(mine)) as session:
-        assert await session.scalar(text("SELECT count(*) FROM audit_events")) == 0
+    # It never opens another scope, and outside system scope its policy matches nothing.
+    with pytest.raises(ScopeNotAllowedError, match="sft_archive never opens a tenant scope"):
+        async with archive_db.transaction(Scope.tenant(mine)):
+            pass  # pragma: no cover
+    async with archive_db.raw_connection_for_tests() as connection, connection.begin():
+        await connection.execute(
+            text(
+                "SELECT set_config('app.scope', 'tenant', true), "
+                "set_config('app.tenant_id', :t, true)"
+            ),
+            {"t": str(mine)},
+        )
+        assert await connection.scalar(text("SELECT count(*) FROM audit_events")) == 0
 
     # Workers write events but never read them.
     with pytest.raises(DBAPIError) as refused:

@@ -2,16 +2,21 @@ import io
 import json
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from prometheus_client import CollectorRegistry
 from sqlalchemy import URL
 
+from isolation import Mode, World, world_database
 from pg import ADMIN_URL_VARIABLE, ScratchDatabase, fresh_database
 from sft.core.logs import JsonFormatter
 from sft.core.telemetry import build_tracer_provider
+from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
 from sft.data.roles import API, MIGRATE, OPERATOR
@@ -34,6 +39,34 @@ def spans() -> Iterator[InMemorySpanExporter]:
     _SPANS.clear()
     yield _SPANS
     _SPANS.clear()
+
+
+class _Collector(BaseHTTPRequestHandler):
+    received: list[tuple[str, bytes]]
+
+    def do_POST(self) -> None:
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.received.append((self.path, body))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-protobuf")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def collector() -> Iterator[tuple[str, list[tuple[str, bytes]]]]:
+    """A stand-in for the node's collector agent: it records what it is sent over OTLP/HTTP."""
+    received: list[tuple[str, bytes]] = []
+    handler = type("Handler", (_Collector,), {"received": received})
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", received
+    server.shutdown()
+    server.server_close()
 
 
 @pytest.fixture
@@ -96,3 +129,41 @@ async def operator_db(migrated_db: ScratchDatabase) -> AsyncIterator[Database]:
     database = Database.connect(migrated_db.url(OPERATOR), pool_size=1)
     yield database
     await database.dispose()
+
+
+@pytest.fixture(scope="session")
+def isolation_world(admin_url: URL) -> Iterator[World]:
+    """The isolation suite's databases: one as built, one with row-level security off."""
+    with (
+        world_database(admin_url, rls=True) as as_built,
+        world_database(admin_url, rls=False) as data_layer_alone,
+    ):
+        world = World({Mode.AS_BUILT: as_built, Mode.DATA_LAYER_ALONE: data_layer_alone})
+        yield world
+        world.close()
+
+
+# ---- real Valkey ----
+
+# A Valkey URL with credentials, e.g. redis://sft-test:…@127.0.0.1:6379/0. Tests flush its database
+# 0 before each test that uses it, so never point it at a stack you care about.
+VALKEY_URL_VARIABLE = "TEST_VALKEY_URL"
+
+
+@pytest.fixture(scope="session")
+def valkey_url() -> str:
+    raw = os.environ.get(VALKEY_URL_VARIABLE)
+    if not raw:
+        if os.environ.get("CI"):
+            pytest.fail(f"{VALKEY_URL_VARIABLE} must be set in CI")
+        pytest.skip(f"set {VALKEY_URL_VARIABLE} to a Valkey 9 URL with credentials")
+    return raw
+
+
+@pytest.fixture
+async def counter_store(valkey_url: str) -> AsyncIterator[CounterStore]:
+    """A store on the test server, emptied first, with metrics of its own."""
+    store = CounterStore.connect(valkey_url, CounterMetrics.create(CollectorRegistry()))
+    await store._client.flushdb()  # read here only to start each test empty
+    yield store
+    await store.close()

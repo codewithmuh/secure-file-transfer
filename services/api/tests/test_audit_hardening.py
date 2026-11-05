@@ -12,11 +12,12 @@ from sqlalchemy.exc import DBAPIError
 
 from pg import ScratchDatabase
 from sft.data import audit
+from sft.data.access import ScopeNotAllowedError
 from sft.data.audit import Actor, ActorType, Origin, Outcome, Target
 from sft.data.database import Database
 from sft.data.models import Tenant
 from sft.data.roles import RECOVERY
-from sft.data.scope import Scope
+from sft.data.scope import Scope, Subject
 
 pytestmark = pytest.mark.anyio
 
@@ -138,7 +139,8 @@ async def test_resource_scope_writes_events_but_reads_none(
     api_db: Database, operator_db: Database
 ) -> None:
     tenant_id = await new_tenant(operator_db)
-    async with api_db.transaction(Scope.resource(tenant_id)) as session:
+    link = Subject.recipient(uuid.uuid4())
+    async with api_db.transaction(Scope.resource(tenant_id, link)) as session:
         await audit.record(
             session,
             action="transfer.downloaded",
@@ -150,16 +152,29 @@ async def test_resource_scope_writes_events_but_reads_none(
         assert await session.scalar(text("SELECT count(*) FROM audit_events")) == 2
 
 
-@pytest.mark.parametrize("scope", [Scope.lookup(), Scope.recovery()])
 async def test_scopes_with_no_tenant_insert_no_tenant_events(
-    api_db: Database, operator_db: Database, scope: Scope
+    api_db: Database, operator_db: Database
 ) -> None:
     tenant_id = await new_tenant(operator_db)
+    insert = text(INSERT_WITH.format(column="details", value="'{}'"))
     with pytest.raises(DBAPIError) as refused:
-        async with api_db.transaction(scope) as session:
-            await session.execute(
-                text(INSERT_WITH.format(column="details", value="'{}'")), {"tenant": tenant_id}
-            )
+        async with api_db.transaction(Scope.lookup()) as session:
+            await session.execute(insert, {"tenant": tenant_id})
+    assert getattr(refused.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE
+
+    # sft_api never opens recovery scope (sft.data.access.SCOPES_BY_ROLE), and if a connection
+    # claimed it anyway, the recovery insert policy is sft_recovery's alone.
+    with pytest.raises(ScopeNotAllowedError, match="sft_api never opens a recovery scope"):
+        async with api_db.transaction(Scope.recovery()):
+            pass  # pragma: no cover
+
+    async def insert_claiming_recovery() -> None:
+        async with api_db.raw_connection_for_tests() as connection, connection.begin():
+            await connection.execute(text("SELECT set_config('app.scope', 'recovery', true)"))
+            await connection.execute(insert, {"tenant": tenant_id})
+
+    with pytest.raises(DBAPIError) as refused:
+        await insert_claiming_recovery()
     assert getattr(refused.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE
 
 

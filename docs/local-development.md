@@ -15,13 +15,14 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 - **Docker** with Compose v2.20 or later and Docker Engine 25 or later (the healthchecks use start intervals). Give
   Docker about 3 GB of memory: clamd and Keycloak use about 1 GB each, the rest about 300 MB together.
 - **uv** and **pre-commit**. `make setup` checks for all three and says which one is missing.
-- These ports free on 127.0.0.1: 1025, 3310, 5432, 6379, 8000, 8025, 8180, 9090 and 9324.
+- These ports free on 127.0.0.1: 1025, 3310, 5432, 6379, 8000, 8001, 8025, 8180, 9090 and 9324.
 
 | Command | What it does |
 |---|---|
 | `make setup` | Checks the prerequisites, installs the API's dependencies and the git hooks |
-| `make up` | Builds the API, starts it with the stack and waits until every service is healthy (under a minute once images are pulled) |
-| `make smoke` | One real round trip to each stack service, from the host ([`local/smoke.py`](../local/smoke.py)) |
+| `make up` | Builds the API, starts the stack, runs the database jobs (section 3), then starts the API and waits until every service is healthy (under a minute once images are pulled) |
+| `make smoke` | One real round trip to each stack service, from the host ([`local/smoke.py`](../local/smoke.py)), and a check that `sft_api` reads no tenant's rows without a scope |
+| `make test` | The API's tests. While the stack runs, the database tests use its server as `sft`, unless `TEST_DATABASE_URL` is set; they make and drop their own databases and leave `sft` alone |
 | `make down` | Stops and removes the containers; the database and S3 objects stay |
 | `make reset` | Stops everything and deletes the local data; the next `make up` starts empty and seeds again |
 | `make logs` | Follows the logs of every container |
@@ -46,7 +47,8 @@ weekly. The configuration files are in [`local/`](../local/).
 | `oidc` | The Cognito user pool and its app client ([ADR-0016](adr/0016-member-sign-in-cognito.md)) | `quay.io/keycloak/keycloak:26.8.1` | 8180 | Realm `sft`, confidential client `sft-api-local` and a test member, re-imported on every start |
 
 The stack also runs the API (`:8000`). `s3-init` is a one-shot container that seeds the S3 stand-in on every
-`make up` and exits; repeating it is safe.
+`make up` and exits; repeating it is safe. So are the three database jobs of section 3, which run before the API
+starts.
 
 ## 3. Local credentials
 
@@ -55,7 +57,8 @@ over all of them.
 
 | What | Value |
 |---|---|
-| PostgreSQL | `sft` / `sft-local-only` |
+| PostgreSQL superuser | `sft` / `sft-local-only`, for the bootstrap job, `make smoke` and `make test` only |
+| PostgreSQL login roles | `sft_api`, `sft_migrate` and every other `sft_` role that logs in, all with `test-only-password` |
 | AWS SDK, for S3 and SQS | Access key `local-only`, secret `local-only`. Fake keys mean a local run never picks up a real AWS identity. |
 | SSE-KMS key IDs | Files `00000000-0000-4000-8000-000000000001`, audit `00000000-0000-4000-8000-000000000002` |
 | Valkey | `sft-local` / `local-only-valkey-password` |
@@ -64,14 +67,38 @@ over all of them.
 | Keycloak admin console | `admin` / `local-only-admin` at <http://localhost:8180/admin> |
 | Mail catcher | No sign-in; it accepts any SMTP credentials. Web UI at <http://localhost:8025> |
 
+### PostgreSQL roles and passwords
+
+The API never logs in as `sft`: a superuser bypasses row-level security, so tenant isolation would go untested
+locally. On every `make up`, before the API starts, three one-shot services run in order, each only if the one before
+it succeeded (`service_completed_successfully`):
+
+1. **`db-bootstrap`**, from the API image: `python -m sft.data.bootstrap` as `sft`, with `BOOTSTRAP_IAM_AUTH=false`.
+   It creates `sft_owner`, `sft_lookup`, one login role per workload and `sft_migrate`, or repairs them (ADR-0020,
+   authentication and authorization 7.3). In AWS the master user runs it.
+2. **`db-passwords`**, from the PostgreSQL image: [`local/postgres/passwords.sql`](../local/postgres/passwords.sql)
+   gives every `sft_` login role the password `test-only-password`. It is local only: in AWS the roles have no
+   password and sign in with IAM tokens (encryption and keys 6.3), and no application code sets a password. It is the
+   test suite's value because roles belong to the whole server: `make test` against the stack sets the same one, so
+   a test run never locks the API out.
+3. **`db-migrate`**, from the API image: `python -m sft.data.migrate` as `sft_migrate`, which becomes `sft_owner` and
+   upgrades to the image's head, or does nothing when the database is there already. In AWS it is the Argo CD PreSync
+   job (ADR-0005).
+
+The API then connects as `sft_api` (`postgres:5432` in the stack, `DATABASE_URL` in [`.env.example`](../.env.example)
+from the host). If a job fails, `make up` stops and the API doesn't start; `docker compose logs db-migrate` says why.
+Each workload added later, such as the outbox relay (#51), depends on `db-migrate` the same way and logs in as its own
+role with the same password.
+
 ## 4. Differences from AWS that matter for tests
 
 ### PostgreSQL
 
 - **No TLS and no IAM authentication.** Locally a password goes over plain TCP; Aurora uses IAM tokens and
-  `sslmode=verify-full` (ADR-0011), so the connection code needs both paths.
-- **The `sft` login is a superuser, and superusers bypass row-level security.** Tests of tenant isolation must connect
-  as the workload roles that the migrations create (#48), never as `sft` (ADR-0020).
+  `sslmode=verify-full` (ADR-0011), so the connection code needs both paths. The login roles' local password comes
+  from `db-passwords` (section 3), not from the bootstrap job.
+- **The `sft` login is a superuser, and superusers bypass row-level security.** The API and tests of tenant isolation
+  connect as the workload roles that the bootstrap job creates, never as `sft` (ADR-0020).
 - Community PostgreSQL 17.11 against Aurora's 17.x, with Aurora's own storage, failover and parameter defaults.
 
 ### S3 (S3Mock)
@@ -161,7 +188,9 @@ root (ElasticMQ, Mailpit and the ClamAV entrypoint), and every port binds to 127
 - **`oidc`** has a writable root file system, because Keycloak's `start-dev` rebuilds into `/opt/keycloak/lib` at
   startup. It still runs as uid 1000 with every capability dropped. A read-only Keycloak needs a pre-built image,
   which isn't worth one more build for a local stand-in.
-- **`s3-init`** has `restart: "no"`, because it exits once the buckets exist.
+- **`s3-init`, `db-bootstrap`, `db-passwords` and `db-migrate`** have `restart: "no"`, because each exits once its
+  work is done. The API waits for all of them, which also lets `make up` accept their exit when the stack is already
+  running.
 
 ## 6. Why these emulators
 

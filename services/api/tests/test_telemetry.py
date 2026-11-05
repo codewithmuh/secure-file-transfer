@@ -1,13 +1,10 @@
 """Traces: propagation through messages, the attribute allowlist, export, and AWS call spans."""
 
 import contextlib
-import json
 import logging
 import signal
-import threading
 import time
-from collections.abc import Callable, Iterator
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
@@ -23,16 +20,19 @@ from opentelemetry.trace import Link, SpanKind, StatusCode
 from starlette.testclient import TestClient
 
 from sft.api.app import create_app
-from sft.api.observability import HttpMetrics, RequestContextMiddleware
 from sft.core import telemetry
 from sft.core.logs import bind_context, trace_id_var
 from sft.core.telemetry import (
     build_tracer_provider,
     continued_trace,
     current_trace_context,
+    link_to,
+    mark_error,
+    messaging_attributes,
     parse_traceparent,
     scrubbed,
     trace_aws_client,
+    traced,
 )
 
 TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -148,40 +148,63 @@ def test_a_logged_trace_id_restores_after_a_nested_trace() -> None:
     bind_context(request_id=None, trace_id=None)
 
 
-def test_a_requests_trace_follows_it_through_a_message_to_the_consumer(
+# The acceptance test of #108, a request's trace through the outbox, the relay and SQS to the
+# consumer, is in test_message_traces.
+
+
+def test_a_traced_block_is_a_child_of_the_current_span_with_its_links(
     spans: InMemorySpanExporter, json_logs: Logs
 ) -> None:
-    """The acceptance test of #108, with a list standing in for the outbox and SQS (#51)."""
-    queue: list[str] = []
-    app = create_app()
-
-    @app.post("/v1/things")
-    async def create_thing() -> dict[str, str]:
-        # What the outbox stores and the relay publishes: a JSON body with the trace context.
-        queue.append(json.dumps({"id": "msg-1", "trace_context": current_trace_context()}))
-        return {"id": "thing-1"}
-
-    client = TestClient(RequestContextMiddleware(app, HttpMetrics.create()))
-    client.post("/v1/things", headers={"traceparent": f"00-{TRACE}-{PARENT}-01"})
-
-    [body] = queue
-    message = json.loads(body)
-    with continued_trace(
-        message["trace_context"],
-        "things process",
-        attributes={"messaging.message.id": message["id"]},
+    other = trace.SpanContext(int(TRACE, 16), int(PARENT, 16), is_remote=True)
+    with (
+        tracer.start_as_current_span("outer") as outer,
+        traced("inner", kind=SpanKind.PRODUCER, links=[Link(other)]) as inner,
     ):
-        logging.getLogger("sft.workers.things").info("processed")
+        logging.getLogger("sft.test").info("inside")
+        assert trace.get_current_span() is inner
+    assert trace_id_var.get() is None
+    span, _ = spans.get_finished_spans()
+    assert span.kind == SpanKind.PRODUCER
+    assert span.parent is not None
+    assert span.parent.span_id == outer.get_span_context().span_id
+    assert [link.context for link in span.links] == [other]
+    [line] = [line for line in json_logs() if line["msg"] == "inside"]
+    assert line["trace_id"] == hex_trace(span)
 
-    server, consumer = spans.get_finished_spans()
-    assert server.kind == SpanKind.SERVER
-    assert hex_trace(server) == hex_trace(consumer) == TRACE  # the web app's trace
-    assert consumer.parent is not None
-    assert server.context is not None
-    assert consumer.parent.span_id == server.context.span_id
-    request_line = next(line for line in json_logs() if line["logger"] == "sft.api.request")
-    consumer_line = next(line for line in json_logs() if line["msg"] == "processed")
-    assert request_line["trace_id"] == consumer_line["trace_id"] == TRACE
+
+def test_a_handled_error_marks_the_span_with_its_type_alone(spans: InMemorySpanExporter) -> None:
+    with traced("send"):
+        mark_error(trace.get_current_span(), "AWS.SimpleQueueService.BatchRequestTooLong")
+    [span] = spans.get_finished_spans()
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.attributes == {"error.type": "AWS.SimpleQueueService.BatchRequestTooLong"}
+
+
+@pytest.mark.parametrize(
+    ("carrier", "linked"),
+    [
+        ({"traceparent": f"00-{TRACE}-{PARENT}-01"}, True),
+        ({}, False),
+        ({"trace_id": TRACE}, False),
+        ({"traceparent": "garbage"}, False),
+    ],
+)
+def test_a_link_points_at_the_span_a_message_was_written_in(
+    carrier: dict[str, str], linked: bool
+) -> None:
+    link = link_to(carrier)
+    assert (link is not None) is linked
+    if link is not None:
+        assert (f"{link.context.trace_id:032x}", f"{link.context.span_id:016x}") == (TRACE, PARENT)
+
+
+def test_message_spans_name_sqs_the_operation_and_the_queue() -> None:
+    assert messaging_attributes("send", "scan-small") == {
+        "messaging.system": "aws_sqs",
+        "messaging.operation.type": "send",
+        "messaging.destination.name": "scan-small",
+    }
+    assert set(messaging_attributes("send", "x")) <= telemetry.ALLOWED_ATTRIBUTES
 
 
 # ---- the allowlist ----
@@ -259,34 +282,6 @@ def test_with_an_endpoint_the_exporter_posts_to_v1_traces(
     assert isinstance(exporter.exporter, OTLPSpanExporter)
     assert exporter.exporter._endpoint == "http://otel-agent:4318/v1/traces"
     provider.shutdown()
-
-
-class _Collector(BaseHTTPRequestHandler):
-    received: list[tuple[str, bytes]]
-
-    def do_POST(self) -> None:
-        body = self.rfile.read(int(self.headers["Content-Length"]))
-        self.received.append((self.path, body))
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-protobuf")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    def log_message(self, format: str, *args: object) -> None:
-        pass
-
-
-@pytest.fixture
-def collector() -> Iterator[tuple[str, list[tuple[str, bytes]]]]:
-    """A stand-in for the node's collector agent: it records what it is sent over OTLP/HTTP."""
-    received: list[tuple[str, bytes]] = []
-    handler = type("Handler", (_Collector,), {"received": received})
-    server = HTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_port}", received
-    server.shutdown()
-    server.server_close()
 
 
 def test_spans_reach_the_collector_allowlisted(
@@ -384,6 +379,19 @@ def test_an_aws_call_is_a_client_span_under_the_current_one(spans: InMemorySpanE
         "aws.request_id": "req-aws-1",
     }
     assert call.status.status_code == StatusCode.UNSET
+
+
+def test_an_untraced_operation_gets_no_span(spans: InMemorySpanExporter) -> None:
+    client = fake_client()
+    trace_aws_client(client, untraced={"ReceiveMessage"})
+    events: FakeEvents = client.meta.events
+    context: dict[str, Any] = {}
+    events.emit("before-call", model=model("ReceiveMessage"), context=context)
+    events.emit(
+        "after-call", http_response=SimpleNamespace(status_code=200), parsed={}, context=context
+    )
+    assert context == {}
+    assert spans.get_finished_spans() == ()
 
 
 def test_an_aws_error_response_is_an_error_span(spans: InMemorySpanExporter) -> None:

@@ -5,8 +5,9 @@ the pod spec does. A secret is a `SecretStr` field with no default, so a missing
 process at startup instead of running with a placeholder; a test fails if a secret field gets a
 default. In the cloud, secrets come from AWS Secrets Manager, never from git.
 
-Each entry point reads only the settings it needs: `Settings` for the API (and later the workers),
-`MigrationSettings` for the migration job, `BootstrapSettings` for the database bootstrap job.
+Each entry point reads only the settings it needs: `Settings` for the API, `RelaySettings` for the
+outbox relay (and `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the
+migration job, `BootstrapSettings` for the database bootstrap job.
 """
 
 from __future__ import annotations
@@ -18,12 +19,13 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     AfterValidator,
     Field,
+    IPvAnyNetwork,
     SecretStr,
     ValidationError,
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sft.core.logs import configure_logging
 
@@ -45,6 +47,19 @@ def _postgres_url(value: SecretStr) -> SecretStr:
 # database authentication (encryption and keys 6.3). Locally it may hold a fake password.
 PostgresUrl = Annotated[SecretStr, AfterValidator(_postgres_url)]
 
+_VALKEY_SCHEMES = ("redis://", "rediss://", "valkey://", "valkeys://")
+
+
+def _valkey_url(value: SecretStr) -> SecretStr:
+    if not value.get_secret_value().startswith(_VALKEY_SCHEMES):
+        raise ValueError("must start with redis://, rediss://, valkey:// or valkeys://")
+    return value
+
+
+# A Valkey URL with its credentials: locally the ACL user and its fake password; in AWS `rediss://`
+# and the workload's user, whose IAM token M4 signs per connection (ADR-0014).
+ValkeyUrl = Annotated[SecretStr, AfterValidator(_valkey_url)]
+
 
 # Pods set enableServiceLinks: false, so Service variables can't clash with these (architecture 8).
 class _Base(BaseSettings):
@@ -58,7 +73,24 @@ class _Base(BaseSettings):
         return value.lower() if isinstance(value, str) else value
 
 
-class Settings(_Base):
+class _Traced(_Base):
+    """What every long-running workload reads to export its traces: the API and the workers."""
+
+    otel_exporter_otlp_endpoint: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^/?#\s]+(/[^?#\s]*)?$",
+        description="The collector's OTLP/HTTP base URL; spans go to <endpoint>/v1/traces. "
+        "Unset: traces are made for the logs and messages but not exported (ADR-0009).",
+    )
+
+    @field_validator("otel_exporter_otlp_endpoint", mode="before")
+    @classmethod
+    def _empty_endpoint_is_unset(cls, value: object) -> object:
+        # A chart that renders the variable empty means "don't export", not a bad URL.
+        return None if value == "" else value
+
+
+class Settings(_Traced):
     """The API's settings. The field name in capitals is the environment variable."""
 
     app_version: str = Field(default="0.0.0", description="Set by the image build.")
@@ -91,24 +123,80 @@ class Settings(_Base):
         le=50,
         description="Connections per process, with no overflow, so the total is predictable.",
     )
-    otel_exporter_otlp_endpoint: str | None = Field(
-        default=None,
-        pattern=r"^https?://[^/?#\s]+(/[^?#\s]*)?$",
-        description="The collector's OTLP/HTTP base URL; spans go to <endpoint>/v1/traces. "
-        "Unset: traces are made for the logs and messages but not exported (ADR-0009).",
+    valkey_url: ValkeyUrl = Field(
+        description="The rate-limit counter store, with its credentials (ADR-0014).",
+    )
+    trusted_proxies: Annotated[tuple[IPvAnyNetwork, ...], NoDecode] = Field(
+        default=(),
+        description="Our load balancer's subnets, comma-separated. Only a request from them has "
+        "its client address taken from X-Forwarded-For (ADR-0002); empty locally.",
     )
 
-    @field_validator("otel_exporter_otlp_endpoint", mode="before")
+    @field_validator("trusted_proxies", mode="before")
     @classmethod
-    def _empty_endpoint_is_unset(cls, value: object) -> object:
-        # A chart that renders the variable empty means "don't export", not a bad URL.
-        return None if value == "" else value
+    def _split_networks(cls, value: object) -> object:
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
 
     @model_validator(mode="after")
     def _ports_differ(self) -> Self:
         if self.public_port == self.internal_port:
             raise ValueError("PUBLIC_PORT and INTERNAL_PORT must differ")
         return self
+
+
+_QUEUE_PREFIX = r"^[a-z0-9]+(-[a-z0-9]+)*-$"
+
+
+class WorkerSettings(_Traced):
+    """What every worker reads: its probes, its database role, SQS, traces (architecture 8)."""
+
+    app_version: str = Field(default="0.0.0", description="Set by the image build.")
+    bind_host: str = "127.0.0.1"
+    internal_port: int = Field(
+        default=8001,
+        ge=1,
+        le=65535,
+        description="Probes and metrics; a worker has no other port.",
+    )
+    shutdown_drain_seconds: int = Field(
+        default=15,
+        ge=1,
+        le=60,
+        description="How long the work in hand gets to finish after SIGTERM.",
+    )
+    database_url: PostgresUrl = Field(
+        description="The workload's own login role, never the migration role or the master user.",
+    )
+    database_pool_size: int = Field(default=2, ge=1, le=20)
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    sqs_queue_prefix: str = Field(
+        pattern=_QUEUE_PREFIX,
+        description="Names the environment's queues: `sft-dev-` makes `sft-dev-notify`. Required.",
+    )
+    sqs_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for ElasticMQ. In AWS the SDK finds SQS's VPC endpoint itself.",
+    )
+
+
+class RelaySettings(WorkerSettings):
+    """The outbox relay's settings (ADR-0013)."""
+
+    relay_batch_size: int = Field(
+        default=50,
+        ge=1,
+        le=100,
+        description="Rows claimed per transaction; sent in batches of 10, one call per queue.",
+    )
+    relay_poll_interval_seconds: float = Field(
+        default=1.0,
+        ge=0.05,
+        le=30,
+        description="The wait after a batch that wasn't full, before looking for due rows again.",
+    )
 
 
 class MigrationSettings(_Base):

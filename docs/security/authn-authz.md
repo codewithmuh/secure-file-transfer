@@ -719,11 +719,11 @@ CREATE POLICY audit_archive_read ON audit_events FOR SELECT
     TO sft_archive
     USING (app_scope() = 'system');
 
--- The credential lookup functions run as sft_lookup, which has no BYPASSRLS.
+-- The credential lookup functions run as sft_lookup, which has no BYPASSRLS, in lookup scope only.
 ALTER TABLE member_sessions ENABLE ROW LEVEL SECURITY;
 CREATE POLICY lookup_read ON member_sessions FOR SELECT
     TO sft_lookup
-    USING (true);
+    USING (app_scope() = 'lookup');
 ```
 
 - **Setting the scope.** The data-access layer opens every transaction through its scope object, whose first statement

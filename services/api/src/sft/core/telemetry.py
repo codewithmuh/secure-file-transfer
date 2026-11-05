@@ -2,8 +2,9 @@
 
 `configure_tracing` runs once per process, at startup. After it, every span the service starts is
 recorded: the API's request spans (sft.api.observability), each SQL statement
-(sft.data.database), each AWS call of a client passed to `trace_aws_client`, and the spans the
-workers start with `continued_trace`. Sampling happens only in the collector gateway, whose tail
+(sft.data.database), each AWS call of a client passed to `trace_aws_client`, and the message
+spans of the outbox, the relay and the consumers (sft.data.outbox, sft.workers). Sampling
+happens only in the collector gateway, whose tail
 sampling keeps every error and slow trace and 10 % of the rest (ADR-0009). The service keeps
 everything so the gateway sees every error; a caller's "not sampled" flag is ignored for the same
 reason, so a client can't hide its requests from it.
@@ -25,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -80,12 +81,13 @@ ALLOWED_ATTRIBUTES = frozenset(
         "rpc.method",
         "aws.request_id",
         "cloud.region",
-        # Messages: the consumer, the queue and the outbox ID.
+        # Messages: the consumer, the queue, the outbox ID and how many go in one call.
         "messaging.system",
         "messaging.operation.type",
         "messaging.destination.name",
         "messaging.consumer.group.name",
         "messaging.message.id",
+        "messaging.batch.message_count",
         # Errors: the type, never the message or the stack trace (the logs have the stack trace).
         "error.type",
         "exception.type",
@@ -162,7 +164,56 @@ def trace_id_of(span: Span) -> str | None:
     return f"{span_context.trace_id:032x}" if span_context.is_valid else None
 
 
+@contextmanager
+def traced(
+    name: str,
+    *,
+    kind: SpanKind = SpanKind.INTERNAL,
+    context: Context | None = None,
+    attributes: Mapping[str, AttributeValue] | None = None,
+    links: Sequence[Link] | None = None,
+) -> Iterator[Span]:
+    """A span, current while the block runs, under the current one (or under `context`).
+
+    The work's own spans (SQL, AWS calls) are its children, and log lines carry its trace ID. An
+    exception is recorded on the span as its type, never its message; the span ends with an error
+    status, and the exception is raised again.
+    """
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_as_current_span(
+        name, context=context, kind=kind, attributes=attributes, links=links
+    ) as span:
+        token = trace_id_var.set(trace_id_of(span))
+        try:
+            yield span
+        except BaseException as exc:
+            span.set_attribute("error.type", type(exc).__qualname__)
+            raise
+        finally:
+            trace_id_var.reset(token)
+
+
+def mark_error(span: Span, error_type: str) -> None:
+    """End `span` as an error that was handled, not raised: its type or code, never a message."""
+    span.set_attribute("error.type", error_type)
+    span.set_status(StatusCode.ERROR)
+
+
 # ---- propagation through messages (architecture 5.3) ----
+
+MESSAGING_SYSTEM = "aws_sqs"
+
+
+def messaging_attributes(operation: str, queue: str) -> dict[str, AttributeValue]:
+    """What every message span says: SQS, the operation (`create`, `send`, `process`), the queue.
+
+    The queue is its name without the environment's prefix, such as `scan-small`.
+    """
+    return {
+        "messaging.system": MESSAGING_SYSTEM,
+        "messaging.operation.type": operation,
+        "messaging.destination.name": queue,
+    }
 
 
 def current_trace_context() -> dict[str, str]:
@@ -175,6 +226,16 @@ def current_trace_context() -> dict[str, str]:
     return carrier
 
 
+def link_to(carrier: Mapping[str, str]) -> Link | None:
+    """A link to the span whose context `carrier` holds, or None without a valid `traceparent`.
+
+    A span that acts on many messages at once, such as the relay's send, can't be the child of
+    each message's trace; it links to them instead.
+    """
+    remote = parse_traceparent(default_getter.get(carrier, TRACEPARENT))
+    return None if remote is None else Link(remote)
+
+
 @contextmanager
 def continued_trace(
     carrier: Mapping[str, str],
@@ -185,38 +246,33 @@ def continued_trace(
 ) -> Iterator[Span]:
     """A span that continues the trace in `carrier`, a dict from `current_trace_context`.
 
-    While the block runs the span is current, so the work's own spans (SQL, AWS calls) are its
-    children, and log lines carry its trace ID. Without a valid `traceparent` a new trace starts.
-    An exception is recorded on the span, which ends with an error status, and is raised again.
+    It is the child of the span that wrote the message, whatever span is current here, and works
+    as `traced` does. Without a valid `traceparent` a new trace starts.
     """
-    parent = PROPAGATOR.extract(carrier)
-    tracer = trace.get_tracer(__name__)
-    with tracer.start_as_current_span(
-        name, context=parent, kind=kind, attributes=attributes
+    with traced(
+        name, kind=kind, context=PROPAGATOR.extract(carrier), attributes=attributes
     ) as span:
-        token = trace_id_var.set(trace_id_of(span))
-        try:
-            yield span
-        except BaseException as exc:
-            span.set_attribute("error.type", type(exc).__qualname__)
-            raise
-        finally:
-            trace_id_var.reset(token)
+        yield span
 
 
 # ---- AWS calls ----
 
 
-def trace_aws_client(client: Any) -> None:
+def trace_aws_client(client: Any, *, untraced: Iterable[str] = ()) -> None:
     """Give every call of a boto3 client a CLIENT span: `SQS.SendMessageBatch`, say.
 
     It listens on botocore's own events, so it needs no wrapper around the SDK. The span's parent
-    is the context the call runs in: run blocking calls with `asyncio.to_thread`, which copies the
-    context, not `loop.run_in_executor`, which doesn't. Retries inside one call share its span.
+    is the context the call runs in: run blocking calls with `asyncio.to_thread`, or in an executor
+    through `contextvars.copy_context().run`, never with a bare `loop.run_in_executor`, which
+    loses the context. Retries inside one call share its span. Calls of the operations in
+    `untraced`, such as `ReceiveMessage`, get no span.
     """
     events = client.meta.events
     region = client.meta.region_name
-    events.register("before-call", _AwsCallTracer.before(region), unique_id="sft-trace-before")
+    skip = frozenset(untraced)
+    events.register(
+        "before-call", _AwsCallTracer.before(region, skip), unique_id="sft-trace-before"
+    )
     events.register("after-call", _AwsCallTracer.after, unique_id="sft-trace-after")
     events.register("after-call-error", _AwsCallTracer.error, unique_id="sft-trace-error")
 
@@ -225,8 +281,10 @@ class _AwsCallTracer:
     _KEY = "sft_span"  # where the span waits in botocore's per-call context dict
 
     @classmethod
-    def before(cls, region: str | None) -> Any:
+    def before(cls, region: str | None, untraced: frozenset[str] = frozenset()) -> Any:
         def handler(*, model: Any, context: dict[str, Any], **_: Any) -> None:
+            if model.name in untraced:
+                return
             service = str(model.service_model.service_id)
             attributes: dict[str, AttributeValue] = {
                 "rpc.system": "aws-api",

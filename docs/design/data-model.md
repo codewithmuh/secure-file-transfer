@@ -333,8 +333,8 @@ doesn't lock the subject again.
 |---|---|---|
 | `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `outcome` (success, failure), `source_ip`, `user_agent`, `request_id`, `trace_id`, `security_critical`, `details` (JSON) | Partitioned by UTC month on `occurred_at`; primary key `(id, occurred_at)`, because a partitioned table's keys must include the partition key. The database sets `tx_id` (`pg_current_xact_id()`) and `occurred_at` (`now()`, the transaction's start, which also serves as `created_at`), so code can't backdate an event. The tenant comes from the transaction's scope, and the request and trace IDs from the log context. The application roles can only insert, and their grant leaves out `tx_id` and `occurred_at`; only `sft_recovery`, re-importing archived events, sets them. Events are inserted in tenant or resource scope (a recipient's download) or platform scope, and read by `sft_api` in tenant scope only, so a link session can't read the log. `action` is a dotted code (`transfer.revoked`), `target_type` a code (`transfer`), and actor and target are IDs. `details` holds IDs, enums, numbers, flags and times only, never free text, so no file name, message, address, token or code can reach it (FR-27, NFR-15). `user_agent` is cut to 512 characters. |
 | `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `archived_at` | One row: the current archive generation, and how far the archive job has got in it. |
-| `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `delay_seconds` asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4). |
-| `processed_messages` | `consumer`, `message_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`), `message_id` is the SHA-256 of `mail.messageId`, `eventType`, the HMAC of the recipient address and the event's timestamp, not the SQS message ID, because SES can publish one event more than once and a bounce can name several recipients. |
+| `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at`, `attempts`, `next_attempt_at`, `last_error` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `payload` maps names to UUIDs or lists of UUIDs and nothing else, so no token, code, address or file name can reach a queue (threat model T-49). `delay_seconds` (0 to 900) asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4); it counts from `created_at`, so the relay sends what is left of it and a late relay doesn't delay the message twice. A send SQS refuses adds one to `attempts`, records SQS's error code in `last_error` and moves `next_attempt_at` on (2 s doubling to 5 minutes), so one refused row can't hold up the rows behind it. The API, the operator API, the scan worker and the lifecycle jobs insert in their tenant's scope; only `sft_relay` reads and marks rows, in system scope (ADR-0013). |
+| `processed_messages` | `consumer`, `message_id`, `tenant_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work, in the message's tenant scope, first: a second copy handled at the same time waits on the first one's row and is skipped once it commits. `message_id` is text, because intake queues use their source's event ID. The consumers may only insert, with `ON CONFLICT DO NOTHING` and no conflict target, and learn of a duplicate from the row count, so none of them can read another consumer's records. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`), `message_id` is the SHA-256 of `mail.messageId`, `eventType`, the HMAC of the recipient address and the event's timestamp, not the SQS message ID, because SES can publish one event more than once and a bounce can name several recipients. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. |
 | `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
 | `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB) comes from deploy configuration and is the same for every tenant; v1 has no per-tenant overrides (section 10). |
@@ -372,8 +372,11 @@ commit, so nothing is skipped; then the cursor moves to `xmin`.
   single statement, or a wait inside a transaction, gets 10 seconds. The bootstrap job sets them on the roles. Jobs
   delete and purge in small batches, one transaction each (section 6). No code holds a transaction open across an S3
   or SES call. Upload completion, for example, runs in three phases with its S3 calls between two short transactions
-  (3.1). Migrations are the one exception (section 7). An alert fires when the oldest unarchived audit row is more
-  than 2 minutes old (NFR-15).
+  (3.1). The outbox relay is the one transaction that spans a call to AWS: it holds its claimed rows' locks while it
+  sends them to SQS (ADR-0013), and stops waiting after a 6-second send budget, per-row re-sends included; a row
+  with no answer by then is tried again later. Its queue URLs are looked up at startup. So it stays inside the
+  10-second idle limit. Migrations are the one exception (section 7). An alert fires when the
+  oldest unarchived audit row is more than 2 minutes old (NFR-15).
 - **Restores and failovers reuse transaction IDs.** A point-in-time restore, or a regional failover that loses the
   replica's unreplicated tail, takes the database back in time: transaction IDs used after that point are given out
   again, and the cursor row goes back too. So archive object keys start with the cursor's `generation`. The restore
@@ -697,11 +700,37 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    identity's user must belong to it. For a local sign-in the pool's connection has no tenant, and the tenant is that
    of the identity's user. An issuer string or an email claim never finds a connection, a tenant or a user (2.1). The
    functions are owned by `sft_lookup`, pin their `search_path`, and only `sft_api` may execute them.
+
+   **How the data layer holds the scopes** (`sft.data.access`, #49):
+   - **Who opens which scope.** A pool logs in as one workload role, named in its URL, and opens only that role's
+     scopes in authentication and authorization 7.3: `sft_api` tenant, resource, platform and lookup; `sft_operator`
+     platform and tenant; `sft_scan` and `sft_notify` tenant; `sft_relay` and `sft_archive` system; `sft_jobs` system
+     and tenant; `sft_recovery` recovery. Any other scope is refused before it reaches the database, and so is a URL
+     that names any other user, the master user included, or whose query could change who logs in (only TLS
+     settings, a connect timeout and an application name pass). Every new connection checks `current_user` too. In
+     system scope the session refuses any `INSERT`, `UPDATE`, `DELETE` or flush that touches a tenant table, except
+     the relay's on `outbox`, so "find across, act within" holds without row-level security and nothing has to
+     remember a flag. Work on no tenant's rows, such as the audit partition upkeep, isn't affected.
+   - **What a scope reaches.** Every query adds `in_scope(Model, session)`: the scope's tenant in tenant and
+     resource scope, every tenant in system and recovery scope (the role's grants and policies decide the tables),
+     no tenant row in platform and lookup scope. A resource scope carries its subject, the link session's recipient
+     or upload request, and each model says what that subject reaches (`TenantOwned.reach`); a model that says
+     nothing is closed to link sessions. Rows written take their tenant from the scope, never from a parameter.
+   - **Lookups run in lookup scope.** Each lookup function is called in a transaction of its own in lookup scope,
+     and its `lookup_read` policies are `USING (app_scope() = 'lookup')`, so a lookup inside a tenant's transaction
+     finds nothing. Like every definer function, they pin `search_path = pg_catalog, public, pg_temp` (the
+     temporary schema last) and name their tables with the schema. The bootstrap job lets `sft_owner` become
+     `sft_lookup`, without inheriting from it, and grant `CREATE` on `public`. `ALTER FUNCTION … OWNER TO
+     sft_lookup` needs the new owner to hold it, so the revision grants it, hands the function over and revokes it
+     again; only `sft_owner` keeps `CREATE` there, which a catalog test checks (CVE-2018-1058). The revision revokes
+     `PUBLIC`'s `EXECUTE` and grants `sft_api` before the hand-over.
 2. **Composite foreign keys.** Every tenant-owned table has a unique key `(tenant_id, id)`, and children reference
    their parent by both columns, for example `files (tenant_id, transfer_id) → transfers (tenant_id, id)`. The database
    itself refuses a row that points at another tenant's parent. This includes `verification_codes`, `link_sessions`,
    `member_sessions`, `download_grants`, the ciphertext columns' `data_key_version` (sections 2.1 to 2.4), and every
-   DLP table with its `dlp_key_version` (2.7).
+   DLP table with its `dlp_key_version` (2.7). `sft.data.rls` writes the statements a migration pastes in
+   (`tenant_keys_sql`, `tenant_foreign_key_sql`), and a catalog test fails the build on a foreign key between tenant
+   tables that leaves `tenant_id` out, unless it is one of the exceptions in section 2.
 3. **Row-level security as a second layer**, decided in the
    [authentication and authorization design](../security/authn-authz.md), sections 7.2 to 7.5:
    - **Enabled, not forced.** Every tenant-owned table has row-level security enabled, in every environment, dev and
@@ -763,7 +792,10 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    "not found" fails the build. It also gives two tenants SSO connections with the same issuer string and an identity
    with the same subject in each, signs in through each connection, and checks that each sign-in reaches only its own
    tenant's user. It runs three ways: as built; with row-level security off, so the data-access layer alone must hold;
-   and with the data-access layer's tenant filter removed, so row-level security alone must hold.
+   and with the data-access layer's tenant filter removed, so row-level security alone must hold. Row-level security
+   is off in a database of its own, where every table has it disabled; the tenant filter is removed by replacing the
+   one function that builds it. Each attempt fails if the result holds any of the other tenant's IDs or text, if any
+   of its rows changed, or if a row of another tenant now refers to one of its IDs.
 6. **Storage.** Object keys start with `tenants/{tenant_id}/` in both bucket pairs. S3 objects carry no per-tenant KMS
    encryption context, because S3 Bucket Keys bind KMS to the bucket; cross-tenant protection for files is the
    data-access scope, IAM prefix conditions and tests (encryption and keys 5, 9.1). The prefix lets a tenant move to a

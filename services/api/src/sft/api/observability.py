@@ -17,19 +17,13 @@ from dataclasses import dataclass
 from opentelemetry import trace
 from opentelemetry.propagators.textmap import Getter
 from opentelemetry.trace import SpanKind, StatusCode
-from prometheus_client import (
-    CollectorRegistry,
-    Counter,
-    GCCollector,
-    Histogram,
-    PlatformCollector,
-    ProcessCollector,
-)
+from prometheus_client import CollectorRegistry, Counter, Histogram
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sft.core.logs import bind_context
 from sft.core.telemetry import PROPAGATOR, trace_id_of
+from sft.runtime.internal import process_registry
 
 log = logging.getLogger("sft.api.request")
 
@@ -64,11 +58,7 @@ class HttpMetrics:
 
     @classmethod
     def create(cls) -> HttpMetrics:
-        registry = CollectorRegistry()
-        # The process, platform and garbage-collector metrics the default registry would have.
-        ProcessCollector(registry=registry)
-        PlatformCollector(registry=registry)
-        GCCollector(registry=registry)
+        registry = process_registry()
         requests = Counter(
             "http_requests_total",
             "HTTP requests on the public port.",

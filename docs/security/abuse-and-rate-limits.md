@@ -160,7 +160,7 @@ There are four ways to make the service email someone, and each one is capped:
 
 | Key | Value used | Notes |
 |---|---|---|
-| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. Dual-stack needs the limiter to group IPv6 addresses by /64 first, because WAF rate rules key each IPv6 address separately. |
+| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. The limiter already counts an IPv6 address per /64 (#97); the WAF rate rules still key each IPv6 address separately, so dual-stack needs a WAF change too. |
 | Account | The member's user ID; for sign-in, the Cognito user | |
 | Tenant | `tenant_id` from the member session or API key | Recipients and uploaders don't count against their tenant's request budget (2.2, H) |
 | Invited email | HMAC-SHA-256 of the normalized address (data model section 1) | Never the address itself. For 25 hours after an HMAC key rotation, each per-address limit adds the old pseudonym's count, so a rotation never resets a cap (#22). |
@@ -193,14 +193,15 @@ load balancer's web ACL unless the row says otherwise, whose `429` has a fixed `
 Only the probe mailbox's addresses are exempt from the per-address caps here and in group G, and only on the
 synthetic tenant's links (NFR-1). The recipient-page challenge is on the web app's web ACL (3.2).
 
-**B. Member sign-in:** `/v1/auth/sign-in` and `/v1/auth/callback` (defined in #23), and Cognito managed login. Fail
-closed.
+**B. Member sign-in:** `/v1/auth/sign-in` and `/v1/auth/callback` (defined in #23), `startInvitationSignIn`, and
+Cognito managed login. Fail closed.
 
 | Key | Limit | Enforced by | Over the limit |
 |---|---|---|---|
 | IP, except our NAT gateways | 2,000 requests and 500 form submissions in 5 minutes | Sign-in web ACL on the user pool (3.2) | `403` from Cognito |
 | Our NAT gateways | Only they may call the token and revoke endpoints, at most 10,000 times per gateway in 5 minutes | Sign-in web ACL | `403` |
 | IP | 60 sign-in starts a minute and 60 callbacks a minute | App | `429` |
+| IP | 60 invitation sign-ins (`startInvitationSignIn`) a minute | App | `429` |
 | Account | 10 failed sign-ins in 15 minutes (NFR-14) | Pre-authentication trigger (2.3) | Sign-in denied with a generic message |
 | Account | Cognito's own lockout after 5 failed passwords | Cognito | `Password attempts exceeded` |
 
@@ -274,7 +275,7 @@ Section 7 explains each cap.
 | Account | 300 requests a minute | App | `429` |
 | API key | 300 requests a minute | App | `429` |
 | Tenant | 1,000 requests a minute (NFR-14), members and API keys together, groups D, F, G, H, I and K included | App | `429` |
-| IP | 100 failed authentications (any `401`) in 5 minutes | App | `429` for 15 minutes |
+| IP | 100 failed authentications (any `401`) in 5 minutes | App | `429` for 15 minutes on every operation, checked before authentication, so a blocked IP never gets a `401` back |
 | IP | 6,000 requests in 5 minutes | WAF `rate-api-ip` | `429`, `Retry-After: 300` |
 
 Safety actions never count against the tenant budget and are never refused by it: `revokeTransfer`,
@@ -501,20 +502,28 @@ Use **ElastiCache Serverless for Valkey**, one cache per environment and region,
 PostgreSQL holding the security state. The phase 4 ADR confirms it.
 
 - **Algorithms.** Request rates use GCRA (the generic cell rate algorithm): one key per limit, and an exact
-  `Retry-After`. Small event quotas (codes per address or link, failures per account or IP, `link_not_found` per IP)
-  use a sliding log in a sorted set, which is exact and cheap for counts of 50 or fewer. Concurrent streams use a
-  sorted set of stream IDs scored by lease expiry; each stream renews its lease every 30 seconds and the lease lasts
-  60.
+  `Retry-After`. A limit of N per period admits a burst of ⌊N/2⌋ + 1 requests at once, then ⌈N/2⌉ per period, one
+  every period ÷ ⌈N/2⌉, so no window of one period, the same window the sliding log keeps, holds more than N (#97).
+  Sized with N for both, GCRA would let 2N − 1 through in one period. A request that costs more than the burst, such
+  as more recipient emails at once than half a limit, is never admitted. Small event quotas (codes per address or
+  link, failures per account or IP, `link_not_found` per IP) use a sliding log in a sorted set, which is exact and
+  cheap for counts of 50 or fewer. Concurrent streams use a sorted set of stream IDs scored by lease expiry; each
+  stream renews its lease every 30 seconds and the lease lasts 60.
 - **Several limits on one request.** Each limit is one key, checked by a script that increments it only if it admits
   the request. Limits run narrowest first (the caller's own keys, then IP, invited address, tenant; link steps put IP
   first, 2.4) and stop at the first refusal, so a flood refused per IP or per key never uses up a tenant's budget or a
-  victim's code cap. That costs up to four 1 ms round trips; one script over all keys would need one hash slot, which
-  cluster mode denies.
-- **Key names** look like `rl:{group}:{key type}:{value}`, where the value is an ID, an HMAC or an IPv4 address.
+  victim's code cap. That costs up to four 1 ms round trips, plus one on every request for the failed-authentication
+  block (2.2, H); one script over all keys would need one hash slot, which cluster mode denies.
+- **Key names** look like `rl:{group}.{limit}:{key type}:{value}`, for example `rl:A.ip_requests:ip:203.0.113.7`,
+  where the value is an ID, an HMAC, an IPv4 address or an IPv6 /64. The limit's name keeps two limits on one key
+  type apart; a key holds no braces, so no hash tag, and each script touches its one key (#97).
   Access is by IAM authentication from the roles of the API, the sign-in triggers, the scan worker and the
   notification worker, over TLS, through a security group open only to them (ADR-0014).
 - **Timeouts.** 50 ms per call. After 5 errors in a row, the API stops calling the store for 10 seconds and applies
-  each group's failure mode, so a sick cache doesn't add latency to every request.
+  each group's failure mode, so a sick cache doesn't add latency to every request. After the rest, one failed call
+  starts the next rest at once; one success ends it.
+- **Retry-After.** After the first refusal the wider limits are only read, never counted, so the answer can still
+  give the largest wait (2.4) without spending a tenant's budget.
 
 ### 4.5 Failure modes
 
@@ -957,7 +966,7 @@ verification funnel, streams and email reputation.
 | Closing the browser ends the link cookie, so finishing a download after verifying again counts a new download | Grants are bound to their session | Accepted; resumes within the session are free |
 | Deploys cut downloads still running after 120 s, and browsers differ in whether they resume a cut download with a `Strict` cookie | Streaming through pods | Measured; otherwise a restart within the same grant |
 | Files clean at upload aren't re-scanned when signatures update | Files live at most 90 days | Possible later: re-scan on download when the scan is older than a set age |
-| IPv6 clients would each get their own limits | WAF and our limiter key single addresses | The load balancer stays IPv4-only until the limiter groups IPv6 by /64 |
+| IPv6 clients would each get their own WAF limits | The WAF keys single addresses; our limiter counts per /64 | The load balancer stays IPv4-only until the WAF rules are revisited |
 | A botnet spreads code guesses over many IPs and leaked links | Per-IP limits don't see it | The per-code and per-recipient limits are in PostgreSQL and hold whatever the IP; the odds stay ≤ 2 × 10^-5 per recipient |
 
 ### 9.2 Tests
@@ -1019,6 +1028,12 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
 - **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** AB-12, group K, the inspection
   limits (6.5), the DLP emails (7.1, 7.2), signals and alerts (8.1, 8.2), and `rejectTransfer` among the safety
   actions. The API README lists group K.
+
+- **Rate limiting, [#97](https://github.com/codewithmuh/secure-file-transfer/issues/97).** Groups A, B, G
+  (`inviteUser`), H and J are data in `services/api/src/sft/service/rate_limits/limits.py`, with each operation's
+  bundle; the key names (4.4), IPv6 per /64 (2.1), the read-only check of wider limits after a refusal (4.4), GCRA's
+  burst (4.4), `startInvitationSignIn` in group B and the failed-authentication block on every operation (2.2).
+  Groups C to F, I and K, the stream leases and the byte budgets join with their routes.
 
 **Open points for the maintainer:**
 
