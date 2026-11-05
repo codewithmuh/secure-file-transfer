@@ -1,0 +1,45 @@
+{{- $registry := required "registry is required" .Values.registry -}}
+# Our builds are signed keylessly by the build workflow on main (ADR-0007, #107). Verified offline against the
+# Sigstore trusted root pinned in Git, so admission never calls Sigstore through the proxy.
+apiVersion: policies.kyverno.io/v1
+kind: ImageValidatingPolicy
+metadata:
+  name: sft-signed-images
+  labels:
+    {{- include "policies.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/description: sft/ images need the build workflow's keyless signature.
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  webhookConfiguration:
+    timeoutSeconds: 15
+  matchConstraints:
+    {{- include "policies.podRules" . | nindent 4 }}
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: [kube-system]
+  matchImageReferences:
+  - glob: {{ printf "%s/sft/*" $registry | quote }}
+  credentials:
+    providers: [amazon]
+  validationConfigurations:
+    required: true
+    verifyDigest: true
+    mutateDigest: false
+  attestors:
+  - name: build
+    cosign:
+      keyless:
+        identities:
+        - subject: {{ .Values.signing.subject | quote }}
+          issuer: {{ .Values.signing.issuer | quote }}
+      trustedRoot:
+        value: {{ required "trustedRoot is required" .Values.trustedRoot | quote }}
+  validations:
+  - expression: >-
+      (images.containers + images.?initContainers.orValue([])).filter(i, i.startsWith({{ printf "%s/sft/" $registry | quote }}))
+        .map(i, verifyImageSignatures(i, [attestors.build])).all(n, n > 0)
+    message: sft/ images must be signed by the build workflow on main (ADR-0007).

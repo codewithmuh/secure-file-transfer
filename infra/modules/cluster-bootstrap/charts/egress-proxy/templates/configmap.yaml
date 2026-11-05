@@ -1,0 +1,144 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: egress-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "egress-proxy.labels" . | nindent 4 }}
+data:
+  envoy.yaml: |
+    # Generated from infra/modules/cluster-bootstrap/charts/egress-proxy. Each listener accepts only CONNECT to its own
+    # names on port 443; Envoy resolves each name itself, so a client can't name an allowed host and reach another
+    # address. Anything else gets 403. Access logs are JSON on stdout: listener, name, bytes each way (ADR-0021).
+    admin:
+      address:
+        socket_address: {address: 127.0.0.1, port_value: {{ .Values.adminPort }}}
+    static_resources:
+      listeners:
+      {{- range .Values.listeners }}
+      - name: {{ .name }}
+        address:
+          socket_address: {address: 0.0.0.0, port_value: {{ .port }}}
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: {{ .name }}
+              stream_idle_timeout: 300s
+              access_log:
+              - name: envoy.access_loggers.stdout
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                  log_format:
+                    json_format:
+                      listener: {{ .name }}
+                      start_time: "%START_TIME%"
+                      method: "%REQ(:METHOD)%"
+                      authority: "%REQ(:AUTHORITY)%"
+                      response_code: "%RESPONSE_CODE%"
+                      response_flags: "%RESPONSE_FLAGS%"
+                      bytes_received: "%BYTES_RECEIVED%"
+                      bytes_sent: "%BYTES_SENT%"
+                      duration_ms: "%DURATION%"
+                      client: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"
+                      upstream: "%UPSTREAM_HOST%"
+              route_config:
+                name: {{ .name }}
+                virtual_hosts:
+                {{- if .domains }}
+                - name: allowed
+                  domains:
+                  {{- range .domains }}
+                  - {{ printf "%s:443" . | quote }}
+                  {{- end }}
+                  routes:
+                  - match: {connect_matcher: {}}
+                    route:
+                      cluster: forward_{{ .name }}
+                      timeout: 0s
+                      upgrade_configs:
+                      - upgrade_type: CONNECT
+                        connect_config: {}
+                {{- end }}
+                - name: refused
+                  domains: ["*"]
+                  routes:
+                  - match: {connect_matcher: {}}
+                    direct_response: {status: 403}
+                  - match: {prefix: "/"}
+                    direct_response: {status: 403}
+              http_filters:
+              - name: envoy.filters.http.dynamic_forward_proxy
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                  dns_cache_config:
+                    name: dns_cache
+                    dns_lookup_family: V4_ONLY
+                    max_hosts: 256
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+              upgrade_configs:
+              - upgrade_type: CONNECT
+      {{- end }}
+      - name: health
+        address:
+          socket_address: {address: 0.0.0.0, port_value: {{ .Values.healthPort }}}
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: health
+              route_config:
+                name: health
+                virtual_hosts:
+                - name: health
+                  domains: ["*"]
+                  routes:
+                  - match: {path: /stats/prometheus}
+                    route: {cluster: admin}
+                  - match: {prefix: "/"}
+                    direct_response: {status: 404}
+              http_filters:
+              - name: envoy.filters.http.health_check
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.health_check.v3.HealthCheck
+                  pass_through_mode: false
+                  headers:
+                  - name: ":path"
+                    string_match: {exact: /ready}
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+      {{- range .Values.listeners }}
+      # One upstream cluster per listener, so each workload has its own connection cap and its own byte counters.
+      - name: forward_{{ .name }}
+        connect_timeout: 5s
+        lb_policy: CLUSTER_PROVIDED
+        circuit_breakers:
+          thresholds:
+          - max_connections: {{ $.Values.maxConnectionsPerListener }}
+            max_pending_requests: {{ $.Values.maxConnectionsPerListener }}
+            max_requests: {{ $.Values.maxConnectionsPerListener }}
+        cluster_type:
+          name: envoy.clusters.dynamic_forward_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+            dns_cache_config:
+              name: dns_cache
+              dns_lookup_family: V4_ONLY
+              max_hosts: 256
+      {{- end }}
+      - name: admin
+        connect_timeout: 1s
+        type: STATIC
+        load_assignment:
+          cluster_name: admin
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address: {address: 127.0.0.1, port_value: {{ .Values.adminPort }}}

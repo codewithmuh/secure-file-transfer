@@ -44,13 +44,13 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 |---|---|---|
 | `network` | VPC, subnets, NAT gateways, VPC endpoints and their policies, the egress security groups, DNS Firewall, the flow log (ADR-0021) | [`modules/network`](modules/network/README.md); dev has two AZs, one NAT gateway and its endpoints in one AZ |
 | `data` | Aurora, the files buckets, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
-| `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | |
-| `cluster-bootstrap` | Argo CD's Helm release (ADR-0005) | Planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
+| `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
+| `cluster-bootstrap` | Argo CD and its root Application, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
 | `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | |
 | `retained` | See above | prod only, one root for both Regions |
 
-Every environment layer is a skeleton for now: providers, backend and conventions, with a header comment naming the
-issue that fills it. The bootstrap stacks are complete.
+The `network`, `data`, `cluster` and `cluster-bootstrap` layers are written; `edge` is still a skeleton: providers,
+backend and conventions, with a header comment naming the issue that fills it. The bootstrap stacks are complete.
 
 Two deliberate exceptions to "one root per Region": `shared` and `retained` each hold a few Osaka (and us-east-1)
 resources through provider aliases. Neither is in the failover path, and `retained` is one unit by design: its archive
@@ -60,11 +60,17 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 
 | Module | What it makes |
 |---|---|
+| `audit-archive` | One Region's audit archive bucket with Object Lock, its policy and replication to Osaka; in prod, called by the retained stack with its own replication role ([README](modules/audit-archive/README.md), #102) |
+| `cluster-bootstrap` | The cluster's platform: Argo CD, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy, operator RBAC ([README](modules/cluster-bootstrap/README.md), #104) |
 | `conventions` | Nothing: names, tags, the state bucket name and the bootstrap role names and ARNs, from the environment, Region and stack. Every root calls it once. |
 | `tfstate-backend` | A state bucket and its tfstate key (or, in Osaka, the key's replica) with the bucket and key policies below |
 | `terraform-oidc-roles` | The GitHub OIDC provider, the plan role and the deploy role |
 | `key-admin-role` | `sft-<env>-keyadmin`, which only BreakGlass may assume (encryption 4.4, rule 6) |
 | `emergency-user` | `sft-<env>-emergency` under `/sft-emergency/`, the account's way in when Identity Center can't be reached (authn-authz 8.4) |
+| `eks-cluster` | One EKS cluster per account and Region: private API, control-plane logs, the `system` node group, Karpenter's IAM, queue and node pools, Pod Identity roles, access entries, the tunnel's session document ([README](modules/eks-cluster/README.md), #103) |
+| `events-delivery-role` | `sft-<env>-events-delivery`, the role every EventBridge rule delivers into our queues and topics through (encryption 4.4, #102) |
+| `files-buckets` | One Region's files and large-files buckets: policies, lifecycle safety nets, replication with RTC from Tokyo, GuardDuty Malware Protection on large files and its results rule ([README](modules/files-buckets/README.md), #102) |
+| `kms-keys` | The environment's keys, one per data class: primaries in Tokyo, replicas in Osaka, with the key policies of encryption 4.4 ([README](modules/kms-keys/README.md), #102) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
 | `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
 | `data-stack` | One environment and Region's data layer: calls `aurora`, `valkey` and `queues` with the network stack's subnets and groups, so every `data` root passes only what differs (#101) |
@@ -88,10 +94,17 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    `retained` goes before `data`, because the environment refers to the archive by ARN. On a fresh build `network`
    runs twice: first without a flow log, then, once `data` has made the log bucket, with
    `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
-   In staging and prod Tokyo's `data` also runs twice: first with `TF_VAR_replicate_master_secret=false`, then, once
-   Osaka's `data` has made the key replicas, again, so that the master secret's Osaka replica has its key. Both runs
-   take that key's ARN explicitly, `TF_VAR_master_secret_replica_kms_key_arn`, until #102's keys module provides it;
-   it must be the Tokyo secrets key's ID in ap-northeast-3, which `modules/data-stack` checks.
+   In staging and prod `data` also runs twice in Tokyo, because the two Regions need each other's keys and buckets:
+   Osaka's `data` replicates Tokyo's key primaries (`TF_VAR_primary_key_arns`, from Tokyo's `kms_key_arns` output),
+   while Tokyo's bucket replication and the master secret's Osaka replica need Osaka's buckets and key replicas. So
+   Tokyo first with `TF_VAR_osaka_ready=false`, then Osaka, then Tokyo again without it (`osaka_ready` defaults to
+   true; modules/files-buckets, modules/data-stack).
+   Tokyo's `data` also makes the Auto Scaling and EC2 Fleet service-linked roles before the keys whose policies name
+   them; in an account that already has either, import it first
+   (`terraform import 'module.data.aws_iam_service_linked_role.volumes["autoscaling"]' <role ARN>`).
+   Tokyo's `cluster` makes the account's IAM roles and Osaka's refers to them, so Osaka's goes after it; both need
+   `data` first, for the keys' aliases and EventBridge's delivery role. `cluster-bootstrap` reaches the cluster API
+   only through the Systems Manager tunnel, as the deploy role (modules/cluster-bootstrap).
 
 Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
 deletion protection off, skips the final snapshot and drops the master secret's recovery window, then the destroy.
@@ -147,8 +160,8 @@ bootstrap's `backend_override.tf` is the one override ever used, and it is gone 
 
 | Role | Trust (T-71) | May |
 |---|---|---|
-| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network and data layers (below) |
-| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network and data layers (below) |
+| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network, data, storage and cluster layers (below) |
+| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network, data, storage and cluster layers (below) |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
 
 All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
@@ -328,6 +341,32 @@ comment.
   RDS and ElastiCache service-linked roles; and uses KMS keys only through RDS, ElastiCache, Secrets Manager and SQS
   (`kms:ViaService`), with grants for AWS resources only, and `Encrypt` for the master secret's Osaka replica. Its
   security groups use the network layer's EC2 permissions.
+
+- **Storage and keys** (#102), in the same Regions, as managed policies under `/sft-bootstrap/`
+  (`sft-<env>-terraform-storage-read`, `-kms` and `-write`, in `modules/terraform-oidc-roles/permissions-storage.tf`).
+  The plan role reads keys, the files and archive buckets' settings, the storage roles, GuardDuty plans and `sft-<env>-*`
+  rules. The deploy role also creates multi-Region keys and administers them (each key policy then limits it),
+  replicates only to Osaka, creates grants only for AWS resources through RDS, ElastiCache and EKS, encrypts the
+  secrets it writes, manages the buckets `sft-<env>-apne?-{files,large-files,audit-archive}-<account-id>` (not the
+  archive in prod, which is the retained stack's), the roles `sft-<env>-{s3-replication,malware-protection,events-delivery}`
+  and the services they are passed to (`events-delivery` only with the workload boundary), the Auto Scaling and EC2
+  Fleet service-linked roles that the platform and files keys name, the account's EBS encryption by default,
+  GuardDuty plans and `sft-<env>-*` rules. In dev and staging it may empty the buckets at teardown.
+
+- **Cluster** (#103), in the same Regions: every environment Region with a network has a cluster. Three managed
+  policies under `/sft-bootstrap/` (`sft-<env>-terraform-cluster-read`, `-cluster-deploy`, `-cluster-deploy-iam`),
+  not inline ones, and the workload permissions boundary `sft-<env>-workload-boundary`. The plan role reads EKS, the
+  launch templates, the interruption queue and rules, the log groups, the tunnel document, IAM roles (Identity
+  Center's included) and KMS aliases. The deploy role also builds EKS resources named `sft-<env>-*`, never with a
+  public endpoint (`eks:endpointPublicAccess`), the system nodes' launch templates, the queue, rules, log groups and
+  document; it creates and changes only the cluster layer's named roles, only with the boundary, never assumes them,
+  attaches only four AWS managed policies, and passes roles only to EKS, Pod Identity, EC2 and, for the data layer's
+  execution role, EventBridge ([`modules/eks-cluster`](modules/eks-cluster/README.md#roles)).
+- **Cluster bootstrap** (#104), in the same Regions, deploy role only, as `sft-<env>-terraform-cluster-bootstrap`
+  (`permissions-cluster-bootstrap.tf`): finding the system nodes, and starting a Systems Manager session only with the
+  cluster's tunnel document and only on instances tagged `eks:nodegroup-name = sft-<env>-<rs>-system`, with the
+  document check on; ending or resuming only its own sessions. The cluster API admits it through the cluster layer's
+  access entry. The plan role gets nothing: the layer is planned only on `main`.
 
 These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
 `/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply

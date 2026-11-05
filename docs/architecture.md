@@ -226,8 +226,9 @@ Running all the time, so a failover only has to add compute (section 7):
   production-approved SES setup (SES is available in Osaka), a copy of the web app bundle, and the container images.
 - **Sign-in:** a standby Cognito user pool from the same Terraform, with no users, every tenant's SSO provider under
   the same name, and its own app client secret, which lives only in Osaka ([AUTH] 2.6). Staging and prod only.
-- **Scanning:** the GuardDuty Malware Protection plan for the Osaka large-files bucket is defined but turned on by the
-  failover runbook, so replicas aren't scanned and billed twice; staging confirms how a plan treats replicated
+- **Scanning:** the Osaka large-files bucket has no GuardDuty Malware Protection plan in the pilot light, so replicas
+  aren't scanned and billed twice. The failover runbook's apply creates the plan, its results rule and the rule's
+  target, and GuardDuty validates its access to the bucket then; staging confirms how a plan treats replicated
   objects.
 - **Control:** a Kubernetes control plane and one `system` node that always runs, with Argo CD, Kyverno, Karpenter,
   CoreDNS and the egress proxy, so Argo CD and Kyverno stay installed and in sync with Git (ADR-0004). Osaka's values

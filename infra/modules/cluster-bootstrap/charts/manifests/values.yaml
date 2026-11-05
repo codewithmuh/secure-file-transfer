@@ -1,0 +1,2 @@
+# Full objects (apiVersion, kind, metadata, spec), set by infra/modules/cluster-bootstrap.
+manifests: []

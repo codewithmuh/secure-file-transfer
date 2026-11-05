@@ -30,3 +30,22 @@ output "queues" {
     dead_letter_queue_arns = module.queues.dead_letter_queue_arns
   }
 }
+
+output "kms" {
+  description = "The keys (#102): ARN and alias of each class's key in this Region (in Osaka the replicas), and in Tokyo for staging and prod the ARN each key's Osaka replica has."
+  value = {
+    key_arns       = module.kms.key_arns
+    alias_names    = module.kms.alias_names
+    osaka_key_arns = module.kms.osaka_key_arns
+  }
+}
+
+output "storage" {
+  description = "The buckets and roles (#102): the files buckets, the audit archive (null in prod, whose archive is the retained stack's), EventBridge's delivery role (Tokyo only) and the Malware Protection plan (null where it is off)."
+  value = {
+    files_bucket_names          = module.files_buckets.bucket_names
+    audit_archive_bucket_name   = one(module.audit_archive[*].bucket_name)
+    events_delivery_role_arn    = one(module.events_delivery[*].role_arn)
+    malware_protection_plan_arn = module.files_buckets.malware_protection_plan_arn
+  }
+}

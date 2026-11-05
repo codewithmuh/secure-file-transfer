@@ -1,0 +1,25 @@
+# Defaults only; infra/modules/cluster-bootstrap/kyverno.tf sets every value per cluster.
+
+# Our registry in this cluster's Region: <shared account>.dkr.ecr.<region>.amazonaws.com (ADR-0007).
+registry: ""
+
+# Digests of third-party images in mirror/ that may run: the platform's (images.tf) and the application's.
+mirrorDigests: []
+
+# The keyless identity that signs sft/* images: the build workflow on main (ADR-0007, #107).
+signing:
+  subject: https://github.com/codewithmuh/secure-file-transfer/.github/workflows/build.yml@refs/heads/main
+  issuer: https://token.actions.githubusercontent.com
+
+# Sigstore's trusted root (Fulcio, Rekor, CT log), pinned in Git so verification never calls Sigstore (ADR-0007).
+trustedRoot: ""
+
+# The AWS-owned registry that serves the EKS add-ons, and the repositories admitted from it, in kube-system only.
+eksAddonRegistry: ""
+eksAddonRepositories: []
+
+# Namespaces whose pods may tolerate and select the system node pool (ADR-0021).
+systemNamespaces: []
+
+# Namespaces whose pods may use host namespaces, paths and ports (the node agents of ADR-0009).
+hostAccessNamespaces: []

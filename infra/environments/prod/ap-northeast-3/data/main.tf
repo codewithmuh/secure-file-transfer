@@ -4,8 +4,8 @@
 # In Osaka these are the pilot light's replicas: the Aurora secondary, replica buckets and key replicas
 # (architecture 3.2).
 #
-# #101 fills this file, variables.tf and outputs.tf: Aurora, the counter store and the queues, through
-# modules/data-stack, which holds what every data root shares. #102 adds the keys and buckets in their own files.
+# Everything comes from modules/data-stack, which holds what every data root shares: Aurora, the counter store and
+# the queues (#101), and the keys, buckets and audit archive (#102). This root passes only what differs.
 #
 # The pilot light's data: the secondary of prod's global database on one db.r8g.large until a drill shows Serverless
 # v2 is enough (ADR-0011, capacity 4.5), and an idle counter store and queues.
@@ -54,14 +54,12 @@ module "data" {
   account_id  = var.account_id
   conventions = module.conventions
 
-  # The environment's keys (encryption 4.1). Until #102 merges they come in as a variable; then this line becomes
-  # module.kms.key_arns, the keys module in kms.tf.
-  kms_key_arns = var.kms_key_arns
-
   aurora = {
     cluster_role          = "secondary"
     instance_class        = "db.r8g.large"
     backup_retention_days = 14
   }
-  teardown = var.teardown
+  primary_key_arns                 = var.primary_key_arns
+  osaka_malware_protection_enabled = var.malware_protection_enabled
+  teardown                         = var.teardown
 }

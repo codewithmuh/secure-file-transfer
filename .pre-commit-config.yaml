@@ -6,6 +6,10 @@ repos:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        # Kubernetes manifests and test fixtures hold several documents. Helm templates are Go templates, not YAML,
+        # until rendered; `helm lint` and `helm template` check those.
+        args: [--allow-multiple-documents]
+        exclude: /charts/[^/]+/templates/
       - id: check-json
       - id: check-merge-conflict
       - id: check-added-large-files

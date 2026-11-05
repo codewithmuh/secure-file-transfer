@@ -1,0 +1,31 @@
+# Every namespace enforces Pod Security Admission at restricted (ADR-0004, T-52), except Kubernetes' own and the node
+# agents' (ADR-0009), so no namespace can be created or relabelled to let pods run as root or with host access.
+# Terraform labels the default namespace too (main.tf).
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: sft-namespaces-restricted
+  labels:
+    {{- include "policies.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/description: Namespaces enforce Pod Security Admission at restricted.
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: [v1]
+      operations: [CREATE, UPDATE]
+      resources: [namespaces]
+  variables:
+  - name: exempt
+    expression: '{{ toJson (concat (list "kube-system" "kube-public" "kube-node-lease") .Values.hostAccessNamespaces) }}'
+  - name: labels
+    expression: object.metadata.?labels.orValue({})
+  validations:
+  - expression: >-
+      object.metadata.name in variables.exempt ||
+      ('pod-security.kubernetes.io/enforce' in variables.labels &&
+       variables.labels['pod-security.kubernetes.io/enforce'] == 'restricted')
+    message: Namespaces must set pod-security.kubernetes.io/enforce=restricted (ADR-0004, T-52).

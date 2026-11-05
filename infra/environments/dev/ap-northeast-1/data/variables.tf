@@ -8,20 +8,6 @@ variable "account_id" {
   }
 }
 
-variable "kms_key_arns" {
-  description = <<-EOT
-    This Region's keys by class (encryption 4.1), until #102 merges and module.kms.key_arns replaces this variable:
-    database (Aurora), logs (its log group), secrets (the master password) and platform (queues and the counter
-    store). Each is a multi-Region key in ap-northeast-1; modules/data-stack checks them.
-  EOT
-  type = object({
-    database = string
-    logs     = string
-    secrets  = string
-    platform = string
-  })
-}
-
 variable "teardown" {
   description = <<-EOT
     True only for the apply that comes before destroying this stack: it turns deletion protection off, skips the

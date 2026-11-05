@@ -1,0 +1,10 @@
+# Values for rendering the policies in the policy tests (run.sh). Placeholder accounts; 602401143452 is AWS's EKS
+# add-on registry, which is public.
+registry: 000000000000.dkr.ecr.ap-northeast-1.amazonaws.com
+mirrorDigests:
+  - sha256:1111111111111111111111111111111111111111111111111111111111111111
+trustedRoot: "{}"
+eksAddonRegistry: 602401143452.dkr.ecr.ap-northeast-1.amazonaws.com
+eksAddonRepositories: [amazon-k8s-cni, eks/kube-proxy, eks/coredns]
+systemNamespaces: [kube-system, argocd, kyverno, karpenter, egress-proxy]
+hostAccessNamespaces: [node-agents]

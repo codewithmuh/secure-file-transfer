@@ -1,0 +1,8 @@
+apiVersion: v2
+name: egress-proxy
+description: >-
+  Envoy as an HTTPS CONNECT proxy with one listener and allowlist per workload, the only way out of the VPC that
+  isn't a VPC endpoint (ADR-0021). Installed by Terraform (infra/modules/cluster-bootstrap).
+type: application
+version: 0.1.0
+appVersion: "1.40.2"

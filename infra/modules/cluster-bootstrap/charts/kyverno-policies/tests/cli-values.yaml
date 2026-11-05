@@ -1,0 +1,14 @@
+# Namespace labels for the Kyverno CLI, which has no cluster to read them from.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Value
+metadata:
+  name: values
+namespaceSelector:
+  - name: sft
+    labels: {kubernetes.io/metadata.name: sft}
+  - name: kube-system
+    labels: {kubernetes.io/metadata.name: kube-system}
+  - name: egress-proxy
+    labels: {kubernetes.io/metadata.name: egress-proxy}
+  - name: node-agents
+    labels: {kubernetes.io/metadata.name: node-agents}

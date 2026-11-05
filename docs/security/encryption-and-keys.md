@@ -145,9 +145,9 @@ AWS encrypts all traffic between Regions on its network at the physical layer. O
 | Aurora PostgreSQL: Tokyo cluster, Osaka secondary, automated backups (14-day point-in-time recovery), snapshots, Performance Insights | Aurora storage encryption, set at creation | database | Each Region's cluster uses that Region's copy of the key. An unencrypted cluster can't be encrypted in place, so CI rejects a plan that would create one (section 9). |
 | File names and messages inside PostgreSQL | AES-256-GCM with per-tenant data keys | fields | Section 3.2 |
 | Aurora PostgreSQL logs | CloudWatch Logs | logs | The parameter group keeps values out of the log: `log_parameter_max_length = 0` and `log_parameter_max_length_on_error = 0` (no bound values), `log_error_verbosity = terse` (no `DETAIL` lines, which print the conflicting key of a unique violation, such as an email address, or the failing row of a check constraint), `pgaudit.log_parameter = off`, and `log_statement = none` (pgaudit decides what is audited). The application sends parameterized statements, so statement text holds `$1` placeholders, not values. What can still get through, a residual risk (9.1): text a person types under break-glass, which pgaudit records on purpose, and the primary message of an input-syntax error, which quotes the bad value. A CloudWatch Logs data protection policy with the email address identifier masks any address that does get through. |
-| SQS work queues, intake queues and dead-letter queues | SSE-KMS, data key reused for 5 minutes | platform | Work queue messages hold IDs only; intake messages are classified in section 1. Only the outbox relay sends to the work queues. Each intake queue has one sender: the sign-in triggers' role for sign-in events, the SES events topic for sending events, and the EventBridge delivery role for GuardDuty scan results and SES tenant pauses, through the statements in 4.4. |
+| SQS work queues, intake queues and dead-letter queues | SSE-KMS, data key reused for 5 minutes | platform | Work queue messages hold IDs only; intake messages are classified in section 1. Only the outbox relay sends to the work queues. Each intake queue has one sender: the sign-in triggers' role for sign-in events, the SES events topic for sending events, and the EventBridge delivery role for GuardDuty scan results and SES tenant pauses, through the statements in 4.4. Karpenter's interruption queue has the same delivery role as its one sender. |
 | ElastiCache Serverless (Valkey) | Encryption at rest, always on | platform | Rate-limit counters and sign-in state |
-| EBS: node root volumes, observability volumes | EBS encryption by default, set for the account in each Region | platform | The node provisioner (Karpenter and the EC2 Fleet service-linked role) uses the key for each volume it launches (4.4). |
+| EBS: node root volumes, observability volumes | EBS encryption by default, set for the account in each Region by the data stack (`infra/modules/data-stack`) | platform | The node provisioner (Karpenter, and the EC2 Fleet and Auto Scaling service-linked roles) uses the key for each volume it launches (4.4). |
 | EBS: scan node volumes | Encrypted | files | clamd's scratch holds file contents during a scan, so the scan workers and clamd run in their own node pool whose volumes use the files key. The worker deletes each scratch file when its scan ends. The separate pool also keeps hostile files off the API's nodes. |
 | ECR images | KMS | registry | Repositories live in the shared registry stack (capacity 5.4), and a repository's encryption setting can't change after creation, so they can't use an environment's key, which goes away with that environment. The registry key belongs to the shared stack. Osaka replicas use its Osaka copy through a repository creation template. |
 | CloudWatch Logs: EKS control plane, Aurora | KMS | logs | |
@@ -312,7 +312,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | S3 replication role | D Tokyo, E D Osaka | — | — | D Tokyo, E D Osaka (in prod, the retained stack's own role) | — | — | — | D Tokyo, E D Osaka |
 | GuardDuty Malware Protection role (decision 15) | E D, through S3, large-file buckets only | — | — | — | — | — | — | — |
 | EventBridge delivery role | — | — | — | — | — | — | E D, named queues and topics | — |
-| Node provisioner: Karpenter controller and the EC2 Fleet service-linked role | V, scan node pool | — | — | — | — | — | V, root volumes | — |
+| Node provisioner: Karpenter controller, and the EC2 Fleet and Auto Scaling service-linked roles (named as principals, 4.4) | V, scan node pool | — | — | — | — | — | V, root volumes | — |
 | Log and trace stores | — | — | — | — | E D | — | — | — |
 | AWS service principals in the key policy | — | — | — | CloudTrail, for the retained trail (8.4) | CloudWatch Logs, CloudTrail, log delivery | — | CloudWatch alarms, SES, SNS into SQS | — |
 | AWS services through grants | EBS | — | RDS | — | — | EKS | EBS, ElastiCache | — |
@@ -343,6 +343,9 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
   `sft-{env}-malware-protection`, `sft-{env}-events-delivery`, `sft-{env}-signin-trigger`, `sft-{env}-karpenter` and the
   bootstrap stack's key-admin role `sft-{env}-keyadmin` (4.4). The recovery role pairs with the PostgreSQL login role
   `sft_recovery`.
+- **Reading for plans.** The Terraform plan role may read every key's state and policy (`DescribeKey`, `GetKeyPolicy`,
+  `GetKeyRotationStatus`, `ListKeyRotations`, `ListResourceTags`) so pull request plans can refresh the keys, and
+  nothing more: no use, no change (#102).
 - **The recovery job** runs only from the failover and restore runbooks: in Osaka to re-apply security-critical
   changes from the archive (architecture section 7), in Tokyo after a point-in-time restore.
 
@@ -493,10 +496,7 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
     {
       "Sid": "NodeProvisionerUsesKeyForScanVolumes",
       "Effect": "Allow",
-      "Principal": {"AWS": [
-        "arn:aws:iam::<prod>:role/sft-prod-karpenter",
-        "arn:aws:iam::<prod>:role/aws-service-role/ec2fleet.amazonaws.com/AWSServiceRoleForEC2Fleet"
-      ]},
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-prod-karpenter"},
       "Action": [
         "kms:GenerateDataKeyWithoutPlaintext", "kms:Decrypt", "kms:DescribeKey", "kms:ReEncryptFrom", "kms:ReEncryptTo"
       ],
@@ -506,16 +506,28 @@ The files key in Tokyo, as a sketch (the Osaka replica has its own policy with O
     {
       "Sid": "NodeProvisionerGrantsForEbsOnly",
       "Effect": "Allow",
-      "Principal": {"AWS": [
-        "arn:aws:iam::<prod>:role/sft-prod-karpenter",
-        "arn:aws:iam::<prod>:role/aws-service-role/ec2fleet.amazonaws.com/AWSServiceRoleForEC2Fleet"
-      ]},
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/sft-prod-karpenter"},
       "Action": "kms:CreateGrant",
       "Resource": "*",
       "Condition": {
         "Bool": {"kms:GrantIsForAWSResource": "true"},
         "StringEquals": {"kms:ViaService": "ec2.ap-northeast-1.amazonaws.com"}
       }
+    },
+    {
+      "Sid": "ServiceLinkedRolesUseKeyForScanVolumes",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/aws-service-role/ec2fleet.amazonaws.com/AWSServiceRoleForEC2Fleet"},
+      "Action": ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ServiceLinkedRolesGrantForScanVolumes",
+      "Effect": "Allow",
+      "Principal": {"AWS": "arn:aws:iam::<prod>:role/aws-service-role/ec2fleet.amazonaws.com/AWSServiceRoleForEC2Fleet"},
+      "Action": "kms:CreateGrant",
+      "Resource": "*",
+      "Condition": {"Bool": {"kms:GrantIsForAWSResource": "true"}}
     },
     {
       "Sid": "DenyDisableOrDeleteExceptDeployRole",
@@ -595,11 +607,31 @@ services that publish into encrypted topics and queues (Tokyo values):
 
 - **SES sending events** go from the configuration set to the `sft-{env}-{region-short}-ses-events` topic, then to the
   queue the notification worker reads (abuse and rate limits 7.3). The topic and the queue both use the platform key.
-- **EventBridge rules** (GuardDuty scan results and SES tenant pauses into queues, security alerts into alarm topics)
-  deliver through their own execution role, `sft-{env}-events-delivery`, whose trust policy pins `aws:SourceAccount`
-  and the rule ARNs. AWS doesn't support `aws:SourceAccount` or `aws:SourceArn` in a key policy statement for
-  EventBridge delivering to an encrypted SNS topic, so a bare `events.amazonaws.com` statement would trust any rule;
-  naming a role keeps the key policy specific.
+- **EventBridge rules** (GuardDuty scan results, SES tenant pauses and Karpenter's interruption events into queues,
+  security alerts into alarm topics) deliver through their own execution role, `sft-{env}-events-delivery`, whose
+  trust policy pins `aws:SourceAccount` and the rule ARNs. AWS doesn't support `aws:SourceAccount` or `aws:SourceArn`
+  in a key policy statement for EventBridge delivering to an encrypted SNS topic, so a bare `events.amazonaws.com`
+  statement would trust any rule; naming a role keeps the key policy specific.
+
+As built ([#102](https://github.com/codewithmuh/secure-file-transfer/issues/102), `infra/modules/kms-keys`), the
+policies follow these sketches with one change of form: **roles are matched by `aws:PrincipalArn` through the account
+principal**, never named as the principal. KMS refuses a policy that names a role that doesn't exist yet, and the
+workload roles arrive with the cluster layer, after the data layer that makes the keys. The account principal with an
+exact ARN condition still gives nothing to anyone else, because there is no `kms:*` for the account (rule 1), and
+each role also needs its own IAM policy. A role deleted and re-created keeps matching, so the key-admin role (rule 6)
+is needed only for a broken policy. The same build adds the principals the cluster layer needs (#103): Karpenter
+and the EBS CSI driver's role for root volumes, Karpenter reading its interruption queue, and the EKS cluster role for
+etcd through a grant.
+
+**Service-linked roles are the exception: they are named as principals.** The Auto Scaling role (the system node
+group, platform key) and the EC2 Fleet role (Karpenter's launches, platform and files keys) create the EBS volumes,
+and a service-linked role has no IAM policy that could allow KMS and can't be given one, so an account principal with
+an `aws:PrincipalArn` condition would never let it in. Each key names them directly with the statements AWS documents
+for EBS with a customer managed key: `Encrypt`, `Decrypt`, `ReEncrypt*`, `GenerateDataKey*` and `DescribeKey`, and
+`CreateGrant` only with `kms:GrantIsForAWSResource`. Because KMS refuses a policy that names a role that doesn't exist,
+Tokyo's data stack creates both service-linked roles (`aws_iam_service_linked_role`) before the keys, and Osaka's runs
+after it. The wait statement is `RequireTheDeletionWait`: 30 days in prod,
+7 in dev and staging, so they can be torn down (rule 5, 8.3).
 
 How the other keys differ:
 
@@ -912,7 +944,7 @@ teardown removes (decision 19). From the day prod is created it holds:
 | Separate root module and state; environment stacks refer to the archive only by ARN; `prevent_destroy` on the buckets and the key | An environment `terraform destroy` reaching the archive |
 | CI fails a plan that deletes or replaces any resource tagged `retention = audit-archive`, and plans the retained stack with no environment or bootstrap stack present | A refactor that moves them by accident, or a hidden dependency on something teardown removes |
 | Object Lock in compliance mode, 365 days | Deleting or overwriting records, even by the root user; a bucket that still holds objects can't be deleted either |
-| SCP and key policy (decision 13): `PutKeyPolicy`, `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait; while prod runs, `PutKeyPolicy` also for the key-admin role (4.4) | Disabling or deleting the key, which would make the locked objects unreadable |
+| SCP and key policy (decision 13): `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait; `PutKeyPolicy` for it and for `Admin`, because the stack's first apply runs with `Admin` from local state (ADR-0005), and while prod runs also for the key-admin role (4.4) | Disabling or deleting the key, which would make the locked objects unreadable |
 | Multi-Region key: replica first, then primary | Destroying the key takes at least 60 days; a deleted replica can be re-created from the primary |
 | SCP, on the prod OU (ADR-0006): changes to the archive buckets' policy, lifecycle rules and Object Lock settings only by the retained stack's deploy role | BreakGlass and every other role in the prod account |
 | EventBridge alerts on those calls against the retained resources, and on any SCP change | A change nobody notices |

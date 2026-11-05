@@ -43,7 +43,9 @@ Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
 - **Only lifecycle jobs and lifecycle rules delete.** Only the lifecycle jobs' role has `s3:DeleteObjectVersion` on the
   files buckets; the API may only abort unfinished multipart uploads. The deletion job deletes **every version by
   version ID in Tokyo and again in Osaka**, because S3 replication doesn't copy deletes of specific versions. Delete
-  marker replication stays off, since nothing creates delete markers on purpose.
+  marker replication stays off, since nothing creates delete markers on purpose. The bucket policy denies deletes to
+  every other principal. In dev and staging the Terraform deploy role may also delete, so teardown can empty the
+  buckets (NFR-19, #102); in prod it can't.
 - **Lifecycle rules as safety nets** on every files bucket, in each region, because lifecycle rules don't replicate:
   expire noncurrent versions after 7 days, abort multipart uploads still unfinished after 7 days, and remove expired
   delete markers.

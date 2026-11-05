@@ -1,5 +1,5 @@
 # Read by the cluster and cluster-bootstrap stacks and by the application's settings (infra/modules/data-stack).
-# Key and bucket outputs come with #102.
+# The keys and buckets (#102) are at the end.
 
 output "aurora_cluster_identifier" {
   description = "The Aurora cluster in this Region."
@@ -63,4 +63,29 @@ output "queue_urls" {
 output "dead_letter_queue_arns" {
   description = "Dead-letter queue ARNs by the short name of the queue they serve."
   value       = module.data.queues.dead_letter_queue_arns
+}
+
+output "kms_key_arns" {
+  description = "ARN of each data class's key in this Region, by class (encryption 4.1)."
+  value       = module.data.kms.key_arns
+}
+
+output "kms_alias_names" {
+  description = "Alias of each data class's key, alias/sft/<env>/<class>."
+  value       = module.data.kms.alias_names
+}
+
+output "files_bucket_names" {
+  description = "The files buckets in this Region: files (up to 2 GB) and large-files."
+  value       = module.data.storage.files_bucket_names
+}
+
+output "audit_archive_bucket_name" {
+  description = "The audit archive bucket in this Region."
+  value       = module.data.storage.audit_archive_bucket_name
+}
+
+output "malware_protection_plan_arn" {
+  description = "The large-files bucket's GuardDuty Malware Protection plan, or null where it is off."
+  value       = module.data.storage.malware_protection_plan_arn
 }

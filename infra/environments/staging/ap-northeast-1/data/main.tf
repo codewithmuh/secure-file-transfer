@@ -2,8 +2,8 @@
 # store and the environment's KMS keys (ADR-0011 to ADR-0014, ADR-0017). dev and staging also keep their audit archive
 # here; prod keeps it in the retained stack (encryption 8.4).
 #
-# #101 fills this file, variables.tf and outputs.tf: Aurora, the counter store and the queues, through
-# modules/data-stack, which holds what every data root shares. #102 adds the keys and buckets in their own files.
+# Everything comes from modules/data-stack, which holds what every data root shares: Aurora, the counter store and
+# the queues (#101), and the keys, buckets and audit archive (#102). This root passes only what differs.
 #
 # The primary of staging's global database, with a db.r8g.large writer and no reader (capacity 5.2), the counter store
 # and the queues.
@@ -52,16 +52,12 @@ module "data" {
   account_id  = var.account_id
   conventions = module.conventions
 
-  # The environment's keys (encryption 4.1). Until #102 merges they come in as a variable; then this line becomes
-  # module.kms.key_arns, the keys module in kms.tf.
-  kms_key_arns = var.kms_key_arns
-
   aurora = {
     cluster_role          = "primary"
     instance_class        = "db.r8g.large"
     backup_retention_days = 14
   }
-  master_secret_replica_kms_key_arn = var.replicate_master_secret ? var.master_secret_replica_kms_key_arn : null
-  master_password_version           = var.master_password_version
-  teardown                          = var.teardown
+  osaka_ready             = var.osaka_ready
+  master_password_version = var.master_password_version
+  teardown                = var.teardown
 }

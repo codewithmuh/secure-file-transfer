@@ -291,7 +291,7 @@ of their own. One trio per node keeps the clamd pattern (ADR-0022), so this page
 | Egress proxy and DNS Firewall | Envoy, 2 replicas on the `system` nodes in different AZs, one listener and allowlist per workload; Route 53 Resolver DNS Firewall answering only allowed names | ADR-0021, A17 |
 | Load balancer | One Application Load Balancer per region; about 2 LCU of API traffic plus 41.7 LCU of streamed downloads at design load (#24) | Section 5.6 |
 | CloudFront | One distribution, for the web app bundle only | Architecture 4.2 |
-| GuardDuty Malware Protection for S3 | Under option (b), one protection plan on the whole large-file bucket in Tokyo, which holds only files over 2 GB; the plan on the Osaka large-file bucket is enabled by the failover runbook (ADR-0019) | Section 5.5 |
+| GuardDuty Malware Protection for S3 | Under option (b), one protection plan on the whole large-file bucket in Tokyo, which holds only files over 2 GB; the plan on the Osaka large-file bucket is created by the failover runbook's apply (ADR-0019) | Section 5.5 |
 
 Even at 2× design load the API needs about 200 database connections (15 pods × 10, plus workers), far below what a
 db.r8g.large allows. Streaming downloads (#24) adds about 35 MB/s in the peak hour and about 15 concurrent streams,

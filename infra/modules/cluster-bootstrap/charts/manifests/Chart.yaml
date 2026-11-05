@@ -1,0 +1,8 @@
+apiVersion: v2
+name: manifests
+description: >-
+  Applies the Kubernetes objects Terraform hands it, one release per set: Karpenter's node pools, External Secrets'
+  store. A Helm release rather than kubernetes_manifest, which needs the objects' CRDs at plan time, before the release
+  that installs them exists (infra/modules/cluster-bootstrap).
+type: application
+version: 0.1.0

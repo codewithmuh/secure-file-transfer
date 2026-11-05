@@ -15,8 +15,9 @@ variable "conventions" {
     name_prefix           = string
     global_name_prefix    = string
     state_bucket_name     = string
-    sso_role_arn_patterns = object({ break_glass = string })
-    bootstrap_role_arns   = object({ terraform_deploy = string })
+    bootstrap_iam_path    = string
+    sso_role_arn_patterns = object({ admin = string, break_glass = string })
+    bootstrap_role_arns   = object({ terraform_deploy = string, terraform_plan = string, key_admin = string })
   })
 
   validation {
@@ -27,33 +28,6 @@ variable "conventions" {
   validation {
     condition     = can(regex("^sft-(dev|staging|prod)$", var.conventions.global_name_prefix))
     error_message = "The data layer exists only in dev, staging and prod."
-  }
-}
-
-variable "kms_key_arns" {
-  description = <<-EOT
-    This Region's keys by class (encryption 4.1): database (Aurora), logs (its log group), platform (queues and the
-    counter store) and, where the master secret lives (standalone and primary), secrets. Each is a multi-Region key; in
-    Osaka, the replica. Until #102 merges, each root takes them as a variable; then the keys module provides them.
-  EOT
-  type = object({
-    database = string
-    logs     = string
-    platform = string
-    secrets  = optional(string)
-  })
-
-  validation {
-    condition = alltrue([
-      for arn in values(var.kms_key_arns) :
-      arn == null || can(regex("^arn:aws:kms:${var.conventions.region}:[0-9]{12}:key/mrk-[0-9a-f]{32}$", arn))
-    ])
-    error_message = "Each key must be a multi-Region key ARN in this stack's Region."
-  }
-
-  validation {
-    condition     = (var.aurora.cluster_role == "secondary") == (var.kms_key_arns.secrets == null)
-    error_message = "kms_key_arns.secrets is the master secret's key: set it for a standalone or primary cluster only."
   }
 }
 
@@ -84,22 +58,38 @@ variable "aurora" {
   }
 }
 
-variable "master_secret_replica_kms_key_arn" {
+variable "primary_key_arns" {
   description = <<-EOT
-    Osaka's replica of the secrets key, for the master secret's Osaka replica: staging and prod Tokyo only, null
-    elsewhere and for the first Tokyo apply of a fresh build (infra/README.md, "Apply order"). A multi-Region replica
-    has its primary's key ID, so it must be kms_key_arns.secrets's key in ap-northeast-3 (encryption 4.2).
+    Osaka only: the Tokyo data stack's kms_key_arns output, the primary of each class, which this stack replicates
+    (TF_VAR_primary_key_arns, never committed). Empty in Tokyo, where the keys module makes the primaries.
   EOT
-  type        = string
-  default     = null
+  type        = map(string)
+  default     = {}
 
   validation {
-    condition = var.master_secret_replica_kms_key_arn == null || (
-      var.aurora.cluster_role == "primary" &&
-      can(regex("^arn:aws:kms:ap-northeast-3:[0-9]{12}:key/mrk-[0-9a-f]{32}$", var.master_secret_replica_kms_key_arn)) &&
-      try(split("/", var.master_secret_replica_kms_key_arn)[1] == split("/", var.kms_key_arns.secrets)[1], false)
-    )
-    error_message = "master_secret_replica_kms_key_arn is for a primary only, and must be the Osaka replica of kms_key_arns.secrets (same mrk- key ID, ap-northeast-3)."
+    condition     = (var.conventions.region == "ap-northeast-3") == (length(var.primary_key_arns) > 0)
+    error_message = "primary_key_arns is required in Osaka and must be empty in Tokyo."
+  }
+}
+
+variable "osaka_ready" {
+  description = <<-EOT
+    Tokyo in staging and prod: true once Osaka's data stack has made its buckets and key replicas. It turns on S3
+    replication to them and the master secret's Osaka replica. False only for the first Tokyo apply of a fresh build
+    (infra/README.md, "Apply order"). Ignored in dev and in Osaka.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "osaka_malware_protection_enabled" {
+  description = "Osaka only: turn on GuardDuty Malware Protection for the large-files bucket. Off in the pilot light, with no plan at all; the failover runbook's apply creates it (ADR-0019). Tokyo always has it."
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.osaka_malware_protection_enabled || var.conventions.region == "ap-northeast-3"
+    error_message = "osaka_malware_protection_enabled is for Osaka only; Tokyo always has Malware Protection."
   }
 }
 

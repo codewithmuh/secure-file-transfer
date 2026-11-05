@@ -1,7 +1,8 @@
 # The data layer of one environment and Region (#101): Aurora, the counter store and the queues, wired to the network
 # stack's subnets and security groups. Every data root calls this module once and passes only what differs between
-# them: the cluster's role and size, its backups, the master secret's recovery window and replica key, and the keys.
-# So a change to the layer is made here once, not in five roots. Providers, the backend and the conventions module stay
+# them: the cluster's role and size, its backups, the master secret's recovery window, and the inputs of the two-pass
+# fresh build. #102 adds the keys and buckets (storage.tf). So a change to the layer is made here once, not in five
+# roots. Providers, the backend and the conventions module stay
 # in the roots (infra/README.md, "Add a stack or a module").
 
 locals {
@@ -54,8 +55,8 @@ module "aurora" {
   subnet_ids                = local.isolated_subnet_ids
   client_security_group_ids = local.data_store_clients
 
-  kms_key_arn      = var.kms_key_arns.database
-  logs_kms_key_arn = var.kms_key_arns.logs
+  kms_key_arn      = local.kms_key_arns["database"]
+  logs_kms_key_arn = local.kms_key_arns["logs"]
 
   backup_retention_days = var.aurora.backup_retention_days
   deletion_protection   = !var.teardown
@@ -65,8 +66,8 @@ module "aurora" {
   master_password_version = var.master_password_version
   master_secret = local.secondary ? null : {
     name                    = "sft/${local.environment}/db/master"
-    kms_key_arn             = var.kms_key_arns.secrets
-    replica_kms_key_arn     = var.master_secret_replica_kms_key_arn
+    kms_key_arn             = local.kms_key_arns["secrets"]
+    replica_kms_key_arn     = local.master_secret_replica_kms_key_arn
     reader_role_arn         = "${local.role_arn_prefix}db-bootstrap"
     break_glass_arn_like    = var.conventions.sso_role_arn_patterns.break_glass
     writer_role_arn         = var.conventions.bootstrap_role_arns.terraform_deploy
@@ -84,19 +85,19 @@ module "valkey" {
   subnet_ids                = local.isolated_subnet_ids
   client_security_group_ids = local.data_store_clients
 
-  kms_key_arn = var.kms_key_arns.platform
+  kms_key_arn = local.kms_key_arns["platform"]
 }
 
 module "queues" {
   source = "../queues"
 
   name_prefix = var.conventions.name_prefix
-  kms_key_arn = var.kms_key_arns.platform
+  kms_key_arn = local.kms_key_arns["platform"]
 
   senders = {
     relay_role_arn           = "${local.role_arn_prefix}relay"
     signin_trigger_role_arn  = "${local.role_arn_prefix}signin-trigger"
-    events_delivery_role_arn = "${local.role_arn_prefix}events-delivery"
+    events_delivery_role_arn = local.events_delivery_role_arn
     ses_events_topic_arn     = "arn:aws:sns:${local.region}:${var.account_id}:${var.conventions.name_prefix}-ses-events"
   }
 }
