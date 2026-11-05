@@ -13,11 +13,11 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
+    errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     internal.py       /healthz, /readyz, /metrics on the internal port
     observability.py  request and trace IDs, request metrics, one log line per request
     rate_limits.py    rate_limit(bundle): the route dependency; 401 counting
     client_ip.py      the client's address by ADR-0002's rule
-    errors.py         Problem responses for sft.core.errors (#96 completes it)
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
   (workers/)    later, beside api: asyncio workers that use the service layer without HTTP
@@ -26,6 +26,8 @@ src/sft/
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations; Valkey counters
     database.py       the pool, and Database.transaction(scope), the only way to open a transaction
     scope.py          Scope: tenant, resource, system, platform, lookup or recovery
+    access.py         the rules on top: who opens which scope, in_scope(), TenantOwned
+    tenants.py        data-access functions for tenants (one module per table or aggregate)
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
@@ -33,7 +35,9 @@ src/sft/
     audit_required.py the fail-closed trigger for migrations, and the tables exempt from it
     migrations/       the Alembic revisions; migrate.py is the migration job
     counters.py       Valkey: the rate-limit counter scripts, with a timeout and a rest after failures
-  core/         settings, logging, errors and email pseudonyms, used by every layer
+  core/         settings and logging, used by every layer
+    errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
+    pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
 ```
 
 `service`, `data` and `core` never import FastAPI, Starlette or uvicorn.
@@ -42,12 +46,13 @@ src/sft/
 
 From the repository root, `make check` runs what CI runs: ruff, mypy (strict), `lint-imports` and pytest with the
 80 % coverage gate. The data layer's tests need a real PostgreSQL 17 server (below). `make up` runs the image with the
-production hardening. To run it from source:
+production hardening, after the jobs that create the database roles and run the migrations. To run it from source
+against the stack's database (`docker compose stop api` first: it holds the ports):
 
 ```bash
 cd services/api
 uv sync
-DATABASE_URL=postgresql://sft_api@127.0.0.1:5432/sft \
+DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft \
   VALKEY_URL=redis://sft-local:local-only-valkey-password@127.0.0.1:6379/0 uv run python -m sft.api
 curl -s localhost:8001/readyz   # API on 127.0.0.1:8000, probes and metrics on 127.0.0.1:8001
 ```
@@ -120,6 +125,36 @@ to get a session: one without a scope is refused before its first statement reac
 scopes set a tenant; system, platform, lookup and recovery scopes set none, so every tenant policy matches nothing in
 them. In the API, the app's lifespan creates the `Database` and a route gets it with `Depends(get_database)`.
 
+### Scoped data access
+
+`DATABASE_URL` names the workload's own role, and the pool opens only that role's scopes
+(`sft.data.access.SCOPES_BY_ROLE`, authentication and authorization 7.3): `sft_api` tenant, resource, platform and
+lookup; `sft_jobs` system and tenant; and so on. Any other scope raises `ScopeNotAllowedError` before it reaches the
+database. A URL naming any other user, a superuser included, is refused at `connect`, and so is one whose query
+could change who logs in (`user`, `options`, `service`, …; TLS settings, `connect_timeout` and `application_name`
+pass); every new connection also checks `current_user`. A resource scope names its subject, the link session's
+recipient or upload request: `Scope.resource(tenant_id, Subject.recipient(id))`.
+
+Every data-access function filters with `in_scope`, never with a tenant of its own, and writes the scope's tenant:
+
+```python
+from sft.data.access import in_scope, tenant_of
+
+async def get_widget(session: AsyncSession, widget_id: UUID) -> Widget | None:
+    statement = select(Widget).where(Widget.id == widget_id, in_scope(Widget, session))
+    return await session.scalar(statement)
+
+session.add(Widget(id=uuid7(), tenant_id=tenant_of(session), ...))
+```
+
+Every tenant-owned model mixes in `TenantOwned`. Its `reach(subject)` says which rows a link session reaches; the
+default is none. Row-level security keeps tenants apart; within a tenant the resource rule is this layer's alone.
+
+In system scope the session refuses any `INSERT`, `UPDATE`, `DELETE` or flush that touches a tenant table, before it
+reaches the database, unless the role is the relay: a job finds its work across tenants and changes each item in its
+tenant's scope. There is no flag to forget. A row the scope doesn't reach is `NotFoundError`, which the service
+answers with 404.
+
 ### Roles
 
 Created by the bootstrap job, `python -m sft.data.bootstrap`, never by a migration (`sft.data.roles`):
@@ -129,7 +164,8 @@ Created by the bootstrap job, `python -m sft.data.bootstrap`, never by a migrati
   waits within 10 s).
 - `sft_migrate`: the migration job's login role. It has no privileges of its own; it becomes `sft_owner` with
   `SET ROLE`.
-- `sft_owner` owns every table and `sft_lookup` will own the credential lookup functions. Nobody logs in as either.
+- `sft_owner` owns every table and `sft_lookup` owns the credential lookup functions. Nobody logs in as either.
+  `sft_owner` may become `sft_lookup` (`SET ROLE`, no inheritance), so a migration can hand it a function.
 - No role of ours has `BYPASSRLS`, superuser, `CREATEROLE` or `CREATEDB`; the catalog tests check it.
 
 **In AWS** the bootstrap job (`sft-{env}-db-bootstrap`, M4) runs as the master user with `BOOTSTRAP_IAM_AUTH=true`.
@@ -199,6 +235,43 @@ def upgrade() -> None:
         op.execute(statement)
 ```
 
+- gives every tenant-owned table `tenant_id` referencing `tenants (id)` and a unique key `(tenant_id, id)`, and refers
+  to a parent by both columns, so the database refuses a reference to another tenant's row (data model 4.2). The
+  statements come from `tenant_keys_sql(table)` and `tenant_foreign_key_sql(table, column, parent)`, pasted the same
+  way:
+
+```python
+WIDGET_PARTS_KEYS = (
+    "ALTER TABLE widget_parts ADD CONSTRAINT widget_parts_tenant_id_fkey "
+    "FOREIGN KEY (tenant_id) REFERENCES tenants (id)",
+    "ALTER TABLE widget_parts ADD CONSTRAINT widget_parts_tenant_id_id_key UNIQUE (tenant_id, id)",
+    "ALTER TABLE widget_parts ADD CONSTRAINT widget_parts_tenant_id_widget_id_fkey "
+    "FOREIGN KEY (tenant_id, widget_id) REFERENCES widgets (tenant_id, id) ON DELETE CASCADE",
+)
+```
+
+- puts a credential lookup (data model 4.2) in a `SECURITY DEFINER` function owned by `sft_lookup`, for `sft_api`
+  only. `lookup_read_sql(table, columns)` gives `sft_lookup` those columns and a policy that matches in lookup scope
+  only; `lookup_function_sql` writes the function, pins its `search_path`, grants `sft_api` alone and hands it to
+  `sft_lookup`:
+
+```python
+from sft.data.rls import lookup_function_sql, lookup_read_sql
+
+print(*lookup_read_sql("api_keys", ["id", "tenant_id", "key_hash", "revoked_at"]), sep="\n")
+print(
+    *lookup_function_sql(
+        "lookup_api_key(p_key_hash bytea)",
+        returns="TABLE (key_id uuid, owner_tenant_id uuid, revoked_at timestamptz)",
+        body="SELECT id, tenant_id, revoked_at FROM public.api_keys WHERE key_hash = p_key_hash",
+    ),
+    sep="\n",
+)
+```
+
+  Call it in a lookup-scope transaction of its own, after `require_scope(session, ScopeKind.LOOKUP)`, and continue in
+  the tenant or resource scope it returns.
+
 - decides whether changes to each new tenant-owned table need an audit event (FR-27, NFR-15). Either it pastes in the
   `audit_required` trigger, which refuses to commit a change by a workload role without an audit event in the same
   transaction, or the table goes in `NOT_AUDITED` in `sft/data/audit_required.py`, with the reason. The trigger's SQL
@@ -216,8 +289,9 @@ print(
 
 Add the table to `sft/data/models.py` too: a test compares the models with the migrated schema. The catalog tests fail
 if a tenant table has no row-level security or neither the audit trigger nor a `NOT_AUDITED` entry, a role is granted
-a table without a policy for it, `TRUNCATE` is granted, anyone but `sft_owner` owns a table, or a `SECURITY DEFINER`
-function leaves its `search_path` open or is executable by every role.
+a table or a column without a policy for it, `TRUNCATE` is granted, anyone but `sft_owner` owns a table, a foreign
+key between tenant tables leaves out `tenant_id`, or a `SECURITY DEFINER` function isn't a pinned lookup for `sft_api`
+alone.
 
 ### Audit events
 
@@ -270,7 +344,8 @@ API, standalone and cluster clients, and a credential provider for the IAM token
 The data layer's tests need a PostgreSQL 17 superuser URL in `TEST_DATABASE_URL`. They make their own databases there
 and drop them afterwards; the roles, which are cluster-wide, stay. In CI it is a service container on the Python job.
 Without it the database tests are skipped locally; in CI (`CI` set) they fail instead, so they can't be skipped
-there by accident.
+there by accident. While the local stack runs (`make up`), `make test` sets it to the stack's superuser for you
+([local development](../../docs/local-development.md) 1); otherwise start a server of your own:
 
 ```bash
 docker run --detach --name sft-test-postgres --publish 127.0.0.1:55432:5432 \
@@ -286,3 +361,30 @@ docker run --detach --name sft-test-valkey --publish 127.0.0.1:56379:6379 \
   --env "VALKEY_EXTRA_FLAGS=--save '' --requirepass test-only" valkey/valkey:9.0.7-alpine
 TEST_VALKEY_URL=redis://:test-only@127.0.0.1:56379/0 uv run pytest
 ```
+
+### The isolation suite
+
+NFR-12, delivery plan 2 point 3: every new data-access function, and later every endpoint, gets a case in
+`tests/test_isolation.py`. A case calls the function in one tenant's scope ("mine") with the other tenant's IDs
+("theirs"):
+
+```python
+@cases.add(scopes={API: [TENANT, RESOURCE], OPERATOR: [TENANT]})
+async def get_tenant_of_another_tenant(session: AsyncSession, tenants: Tenants) -> object:
+    return await get_tenant(session, tenants.theirs.tenant_id)
+```
+
+`scopes` lists, per workload role, the scopes the function is used in; the harness also tries the platform and lookup
+scopes the role may open. A resource-scope case passes `subject=` to give mine's link session its item. Each case runs
+three ways (ADR-0020): as built; with row-level security disabled in a database of its own, so `in_scope` must hold
+alone; and with `in_scope`'s tenant filter removed, so the policies must hold alone. An attempt fails the build if
+its result holds any of theirs' IDs or the marker in their text columns, if any of their rows changed, or if a row of
+another tenant now refers to one of their IDs. A refusal is fine: no row, `None`, a policy, privilege or foreign key
+error, or the data layer's `NotFoundError` or `ScopeNotAllowedError`; anything else, a `KeyError` included, fails.
+In system scope, and in lookup scope when the case names it, reading across tenants is the point, so only the
+"nothing changed" checks apply.
+
+A new tenant table also gets its rows in `seed_tenant` (`tests/isolation.py`), which seeds as the superuser so the
+code under test never seeds itself. `tests/isolation_fixture.py` holds stand-in tables, a parent with a credential and
+a child, that prove the harness, the composite keys and the lookup mechanism until the real tables arrive;
+`tests/test_isolation_harness.py` breaks each layer in turn and checks that the suite fails.

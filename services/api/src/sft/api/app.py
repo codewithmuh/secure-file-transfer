@@ -76,6 +76,6 @@ def create_app(
         lifespan=None if settings is None else _lifespan(settings, registry or CollectorRegistry()),
     )
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
-    register_error_handlers(app)
+    register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
     return app

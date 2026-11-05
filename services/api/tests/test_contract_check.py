@@ -21,6 +21,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.applications import Starlette
 
+from sft.api.errors import problem_responses, register_error_handlers
 from tools import contract_check
 from tools.contract_check import (
     CONTRACT,
@@ -99,8 +100,8 @@ class SignOutResult(BaseModel):
     logout_url: Annotated[str, Field(json_schema_extra={"format": "uri"})]
 
 
-def app(*routers: APIRouter, version: str = SAMPLE_VERSION) -> FastAPI:
-    """An app built like create_app(), with the given routes."""
+def plain_app(*routers: APIRouter, version: str = SAMPLE_VERSION) -> FastAPI:
+    """An app with FastAPI's own error answers, as before #96."""
     result = FastAPI(
         title=SAMPLE_TITLE, version=version, docs_url=None, redoc_url=None, openapi_url=None
     )
@@ -109,7 +110,18 @@ def app(*routers: APIRouter, version: str = SAMPLE_VERSION) -> FastAPI:
     return result
 
 
+def app(*routers: APIRouter, version: str = SAMPLE_VERSION) -> FastAPI:
+    """An app built like create_app(), with the given routes."""
+    result = plain_app(*routers, version=version)
+    register_error_handlers(result)
+    return result
+
+
 # ---- routes that match the contract: five public operations and one operator operation ----
+
+# The error statuses the contract declares for two of them.
+LIST_USERS = (400, 401, 403, 429)
+DELETE_FILE = (401, 403, 404, 409, 429)
 
 
 def public_routes() -> APIRouter:
@@ -120,6 +132,7 @@ def public_routes() -> APIRouter:
         operation_id="startSignIn",
         status_code=302,
         response_class=RedirectResponse,
+        responses=problem_responses(400, 422, 429, 503, "default"),
     )
     def start_sign_in(
         method: Literal["sso", "local"],
@@ -130,11 +143,15 @@ def public_routes() -> APIRouter:
     ) -> RedirectResponse:
         raise NotImplementedError
 
-    @router.post("/auth/sign-out", operation_id="signOut")
+    @router.post(
+        "/auth/sign-out",
+        operation_id="signOut",
+        responses=problem_responses(400, 401, 403, 422, 429),
+    )
     def sign_out(body: Annotated[SignOutRequest | None, Body()] = None) -> SignOutResult:
         raise NotImplementedError
 
-    @router.get("/users", operation_id="listUsers")
+    @router.get("/users", operation_id="listUsers", responses=problem_responses(*LIST_USERS))
     def list_users(
         role: Role | None = None,
         status: UserStatus | None = None,
@@ -143,7 +160,12 @@ def public_routes() -> APIRouter:
     ) -> UserPage:
         raise NotImplementedError
 
-    @router.delete("/files/{file_id}", operation_id="deleteFile", status_code=204)
+    @router.delete(
+        "/files/{file_id}",
+        operation_id="deleteFile",
+        status_code=204,
+        responses=problem_responses(*DELETE_FILE),
+    )
     def delete_file(file_id: UUID) -> None:
         raise NotImplementedError
 
@@ -151,7 +173,11 @@ def public_routes() -> APIRouter:
         "/files/{file_id}/downloads/{grant_id}/content",
         operation_id="getReceivedFileDownloadContent",
         response_class=StreamingResponse,
-        responses={200: {"content": FILE_BYTES}, 206: {"content": FILE_BYTES}},
+        responses={
+            200: {"content": FILE_BYTES},
+            206: {"content": FILE_BYTES},
+            **problem_responses(401, 403, 404, 416, 429, 503),
+        },
     )
     def get_content(
         file_id: UUID,
@@ -169,7 +195,12 @@ def public_routes() -> APIRouter:
 def operator_routes() -> APIRouter:
     router = APIRouter(prefix="/v1")
 
-    @router.post("/operator/tenants", operation_id="createTenant", status_code=201)
+    @router.post(
+        "/operator/tenants",
+        operation_id="createTenant",
+        status_code=201,
+        responses=problem_responses(400, 401, 403, 409, 422, 429),
+    )
     def create_tenant(body: TenantCreate, idempotency_key: IdempotencyKey = None) -> TenantCreated:
         raise NotImplementedError
 
@@ -461,6 +492,45 @@ def constraint_only_in_the_code() -> FastAPI:
     return app(router)
 
 
+def delete_file_route(responses: dict[int | str, dict[str, Any]]) -> FastAPI:
+    router = APIRouter(prefix="/v1")
+
+    @router.delete(
+        "/files/{file_id}", operation_id="deleteFile", status_code=204, responses=responses
+    )
+    def delete_file(file_id: UUID) -> None:
+        raise NotImplementedError
+
+    return app(router)
+
+
+# A problem document without the Problem component, which only register_error_handlers adds.
+LIST_USERS_PLAIN = {
+    status: {"description": "Error", "content": {"application/problem+json": {"schema": {}}}}
+    for status in LIST_USERS
+}
+
+
+class NotAProblem(BaseModel):
+    detail: str
+
+
+def fastapi_errors() -> FastAPI:
+    """listUsers on an app without register_error_handlers: FastAPI's own 422 shows."""
+    router = APIRouter(prefix="/v1")
+
+    @router.get("/users", operation_id="listUsers", responses=LIST_USERS_PLAIN)
+    def list_users(
+        role: Role | None = None,
+        status: UserStatus | None = None,
+        cursor: Annotated[str | None, Query(max_length=512)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    ) -> UserPage:
+        raise NotImplementedError
+
+    return plain_app(router)
+
+
 def openapi_3_0() -> FastAPI:
     result = app()
     result.openapi_version = "3.0.3"
@@ -485,7 +555,67 @@ WRONG: list[tuple[str, str, Callable[[], FastAPI], list[str]]] = [
         "unexpected body",
         PUBLIC_SERVER,
         unexpected_body,
-        ["request body: the code takes one, the contract none"],
+        [
+            "request body: the code takes one, the contract none",
+            "error response 422: not in the contract, so the route may not answer with it",
+        ],
+    ),
+    (
+        "undeclared error status",
+        PUBLIC_SERVER,
+        lambda: delete_file_route(problem_responses(*DELETE_FILE, 410)),
+        [
+            "DELETE /v1/files/{file_id} (deleteFile): error response 410: not in the contract, "
+            "so the route may not answer with it"
+        ],
+    ),
+    (
+        "missing error status",
+        PUBLIC_SERVER,
+        lambda: delete_file_route(problem_responses(401, 403, 404, 429)),
+        [
+            "error response 409: missing in the code; "
+            "declare it with sft.api.errors.problem_responses()"
+        ],
+    ),
+    (
+        "error range instead of statuses",
+        PUBLIC_SERVER,
+        lambda: delete_file_route(
+            problem_responses(*DELETE_FILE) | {"4XX": problem_responses(404)[404]}
+        ),
+        ["error response 4XX: not in the contract"],
+    ),
+    (
+        "error media type",
+        PUBLIC_SERVER,
+        lambda: delete_file_route(
+            problem_responses(401, 403, 409, 429) | {404: {"model": NotAProblem}}
+        ),
+        [
+            "response 404: the contract has ['application/problem+json'], "
+            "the code ['application/json']"
+        ],
+    ),
+    (
+        "error schema",
+        PUBLIC_SERVER,
+        lambda: delete_file_route(
+            problem_responses(401, 403, 409, 429)
+            | {
+                404: {
+                    "description": "Not found",
+                    "content": {"application/problem+json": {"schema": {"type": "object"}}},
+                }
+            }
+        ),
+        ["response 404 application/problem+json at /properties: the contract has"],
+    ),
+    (
+        "FastAPI's own 422",
+        PUBLIC_SERVER,
+        fastapi_errors,
+        ["GET /v1/users (listUsers): error response 422: not in the contract"],
     ),
     (
         "constraint only in the code",

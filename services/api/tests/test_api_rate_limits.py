@@ -202,7 +202,6 @@ def test_client_ip(peer: str | None, forwarded: tuple[str, ...], expected: str) 
 
 
 def test_problem_errors_carry_their_detail_and_retry_after() -> None:
-    # The stub of #96's handlers: only the two errors rate limiting raises.
     from sft.core.errors import ServiceUnavailable
 
     app = create_app()

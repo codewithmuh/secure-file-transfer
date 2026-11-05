@@ -4,13 +4,21 @@ import { UserPlus, MoreHorizontal } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import { Button, Card, Badge, Input, Dialog, Table, TableHead, TableBody, TableRow, TableHeader, TableCell } from '@/components/ui';
 import { formatDate } from '@/lib/formatters';
-import type { TenantUser } from '@/types';
+import type { User, UserStatus } from '@/api';
 
-const mockUsers: TenantUser[] = [
-  { id: '1', email: 'admin@company.com', name: 'Rashid', role: 'admin', status: 'active', last_sign_in_at: '2026-11-04T05:00:00Z', created_at: '2026-10-01T00:00:00Z' },
-  { id: '2', email: 'alice@company.com', name: 'Alice', role: 'member', status: 'active', last_sign_in_at: '2026-11-03T12:00:00Z', created_at: '2026-10-15T00:00:00Z' },
-  { id: '3', email: 'bob@company.com', name: 'Bob', role: 'member', status: 'deactivated', last_sign_in_at: '2026-10-20T08:00:00Z', created_at: '2026-10-10T00:00:00Z' },
+// Mock data in the contract's shape; replaced by TanStack Query when the API exists. The contract's `User` has no
+// display name or last sign-in time, so the page shows the email address and when the user was added.
+const mockUsers: User[] = [
+  { id: '1', email: 'admin@company.com', role: 'admin', status: 'active', sso_fallback: false, dlp_approver: true, created_at: '2026-10-01T00:00:00Z' },
+  { id: '2', email: 'alice@company.com', role: 'member', status: 'active', sso_fallback: false, dlp_approver: false, created_at: '2026-10-15T00:00:00Z' },
+  { id: '3', email: 'bob@company.com', role: 'member', status: 'deactivated', sso_fallback: false, dlp_approver: false, created_at: '2026-10-10T00:00:00Z' },
 ];
+
+const statusBadge: Record<UserStatus, { variant: 'success' | 'default' | 'info'; labelKey: string }> = {
+  active: { variant: 'success', labelKey: 'admin.active' },
+  invited: { variant: 'info', labelKey: 'admin.invited' },
+  deactivated: { variant: 'default', labelKey: 'admin.deactivated' },
+};
 
 export function UserManagementPage() {
   const { t } = useTranslation();
@@ -32,30 +40,26 @@ export function UserManagementPage() {
         <Table>
           <TableHead>
             <tr>
-              <TableHeader>Name</TableHeader>
               <TableHeader>Email</TableHeader>
               <TableHeader>{t('admin.role')}</TableHeader>
               <TableHeader>{t('common.status')}</TableHeader>
-              <TableHeader>Last sign-in</TableHeader>
+              <TableHeader>Added</TableHeader>
               <TableHeader>{t('common.actions')}</TableHeader>
             </tr>
           </TableHead>
           <TableBody>
             {mockUsers.map((user) => (
               <TableRow key={user.id}>
-                <TableCell><span className="font-medium text-gray-900">{user.name}</span></TableCell>
-                <TableCell>{user.email}</TableCell>
+                <TableCell><span className="font-medium text-gray-900">{user.email}</span></TableCell>
                 <TableCell>
                   <Badge variant={user.role === 'admin' ? 'info' : 'default'}>
                     {user.role === 'admin' ? t('admin.roleAdmin') : t('admin.roleMember')}
                   </Badge>
                 </TableCell>
                 <TableCell>
-                  <Badge variant={user.status === 'active' ? 'success' : 'default'}>
-                    {user.status === 'active' ? t('admin.active') : t('admin.deactivated')}
-                  </Badge>
+                  <Badge variant={statusBadge[user.status].variant}>{t(statusBadge[user.status].labelKey)}</Badge>
                 </TableCell>
-                <TableCell>{user.last_sign_in_at ? formatDate(user.last_sign_in_at) : '—'}</TableCell>
+                <TableCell>{formatDate(user.created_at)}</TableCell>
                 <TableCell>
                   <button className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600">
                     <MoreHorizontal className="h-4 w-4" />
