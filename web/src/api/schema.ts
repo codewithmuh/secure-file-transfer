@@ -2642,7 +2642,10 @@ export interface components {
             code: components["schemas"]["ProblemCode"];
             /** @description ID of the request, also in the service's logs and traces. Quote it when reporting a problem. */
             request_id?: string;
-            /** @description For `validation_failed`, one entry per problem. */
+            /**
+             * @description One entry per problem: for `validation_failed` and `recipient_undeliverable`, and for a `malformed_request`
+             *     caused by a query, header or cookie parameter.
+             */
             errors?: components["schemas"]["ValidationIssue"][];
             /** @description For `code_invalid`, how many attempts this code still allows. */
             attempts_remaining?: number;
@@ -2654,7 +2657,7 @@ export interface components {
          *     without a new API version, so clients treat an unknown code by its HTTP status.
          * @enum {string}
          */
-        ProblemCode: "malformed_request" | "invalid_cursor" | "authentication_required" | "session_expired" | "credentials_invalid" | "reauthentication_required" | "permission_denied" | "passkey_required" | "self_approval_forbidden" | "csrf_failed" | "recipient_locked" | "download_limit_reached" | "download_grant_exhausted" | "not_found" | "link_not_found" | "idempotency_conflict" | "idempotency_in_progress" | "invalid_state" | "transfer_revoked" | "transfer_expired" | "upload_request_revoked" | "upload_request_expired" | "transfer_empty" | "upload_incomplete" | "file_not_shareable" | "user_exists" | "last_admin" | "dlp_decision_changed" | "dlp_policy_conflict" | "detector_in_use" | "no_eligible_approver" | "approval_limit_reached" | "link_revoked" | "link_expired" | "file_too_large" | "total_too_large" | "storage_quota_exceeded" | "request_too_large" | "range_not_satisfiable" | "validation_failed" | "expiry_out_of_range" | "recipient_domain_not_allowed" | "recipient_undeliverable" | "too_many_files" | "upload_size_mismatch" | "code_invalid" | "code_expired" | "code_attempts_exhausted" | "export_too_large" | "justification_required" | "approvers_insufficient" | "rate_limited" | "service_unavailable";
+        ProblemCode: "malformed_request" | "invalid_cursor" | "authentication_required" | "session_expired" | "credentials_invalid" | "reauthentication_required" | "permission_denied" | "passkey_required" | "self_approval_forbidden" | "csrf_failed" | "recipient_locked" | "download_limit_reached" | "download_grant_exhausted" | "not_found" | "link_not_found" | "method_not_allowed" | "idempotency_conflict" | "idempotency_in_progress" | "invalid_state" | "transfer_revoked" | "transfer_expired" | "upload_request_revoked" | "upload_request_expired" | "transfer_empty" | "upload_incomplete" | "file_not_shareable" | "user_exists" | "last_admin" | "dlp_decision_changed" | "dlp_policy_conflict" | "detector_in_use" | "no_eligible_approver" | "approval_limit_reached" | "link_revoked" | "link_expired" | "file_too_large" | "total_too_large" | "storage_quota_exceeded" | "request_too_large" | "unsupported_media_type" | "range_not_satisfiable" | "validation_failed" | "expiry_out_of_range" | "recipient_domain_not_allowed" | "recipient_undeliverable" | "too_many_files" | "upload_size_mismatch" | "code_invalid" | "code_expired" | "code_attempts_exhausted" | "export_too_large" | "justification_required" | "approvers_insufficient" | "rate_limited" | "internal_error" | "service_unavailable";
         ValidationIssue: {
             /** @description What is wrong. */
             detail: string;
@@ -4089,8 +4092,9 @@ export interface components {
             };
         };
         /**
-         * @description An unexpected server error, as a problem document. Declared on the sign-in navigations, which succeed with a
-         *     redirect: apart from `429` and `503`, it is the only answer they give that isn't a redirect.
+         * @description An unexpected server error, as a problem document (`500 internal_error`). Declared on the sign-in
+         *     navigations, which succeed with a redirect: apart from `429` and `503`, it is the only answer they give that
+         *     isn't a redirect.
          */
         UnexpectedError: {
             headers: {
