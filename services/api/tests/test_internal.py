@@ -1,8 +1,8 @@
 import pytest
 from starlette.testclient import TestClient
 
-from sft.api.internal import Readiness, create_internal_app
 from sft.api.observability import HttpMetrics
+from sft.runtime.internal import Readiness, create_internal_app
 
 
 @pytest.fixture
