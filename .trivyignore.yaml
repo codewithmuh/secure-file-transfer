@@ -38,3 +38,31 @@ misconfigurations:
       encryption 3.1), which the data layer creates after the network, so a fresh build applies the network a second
       time with it (infra/README.md, "Apply order"). Trivy sees the default, null. Flow logs are part of T-53's
       detection, with the proxy's byte logs and GuardDuty.
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/modules/files-buckets/main.tf"
+      - "**/modules/audit-archive/main.tf"
+    statement: >-
+      Encryption 3.1 decides against S3 server access logs: they support only SSE-S3, an exception to NFR-13 for logs
+      that would hold every object key and requester. CloudTrail S3 data events are the storage access log instead,
+      for NFR-15's daily match: the files buckets' through the environment's trail into the shared account's log
+      archive under Object Lock, so a break-glass session can't erase its own record (authn-authz 8.3), and the prod
+      archive's through the retained stack's trail (encryption 8.4). Threat model T-51, T-75.
+  - id: AVD-AWS-0342 # iam:PassRole
+    paths:
+      - "**/modules/terraform-oidc-roles/permissions-storage.tf"
+    statement: >-
+      The deploy role passes three roles it creates in the data layer, each by exact ARN and each only to its one
+      service (iam:PassedToService): sft-<env>-s3-replication to S3, sft-<env>-malware-protection to GuardDuty and
+      sft-<env>-events-delivery to EventBridge. Replication rules, the malware protection plan and the rule targets
+      can't be made without it. SCP 4 keeps these policies with Admin, so the deploy role can't widen them (T-71).
+  - id: AVD-AWS-0342 # iam:PassRole
+    paths:
+      - "**/modules/terraform-oidc-roles/permissions-cluster.tf"
+    statement: >-
+      The cluster layer (#103) must pass roles: the deploy role passes the cluster and node roles to EKS, the workload
+      roles to Pod Identity, the Karpenter node role into its instance profile and the data layer's execution role to
+      EventBridge, each statement limited to those exact role ARNs and iam:PassedToService. The workload permissions
+      boundary lets a cluster-layer role pass only the Karpenter node role, which Karpenter's own policy also limits to
+      ec2.amazonaws.com. The roles that can be passed all carry the same boundary, which allows no IAM change and no
+      sts:AssumeRole, so passing one gains nothing beyond the workload's own rights (T-71).

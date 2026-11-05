@@ -8,25 +8,30 @@ variable "account_id" {
   }
 }
 
-variable "kms_key_arns" {
-  description = <<-EOT
-    This Region's keys by class (encryption 4.1), until #102 merges and module.kms.key_arns replaces this variable:
-    database (Aurora), logs (its log group) and platform (queues and the counter store). Each is the Osaka replica of
-    a multi-Region key; modules/data-stack checks them. Osaka has no master secret of its own, so no secrets key here:
-    Tokyo's data stack replicates the secret under it (master_secret_replica_kms_key_arn).
-  EOT
-  type = object({
-    database = string
-    logs     = string
-    platform = string
-  })
-}
-
 variable "teardown" {
   description = <<-EOT
     True only for the apply that comes before destroying this stack: it turns deletion protection off, skips the
     final snapshot and lets the master secret go without a recovery window (infra/README.md, "Apply order").
   EOT
+  type        = bool
+  default     = false
+}
+
+variable "primary_key_arns" {
+  description = "The Tokyo data stack's kms_key_arns output: the primary of each class, which this stack replicates. Supplied at plan time (TF_VAR_primary_key_arns), never committed."
+  type        = map(string)
+
+  validation {
+    condition = alltrue([
+      for arn in values(var.primary_key_arns) :
+      can(regex("^arn:aws:kms:ap-northeast-1:[0-9]{12}:key/mrk-[0-9a-f]{32}$", arn))
+    ])
+    error_message = "Each value must be the ARN of a multi-Region key in ap-northeast-1."
+  }
+}
+
+variable "malware_protection_enabled" {
+  description = "Turn on GuardDuty Malware Protection for Osaka's large-files bucket. Off in the pilot light, with no plan at all; the failover runbook's apply creates it (ADR-0019)."
   type        = bool
   default     = false
 }

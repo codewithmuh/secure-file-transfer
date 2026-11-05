@@ -2,8 +2,8 @@
 # store and the environment's KMS keys (ADR-0011 to ADR-0014, ADR-0017). dev and staging also keep their audit archive
 # here; prod keeps it in the retained stack (encryption 8.4).
 #
-# #101 fills this file, variables.tf and outputs.tf: Aurora, the counter store and the queues, through
-# modules/data-stack, which holds what every data root shares. #102 adds the keys and buckets in their own files.
+# Everything comes from modules/data-stack, which holds what every data root shares: Aurora, the counter store and
+# the queues (#101), and the keys, buckets and audit archive (#102). This root passes only what differs.
 #
 # dev's shape (capacity 5.3): one db.t4g.medium writer with no global database, the counter store and the queues.
 
@@ -50,10 +50,6 @@ module "data" {
 
   account_id  = var.account_id
   conventions = module.conventions
-
-  # The environment's keys (encryption 4.1). Until #102 merges they come in as a variable; then this line becomes
-  # module.kms.key_arns, the keys module in kms.tf.
-  kms_key_arns = var.kms_key_arns
 
   aurora = {
     cluster_role          = "standalone"

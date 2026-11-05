@@ -89,11 +89,12 @@ conventions() {
   fi
 
   # Account IDs come in as variables, never in the code. An AWS-owned account (for example a regional registry that
-  # serves EKS add-ons, ADR-0021) is allowed on a line marked "aws-owned-account".
+  # serves EKS add-ons, ADR-0021) is allowed on a line marked "aws-owned-account". Image digests (sha256:<hex>) can
+  # hold twelve digits in a row, so they are removed before the match.
   local ids
   ids=$(grep -rnE --include='*.tf' --include='*.tfvars' --include='*.hcl' --exclude='.terraform.lock.hcl' \
-    --exclude-dir=.terraform \
-    '(^|[^0-9])[0-9]{12}([^0-9]|$)' infra | grep -v 'aws-owned-account' || true)
+    --exclude-dir=.terraform '[0-9]{12}' infra | grep -v 'aws-owned-account' |
+    sed -E 's/sha256:[0-9a-f]{64}//g' | grep -E '^[^:]+:[0-9]+:.*(^|[^0-9])[0-9]{12}([^0-9]|$)' || true)
   if [[ -n $ids ]]; then
     echo "Possible AWS account IDs in infra/ (pass them as variables):" >&2
     echo "$ids" >&2
@@ -145,11 +146,16 @@ tflint() {
 trivy() {
   # --skip-check-update uses the checks built into this Trivy version, so results change only when the image does;
   # Trivy logs "Falling back to embedded checks" as an error, which is expected. The variables are placeholders, an
-  # account that can't exist, so Trivy evaluates every expression; no real account ID is ever needed here.
+  # account that can't exist, so Trivy evaluates every expression; no real account ID is ever needed here. Osaka's
+  # data stacks get a placeholder primary for every key class (TF_VAR_primary_key_arns, infra/README.md).
+  local key=arn:aws:kms:ap-northeast-1:000000000000:key/mrk-00000000000000000000000000000000 primaries='' class
+  for class in files fields database audit logs secrets platform; do primaries+="${primaries:+,}\"$class\":\"$key\""; done
   container none \
     --env TF_VAR_account_id=000000000000 \
+    --env TF_VAR_shared_account_id=000000000000 \
     --env 'TF_VAR_admin_principal_arn_patterns=["arn:aws:iam::000000000000:role/placeholder-admin"]' \
-    --env TF_VAR_tfstate_primary_key_arn=arn:aws:kms:ap-northeast-1:000000000000:key/mrk-00000000000000000000000000000000 \
+    --env TF_VAR_tfstate_primary_key_arn="$key" \
+    --env TF_VAR_primary_key_arns="{$primaries}" \
     "$TRIVY_IMAGE" config --exit-code 1 --severity "$TRIVY_SEVERITY" --skip-check-update \
     --ignorefile .trivyignore.yaml --skip-dirs '**/.terraform' infra
 }

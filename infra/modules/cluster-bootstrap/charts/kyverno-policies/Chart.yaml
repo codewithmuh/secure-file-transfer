@@ -1,0 +1,8 @@
+apiVersion: v2
+name: kyverno-policies
+description: >-
+  The admission policies the design names (ADR-0004, ADR-0007, ADR-0021, T-52, T-70): where images may come from and
+  how they are signed, no privileged or host access, the system node pool kept for the platform, and Pod Security
+  Admission at restricted. Installed by Terraform after Kyverno (infra/modules/cluster-bootstrap).
+type: application
+version: 0.1.0

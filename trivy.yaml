@@ -3,3 +3,11 @@ pkg:
   # Scan development dependencies too. They run in the build and in CI (vite, eslint, vitest), so a compromised or
   # vulnerable one matters as much as a runtime one (threat model T-68). Without this Trivy skips them.
   include-dev-deps: true
+
+scan:
+  # The Kyverno CLI test's fixtures: pods that break the admission policies on purpose (privileged, host namespaces,
+  # hostPath, unpinned or foreign images, the system pool's toleration), so `kyverno test` can show each is refused
+  # (infra/modules/cluster-bootstrap, threat model T-52). They are never applied to a cluster, and every check Trivy
+  # would run on them is one the policies themselves enforce. Only this one file is skipped.
+  skip-files:
+    - "**/charts/kyverno-policies/tests/resources.yaml"

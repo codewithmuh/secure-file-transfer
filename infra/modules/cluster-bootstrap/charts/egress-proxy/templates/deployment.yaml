@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: egress-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "egress-proxy.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: egress-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "egress-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "egress-proxy.selector" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "egress-proxy.labels" . | nindent 8 }}
+      annotations:
+        # A changed allowlist rolls the pods.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: egress-proxy
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      priorityClassName: system-cluster-critical
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if gt (int .Values.replicas) 1 }}
+      # Replicas in different AZs (ADR-0021): losing one AZ leaves a proxy.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                {{- include "egress-proxy.selector" . | nindent 16 }}
+      {{- end }}
+      containers:
+      - name: envoy
+        image: {{ required "image is required" .Values.image | quote }}
+        imagePullPolicy: IfNotPresent
+        args:
+        - --config-path
+        - /etc/envoy/envoy.yaml
+        - --disable-hot-restart
+        - --log-level
+        - warn
+        ports:
+        {{- range .Values.listeners }}
+        - name: {{ .name | trunc 15 | trimSuffix "-" }}
+          containerPort: {{ .port }}
+          protocol: TCP
+        {{- end }}
+        - name: health
+          containerPort: {{ .Values.healthPort }}
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          periodSeconds: 5
+          failureThreshold: 2
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        lifecycle:
+          # Let the Service drop this pod before Envoy stops taking new tunnels.
+          preStop:
+            sleep:
+              seconds: 10
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          privileged: false
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+          capabilities:
+            drop: [ALL]
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - name: config
+          mountPath: /etc/envoy
+          readOnly: true
+      volumes:
+      - name: config
+        configMap:
+          name: egress-proxy

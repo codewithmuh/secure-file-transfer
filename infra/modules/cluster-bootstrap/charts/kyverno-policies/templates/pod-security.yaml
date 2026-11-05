@@ -1,0 +1,70 @@
+# No privileged containers, privilege escalation or added capabilities anywhere but kube-system, whose EKS add-ons
+# need them (T-52). Pod Security Admission at restricted already refuses these in every namespace that sft-namespaces
+# keeps at restricted; this holds even where a namespace's label is wrong.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: sft-no-privileged
+  labels:
+    {{- include "policies.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/description: No privileged containers, privilege escalation or added capabilities.
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    {{- include "policies.podRules" . | nindent 4 }}
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: [kube-system]
+  {{- include "policies.autogen" . | nindent 2 }}
+  variables:
+  {{- include "policies.containers" . | nindent 2 }}
+  validations:
+  - expression: >-
+      variables.containers.all(c, !c.?securityContext.?privileged.orValue(false))
+    message: Privileged containers are not allowed (T-52).
+  - expression: >-
+      variables.containers.all(c, !c.?securityContext.?allowPrivilegeEscalation.orValue(false))
+    message: allowPrivilegeEscalation must not be true (T-52).
+  - expression: >-
+      variables.containers.all(c,
+        c.?securityContext.?capabilities.?add.orValue([]).all(cap, cap == 'NET_BIND_SERVICE'))
+    message: Containers may add no capability but NET_BIND_SERVICE (T-52).
+---
+# No host namespaces, host paths or host ports, except kube-system and the node agents' namespaces (ADR-0009).
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: sft-no-host-access
+  labels:
+    {{- include "policies.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/description: No host network, PID or IPC namespace, host path or host port.
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    {{- include "policies.podRules" . | nindent 4 }}
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: NotIn
+        values: {{ toJson (concat (list "kube-system") .Values.hostAccessNamespaces) }}
+  {{- include "policies.autogen" . | nindent 2 }}
+  variables:
+  {{- include "policies.containers" . | nindent 2 }}
+  validations:
+  - expression: >-
+      !object.spec.?hostNetwork.orValue(false) &&
+      !object.spec.?hostPID.orValue(false) &&
+      !object.spec.?hostIPC.orValue(false)
+    message: Host network, PID and IPC namespaces are not allowed (T-52).
+  - expression: >-
+      object.spec.?volumes.orValue([]).all(v, !has(v.hostPath))
+    message: hostPath volumes are not allowed (T-52).
+  - expression: >-
+      variables.containers.all(c, c.?ports.orValue([]).all(p, p.?hostPort.orValue(0) == 0))
+    message: Host ports are not allowed (T-52).

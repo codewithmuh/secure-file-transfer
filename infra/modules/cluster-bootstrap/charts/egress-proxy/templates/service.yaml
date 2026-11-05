@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: egress-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "egress-proxy.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "egress-proxy.selector" . | nindent 4 }}
+  ports:
+  {{- range .Values.listeners }}
+  - name: {{ .name | trunc 15 | trimSuffix "-" }}
+    port: {{ .port }}
+    targetPort: {{ .port }}
+    protocol: TCP
+  {{- end }}
+  - name: health
+    port: {{ .Values.healthPort }}
+    targetPort: {{ .Values.healthPort }}
+    protocol: TCP
+{{- if gt (int .Values.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: egress-proxy
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "egress-proxy.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "egress-proxy.selector" . | nindent 6 }}
+{{- end }}

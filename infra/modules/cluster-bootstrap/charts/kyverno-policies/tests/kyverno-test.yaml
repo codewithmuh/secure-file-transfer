@@ -1,0 +1,89 @@
+# Kyverno CLI test of the admission policies (run.sh renders them first). One passing and one failing resource per
+# rule the design names: images by digest from our registry (ADR-0007), no privileged or host access (T-52), the
+# system pool kept for the platform (ADR-0021), namespaces at restricted (ADR-0004). sft-signed-images needs a
+# registry and is checked in the first build milestone (ADR-0007).
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: sft-admission-policies
+policies:
+  - /policies/policies.yaml
+resources:
+  - resources.yaml
+variables: cli-values.yaml
+results:
+  - policy: sft-image-sources
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-app, good-mirror, bad-privileged, bad-system-toleration]
+    result: pass
+  - policy: sft-image-sources
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-tag, bad-registry, bad-mirror-digest, bad-lookalike-registry]
+    result: fail
+  - policy: sft-kube-system-images
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-addon]
+    result: pass
+  - policy: sft-kube-system-images
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-addon-other-repo]
+    result: fail
+  - policy: sft-no-privileged
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-app, good-mirror, bad-host-network]
+    result: pass
+  - policy: sft-no-privileged
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-privileged, bad-escalation, bad-capability]
+    result: fail
+  - policy: sft-no-privileged
+    isValidatingPolicy: true
+    kind: Deployment
+    resources: [bad-deployment-privileged]
+    result: fail
+  - policy: sft-no-host-access
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-app, good-host-path-agent]
+    result: pass
+  - policy: sft-no-host-access
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-host-network, bad-host-path, bad-host-port]
+    result: fail
+  - policy: sft-system-pool-platform-only
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-app, good-scan-toleration, good-proxy-on-system]
+    result: pass
+  - policy: sft-system-pool-platform-only
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-system-toleration, bad-system-toleration-exists, bad-tolerate-everything, bad-system-selector, bad-system-affinity]
+    result: fail
+  - policy: sft-no-node-name
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [good-app]
+    result: pass
+  - policy: sft-no-node-name
+    isValidatingPolicy: true
+    kind: Pod
+    resources: [bad-node-name]
+    result: fail
+  - policy: sft-namespaces-restricted
+    isValidatingPolicy: true
+    kind: Namespace
+    resources: [good-ns]
+    result: pass
+  - policy: sft-namespaces-restricted
+    isValidatingPolicy: true
+    kind: Namespace
+    resources: [bad-ns-baseline, bad-ns-unlabelled]
+    result: fail

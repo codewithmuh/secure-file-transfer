@@ -1,0 +1,37 @@
+# Defaults only; infra/modules/cluster-bootstrap/egress-proxy.tf sets every value per cluster.
+
+# The mirrored Envoy image, by digest (ADR-0007).
+image: ""
+
+replicas: 2
+
+nodeSelector: {}
+tolerations: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+# One listener per workload. domains: the names it may CONNECT to, always on port 443. clients: the pods that may
+# reach the listener, by namespace and pod labels; the network policy admits nothing else.
+listeners: []
+#  - name: api
+#    port: 3128
+#    domains: [cognito-idp.ap-northeast-1.amazonaws.com]
+#    clients:
+#      - namespace: sft
+#        podLabels: {app.kubernetes.io/component: api}
+
+# Readiness and Prometheus metrics. Envoy's admin interface listens on localhost only.
+healthPort: 9902
+adminPort: 9901
+metricsClients:
+  - namespace: monitoring
+    podLabels: {app.kubernetes.io/name: prometheus}
+
+# Cap on concurrent tunnels per replica, so one workload can't exhaust the proxy for the others.
+maxConnectionsPerListener: 1024

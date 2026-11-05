@@ -4,8 +4,9 @@
 # environment's layers: the archive and its key are one unit that outlives prod, and nothing in a failover changes it.
 # Its state lives in its own bucket, never the environment's.
 #
-# Skeleton from #54: providers, backend and conventions only. An M4 issue fills it. That issue also adds a provider
-# alias for ap-northeast-3: the archive bucket, the key replica and the EventBridge rules there.
+# Skeleton from #54. #102 adds the audit key, its Osaka replica and the archive buckets in both Regions (archive.tf),
+# through the ap-northeast-3 provider alias below. Still to come: its own state bucket, deploy role, trail, EventBridge
+# rules with the alert topic, and the budget.
 
 terraform {
   required_version = "~> 1.17.0"
@@ -46,5 +47,16 @@ provider "aws" {
 
   default_tags {
     tags = module.conventions.tags
+  }
+}
+
+# Osaka: the archive bucket and the key replica there. Its region tag names Osaka (infra/README.md, Tags).
+provider "aws" {
+  alias               = "osaka"
+  region              = "ap-northeast-3"
+  allowed_account_ids = [var.account_id]
+
+  default_tags {
+    tags = merge(module.conventions.tags, { "region" = "ap-northeast-3" })
   }
 }
