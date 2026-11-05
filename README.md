@@ -2,7 +2,13 @@
 
 <p align="center">
   <a href="https://github.com/codewithmuh/secure-file-transfer/actions/workflows/ci.yml"><img src="https://github.com/codewithmuh/secure-file-transfer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License: MIT"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg?style=flat-square" alt="License: PolyForm Noncommercial 1.0.0"></a>
+</p>
+
+<p align="center">
+  Copyright © 2026 Muhammad Rashid (<a href="https://codewithmuh.com">CodeWithMuh</a>) ·
+  <a href="mailto:contact@codewithmuh.com">contact@codewithmuh.com</a><br>
+  Free to read, run and learn from. Commercial use is not allowed without a licence: see <a href="#license">License</a>.
 </p>
 
 A secure file transfer service on AWS. A company sends confidential files to outside recipients through a link that
@@ -115,7 +121,16 @@ report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-[MIT](LICENSE) © 2026 Muhammad Rashid ([CodeWithMuh](https://youtube.com/@codewithmuh))
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE) © 2026 Muhammad Rashid
+([CodeWithMuh](https://codewithmuh.com)). It is not open source.
+
+- **Free** to read, run and change for learning, personal projects, research, teaching and non-profit use.
+- **Commercial use needs a licence**: running it for a company or its customers, hosting it as a service, or using the
+  code in a product or in paid client work.
+
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) explains what is allowed and how to get a commercial licence. Contact:
+[contact@codewithmuh.com](mailto:contact@codewithmuh.com) ·
+[LinkedIn](https://www.linkedin.com/in/muhammad-rashid-daha) · [YouTube](https://youtube.com/@codewithmuh).
 
 [#2]: https://github.com/codewithmuh/secure-file-transfer/issues/2
 [#6]: https://github.com/codewithmuh/secure-file-transfer/issues/6

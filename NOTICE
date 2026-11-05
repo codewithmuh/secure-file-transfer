@@ -1,0 +1,17 @@
+secure-file-transfer
+https://github.com/codewithmuh/secure-file-transfer
+
+Required Notice: Copyright 2026 Muhammad Rashid (CodeWithMuh) (https://codewithmuh.com)
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0 (see LICENSE,
+or https://polyformproject.org/licenses/noncommercial/1.0.0). Anyone who passes on a copy of
+any part of it must pass on that licence and the "Required Notice:" line above.
+
+Commercial use needs a separate licence. See COMMERCIAL-LICENSE.md, or write to
+contact@codewithmuh.com.
+
+The names "CodeWithMuh" and "codewithmuh", and any logos, are not licensed. Do not use them
+in a way that suggests your copy or product is made, endorsed or supported by the author.
+
+Third-party dependencies, container images and tools that this project uses keep their own
+licences, which are stated in their packages and lock files.
