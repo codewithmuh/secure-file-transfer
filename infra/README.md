@@ -66,6 +66,9 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `key-admin-role` | `sft-<env>-keyadmin`, which only BreakGlass may assume (encryption 4.4, rule 6) |
 | `emergency-user` | `sft-<env>-emergency` under `/sft-emergency/`, the account's way in when Identity Center can't be reached (authn-authz 8.4) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
+| `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
+| `queues` | Every SQS queue of ADR-0013 and its dead-letter queue, with a queue policy that admits only its one sender ([README](modules/queues/README.md), #101) |
+| `valkey` | One Region's counter store: ElastiCache Serverless for Valkey, its IAM-authenticated users and security group ([README](modules/valkey/README.md), #101) |
 
 ## Apply order
 
@@ -84,8 +87,12 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    `retained` goes before `data`, because the environment refers to the archive by ARN. On a fresh build `network`
    runs twice: first without a flow log, then, once `data` has made the log bucket, with
    `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
+   In staging and prod Tokyo's `data` also runs twice: first with `TF_VAR_replicate_master_secret=false`, then, once
+   Osaka's `data` has made the key replicas, again, so that the master secret's Osaka replica has its key.
 
-Teardown runs the other way. Prod's `retained` stack stays, and a bootstrap stack goes only when its environment is
+Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
+deletion protection off, skips the final snapshot and drops the master secret's recovery window, then the destroy.
+Prod's `retained` stack stays, and a bootstrap stack goes only when its environment is
 destroyed for good: its bucket, key and key-admin role have `prevent_destroy`, which the last apply lifts
 (encryption 8.4).
 
@@ -137,8 +144,8 @@ bootstrap's `backend_override.tf` is the one override ever used, and it is gone 
 
 | Role | Trust (T-71) | May |
 |---|---|---|
-| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network layer (below) |
-| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network layer (below) |
+| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network and data layers (below) |
+| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network and data layers (below) |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
 
 All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
@@ -305,9 +312,18 @@ comment.
   (`ec2:VpceServiceOwner`), deletes only resources tagged `managed-by = terraform` and `project =
   secure-file-transfer`, delivers flow logs (`logs:CreateLogDelivery`), writes DNS Firewall but no other Resolver
   resource, and, where it has two Regions, holds `vpce:AllowMultiRegion` for the cross-Region S3 endpoint.
+- **Data, stores** (#101), in the same Regions (`permissions-data.tf`), as managed policies `sft-<env>-terraform-plan-data`
+  and `sft-<env>-terraform-deploy-data` under `/sft-bootstrap/`. The plan role reads: RDS, ElastiCache and log group
+  Describe calls, the queues' attributes, the master secret's metadata and version list, never its value, and
+  `secretsmanager:GetRandomPassword`, because the master password's ephemeral resource opens during plans too. The
+  deploy role also creates and changes `sft-*` clusters, instances, global clusters, subnet and parameter groups,
+  serverless caches, users and user groups, queues, the `sft/*/db/*` secrets and the `/aws/rds/cluster/sft-*` log
+  groups; deletes only those tagged `managed-by = terraform` and `project = secure-file-transfer`; creates the RDS and
+  ElastiCache service-linked roles; and uses KMS keys only through RDS, ElastiCache, Secrets Manager and SQS
+  (`kms:ViaService`), with grants for AWS resources only. Its security groups use the network layer's EC2 permissions.
 
 These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
 `/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply
 `bootstrap/<env>/ap-northeast-1` again with the `Admin` permission set. The roles' inline policies share IAM's limit
-of 10,240 characters per role; when later layers outgrow it, they move to managed policies under `/sft-bootstrap/`,
-which SCP 4 must then cover as well.
+of 10,240 characters per role, so later layers use managed policies under `/sft-bootstrap/` instead, which SCP 4
+already keeps with `Admin` (its `bootstrap_iam_resources`).

@@ -543,7 +543,7 @@ Settings, besides `LOG_LEVEL`, `APP_VERSION`, `BIND_HOST`, `INTERNAL_PORT` (8001
 |---|---|---|
 | `DATABASE_URL` | none, required | `sft_relay`'s URL; a secret |
 | `DATABASE_POOL_SIZE` | `2` | Connections per process |
-| `SQS_QUEUE_PREFIX` | none, required | The environment's queue names: `sft-dev-` gives `sft-dev-notify` |
+| `SQS_QUEUE_PREFIX` | none, required | The environment's queue names. In AWS `sft-<env>-<region-short>-`: `sft-dev-apne1-` gives `sft-dev-apne1-notify` (infra/modules/queues); locally `sft-local-` |
 | `SQS_ENDPOINT_URL` | none | Local only, for ElasticMQ; in AWS the SDK finds SQS's endpoint |
 | `AWS_REGION` | `ap-northeast-1` | |
 | `RELAY_BATCH_SIZE` | `50` | Rows per transaction (1 to 100) |
