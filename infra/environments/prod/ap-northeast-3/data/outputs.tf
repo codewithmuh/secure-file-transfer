@@ -1,1 +1,66 @@
-# No outputs yet: the issue that fills this stack adds them.
+# Read by the cluster and cluster-bootstrap stacks and by the application's settings (infra/modules/aurora, valkey and
+# queues). Key and bucket outputs come with #102.
+
+output "aurora_cluster_identifier" {
+  description = "The Aurora cluster in this Region."
+  value       = module.aurora.cluster_identifier
+}
+
+output "aurora_cluster_resource_id" {
+  description = "The cluster's resource ID, for rds-db:connect ARNs."
+  value       = module.aurora.cluster_resource_id
+}
+
+output "aurora_endpoint" {
+  description = "The writer endpoint, port and database. TLS with sslmode=verify-full; IAM database authentication."
+  value = {
+    host     = module.aurora.endpoint
+    port     = module.aurora.port
+    database = module.aurora.database_name
+  }
+}
+
+output "aurora_reader_endpoint" {
+  description = "The reader endpoint."
+  value       = module.aurora.reader_endpoint
+}
+
+output "aurora_security_group_id" {
+  description = "The cluster's security group."
+  value       = module.aurora.security_group_id
+}
+
+output "valkey_cache_arn" {
+  description = "The counter store, for elasticache:Connect in the workloads' policies."
+  value       = module.valkey.cache_arn
+}
+
+output "valkey_endpoint" {
+  description = "The counter store's endpoint: address and port. TLS and IAM authentication."
+  value       = module.valkey.endpoint
+}
+
+output "valkey_user_arns" {
+  description = "The counter store's users by workload, for elasticache:Connect in each workload's policy."
+  value       = module.valkey.user_arns
+}
+
+output "valkey_security_group_id" {
+  description = "The counter store's security group."
+  value       = module.valkey.security_group_id
+}
+
+output "queue_arns" {
+  description = "Queue ARNs by short name."
+  value       = module.queues.queue_arns
+}
+
+output "queue_urls" {
+  description = "Queue URLs by short name."
+  value       = module.queues.queue_urls
+}
+
+output "dead_letter_queue_arns" {
+  description = "Dead-letter queue ARNs by the short name of the queue they serve."
+  value       = module.queues.dead_letter_queue_arns
+}

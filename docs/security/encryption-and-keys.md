@@ -576,7 +576,7 @@ services that publish into encrypted topics and queues (Tokyo values):
       "Resource": "*",
       "Condition": {
         "StringEquals": {"aws:SourceAccount": "<prod>"},
-        "ArnEquals": {"aws:SourceArn": "arn:aws:sns:ap-northeast-1:<prod>:sft-prod-ses-events"}
+        "ArnEquals": {"aws:SourceArn": "arn:aws:sns:ap-northeast-1:<prod>:sft-prod-apne1-ses-events"}
       }
     },
     {
@@ -593,8 +593,8 @@ services that publish into encrypted topics and queues (Tokyo values):
 }
 ```
 
-- **SES sending events** go from the configuration set to the `sft-{env}-ses-events` topic, then to the queue the
-  notification worker reads (abuse and rate limits 7.3). The topic and the queue both use the platform key.
+- **SES sending events** go from the configuration set to the `sft-{env}-{region-short}-ses-events` topic, then to the
+  queue the notification worker reads (abuse and rate limits 7.3). The topic and the queue both use the platform key.
 - **EventBridge rules** (GuardDuty scan results and SES tenant pauses into queues, security alerts into alarm topics)
   deliver through their own execution role, `sft-{env}-events-delivery`, whose trust policy pins `aws:SourceAccount`
   and the rule ARNs. AWS doesn't support `aws:SourceAccount` or `aws:SourceArn` in a key policy statement for
