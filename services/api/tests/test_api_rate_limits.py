@@ -15,6 +15,7 @@ from starlette.testclient import TestClient
 from sft.api.app import create_app
 from sft.api.client_ip import rate_limit_ip
 from sft.api.rate_limits import get_rate_limiter, rate_limit
+from sft.core.errors import Unauthenticated
 from sft.core.settings import Settings
 from sft.data.counters import gcra_split
 from sft.service.rate_limits import RateLimiter
@@ -74,6 +75,11 @@ def app_with_routes(valkey_url: str, *, trusted_proxies: str = "") -> FastAPI:
         )
         return {"ok": "invited"}
 
+    @app.get("/v1/step-up")
+    async def step_up() -> None:
+        # A valid session whose sign-in is too old for the operation (authn and authz 3.3).
+        raise Unauthenticated("reauthentication_required")
+
     return app
 
 
@@ -130,6 +136,17 @@ def test_a_handler_applies_the_limits_whose_keys_it_finds(client: TestClient) ->
     response = client.post("/v1/invite", headers=auth)
     assert response.status_code == 429
     assert int(response.headers["retry-after"]) > 86000
+
+
+def test_a_step_up_401_is_no_failed_authentication(client: TestClient) -> None:
+    # Admins behind one NAT with older sessions mustn't block their office's IP.
+    for _ in range(120):
+        response = client.get("/v1/step-up")
+        assert (response.status_code, response.json()["code"]) == (
+            401,
+            "reauthentication_required",
+        )
+    assert client.get("/v1/me", headers={"authorization": "Bearer ok"}).status_code == 200
 
 
 def test_100_failed_authentications_block_the_ip_on_every_route(client: TestClient) -> None:

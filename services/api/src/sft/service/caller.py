@@ -107,6 +107,12 @@ class Caller:
         )
 
     @property
+    def bearer(self) -> bool:
+        """The credential came as a bearer token (an API key or an operator token), so a 401 to it
+        carries the RFC 6750 challenge."""
+        return self.kind in (CallerKind.API_KEY, CallerKind.OPERATOR)
+
+    @property
     def is_admin(self) -> bool:
         """The user holds the admin role, whatever the session's sign-in."""
         return self.role is Role.ADMIN

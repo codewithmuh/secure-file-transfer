@@ -100,6 +100,34 @@ def test_only_recovery_may_set_tx_id_or_occurred_at(migrated_db: ScratchDatabase
     assert {role for role, _ in rows} == {"sft_owner", RECOVERY}
 
 
+# The columns each credential lookup reads, as sft_lookup (data model 4.2), and nothing else.
+LOOKUP_COLUMNS = {
+    ("users", column, "SELECT")
+    for column in ("id", "tenant_id", "status", "invitation_token_hash", "invitation_expires_at")
+}
+LOOKUP_GRANTS = {(table, privilege) for table, _, privilege in LOOKUP_COLUMNS}
+
+
+def test_sft_lookup_reads_only_the_columns_of_its_lookups(migrated_db: ScratchDatabase) -> None:
+    rows = migrated_db.sql(
+        """
+        SELECT c.relname, a.attname, g.privilege_type
+          FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid,
+               aclexplode(a.attacl) g
+         WHERE c.relnamespace = 'public'::regnamespace AND g.grantee = 'sft_lookup'::regrole
+        """
+    )
+    assert set(rows) == LOOKUP_COLUMNS
+    tables = migrated_db.sql(
+        """
+        SELECT c.relname, g.privilege_type
+          FROM pg_class c, aclexplode(c.relacl) g
+         WHERE c.relnamespace = 'public'::regnamespace AND g.grantee = 'sft_lookup'::regrole
+        """
+    )
+    assert tables == [], "sft_lookup has a table grant; it reads columns only"
+
+
 def test_column_grants_follow_the_table_rules(migrated_db: ScratchDatabase) -> None:
     # Column grants live in pg_attribute, beside the table grants #48's catalog test reads.
     grants = migrated_db.sql(
@@ -118,7 +146,7 @@ def test_column_grants_follow_the_table_rules(migrated_db: ScratchDatabase) -> N
         assert role not in ("sft_owner", "sft_migrate")
         if role == "sft_lookup":
             # The credential lookups read their columns through lookup_read (data model 4.2).
-            assert privilege == "SELECT", f"sft_lookup may {privilege} columns of {table}"
+            assert (table, privilege) in LOOKUP_GRANTS, f"sft_lookup may {privilege} {table}"
         if table == "audit_events":
             assert privilege == "INSERT", f"{role} may {privilege} columns of audit_events"
         policies = migrated_db.sql(

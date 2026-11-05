@@ -7,9 +7,10 @@ either: ADR-0002 keeps them off the public load balancer, and CI builds the docu
 
 With settings, the app's lifespan opens the database pool and the rate-limit counter store at
 startup, without connecting, and closes them at shutdown, after uvicorn has drained the requests. A
-route reaches them through the `get_database` and `get_rate_limiter` dependencies, or names its
-limits with `rate_limit` (rate_limits.py). Without settings there is neither: that app is for
-generating the OpenAPI document and for tests of routes that don't need them.
+route reaches them through the `get_database` (dependencies.py) and `get_rate_limiter`
+dependencies, or names its limits with `rate_limit` (rate_limits.py). Without settings there is
+neither: that app is for generating the OpenAPI document and for tests of routes that don't need
+them.
 
 FastAPI's own OpenTelemetry support is off: `RequestContextMiddleware` makes the one SERVER span of
 each request, outside FastAPI's error handling, from the attribute allowlist (sft.core.telemetry).
@@ -23,11 +24,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
 from sft.api import members
+from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
 from sft.core.settings import Settings
@@ -70,14 +72,6 @@ def _lifespan(
             await database.dispose()
 
     return lifespan
-
-
-def get_database(request: Request) -> Database:
-    """The FastAPI dependency for the process's database: `Depends(get_database)`."""
-    database = getattr(request.app.state, "database", None)
-    if not isinstance(database, Database):
-        raise RuntimeError("this app was created without settings, so it has no database")
-    return database
 
 
 def create_app(

@@ -275,7 +275,7 @@ Section 7 explains each cap.
 | Account | 300 requests a minute | App | `429` |
 | API key | 300 requests a minute | App | `429` |
 | Tenant | 1,000 requests a minute (NFR-14), members and API keys together, groups D, F, G, H, I and K included | App | `429` |
-| IP | 100 failed authentications (any `401`) in 5 minutes | App | `429` for 15 minutes on every operation, checked before authentication, so a blocked IP never gets a `401` back |
+| IP | 100 failed authentications (any `401` except `reauthentication_required`, which a valid session gets on a step-up) in 5 minutes | App | `429` for 15 minutes on every operation, checked before authentication, so a blocked IP never gets a `401` back |
 | IP | 6,000 requests in 5 minutes | WAF `rate-api-ip` | `429`, `Retry-After: 300` |
 
 Safety actions never count against the tenant budget and are never refused by it: `revokeTransfer`,

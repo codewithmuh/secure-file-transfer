@@ -15,9 +15,11 @@ Refusals are `sft.core.errors` exceptions, which `sft.api.errors` answers: `429`
 `Retry-After`, or `503` with `Retry-After: 5` for a fail-closed limit during a store outage.
 
 `CountFailedAuthentications` records every `401` the API answers against the client's IP (group
-H: 100 in 5 minutes block the IP for 15). It checks that block before the app runs, so a blocked
-IP gets `429` on every route, before authentication: a bad credential can't get its `401` back
-and keep guessing.
+H: 100 in 5 minutes block the IP for 15), except `reauthentication_required`: a step-up answers a
+valid session whose sign-in is old, so it guesses nothing, and admins behind one NAT with older
+sessions mustn't block their office. It checks that block before the app runs, so a blocked IP
+gets `429` on every route, before authentication: a bad credential can't get its `401` back and
+keep guessing.
 """
 
 from __future__ import annotations
@@ -96,6 +98,10 @@ def rate_limit(limits: Sequence[Limit], *, caller: Callable[..., Any] | None = N
     return Depends(by_caller)
 
 
+NOT_FAILED_AUTHENTICATIONS = frozenset({"reauthentication_required"})
+"""The `401` codes that don't count against `H_FAILED_AUTH`: the credential was valid."""
+
+
 class CountFailedAuthentications:
     """Refuses a blocked IP before the app runs, and records each `401` against the client's IP."""
 
@@ -109,6 +115,8 @@ class CountFailedAuthentications:
             await self.app(scope, receive, send)
             return
         ip = client_ip(request)
+        # Shared with the request the error handler sees, which notes the problem's code here.
+        state: dict[str, Any] = scope.setdefault("state", {})
         try:
             await limiter.check(EVERY_REQUEST, {KeyType.IP: ip})
         except ProblemError as refused:
@@ -123,7 +131,7 @@ class CountFailedAuthentications:
             await send(message)
 
         await self.app(scope, receive, watch)
-        if status == 401:
+        if status == 401 and state.get("problem_code") not in NOT_FAILED_AUTHENTICATIONS:
             await limiter.record(H_FAILED_AUTH, ip)
 
 

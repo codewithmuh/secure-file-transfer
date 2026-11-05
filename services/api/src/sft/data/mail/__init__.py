@@ -17,15 +17,12 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
+from sft.core.addresses import is_plain_address
 from sft.core.settings import MailSettings
 
 # SES's rule for tag names and values; the SMTP adapter checks the same, so a test that passes
 # locally doesn't fail in AWS.
 _TAG = re.compile(r"[A-Za-z0-9_-]{1,256}")
-# No whitespace (which covers line and paragraph separators), no control or invisible format
-# characters such as a bidi override: an address goes into a header as it is.
-_ADDRESS_CHAR = r"[^\s@<>\",;\x00-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"
-_ADDRESS = re.compile(f"{_ADDRESS_CHAR}+@{_ADDRESS_CHAR}+")
 _RESERVED_TAGS = frozenset({"tenant_id", "email_type"})
 
 
@@ -46,7 +43,7 @@ class OutgoingEmail:
     def __post_init__(self) -> None:
         # The messages never include the values: an address is personal data.
         for name, address in (("to", self.to), ("reply_to", self.reply_to)):
-            if address is not None and not _ADDRESS.fullmatch(address):
+            if address is not None and not is_plain_address(address):
                 raise ValueError(f"{name} must be one plain email address")
         if self.subject.splitlines() != [self.subject]:  # every line break, U+2028 included
             raise ValueError("subject must be one non-empty line")

@@ -248,8 +248,11 @@ def problem_for(error: ProblemError) -> JSONResponse:
     )
 
 
-async def _problem_error(_: Request, exc: Exception) -> JSONResponse:
-    return problem_for(cast(ProblemError, exc))
+async def _problem_error(request: Request, exc: Exception) -> JSONResponse:
+    error = cast(ProblemError, exc)
+    # For the middleware outside: a step-up 401 isn't a failed authentication (rate_limits.py).
+    request.state.problem_code = error.code
+    return problem_for(error)
 
 
 # ---- requests FastAPI can't validate ----

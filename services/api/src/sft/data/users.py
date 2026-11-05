@@ -46,6 +46,10 @@ TOKEN_HASH_BYTES: Final = 32
 TARGET: Final = "user"
 """The audit target type of every user event."""
 
+MAX_PAGE: Final = 100
+"""The most users one page of `listUsers` holds (contract: `limit` 1 to 100). The route, the
+service and `list_users` all read it from here."""
+
 
 class UserExistsError(Exception):
     """The address is already a user of this tenant: `409 user_exists`. Other tenants are never
@@ -77,10 +81,12 @@ def _token_hash(token_hash: bytes | None) -> bytes | None:
 async def get_user(
     session: AsyncSession, user_id: UUID, *, for_update: bool = False
 ) -> User | None:
-    """The user, if the session's scope reaches them. `for_update` locks the row."""
+    """The user, if the session's scope reaches them. `for_update` locks the row and reads it
+    again from the database, so a lock after an earlier read sees what other transactions have
+    committed meanwhile, not the session's copy."""
     statement = select(User).where(User.id == user_id, in_scope(User, session))
     if for_update:
-        statement = statement.with_for_update()
+        statement = statement.with_for_update().execution_options(populate_existing=True)
     user: User | None = await session.scalar(statement)
     return user
 
@@ -103,12 +109,13 @@ async def list_users(
     after: UUID | None = None,
     limit: int = 25,
 ) -> Sequence[User]:
-    """One page of the tenant's users, oldest first, after the user `after` (keyset paging).
+    """A page of `limit` users of the tenant and one more, oldest first, after the user `after`
+    (keyset paging). The extra user, when there is one, tells the caller that more follow.
 
-    IDs are UUIDv7, so their order is the order of creation.
+    IDs are UUIDv7, so their order is the order of creation. `limit` is 1 to `MAX_PAGE`.
     """
-    if not 1 <= limit <= 101:
-        raise ValueError("a page holds 1 to 100 users, plus one to tell whether more follow")
+    if not 1 <= limit <= MAX_PAGE:
+        raise ValueError(f"a page holds 1 to {MAX_PAGE} users")
     statement = select(User).where(in_scope(User, session))
     if role is not None:
         statement = statement.where(User.role == Role(role).value)
@@ -118,7 +125,7 @@ async def list_users(
         statement = statement.where(User.dlp_approver.is_(dlp_approver))
     if after is not None:
         statement = statement.where(User.id > after)
-    return (await session.scalars(statement.order_by(User.id).limit(limit))).all()
+    return (await session.scalars(statement.order_by(User.id).limit(limit + 1))).all()
 
 
 async def lock_active_admins(session: AsyncSession) -> Sequence[UUID]:
@@ -334,14 +341,18 @@ async def deactivate_user(
     actor: Actor,
     origin: Origin | None = None,
 ) -> User:
-    """Deactivate a user and void any invitation link they have. A security-critical record,
-    `user.deactivated`. Raises `NotFoundError` if the scope doesn't reach the user."""
+    """Deactivate a user, void any invitation link they have, and clear `dlp_approver` and
+    `sso_fallback`: a deactivated user approves nothing and is no fallback admin, so neither flag
+    outlives the user (data model 2.1). A security-critical record, `user.deactivated`. Raises
+    `NotFoundError` if the scope doesn't reach the user."""
     user = await _update_one(
         session,
         [User.id == user_id, in_scope(User, session)],
         status=UserStatus.DEACTIVATED.value,
         invitation_token_hash=None,
         invitation_expires_at=None,
+        dlp_approver=False,
+        sso_fallback=False,
     )
     await audit.record(
         session,

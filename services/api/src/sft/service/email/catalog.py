@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from typing import ClassVar, Literal
 from uuid import UUID
 
+from sft.core.addresses import is_plain_address
+
 
 class Locale(enum.StrEnum):
     """The `Locale` of the API contract (FR-33)."""
@@ -123,10 +125,6 @@ def format_time(value: datetime, locale: Locale) -> str:
 
 # ---- checks: messages name the field, never the value ----
 
-# No whitespace (which covers line and paragraph separators), no control or invisible format
-# characters such as a bidi override: an address goes into a header as it is.
-_ADDRESS_CHAR = r"[^\s@<>\",;\x00-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"
-_ADDRESS = re.compile(f"{_ADDRESS_CHAR}+@{_ADDRESS_CHAR}+")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{22,128}")  # base64url, at least 128 bits (NFR-14)
 _CODE = re.compile(r"[0-9]{6,10}")  # at least 6 digits (NFR-14)
 _PASSWORD = re.compile(r"[!-~]{8,128}")  # printable ASCII, no spaces
@@ -167,7 +165,7 @@ class Email:
         for f in fields(self):
             value = getattr(self, f.name)
             if f.name.endswith("_email"):
-                _check(f.name, isinstance(value, str) and bool(_ADDRESS.fullmatch(value)))
+                _check(f.name, isinstance(value, str) and is_plain_address(value))
             elif f.name == "token":
                 _check(f.name, bool(_TOKEN.fullmatch(value)))
             elif f.name == "code":
