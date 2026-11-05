@@ -20,8 +20,12 @@ RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-edi
 FROM python:3.13-slim-trixie
 ARG APP_VERSION=0.0.0
 ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1 APP_VERSION=${APP_VERSION} BIND_HOST=0.0.0.0
-# pip is only needed to build, and its bundled libraries (urllib3, msgpack, …) show up in CVE scans.
-RUN python -m pip uninstall --yes pip \
+# Debian's fixes go in at build time, not when the base image is next rebuilt upstream: the scan
+# fails on any fixed HIGH or CRITICAL. pip is only needed to build, and its bundled libraries
+# (urllib3, msgpack, …) show up in CVE scans.
+RUN apt-get update && apt-get upgrade --yes --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall --yes pip \
  && groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
 WORKDIR /app
 # Owned by root: the app user can read and run its code but not change it.
