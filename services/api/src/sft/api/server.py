@@ -31,43 +31,26 @@ the pod's 150 s grace period covers the hook plus the drain.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import signal
-from collections.abc import Iterator
 
 import uvicorn
 from starlette.types import ASGIApp
 
 from sft.api.app import create_app
-from sft.api.internal import Readiness, create_internal_app
 from sft.api.observability import HttpMetrics, RequestContextMiddleware
 from sft.core.settings import Settings
+from sft.runtime.internal import Readiness, Server, create_internal_app, internal_config
 
 log = logging.getLogger(__name__)
 
-_INTERNAL_DRAIN_SECONDS = 5  # probes and scrapes are quick
 
-
-class _Server(uvicorn.Server):
-    """A uvicorn server that leaves signal handling to `ApiServer`.
-
-    uvicorn's own handler would stop only one of the two servers. After its graceful shutdown it
-    also raises the signal again with the default handler, so the process ends killed by SIGTERM
-    (exit status 143) instead of exiting 0, unless it runs as PID 1, where the kernel ignores it.
-    """
-
-    @contextlib.contextmanager
-    def capture_signals(self) -> Iterator[None]:
-        yield
-
-
-def _config(app: ASGIApp, host: str, port: int, *, drain: int, lifespan: bool) -> uvicorn.Config:
+def _config(app: ASGIApp, host: str, port: int, *, drain: int) -> uvicorn.Config:
     return uvicorn.Config(
         app,
         host=host,
         port=port,
-        lifespan="on" if lifespan else "off",
+        lifespan="on",
         timeout_graceful_shutdown=drain,
         # Each request runs in a fresh context, so its IDs can't leak into another's logs.
         reset_contextvars=True,
@@ -89,23 +72,16 @@ class ApiServer:
             app or create_app(settings, registry=self.metrics.registry), self.metrics
         )
         internal_app = create_internal_app(self.readiness, self.metrics.registry)
-        self._public = _Server(
+        self._public = Server(
             _config(
                 public_app,
                 settings.bind_host,
                 settings.public_port,
                 drain=settings.shutdown_drain_seconds,
-                lifespan=True,
             )
         )
-        self._internal = _Server(
-            _config(
-                internal_app,
-                settings.bind_host,
-                settings.internal_port,
-                drain=_INTERNAL_DRAIN_SECONDS,
-                lifespan=False,
-            )
+        self._internal = Server(
+            internal_config(internal_app, settings.bind_host, settings.internal_port)
         )
 
     def handle_signal(self, sig: signal.Signals) -> None:

@@ -228,6 +228,22 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
         name=marker,
     )
     rows = isolation_fixture.seed(db, tenant_id, marker)
+    # The outbox (#51): one unpublished message, and one message a consumer has recorded.
+    rows["outbox"], rows["processed_message"] = uuid.uuid4(), uuid.uuid4()
+    db.sql(
+        "INSERT INTO outbox (id, tenant_id, topic, payload, last_error) VALUES (:id, :tenant, "
+        "'isolation.seed', jsonb_build_object('file_id', CAST(:file AS text)), :marker)",
+        id=rows["outbox"],
+        tenant=tenant_id,
+        file=str(rows["outbox"]),
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO processed_messages (consumer, message_id, tenant_id) "
+        "VALUES ('isolation', :message, :tenant)",
+        message=str(rows["processed_message"]),
+        tenant=tenant_id,
+    )
     return Seeded(tenant_id, marker, rows)
 
 

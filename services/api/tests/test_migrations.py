@@ -12,7 +12,7 @@ from pg import ScratchDatabase
 from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, compatible_with, include_name
 from sft.data.models import Base
-from sft.data.rls import tenant_rls_sql
+from sft.data.rls import grant_sql, policy_sql, tenant_rls_sql
 
 SCRIPTS = ScriptDirectory.from_config(alembic_config())
 
@@ -53,6 +53,37 @@ def test_0001_keeps_the_sql_the_helpers_wrote_for_it() -> None:
     frozen = SCRIPTS.get_revision("0001").module.TENANTS_RLS
     assert list(frozen) == tenant_rls_sql(
         "tenants", key="id", grants={"sft_api": "SELECT", "sft_operator": "SELECT, INSERT, UPDATE"}
+    )
+
+
+def test_the_outbox_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001: if a helper changes on purpose, replace the calls with the old output. Found by
+    # its contents, so renumbering the revision doesn't touch this test.
+    [module] = [s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "OUTBOX_RLS")]
+    system = "app_scope() = 'system'"
+    assert list(module.OUTBOX_RLS) == [
+        *tenant_rls_sql(
+            "outbox",
+            grants={
+                "sft_api": "INSERT",
+                "sft_operator": "INSERT",
+                "sft_scan": "INSERT",
+                "sft_jobs": "INSERT",
+            },
+        ),
+        grant_sql("outbox", "sft_relay", "SELECT, UPDATE"),
+        policy_sql("relay_read", "outbox", roles=["sft_relay"], command="SELECT", using=system),
+        policy_sql(
+            "relay_mark",
+            "outbox",
+            roles=["sft_relay"],
+            command="UPDATE",
+            using=system,
+            with_check=system,
+        ),
+    ]
+    assert list(module.PROCESSED_MESSAGES_RLS) == tenant_rls_sql(
+        "processed_messages", grants={"sft_scan": "INSERT", "sft_notify": "INSERT"}
     )
 
 

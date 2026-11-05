@@ -13,18 +13,12 @@ import secrets
 import time
 from dataclasses import dataclass
 
-from prometheus_client import (
-    CollectorRegistry,
-    Counter,
-    GCCollector,
-    Histogram,
-    PlatformCollector,
-    ProcessCollector,
-)
+from prometheus_client import CollectorRegistry, Counter, Histogram
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sft.core.logs import bind_context
+from sft.runtime.internal import process_registry
 
 log = logging.getLogger("sft.api.request")
 
@@ -48,11 +42,7 @@ class HttpMetrics:
 
     @classmethod
     def create(cls) -> HttpMetrics:
-        registry = CollectorRegistry()
-        # The process, platform and garbage-collector metrics the default registry would have.
-        ProcessCollector(registry=registry)
-        PlatformCollector(registry=registry)
-        GCCollector(registry=registry)
+        registry = process_registry()
         requests = Counter(
             "http_requests_total",
             "HTTP requests on the public port.",
