@@ -4,17 +4,18 @@ import { Upload, Plus } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import { Button, Card, Badge, Table, TableHead, TableBody, TableRow, TableHeader, TableCell, EmptyState } from '@/components/ui';
 import { formatDate, formatFileSize } from '@/lib/formatters';
-import type { UploadRequest } from '@/types';
+import type { UploadRequest, UploadRequestState } from '@/api';
 
+// Mock data in the contract's shape; replaced by TanStack Query when the API exists.
 const mockRequests: UploadRequest[] = [
-  { id: '1', email: 'supplier@example.com', locale: 'en', status: 'active', message: 'Please upload the signed contract', expires_at: '2026-11-14T00:00:00Z', file_count: 2, total_size: 8_000_000, created_at: '2026-11-04T05:00:00Z' },
-  { id: '2', email: 'accountant@example.com', locale: 'ja', status: 'expired', message: null, expires_at: '2026-11-01T00:00:00Z', file_count: 0, total_size: 0, created_at: '2026-10-25T09:00:00Z' },
+  { id: '1', state: 'open', created_by: 'u1', created_at: '2026-11-04T05:00:00Z', uploader_email: 'supplier@example.com', locale: 'en', message: 'Please upload the signed contract', expires_at: '2026-11-14T00:00:00Z', revoked_at: null, revoked_by: null, uploader_access_state: 'verified', delivery_state: 'sent', notified_at: '2026-11-04T05:00:05Z', failed_attempts: 0, locked_at: null, file_count: 2, total_size: 8_000_000 },
+  { id: '2', state: 'expired', created_by: 'u1', created_at: '2026-10-25T09:00:00Z', uploader_email: 'accountant@example.com', locale: 'ja', message: null, expires_at: '2026-11-01T00:00:00Z', revoked_at: null, revoked_by: null, uploader_access_state: 'invited', delivery_state: 'sent', notified_at: '2026-10-25T09:00:05Z', failed_attempts: 0, locked_at: null, file_count: 0, total_size: 0 },
 ];
 
-const statusBadge = {
-  active: { variant: 'success' as const, label: 'Active' },
-  expired: { variant: 'default' as const, label: 'Expired' },
-  revoked: { variant: 'danger' as const, label: 'Revoked' },
+const stateBadge: Record<UploadRequestState, { variant: 'success' | 'default' | 'danger'; label: string }> = {
+  open: { variant: 'success', label: 'Open' },
+  expired: { variant: 'default', label: 'Expired' },
+  revoked: { variant: 'danger', label: 'Revoked' },
 };
 
 export function UploadRequestListPage() {
@@ -57,11 +58,11 @@ export function UploadRequestListPage() {
             </TableHead>
             <TableBody>
               {mockRequests.map((req) => {
-                const badge = statusBadge[req.status];
+                const badge = stateBadge[req.state];
                 return (
                   <TableRow key={req.id}>
                     <TableCell><Badge variant={badge.variant}>{badge.label}</Badge></TableCell>
-                    <TableCell><span className="font-medium">{req.email}</span></TableCell>
+                    <TableCell><span className="font-medium">{req.uploader_email}</span></TableCell>
                     <TableCell>{req.message ?? '—'}</TableCell>
                     <TableCell>{req.file_count}</TableCell>
                     <TableCell>{formatFileSize(req.total_size)}</TableCell>

@@ -13,6 +13,7 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
+    errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     observability.py  request and trace IDs, request metrics, one log line per request
     server.py         both listeners in one process, and the graceful shutdown
     __main__.py       python -m sft.api
@@ -38,6 +39,7 @@ src/sft/
     processed.py      processed-message records, which make consumers idempotent
     migrations/       the Alembic revisions; migrate.py is the migration job
   core/         settings, logging and UUIDv7 IDs, used by every layer
+    errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
 ```
 
 `api` and `workers` never import each other. `service`, `data` and `core` never import FastAPI, Starlette or uvicorn;
@@ -48,12 +50,13 @@ other.
 
 From the repository root, `make check` runs what CI runs: ruff, mypy (strict), `lint-imports` and pytest with the
 80 % coverage gate. The data layer's tests need a real PostgreSQL 17 server (below). `make up` runs the image with the
-production hardening. To run it from source:
+production hardening, after the jobs that create the database roles and run the migrations. To run it from source
+against the stack's database (`docker compose stop api` first: it holds the ports):
 
 ```bash
 cd services/api
 uv sync
-DATABASE_URL=postgresql://sft_api@127.0.0.1:5432/sft uv run python -m sft.api
+DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft uv run python -m sft.api
 curl -s localhost:8001/readyz   # API on 127.0.0.1:8000, probes and metrics on 127.0.0.1:8001
 ```
 
@@ -321,7 +324,8 @@ three months ahead and exports `sft_audit_default_partition_rows`, `sft_audit_pa
 The data layer's tests need a PostgreSQL 17 superuser URL in `TEST_DATABASE_URL`. They make their own databases there
 and drop them afterwards; the roles, which are cluster-wide, stay. In CI it is a service container on the Python job.
 Without it the database tests are skipped locally; in CI (`CI` set) they fail instead, so they can't be skipped
-there by accident.
+there by accident. While the local stack runs (`make up`), `make test` sets it to the stack's superuser for you
+([local development](../../docs/local-development.md) 1); otherwise start a server of your own:
 
 ```bash
 docker run --detach --name sft-test-postgres --publish 127.0.0.1:55432:5432 \

@@ -6,7 +6,8 @@ with the contract:
 
 - an operation that isn't in the contract fails, and so does a route the document doesn't show;
 - an operation that is in the contract must match it in method, path, operation ID, parameters,
-  request body and success responses (status codes, media types and schemas);
+  request body, success responses and error responses (status codes, media types and schemas), so
+  a route that declares an error the contract doesn't, or leaves one out, fails;
 - contract operations the code doesn't implement yet are allowed, and counted.
 
 Schemas are compared after both sides are normalised, so that two ways of writing the same schema
@@ -22,7 +23,7 @@ import argparse
 import json
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -318,13 +319,22 @@ def _request_body(operation: Mapping[str, Json], normaliser: _Normaliser) -> dic
     return {"required": required, "content": content}
 
 
-def _success_responses(
-    operation: Mapping[str, Json], normaliser: _Normaliser
+def _is_success(status: str) -> bool:
+    return status[:1] in ("2", "3")
+
+
+def _is_error(status: str) -> bool:
+    """A 4xx or 5xx status, a range such as `4XX`, or `default`."""
+    return status[:1] in ("4", "5") or status == "default"
+
+
+def _responses(
+    operation: Mapping[str, Json], normaliser: _Normaliser, kind: Callable[[str], bool]
 ) -> dict[str, dict[str, Json]]:
     return {
         str(status): _content(normaliser.resolve(response).get("content", {}), normaliser)
         for status, response in operation.get("responses", {}).items()
-        if str(status)[:1] in ("2", "3")
+        if kind(str(status))
     }
 
 
@@ -522,8 +532,8 @@ def _compare_operation(
             )
         differences += _diff_content(contract_body["content"], body["content"], "request body")
 
-    contract_responses = _success_responses(contract_op.operation, contract_normaliser)
-    responses = _success_responses(operation, normaliser)
+    contract_responses = _responses(contract_op.operation, contract_normaliser, _is_success)
+    responses = _responses(operation, normaliser, _is_success)
     if set(contract_responses) != set(responses):
         differences.append(
             f"success statuses: the contract has {sorted(contract_responses)}, "
@@ -533,6 +543,29 @@ def _compare_operation(
         differences += _diff_content(
             contract_responses[status], responses[status], f"response {status}"
         )
+    return differences + _compare_errors(contract_op, contract_normaliser, operation, normaliser)
+
+
+def _compare_errors(
+    contract_op: ContractOperation,
+    contract_normaliser: _Normaliser,
+    operation: Mapping[str, Json],
+    normaliser: _Normaliser,
+) -> list[str]:
+    """Each error status the code declares must be one the contract declares, and the reverse."""
+    expected = _responses(contract_op.operation, contract_normaliser, _is_error)
+    actual = _responses(operation, normaliser, _is_error)
+    differences = [
+        f"error response {status}: not in the contract, so the route may not answer with it"
+        for status in sorted(set(actual) - set(expected))
+    ]
+    differences += [
+        f"error response {status}: missing in the code; declare it with "
+        "sft.api.errors.problem_responses()"
+        for status in sorted(set(expected) - set(actual))
+    ]
+    for status in sorted(set(expected) & set(actual)):
+        differences += _diff_content(expected[status], actual[status], f"response {status}")
     return differences
 
 

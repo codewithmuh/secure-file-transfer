@@ -4583,8 +4583,9 @@ components:
             $ref: '#/components/schemas/Problem'
     UnexpectedError:
       description: |
-        An unexpected server error, as a problem document. Declared on the sign-in navigations, which succeed with a
-        redirect: apart from `429` and `503`, it is the only answer they give that isn't a redirect.
+        An unexpected server error, as a problem document (`500 internal_error`). Declared on the sign-in
+        navigations, which succeed with a redirect: apart from `429` and `503`, it is the only answer they give that
+        isn't a redirect.
       content:
         application/problem+json:
           schema:
@@ -4764,7 +4765,9 @@ components:
           description: ID of the request, also in the service's logs and traces. Quote it when reporting a problem.
         errors:
           type: array
-          description: For `validation_failed`, one entry per problem.
+          description: |
+            One entry per problem: for `validation_failed` and `recipient_undeliverable`, and for a `malformed_request`
+            caused by a query, header or cookie parameter.
           items:
             $ref: '#/components/schemas/ValidationIssue'
         attempts_remaining:
@@ -4796,6 +4799,7 @@ components:
         - download_grant_exhausted
         - not_found
         - link_not_found
+        - method_not_allowed
         - idempotency_conflict
         - idempotency_in_progress
         - invalid_state
@@ -4819,6 +4823,7 @@ components:
         - total_too_large
         - storage_quota_exceeded
         - request_too_large
+        - unsupported_media_type
         - range_not_satisfiable
         - validation_failed
         - expiry_out_of_range
@@ -4833,6 +4838,7 @@ components:
         - justification_required
         - approvers_insufficient
         - rate_limited
+        - internal_error
         - service_unavailable
 
     ValidationIssue:

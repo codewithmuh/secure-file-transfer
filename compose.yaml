@@ -10,21 +10,77 @@ x-hardening: &hardening
   tmpfs: [/tmp]
   restart: unless-stopped
 
+# The API image. The database jobs and the workers run from it too, as in AWS; the build is cached,
+# so each service that names it costs a tag, not a rebuild.
+x-api-image: &api-image
+  build:
+    context: ./services/api
+    args: { APP_VERSION: local }
+
+# A workload starts only once its database is ready: roles, local passwords and migrations
+# (docs/local-development.md 3).
+x-database-ready: &database-ready
+  db-migrate: { condition: service_completed_successfully }
+
 services:
   api:
-    <<: *hardening
-    build:
-      context: ./services/api
-      args: { APP_VERSION: local }
+    <<: [*hardening, *api-image]
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # Its own login role, never a superuser, so row-level security applies (ADR-0020). Required;
-      # the API connects only when a request needs the database. The `postgres` service comes with
-      # the local stack (#52); running the bootstrap and migration jobs in it is a follow-up issue.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://sft_api@postgres:5432/sft}
+      # Its own login role, never a superuser, so row-level security applies (ADR-0020). Fixed
+      # here, not read from .env, whose DATABASE_URL is for code on the host. The password is
+      # local-only; the API connects only when a request needs the database.
+      DATABASE_URL: postgresql://sft_api:test-only-password@postgres:5432/sft
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
+    depends_on:
+      <<: *database-ready
+      # The buckets. Depending on the one-shot also lets `up --wait` accept its exit on a re-run.
+      s3-init: { condition: service_completed_successfully }
+
+  # relay: the outbox relay (#51) goes here, from *api-image, with `depends_on: *database-ready`
+  # and DATABASE_URL as sft_relay with the same local password.
+
+  # ---- Database jobs: one-shot, in order, on every `make up`. Each is safe to repeat. ----
+
+  db-bootstrap: # the roles (sft.data.bootstrap), as the superuser; the master user in AWS
+    <<: [*hardening, *api-image]
+    restart: "no"
+    command: ["python", "-m", "sft.data.bootstrap"]
+    healthcheck: { disable: true } # the image's check is the API's probe port
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      BOOTSTRAP_DATABASE_URL: postgresql://sft:sft-local-only@postgres:5432/sft
+      BOOTSTRAP_IAM_AUTH: "false" # AWS signs in with IAM tokens; locally db-passwords sets passwords
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  db-passwords: # local only: the login roles' fake password; in AWS they have none (IAM tokens)
+    <<: *hardening
+    image: postgres:17.11-trixie@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+    user: "999:999"
+    restart: "no"
+    entrypoint: ["psql", "--no-psqlrc", "--quiet", "--set=ON_ERROR_STOP=1", "--file=/passwords.sql"]
+    environment:
+      PGHOST: postgres
+      PGUSER: sft
+      PGPASSWORD: sft-local-only
+      PGDATABASE: sft
+    volumes: ["./local/postgres/passwords.sql:/passwords.sql:ro"]
+    depends_on:
+      db-bootstrap: { condition: service_completed_successfully }
+
+  db-migrate: # the migrations (sft.data.migrate), as sft_migrate; an Argo CD PreSync job in AWS
+    <<: [*hardening, *api-image]
+    restart: "no"
+    command: ["python", "-m", "sft.data.migrate"]
+    healthcheck: { disable: true } # the image's check is the API's probe port
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      MIGRATION_DATABASE_URL: postgresql://sft_migrate:test-only-password@postgres:5432/sft
+    depends_on:
+      db-passwords: { condition: service_completed_successfully }
 
   relay: # the outbox relay (ADR-0013): the same image, another entry point
     <<: *hardening
@@ -154,6 +210,8 @@ services:
       MP_SMTP_AUTH_ACCEPT_ANY: "true"
       MP_SMTP_AUTH_ALLOW_INSECURE: "true"
       MP_MAX_MESSAGES: "5000"
+      # No reverse DNS of each SMTP client: on Docker Desktop it delays the greeting 4 to 8 s, past smoke's timeout.
+      MP_SMTP_DISABLE_RDNS: "true"
       MP_ALLOWED_HOSTS: localhost:8025,127.0.0.1:8025,mail:8025 # refuse other Host headers (DNS rebinding)
     ports: ["127.0.0.1:1025:1025", "127.0.0.1:8025:8025"] # SMTP; web UI and API
     healthcheck:

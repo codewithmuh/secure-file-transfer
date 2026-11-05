@@ -17,6 +17,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from fastapi import FastAPI, Request
 
+from sft.api.errors import register_error_handlers
 from sft.core.settings import Settings
 from sft.data.database import Database
 
@@ -51,7 +52,7 @@ def get_database(request: Request) -> Database:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    return FastAPI(
+    app = FastAPI(
         title=API_TITLE,
         version=API_VERSION,
         docs_url=None,
@@ -59,3 +60,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
         lifespan=None if settings is None else _lifespan(settings),
     )
+    register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
+    return app

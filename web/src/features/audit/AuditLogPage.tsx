@@ -4,14 +4,15 @@ import { Search, Download, FileText } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import { Button, Card, Input, Badge, Table, TableHead, TableBody, TableRow, TableHeader, TableCell, EmptyState } from '@/components/ui';
 import { formatDate } from '@/lib/formatters';
-import type { AuditEvent } from '@/types';
+import type { AuditEvent } from '@/api';
 
+// Mock data in the contract's shape; replaced by TanStack Query when the API exists.
 const mockEvents: AuditEvent[] = [
-  { id: '1', action: 'transfer.created', actor_type: 'member', actor_email: 'rashid@company.com', target_type: 'transfer', target_id: 'tr_1', ip_address: '203.0.113.1', user_agent: 'Chrome/120', details: {}, created_at: '2026-11-04T06:00:00Z' },
-  { id: '2', action: 'transfer.sent', actor_type: 'member', actor_email: 'rashid@company.com', target_type: 'transfer', target_id: 'tr_1', ip_address: '203.0.113.1', user_agent: 'Chrome/120', details: {}, created_at: '2026-11-04T06:01:00Z' },
-  { id: '3', action: 'link.verified', actor_type: 'recipient', actor_email: 'alice@example.com', target_type: 'transfer', target_id: 'tr_1', ip_address: '198.51.100.5', user_agent: 'Firefox/121', details: {}, created_at: '2026-11-04T07:00:00Z' },
-  { id: '4', action: 'file.downloaded', actor_type: 'recipient', actor_email: 'alice@example.com', target_type: 'file', target_id: 'f_1', ip_address: '198.51.100.5', user_agent: 'Firefox/121', details: {}, created_at: '2026-11-04T07:05:00Z' },
-  { id: '5', action: 'member.sign_in', actor_type: 'member', actor_email: 'admin@company.com', target_type: 'user', target_id: 'u_1', ip_address: '192.0.2.10', user_agent: 'Chrome/120', details: {}, created_at: '2026-11-04T05:00:00Z' },
+  { id: '1', occurred_at: '2026-11-04T06:00:00Z', actor_type: 'member', actor_id: 'u_2', actor_email: 'rashid@company.com', action: 'transfer.created', target_type: 'transfer', target_id: 'tr_1', source_ip: '203.0.113.1', user_agent: 'Chrome/120', request_id: 'req_1', security_critical: false, details: {} },
+  { id: '2', occurred_at: '2026-11-04T06:01:00Z', actor_type: 'member', actor_id: 'u_2', actor_email: 'rashid@company.com', action: 'transfer.sent', target_type: 'transfer', target_id: 'tr_1', source_ip: '203.0.113.1', user_agent: 'Chrome/120', request_id: 'req_2', security_critical: false, details: {} },
+  { id: '3', occurred_at: '2026-11-04T07:00:00Z', actor_type: 'recipient', actor_id: 'r_1', actor_email: 'alice@example.com', action: 'link.verified', target_type: 'transfer', target_id: 'tr_1', source_ip: '198.51.100.5', user_agent: 'Firefox/121', request_id: 'req_3', security_critical: false, details: {} },
+  { id: '4', occurred_at: '2026-11-04T07:05:00Z', actor_type: 'recipient', actor_id: 'r_1', actor_email: 'alice@example.com', action: 'file.downloaded', target_type: 'file', target_id: 'f_1', source_ip: '198.51.100.5', user_agent: 'Firefox/121', request_id: 'req_4', security_critical: true, details: {} },
+  { id: '5', occurred_at: '2026-11-04T05:00:00Z', actor_type: 'member', actor_id: 'u_1', actor_email: 'admin@company.com', action: 'member.sign_in', target_type: 'user', target_id: 'u_1', source_ip: '192.0.2.10', user_agent: 'Chrome/120', request_id: 'req_5', security_critical: false, details: {} },
 ];
 
 const actionBadge: Record<string, { variant: 'success' | 'info' | 'warning' | 'danger' | 'default'; label: string }> = {
@@ -68,7 +69,7 @@ export function AuditLogPage() {
                 const badge = actionBadge[event.action] ?? { variant: 'default' as const, label: event.action };
                 return (
                   <TableRow key={event.id}>
-                    <TableCell className="whitespace-nowrap">{formatDate(event.created_at)}</TableCell>
+                    <TableCell className="whitespace-nowrap">{formatDate(event.occurred_at)}</TableCell>
                     <TableCell><Badge variant={badge.variant}>{badge.label}</Badge></TableCell>
                     <TableCell>
                       <div>
@@ -79,7 +80,7 @@ export function AuditLogPage() {
                     <TableCell>
                       {event.target_type && <span className="text-xs text-gray-500">{event.target_type}:{event.target_id}</span>}
                     </TableCell>
-                    <TableCell><code className="text-xs">{event.ip_address}</code></TableCell>
+                    <TableCell><code className="text-xs">{event.source_ip ?? '—'}</code></TableCell>
                   </TableRow>
                 );
               })}
