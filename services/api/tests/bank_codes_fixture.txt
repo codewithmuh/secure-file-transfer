@@ -1,0 +1,47 @@
+# Japanese bank and branch codes for jp_bank_account (docs/design/dlp-detectors.md 4.4).
+# One 7-digit code per line: the 4-digit bank code, then the 3-digit branch code.
+# Written by tools/bank_codes.py; refresh steps in services/api/README.md.
+# TEST DATA ONLY: made up for the detector tests and the accuracy corpus (#146). Never bundle it.
+# source: synthetic test fixture: random codes from a fixed seed, not a real list
+# licence: this repository's own (PolyForm-Noncommercial-1.0.0)
+# retrieved: 2026-11-05
+0398130
+0420178
+0625009
+0647219
+1067162
+1101133
+1383355
+2153740
+2158594
+2184143
+2413348
+3586922
+3972173
+4379471
+4725961
+5099074
+5376791
+5468075
+5475458
+5532462
+5534580
+5727505
+5893500
+6120436
+6381397
+6433973
+6778312
+6862333
+6986158
+7175884
+7188793
+7272033
+7296490
+7659593
+8777724
+9236288
+9375110
+9521944
+9756958
+9817198

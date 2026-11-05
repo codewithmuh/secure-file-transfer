@@ -11,9 +11,12 @@ never a matched value (FR-53, NFR-26).
     findings = scanner.findings()
 
 `DETECTORS_VERSION` changes with any change to a built-in detector or its data (issuer ranges, TLDs,
-credential patterns); it is part of the inspection engine version each file records ([DLP] 9).
+credential patterns, the bank and branch code list); it is part of the inspection engine version
+each file records ([DLP] 9). The code list's part is its retrieval date, `banks-none` while none is
+bundled (`bank_codes`).
 """
 
+from sft.dlp.detect import bank_codes
 from sft.dlp.detect.blocks import PASSPORT_MRZ, PRIVATE_KEY
 from sft.dlp.detect.builtin import (
     BANK_ACCOUNT,
@@ -41,7 +44,7 @@ from sft.dlp.units import (
     TextUnit,
 )
 
-DETECTORS_VERSION = "1"
+DETECTORS_VERSION = f"2.banks-{bank_codes.load().version}"
 
 BUILTIN_DETECTORS = frozenset(
     {

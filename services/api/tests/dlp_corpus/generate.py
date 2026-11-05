@@ -35,10 +35,11 @@ import string
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import phonenumbers
 
-from sft.dlp.detect import checks
+from sft.dlp.detect import bank_codes, checks
 from sft.dlp.detect.normalise import keyword_term
 from sft.dlp.units import Cell, Confidence, KeywordList, TextUnit
 
@@ -46,6 +47,12 @@ DEFAULT_SEED = 25
 """NFR-25."""
 
 KEYWORD_LIST_ID = "corpus-keywords"
+
+BANK_CODES = bank_codes.parse(
+    (Path(__file__).resolve().parents[1] / "bank_codes_fixture.txt").read_text("utf-8")
+)
+"""The synthetic bank and branch code list the corpus's high bank accounts use ([DLP] 4.4): the
+scorer gives every scanner this list, since nothing real is bundled yet (#146)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -635,10 +642,33 @@ def _card_positives(rng: random.Random, count: int) -> list[Document]:
     return docs
 
 
+def _bank_pair(codes_rng: random.Random) -> tuple[str, str, Confidence]:
+    """Bank and branch codes for an account, and the confidence they give it: half of the time a
+    pair on the corpus's list (high), half a pair that isn't (medium)."""
+    if codes_rng.random() < 0.5:
+        code = codes_rng.choice(sorted(BANK_CODES.codes))
+        return code[:4], code[4:], "high"
+    while True:
+        bank, branch = _digits(codes_rng, 4), _digits(codes_rng, 3)
+        if not BANK_CODES.valid(bank, branch):
+            return bank, branch, "medium"
+
+
+_BANK_CODE_TEMPLATES = (
+    "{company} 架空銀行(銀行コード {bank}) 見本支店(支店コード {branch}) 普通 {{v}}",
+    "振込先: 金融機関コード {bank}-{branch} 当座 口座番号 {{v}}",
+    "Bank code {bank}, branch code {branch}, account number {{v}}",
+)
+
+
 def _bank_positives(rng: random.Random, count: int) -> list[Document]:
     docs = []
     for index in range(count):
         kind = rng.choice(("ordinary", "ordinary", "japan-post", "japan-post-keywords", "table"))
+        # Its own generator, so the bank and branch codes (#146) leave the rest of the corpus as
+        # it was for the same seed.
+        codes_rng = random.Random(f"jp_bank_account-{index}")  # noqa: S311 - test data
+        with_codes = codes_rng.random() < 0.5
         if kind == "ordinary":
             value = _digits(rng, 7)
             template = rng.choice(
@@ -649,8 +679,15 @@ def _bank_positives(rng: random.Random, count: int) -> list[Document]:
                     "普通預金 {v} {name}",
                 )
             )
+            confidence: Confidence = "medium"
+            if with_codes:
+                bank, branch, confidence = _bank_pair(codes_rng)
+                kind = "with-codes"
+                template = codes_rng.choice(_BANK_CODE_TEMPLATES).format(
+                    company="{company}", bank=bank, branch=branch
+                )
             text = _sentence(rng, template, value if rng.random() < 0.7 else full_width(value))
-            expected = [Expected("jp_bank_account", value, "medium")]
+            expected = [Expected("jp_bank_account", value, confidence)]
             name = f"jp_bank_account/positives/text-{kind}/{index:05d}"
             docs.append(_text(name, "positives", "jp_bank_account", [text], expected))
         elif kind == "japan-post":
@@ -667,19 +704,19 @@ def _bank_positives(rng: random.Random, count: int) -> list[Document]:
             docs.append(_text(name, "positives", "jp_bank_account", [text], expected))
         else:
             values = [_digits(rng, 7) for _ in range(rng.randint(1, 3))]
+            headers = ["名義", "支店", "口座番号"]
             rows = [[rng.choice(NAMES_JA), "見本支店", value] for value in values]
             expected = [Expected("jp_bank_account", value, "medium") for value in values]
+            if with_codes:
+                # The codes in their own columns of the account's row ([DLP] 4.4).
+                headers = ["名義", "銀行コード", "支店コード", "口座番号"]
+                expected = []
+                for row in rows:
+                    bank, branch, confidence = _bank_pair(codes_rng)
+                    row[1:2] = [bank, branch]
+                    expected.append(Expected("jp_bank_account", row[3], confidence))
             name = f"jp_bank_account/positives/table/{index:05d}"
-            docs.append(
-                _table(
-                    name,
-                    "positives",
-                    "jp_bank_account",
-                    ["名義", "支店", "口座番号"],
-                    rows,
-                    expected,
-                )
-            )
+            docs.append(_table(name, "positives", "jp_bank_account", headers, rows, expected))
     return docs
 
 

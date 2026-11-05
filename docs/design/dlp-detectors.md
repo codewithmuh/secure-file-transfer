@@ -105,7 +105,7 @@ Detector IDs are stable; the version of the whole set is the inspection engine v
 | `jp_my_number` | Individual Numbers (マイナンバー, 個人番号) | 12 digits, plain or `NNNN-NNNN-NNNN` or with spaces; the check digit must hold (4.1) | マイナンバー, 個人番号, 番号カード, My Number, Individual Number | High with context; medium when grouped 4-4-4; low otherwise |
 | `jp_corporate_number` | Corporate Numbers (法人番号) | 13 digits; the first digit is a check digit (4.2) | 法人番号, 会社法人等番号, Corporate Number | High with context; low otherwise |
 | `payment_card` | Payment card numbers | 13 to 19 digits, plain or in the network's grouping; Luhn; a known issuer range and a length that range uses (4.3) | カード番号, クレジット, 有効期限, セキュリティコード, card number, expiry, CVV | High with context or an expiry date nearby; medium when grouped; low otherwise |
-| `jp_bank_account` | Japanese bank accounts | A 7-digit account number with an account keyword; for Japan Post Bank a 5-digit symbol and an up to 8-digit number with its keywords. No check digit exists. | 口座番号, 普通, 当座, 預金, 支店, ゆうちょ, 記号, account number | Never without context. Medium with context. High waits for a bundled bank and branch code list (4.4) |
+| `jp_bank_account` | Japanese bank accounts | A 7-digit account number with an account keyword; for Japan Post Bank a 5-digit symbol and an up to 8-digit number with its keywords. No check digit exists. | 口座番号, 普通, 当座, 預金, 支店, ゆうちょ, 記号, account number | Never without context. Medium with context. High with context and a valid bank and branch code pair within 80 characters or in the same row (4.4) |
 | `iban` | International bank account numbers | ISO 13616: country code, two check digits, the country's length; mod 97 = 1 | IBAN, 口座, account | High with context or in groups of four; medium otherwise |
 | `phone_number` | Japanese and international phone numbers | Validated with libphonenumber's metadata (the `phonenumbers` package): Japanese numbers without a country code, others with `+` and a country code (4.5) | 電話, TEL, 携帯, 連絡先, FAX, phone, mobile | High with context; medium when formatted with hyphens, parentheses or `+`; low when bare digits |
 | `email_address` | Email addresses | A dot-atom local part, `@`, and a domain whose last label is in the bundled public suffix list | — | High: the format alone is unambiguous |
@@ -147,11 +147,24 @@ There is no check digit, so this detector rests on context. An account number is
 Japan Post Bank accounts are written as a 5-digit symbol starting with 1 and a number of up to 8 digits, and count only
 with their keywords; a number that runs on past 8 digits isn't one.
 
-**Not yet: high confidence.** A valid bank code (4 digits) and branch code (3 digits) within 80 characters, or in the
-same row of a spreadsheet, would raise a match to high. That needs the list of Japanese financial institution and
-branch codes, bundled and refreshed at each release. No list is bundled yet: the published one has tens of thousands of
-branches, and its licence for redistribution has to be settled first. Until then a bank account is medium at most,
-which is the confidence the default rule uses (section 6).
+**High confidence.** A 7-digit account with its keywords is high when a valid bank code (4 digits) followed by a valid
+branch code (3 digits) of that bank appears within 80 characters of it, before or after, or anywhere in the same row
+of a spreadsheet or CSV file. Each code is a whole number, not part of a longer one; a pair that isn't on the list, or a
+branch code before its bank code, leaves the account medium. Japan Post Bank accounts have no branch code and stay
+medium.
+
+The list is data: a sorted set of 7-digit codes (bank, then branch) with its source, licence and retrieval date in its
+header, bundled with the detectors (`sft/dlp/detect/bank_codes.txt`) and read once per process. Japan's roughly
+30,000 branches make about 240 KB on disk and 2 MB in memory, and parse in tens of milliseconds, inside the
+inspector's start-up and memory budgets. `tools/bank_codes.py` writes it from a CSV the maintainer obtained under
+terms that allow bundling; the service README gives the steps. It is refreshed before each release and at least every
+three months, since banks merge and branches close; a stale list only leaves some accounts at medium.
+
+**No list is bundled yet (#146).** No source whose licence allows redistribution has been confirmed: the Zengin-Net
+data is distributed under contract, and the open lists found online (for example `zengin-code/source-data`, MIT for
+the repository) are compiled from third-party sites whose own terms say nothing about reuse. Until one is, the
+bundled file holds only its header, high is never reached, and a bank account is medium at most, which is the
+confidence the default rule uses (section 6). The tests and the accuracy corpus use a synthetic list.
 
 ### 4.5 Phone numbers
 
@@ -191,9 +204,24 @@ RE2 has no backreferences or lookaround, and runs in time linear in its input, s
 slow without bound (threat model T-103). The save-time checks are deterministic: a pattern is accepted or refused the
 same way on any machine. They bound the size of the program RE2 runs per character, not the time a pattern takes. Only
 a match's span is used, so groups don't capture, and RE2 finds matches with its DFAs alone instead of the slower
-submatch engines. A broad pattern can still make RE2's DFA rebuild its states often on some text. The inspector's CPU
-and time limits (ADR-0022) bound that, and the file is then `partial` with `limit_exceeded`. `testDlpDetectors` lets an admin try a detector on sample text before saving
-it (FR-56).
+submatch engines. A broad pattern can still make RE2's DFA rebuild its states often on some text: `(?:.{0,30}\d){1,2}q`
+(548 instructions) takes about 2.5 s per MiB of random text. So each pattern also has a **scan-time budget per file**:
+
+| Budget | Value | Why |
+|---|---|---|
+| CPU time | 0.5 s, plus 50 ms per MiB of text the pattern has scanned | About 20 times what an ordinary pattern costs per MiB; 20 patterns over a file's 256 MiB of text stay well inside the child's 10 minutes of CPU |
+| Matches | 100,000 per file | Far above any rule's threshold; stops a pattern that matches nearly everything |
+
+A pattern scans each unit in chunks of 64 KiB, and the budget is checked after each chunk, so a pattern stops at most
+one chunk past it. A match may run up to 4 KiB past the chunk it starts in; a longer one is cut there. `^` and `$` keep
+meaning the ends of the unit. Past its budget a pattern stops for the rest of the file: its matches so far still count,
+the other detectors carry on, and the file's state doesn't change, since the outcome is the tenant admin's to fix, not
+the sender's. The inspector's result names the stopped patterns by detector ID (`budget_exceeded`), never with a
+match. The scan worker (DLP-4) writes one audit event per file, `dlp.pattern_budget_exceeded`, with the file and the
+detector IDs, and the detector's admin view (`getDlpDetector`) shows how many files stopped it and when it last
+happened; both arrive with those issues. The inspector's CPU and time limits (ADR-0022) still bound the whole file;
+past them the file is `partial` with `limit_exceeded`. `testDlpDetectors` lets an admin try a detector on sample
+text before saving it (FR-56).
 
 ## 6. The default policy
 
@@ -267,7 +295,8 @@ matches over the labelled positives at that confidence or above, counted by dist
 | Keywords and labels | Tenant keyword lists, `confidentiality_label` (medium) | 1.00 | 1.00 across the listed forms |
 
 At low confidence, check-digit identifiers must reach a recall of at least 0.99; their precision there isn't a
-target, which is why the default rules don't use low.
+target, which is why the default rules don't use low. A bank account's high rule (4.4) is measured on its own, on the corpus's synthetic
+code list: at least 0.90 precision and recall at high.
 
 **In CI.** A pull request that touches the detector package or the extraction code runs a corpus of about 20,000
 documents and fails if any detector, in any format, drops below its target, or if any reason fixture gives the wrong
@@ -278,7 +307,8 @@ over the same flows. Each release publishes the per-detector table in its releas
 ## 9. Versions
 
 The inspection engine version changes with any change to a built-in detector, its data (issuer ranges, public
-suffixes, credential patterns, and the bank code list once there is one) or the extraction code. Each file records the version that inspected it, and each
+suffixes, credential patterns, the bank code list, whose retrieval date is part of the version) or the extraction
+code. Each file records the version that inspected it, and each
 release's notes list what changed and the corpus results. A tenant's own detectors are versioned by the DLP policy
 version (data model 2.7). Files aren't re-inspected when either changes (ADR-0022).
 

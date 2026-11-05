@@ -96,7 +96,15 @@ MEMBER_INVITED: Final = Topic("member.invited", Queue.NOTIFY)
 """A user was invited (FR-22): the notification worker creates their sign-in and emails the
 invitation (authn and authz 2.5). Payload `{"user_id": …}`."""
 
-TOPICS: Final[Mapping[str, Topic]] = topic_registry(MEMBER_INVITED)
+FILE_SCAN: Final = Topic("file.scan", Queue.SCAN_SMALL)
+"""A file up to 2 GB reached `scanning`: the scan worker streams it to clamd and the DLP inspector
+(architecture 4.1, #114). Payload `{"file_id": …}`."""
+
+FILE_SCAN_LARGE: Final = Topic("file.scan_large", Queue.SCAN_LARGE)
+"""A file over 2 GB reached `scanning`: GuardDuty scans it on its own, and the large-file scan
+worker waits for that result (ADR-0019, #114). Payload `{"file_id": …}`."""
+
+TOPICS: Final[Mapping[str, Topic]] = topic_registry(MEMBER_INVITED, FILE_SCAN, FILE_SCAN_LARGE)
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.
 The relay leaves a row whose topic isn't here unpublished and counts it as a failure, which the

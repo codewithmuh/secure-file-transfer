@@ -1,7 +1,8 @@
 """The settings every public API `Settings` needs beyond its database: local, obviously fake values.
 
-Member sign-in (#113), the counter store and the email-hmac keyring (#145). Secrets keep no
-defaults in `Settings`, so a test that builds one passes these.
+Member sign-in (#113), the counter store, the email-hmac keyring (#145) and the files buckets
+(#114). Secrets and the buckets keep no defaults in `Settings`, so a test that builds one passes
+these.
 """
 
 import base64
@@ -27,6 +28,9 @@ API_ENV: dict[str, str] = {
     "OIDC_PROVIDER_NAME": "local-keycloak",
     "CSRF_KEYRING": CSRF_KEYRING,
     "EMAIL_HMAC_KEYRING": EMAIL_HMAC_KEYRING,
+    "S3_FILES_BUCKET": "sft-test-files",
+    "S3_LARGE_FILES_BUCKET": "sft-test-large-files",
+    "S3_FILES_KMS_KEY_ID": "alias/sft-test-files",
 }
 """As environment variables, for tests that read the environment."""
 

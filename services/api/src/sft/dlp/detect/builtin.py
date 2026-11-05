@@ -10,12 +10,15 @@ Every preview is masked here, as section 7 says, before the hit reaches the scan
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import partial
 
 import phonenumbers
 
 from sft.dlp.detect import checks
+from sft.dlp.detect.bank_codes import BankCodes, load
 from sft.dlp.detect.normalise import keyword_term
 from sft.dlp.detect.prepared import HIGH, LOW, MEDIUM, Hit, Keywords, Prepared
 from sft.dlp.detect.regex import Regex
@@ -209,10 +212,48 @@ def _payment_card(unit: Prepared, number: _Number) -> Hit | None:
     return Hit(PAYMENT_CARD, confidence, digits, f"{network} ****{digits[-4:]}")
 
 
-def _bank_account(unit: Prepared, number: _Number) -> Hit | None:
+BANK_PAIR_WINDOW = 80
+"""A bank and branch code pair counts within this many characters of the account ([DLP] 4.4)."""
+
+# A digit group for the pair search: Python's re, not RE2, because it runs on the short window
+# around one account number only, and needs the lookarounds that keep a group whole.
+_CODE_GROUP = re.compile(r"(?<![0-9A-Za-z])[0-9]{3,4}(?![0-9A-Za-z])")
+
+
+def _bank_pair_nearby(unit: Prepared, number: _Number, banks: BankCodes) -> bool:
+    """A valid bank code, then a valid branch code of that bank, near the account number: within
+    80 characters on either side, or anywhere in the same row of a spreadsheet or CSV file."""
+    if not banks:
+        return False
+    text = unit.text
+    if unit.cells:
+        start, end = 0, len(text)
+    else:
+        start = max(0, number.start - BANK_PAIR_WINDOW)
+        end = min(len(text), number.end + BANK_PAIR_WINDOW)
+    # `endpos` makes the window's edge look like the end of the text to the lookahead, so a
+    # longer number cut by the window would pass as a code: check the real text on both sides.
+    groups = [
+        (match.start(), match.group())
+        for match in _CODE_GROUP.finditer(text, start, end)
+        if not number.start <= match.start() < number.end
+        and not (match.start() > 0 and text[match.start() - 1] in _ALNUM)
+        and not (match.end() < len(text) and text[match.end()] in _ALNUM)
+    ]
+    return any(
+        banks.valid(bank, branch)
+        for index, (_, bank) in enumerate(groups)
+        if len(bank) == 4
+        for _, branch in groups[index + 1 :]
+        if len(branch) == 3
+    )
+
+
+def _bank_account(unit: Prepared, number: _Number, banks: BankCodes) -> Hit | None:
     if number.grouping == (7,):
         if unit.has_context(number.start, number.end, BANK_CONTEXT):
-            return Hit(BANK_ACCOUNT, MEDIUM, number.digits, "****" + number.digits[-3:])
+            confidence = HIGH if _bank_pair_nearby(unit, number, banks) else MEDIUM
+            return Hit(BANK_ACCOUNT, confidence, number.digits, "****" + number.digits[-3:])
         return None
     grouping = number.grouping
     if (
@@ -239,11 +280,14 @@ def _drivers_licence(unit: Prepared, number: _Number) -> Hit | None:
     return Hit(DRIVERS_LICENCE, confidence, digits, "*" * 9 + digits[-3:])
 
 
-_NUMBER_DETECTORS = (_my_number, _corporate_number, _payment_card, _bank_account, _drivers_licence)
+def _number_detectors(banks: BankCodes) -> tuple[Callable[[Prepared, _Number], Hit | None], ...]:
+    bank = partial(_bank_account, banks=banks)
+    return (_my_number, _corporate_number, _payment_card, bank, _drivers_licence)
 
 
-def _numbers(unit: Prepared) -> Iterator[Hit]:
+def _numbers(unit: Prepared, banks: BankCodes) -> Iterator[Hit]:
     text = unit.text
+    detectors = _number_detectors(banks)
     # Japan Post Bank accounts written with their keywords: 記号 NNNNN 番号 NNNNNNNN.
     taken: list[tuple[int, int]] = []
     for span in _JAPAN_POST_KEYWORDS.finditer(text):
@@ -266,7 +310,7 @@ def _numbers(unit: Prepared) -> Iterator[Hit]:
                 continue
             if not _boundary_ok(text, candidate.start, candidate.end):
                 continue
-            hits = [hit for detector in _NUMBER_DETECTORS if (hit := detector(unit, candidate))]
+            hits = [hit for detector in detectors if (hit := detector(unit, candidate))]
             if hits:
                 accepted.append((candidate.start, candidate.end))
                 yield from hits
@@ -437,9 +481,10 @@ def _labels(unit: Prepared) -> Iterator[Hit]:
             yield Hit(CONFIDENTIALITY_LABEL, MEDIUM if alone else LOW, keyword_term(label), label)
 
 
-def detect(unit: Prepared) -> Iterator[Hit]:
-    """Every single-unit built-in detector over one unit."""
-    yield from _numbers(unit)
+def detect(unit: Prepared, banks: BankCodes | None = None) -> Iterator[Hit]:
+    """Every single-unit built-in detector over one unit. `banks` is the bank and branch code
+    list, the bundled one by default."""
+    yield from _numbers(unit, load() if banks is None else banks)
     yield from _phones(unit)
     yield from _emails(unit)
     yield from _ibans(unit)

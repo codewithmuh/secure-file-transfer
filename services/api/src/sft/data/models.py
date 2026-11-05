@@ -15,26 +15,30 @@ and what a link session's subject reaches, so `in_scope` can filter it.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from ipaddress import IPv4Address, IPv6Address
 from typing import Any
 
 from sqlalchemy import (
     ARRAY,
+    BigInteger,
     CheckConstraint,
     ColumnElement,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Interval,
     LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
     SmallInteger,
     Text,
     UniqueConstraint,
+    false,
     func,
+    select,
     text,
     true,
 )
@@ -44,7 +48,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import UserDefinedType
 
 from sft.data.access import TenantOwned
-from sft.data.scope import Subject
+from sft.data.scope import Subject, SubjectKind
 
 NAMING_CONVENTION = {
     "pk": "%(table_name)s_pkey",
@@ -489,3 +493,237 @@ class IdempotencyKey(TenantOwned, Base):
     resource_id: Mapped[uuid.UUID]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime]
+
+
+class TransferState(StrEnum):
+    """The states of a transfer (data model 3.2). Revision 0008's CHECK lists the same values."""
+
+    DRAFT = "draft"
+    SUBMITTED = "submitted"
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
+    PENDING_APPROVAL = "pending_approval"
+    SENT = "sent"
+    HELD = "held"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class FileState(StrEnum):
+    """The states of a file (data model 3.1). Revision 0008's CHECK lists the same values."""
+
+    UPLOADING = "uploading"
+    COMPLETING = "completing"
+    SCANNING = "scanning"
+    CLEAN = "clean"
+    INFECTED = "infected"
+    UNSCANNABLE = "unscannable"
+    SCAN_FAILED = "scan_failed"
+    REJECTED = "rejected"
+    DELETED = "deleted"
+
+
+class StorageClass(StrEnum):
+    """Which files bucket pair holds a file, chosen from its declared size (ADR-0012)."""
+
+    STANDARD = "standard"
+    LARGE = "large"
+
+
+class DeliveryState(StrEnum):
+    """Where a recipient's latest link email stands (data model 2.2)."""
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    SENT = "sent"
+    BOUNCED = "bounced"
+    SUPPRESSED = "suppressed"
+
+
+class Transfer(TenantOwned, Base):
+    """A transfer to external recipients (data model 2.2). Written through `sft.data.transfers`.
+
+    `message_ct` holds the message as `sft.service.fields` seals it, never as plain text.
+    """
+
+    __tablename__ = "transfers"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        ForeignKeyConstraint(["tenant_id", "revoked_by"], ["users.tenant_id", "users.id"]),
+        CheckConstraint(f"state IN {sql_values(TransferState)}", name="state"),
+        CheckConstraint(
+            "hold_reason IN ('file_blocked', 'dlp_blocked', 'approval_rejected')",
+            name="hold_reason",
+        ),
+        CheckConstraint("(state = 'held') = (hold_reason IS NOT NULL)", name="held"),
+        CheckConstraint(
+            "expires_in BETWEEN interval '1 hour' AND interval '30 days'", name="expires_in"
+        ),
+        CheckConstraint("state <> 'draft' OR expires_at IS NULL", name="draft_expiry"),
+        CheckConstraint("download_limit BETWEEN 1 AND 100", name="download_limit"),
+        CheckConstraint(
+            "(message_ct IS NULL) OR (octet_length(message_ct) > 0)", name="message_ct"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    created_by: Mapped[uuid.UUID]
+    state: Mapped[str] = mapped_column(Text)
+    hold_reason: Mapped[str | None] = mapped_column(Text)
+    message_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
+    data_key_version: Mapped[int | None]
+    expires_in: Mapped[timedelta] = mapped_column(Interval)
+    expires_at: Mapped[datetime | None]
+    download_limit: Mapped[int | None]
+    notify_on_first_download: Mapped[bool] = mapped_column(server_default=false())
+    last_activity_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    submitted_at: Mapped[datetime | None]
+    sent_at: Mapped[datetime | None]
+    ended_at: Mapped[datetime | None]
+    revoked_by: Mapped[uuid.UUID | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches its own transfer; an uploader's none.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.id.in_(
+            select(TransferRecipient.transfer_id).where(TransferRecipient.id == subject.id)
+        )
+
+
+class TransferRecipient(TenantOwned, Base):
+    """One recipient of one transfer (data model 2.2). The link and verification columns arrive
+    with the notification and verification issues of M2."""
+
+    __tablename__ = "transfer_recipients"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("tenant_id", "transfer_id", "email_normalized"),
+        CheckConstraint("locale IN ('en', 'ja')", name="locale"),
+        CheckConstraint(f"delivery_state IN {sql_values(DeliveryState)}", name="delivery_state"),
+        CheckConstraint("email_normalized = lower(email)", name="email_normalized"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID]
+    email: Mapped[str] = mapped_column(Text)
+    email_normalized: Mapped[str] = mapped_column(Text)
+    locale: Mapped[str] = mapped_column(Text)
+    delivery_state: Mapped[str] = mapped_column(Text, server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches its own row only.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.id == subject.id
+
+
+class File(TenantOwned, Base):
+    """A file of a transfer (data model 2.3, states in 3.1). Written through `sft.data.files`.
+
+    `storage_key` is `tenants/{tenant_id}/files/{id}`; the bucket pair follows `storage_class`.
+    `display_name_ct` holds the name as `sft.service.fields` seals it, never as plain text.
+    """
+
+    __tablename__ = "files"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        Index("files_tenant_id_transfer_id_idx", "tenant_id", "transfer_id"),
+        CheckConstraint(f"state IN {sql_values(FileState)}", name="state"),
+        CheckConstraint("declared_size BETWEEN 1 AND 5000000000", name="declared_size"),
+        CheckConstraint("actual_size >= 1", name="actual_size"),
+        CheckConstraint(f"storage_class IN {sql_values(StorageClass)}", name="storage_class"),
+        CheckConstraint(
+            "(storage_class = 'large') = (declared_size > 2000000000)", name="storage_class_size"
+        ),
+        CheckConstraint(
+            "storage_key = 'tenants/' || tenant_id || '/files/' || id", name="storage_key"
+        ),
+        CheckConstraint("part_size >= 5242880", name="part_size"),
+        CheckConstraint("part_count BETWEEN 1 AND 1000", name="part_count"),
+        CheckConstraint(
+            "state NOT IN ('scanning', 'clean', 'infected', 'unscannable', 'scan_failed') OR "
+            "(actual_size IS NOT NULL AND s3_version_id IS NOT NULL AND scan_deadline IS NOT NULL)",
+            name="scanned",
+        ),
+        CheckConstraint(
+            "state <> 'completing' OR completion_started_at IS NOT NULL", name="completing"
+        ),
+        CheckConstraint(
+            "(state <> 'rejected' AND removed_at IS NULL) OR delete_after IS NOT NULL",
+            name="delete_after",
+        ),
+        CheckConstraint("octet_length(display_name_ct) > 0", name="display_name_ct"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID]
+    display_name_ct: Mapped[bytes] = mapped_column(LargeBinary)
+    data_key_version: Mapped[int | None]
+    content_type: Mapped[str] = mapped_column(Text)
+    declared_size: Mapped[int] = mapped_column(BigInteger)
+    actual_size: Mapped[int | None] = mapped_column(BigInteger)
+    storage_class: Mapped[str] = mapped_column(Text)
+    storage_key: Mapped[str] = mapped_column(Text, unique=True)
+    s3_upload_id: Mapped[str] = mapped_column(Text)
+    s3_version_id: Mapped[str | None] = mapped_column(Text)
+    part_size: Mapped[int]
+    part_count: Mapped[int]
+    state: Mapped[str] = mapped_column(Text)
+    last_part_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    completion_started_at: Mapped[datetime | None]
+    removed_at: Mapped[datetime | None]
+    scan_deadline: Mapped[datetime | None]
+    delete_after: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches the files of its own transfer; the files of upload
+        # requests arrive with them.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.transfer_id.in_(
+            select(TransferRecipient.transfer_id).where(TransferRecipient.id == subject.id)
+        )
+
+
+class TenantUsage(TenantOwned, Base):
+    """The bytes a tenant has reserved against its storage quota (data model 2.5).
+
+    Changed only by `sft.data.usage`, with one conditional statement each.
+    """
+
+    __tablename__ = "tenant_usage"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        CheckConstraint("bytes_reserved >= 0", name="bytes_reserved"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    bytes_reserved: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())

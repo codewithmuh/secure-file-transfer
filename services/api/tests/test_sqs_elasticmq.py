@@ -299,11 +299,12 @@ def test_the_relay_process_runs_and_stops_cleanly_on_sigterm(
     migrated_db: ScratchDatabase, endpoint: str, prefix: str
 ) -> None:
     clear_messaging(migrated_db)
-    # The production relay knows no `file.scan` topic yet (M2 adds it), so this row stays
-    # unpublished and is counted as a failure: the process still runs and drains cleanly.
+    # The production relay doesn't know this topic (as an older relay during a rolling deploy
+    # wouldn't), so the row stays unpublished and is counted as a failure: the process still runs
+    # and drains cleanly.
     migrated_db.sql(
         "INSERT INTO outbox (id, tenant_id, topic, payload) "
-        "VALUES (gen_random_uuid(), gen_random_uuid(), 'file.scan', '{}')"
+        "VALUES (gen_random_uuid(), gen_random_uuid(), 'future.topic', '{}')"
     )
     port = free_port()
     process = subprocess.Popen(

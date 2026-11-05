@@ -319,7 +319,50 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
             key=key,
             expires=expires,
         )
+    seed_transfers(db, tenant_id, marker, rows)
     return Seeded(tenant_id, marker, rows)
+
+
+def seed_transfers(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
+    """Transfers (#114): a draft of the seeded user, its recipient, an uploading file, a file that
+    is completing, and the tenant's storage reservation. The marker is in the address, the sealed
+    name and the upload ID."""
+    for key in ("transfer", "recipient", "file", "completing_file"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in, message_ct) "
+        "VALUES (:id, :tenant, :user, 'draft', interval '7 days', convert_to(:marker, 'UTF8'))",
+        id=rows["transfer"],
+        tenant=tenant_id,
+        user=rows["user"],
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO transfer_recipients (id, tenant_id, transfer_id, email, email_normalized, "
+        "locale) VALUES (:id, :tenant, :transfer, :email, :email, 'en')",
+        id=rows["recipient"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+        email=f"{marker}@recipient.test",
+    )
+    for key, state in (("file", "uploading"), ("completing_file", "completing")):
+        db.sql(
+            "INSERT INTO files (id, tenant_id, transfer_id, display_name_ct, content_type, "
+            "declared_size, storage_class, storage_key, s3_upload_id, part_size, part_count, "
+            "state, completion_started_at) VALUES (:id, :tenant, :transfer, "
+            "convert_to(:marker, 'UTF8'), 'text/plain', 10, 'standard', "
+            "'tenants/' || :tenant || '/files/' || :id, :marker, 5242880, 1, :state, "
+            "CASE WHEN :state = 'completing' THEN now() END)",
+            id=rows[key],
+            tenant=tenant_id,
+            transfer=rows["transfer"],
+            marker=marker,
+            state=state,
+        )
+    db.sql(
+        "INSERT INTO tenant_usage (tenant_id, bytes_reserved) VALUES (:tenant, 20)",
+        tenant=tenant_id,
+    )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

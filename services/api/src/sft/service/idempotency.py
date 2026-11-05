@@ -117,14 +117,9 @@ async def once[T](
     caller_type, caller_id = key_owner(caller)
     if not await idempotency.lock(session, caller_type, caller_id, request.key):
         raise Conflict("idempotency_in_progress", "A request with this key is still running.")
-    stored = await idempotency.find(session, caller_type, caller_id, request.key)
-    if stored is not None:
-        if stored.fingerprint != request.fingerprint or stored.resource_type != resource_type:
-            raise Conflict("idempotency_conflict", "This key was used for a different request.")
-        value = await rebuild(stored.resource_id)
-        if value is None:
-            raise NotFound
-        return Outcome(value, stored.status, replayed=True)
+    replayed = await _replayed(session, caller, request, resource_type, rebuild)
+    if replayed is not None:
+        return replayed
     value = await create()
     saved = await idempotency.save(
         session,
@@ -141,6 +136,45 @@ async def once[T](
         # one rolls back rather than make a second resource.
         raise Conflict("idempotency_in_progress", "A request with this key is still running.")
     return Outcome(value, status)
+
+
+async def replay[T](
+    session: AsyncSession,
+    caller: Caller,
+    request: IdempotentRequest | None,
+    *,
+    resource_type: str,
+    rebuild: Callable[[UUID], Awaitable[T | None]],
+) -> Outcome[T] | None:
+    """The first answer to a retry, read without the key's lock; None without a key or for a new
+    one.
+
+    For an operation that does work outside its transaction before `once` runs: `addTransferFile`
+    starts its multipart upload in S3 first, so a retry checks here and starts no second upload.
+    `once` still decides: a key that another request writes in the meantime is replayed there.
+    """
+    if request is None:
+        return None
+    return await _replayed(session, caller, request, resource_type, rebuild)
+
+
+async def _replayed[T](
+    session: AsyncSession,
+    caller: Caller,
+    request: IdempotentRequest,
+    resource_type: str,
+    rebuild: Callable[[UUID], Awaitable[T | None]],
+) -> Outcome[T] | None:
+    caller_type, caller_id = key_owner(caller)
+    stored = await idempotency.find(session, caller_type, caller_id, request.key)
+    if stored is None:
+        return None
+    if stored.fingerprint != request.fingerprint or stored.resource_type != resource_type:
+        raise Conflict("idempotency_conflict", "This key was used for a different request.")
+    value = await rebuild(stored.resource_id)
+    if value is None:
+        raise NotFound
+    return Outcome(value, stored.status, replayed=True)
 
 
 async def delete_expired_keys(database: Database, *, batch: int = JOB_BATCH) -> int:

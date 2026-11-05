@@ -10,10 +10,11 @@ caller's own keys, then IP, then the invited address, then the tenant. A route n
 one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every request. Every
 number is a starting value, changed only through deploy config, for every tenant at once.
 
-This page carries the limits of the routes that exist now or arrive in M1 (groups B, G for
+This page carries the limits of the routes that exist now (groups B, F's request rates, G for
 `inviteUser`, H and J), and group A, whose per-link and per-address keys and fail-closed mode the
-limiter is built around. Groups C to F, I and K join with their routes. Concurrent streams (leases)
-and byte budgets are other algorithms and come with the download and upload issues.
+limiter is built around. Groups C, D, E, I and K join with their routes. Concurrent streams
+(leases) and byte budgets are other algorithms: they come with the download issues, and with the
+upload follow-ups for group F's per-file part-URL count and the tenant's daily upload volume.
 """
 
 from __future__ import annotations
@@ -166,6 +167,12 @@ B_START = _limit(Group.SIGN_IN, "start_ip", KeyType.IP, Rate(60, MINUTE))
 B_CALLBACK = _limit(Group.SIGN_IN, "callback_ip", KeyType.IP, Rate(60, MINUTE))
 B_INVITATION = _limit(Group.SIGN_IN, "invitation_ip", KeyType.IP, Rate(60, MINUTE))
 
+# ---- F. Uploads: declaring files, part URLs, listing parts, completing. ----
+F_CALLER = _limit(
+    Group.UPLOADS, "caller_requests", (*CALLER, KeyType.LINK_SESSION), Rate(600, MINUTE)
+)
+F_IP = _limit(Group.UPLOADS, "ip_requests", KeyType.IP, Rate(1200, MINUTE))
+
 # ---- G. Actions that send email. Recipient emails take a cost: one per address. ----
 G_CALLER_EMAILS = _limit(Group.EMAIL, "caller_emails", CALLER, Rate(200, HOUR))
 G_TENANT_EMAILS = _limit(Group.EMAIL, "tenant_emails", KeyType.TENANT, Rate(2000, HOUR))
@@ -188,6 +195,7 @@ ALL = (
     *(A_IP, A_NOT_FOUND, A_FAILED_CODES, A_SUBJECT_GAP, A_SUBJECT_DAY),
     *(A_EMAIL_HOUR, A_EMAIL_DAY, A_TENANT),
     *(B_START, B_CALLBACK, B_INVITATION),
+    *(F_CALLER, F_IP),
     *(G_CALLER_EMAILS, G_TENANT_EMAILS, G_ADDRESS_EMAILS, G_INVITES, G_ADDRESS_INVITES),
     *(H_CALLER, H_TENANT, H_FAILED_AUTH),
     *(J_API_KEYS, J_TENANTS),
@@ -215,6 +223,11 @@ TENANT_OPERATION = (H_CALLER, H_TENANT)
 SAFETY_ACTION = (H_CALLER,)
 """`revokeTransfer`, `revokeUploadRequest`, `revokeApiKey`, `deactivateUser`, `unlockRecipient`,
 `unlockUploader`, `rejectTransfer`: never counted against, nor refused by, the tenant's budget."""
+
+UPLOAD = (F_CALLER, F_IP, H_TENANT)
+"""`addTransferFile`, `requestUploadPartUrls`, `listUploadedParts` and `completeUpload` (and their
+link-session twins): group F's own budgets, then the tenant's group H budget, which counts group F
+too (abuse and rate limits 2.2)."""
 
 INVITE_USER = (G_CALLER_EMAILS, G_ADDRESS_INVITES, G_INVITES)
 """`inviteUser`, after `TENANT_OPERATION`, once the address is known."""

@@ -12,7 +12,15 @@ from pg import ScratchDatabase
 from sft.data.audit_required import require_audit_sql
 from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, compatible_with, include_name
-from sft.data.models import Base, Role, SessionRevokedReason, UserStatus, sql_values
+from sft.data.models import (
+    Base,
+    FileState,
+    Role,
+    SessionRevokedReason,
+    TransferState,
+    UserStatus,
+    sql_values,
+)
 from sft.data.rls import (
     grant_sql,
     lookup_function_sql,
@@ -275,3 +283,38 @@ def test_the_idempotency_revision_keeps_the_sql_the_helpers_wrote_for_it() -> No
             using="app_scope() = 'system'",
         ),
     ]
+
+
+def test_the_transfers_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # As for 0001. Found by its contents, so renumbering the revision doesn't touch this test.
+    [script] = [
+        s for s in SCRIPTS.walk_revisions() if hasattr(s.module, "KEYS") and "files" in s.path
+    ]
+    module = script.module
+    tables = ("transfers", "transfer_recipients", "files", "tenant_usage")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("transfers"),
+        tenant_foreign_key_sql("transfers", "created_by", "users"),
+        tenant_foreign_key_sql("transfers", "revoked_by", "users"),
+        *tenant_keys_sql("transfer_recipients"),
+        tenant_foreign_key_sql(
+            "transfer_recipients", "transfer_id", "transfers", on_delete="CASCADE"
+        ),
+        *tenant_keys_sql("files"),
+        tenant_foreign_key_sql("files", "transfer_id", "transfers", on_delete="CASCADE"),
+        tenant_keys_sql("tenant_usage")[0],
+    ]
+    assert list(module.RLS) == [
+        statement
+        for table in tables
+        for statement in tenant_rls_sql(table, grants={"sft_api": "SELECT, INSERT, UPDATE"})
+    ]
+    assert list(module.AUDIT) == [require_audit_sql(table) for table in tables[:3]]
+
+
+def test_the_transfers_checks_list_the_states_of_the_code() -> None:
+    [script] = [
+        s for s in SCRIPTS.walk_revisions() if hasattr(s.module, "KEYS") and "files" in s.path
+    ]
+    assert f"({script.module.TRANSFER_STATES})" == sql_values(TransferState)
+    assert f"({script.module.FILE_STATES})" == sql_values(FileState)

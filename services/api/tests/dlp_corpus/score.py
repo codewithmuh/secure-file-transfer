@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from sft.dlp.detect.scanner import _Scanner
 from sft.dlp.units import Confidence, TenantDetector
 
-from .generate import KEYWORD_LIST_ID, Document
+from .generate import BANK_CODES, KEYWORD_LIST_ID, Document
 
 LEVEL: dict[Confidence, int] = {"low": 0, "medium": 1, "high": 2}
 
@@ -89,7 +89,7 @@ def score(
     """
     scores: dict[tuple[str, str], Score] = {}
     for document in corpus:
-        scanner = _Scanner(tenant)
+        scanner = _Scanner(tenant, BANK_CODES)
         for unit in document.units:
             scanner.feed(unit)
         # Ends the file as every caller does: the findings also count what was still waiting.

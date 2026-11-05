@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Tenants
-from sft.data import audit, idempotency, member_sessions
+from sft.data import audit, files, idempotency, member_sessions, transfers, usage
 from sft.data.access import in_scope
 from sft.data.audit import Actor
 from sft.data.identities import find_connection, find_identity
@@ -359,6 +359,120 @@ async def find_tenants_with_expired_keys(session: AsyncSession, tenants: Tenants
 @cases.add(scopes={JOBS: [TENANT], API: [TENANT], **NOT_THE_KEY_ROLES})
 async def delete_another_tenants_expired_keys(session: AsyncSession, tenants: Tenants) -> object:
     return await idempotency.delete_expired(session)
+
+
+# ---- transfers, files and storage usage (#114) ----
+# The API is the only role that changes drafts and files.
+
+API_TENANT = {API: [TENANT]}
+
+
+@cases.add(scopes=API_TENANT)
+async def get_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.get_transfer(session, tenants.theirs.rows["transfer"], lock=True)
+
+
+@cases.add(scopes=API_TENANT)
+async def list_another_tenants_recipients(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.list_recipients(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=API_TENANT)
+async def add_recipients_to_another_tenants_transfer(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    recipient = transfers.NewRecipient(uuid.uuid4(), "x@example.test", "en")
+    return await transfers.insert_recipients(session, tenants.theirs.rows["transfer"], [recipient])
+
+
+@cases.add(scopes=API_TENANT)
+async def touch_another_tenants_draft(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.touch_draft(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=API_TENANT)
+async def get_another_tenants_file(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.get_file(session, tenants.theirs.rows["file"])
+
+
+@cases.add(scopes=API_TENANT)
+async def list_another_tenants_files(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.list_transfer_files(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=API_TENANT)
+async def count_another_tenants_files(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.counted_totals(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=API_TENANT)
+async def add_a_file_to_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.insert_file(
+        session,
+        file_id=uuid.uuid4(),
+        transfer_id=tenants.theirs.rows["transfer"],
+        display_name_ct=b"x",
+        content_type="text/plain",
+        declared_size=1,
+        storage_class="standard",
+        s3_upload_id="isolation",
+        part_size=5_242_880,
+        part_count=1,
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def touch_another_tenants_parts(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.touch_parts(session, tenants.theirs.rows["file"])
+
+
+@cases.add(scopes=API_TENANT)
+async def start_another_tenants_completion(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.start_completion(session, tenants.theirs.rows["file"])
+
+
+@cases.add(scopes=API_TENANT)
+async def resume_another_tenants_upload(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.resume_uploading(session, tenants.theirs.rows["completing_file"])
+
+
+@cases.add(scopes=API_TENANT)
+async def mark_another_tenants_file_scanning(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.mark_scanning(
+        session,
+        tenants.theirs.rows["completing_file"],
+        actual_size=10,
+        s3_version_id="isolation",
+        scan_deadline=datetime.now(UTC),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def reject_another_tenants_file(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.reject_file(session, tenants.theirs.rows["completing_file"])
+
+
+@cases.add(scopes=API_TENANT)
+async def remove_another_tenants_file(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.remove_file(session, tenants.theirs.rows["file"])
+
+
+# Usage is the scope's tenant's own row: these must neither read nor change theirs.
+@cases.add(scopes=API_TENANT)
+async def reserve_storage_leaves_others_alone(session: AsyncSession, tenants: Tenants) -> object:
+    await usage.reserve_storage(session, 5, quota=100)
+    return None
+
+
+@cases.add(scopes=API_TENANT)
+async def release_storage_leaves_others_alone(session: AsyncSession, tenants: Tenants) -> object:
+    await usage.release_storage(session, 5)
+    return None
+
+
+@cases.add(scopes=API_TENANT)
+async def reserved_bytes_are_the_scopes_own(session: AsyncSession, tenants: Tenants) -> object:
+    return await usage.reserved_bytes(session)
 
 
 test_isolation = cases.test()

@@ -20,11 +20,11 @@ import secrets
 from collections.abc import Sequence
 from typing import Protocol
 
-from sft.dlp.detect import builtin
+from sft.dlp.detect import bank_codes, builtin
 from sft.dlp.detect.blocks import BlockDetector
 from sft.dlp.detect.credentials import CredentialDetector
 from sft.dlp.detect.prepared import Hit, Prepared
-from sft.dlp.detect.tenant import TenantDetectors
+from sft.dlp.detect.tenant import DEFAULT_BUDGET, PatternBudget, TenantDetectors
 from sft.dlp.units import Confidence, Finding, TenantDetector, TextUnit
 
 MAX_LOCATIONS = 10
@@ -39,6 +39,8 @@ class Scanner(Protocol):
     def feed(self, unit: TextUnit) -> None: ...
 
     def findings(self) -> list[Finding]: ...
+
+    def budget_exceeded(self) -> list[str]: ...
 
 
 class _Tally:
@@ -79,8 +81,14 @@ class _Tally:
 
 
 class _Scanner:
-    def __init__(self, tenant: Sequence[TenantDetector]) -> None:
-        self._tenant = TenantDetectors(tenant)
+    def __init__(
+        self,
+        tenant: Sequence[TenantDetector],
+        banks: bank_codes.BankCodes | None = None,
+        budget: PatternBudget = DEFAULT_BUDGET,
+    ) -> None:
+        self._tenant = TenantDetectors(tenant, budget)
+        self._banks = bank_codes.load() if banks is None else banks
         self._key = secrets.token_bytes(32)
         self._tallies: dict[str, _Tally] = {}
         self._credentials = CredentialDetector()
@@ -103,7 +111,7 @@ class _Scanner:
     def feed(self, unit: TextUnit) -> None:
         self._units += 1
         prepared = Prepared(unit)
-        for hit in builtin.detect(prepared):
+        for hit in builtin.detect(prepared, self._banks):
             self._record(hit, prepared.location)
         for hit, location in self._credentials.feed(prepared, self._units):
             self._record(hit, location)
@@ -117,6 +125,10 @@ class _Scanner:
         for hit, location in self._credentials.flush():
             self._record(hit, location)
         return [self._tallies[name].finding(name) for name in sorted(self._tallies)]
+
+    def budget_exceeded(self) -> list[str]:
+        """The tenant patterns stopped on this file for spending their budget ([DLP] 5)."""
+        return self._tenant.budget_exceeded()
 
 
 def new_scanner(tenant: Sequence[TenantDetector] = ()) -> Scanner:

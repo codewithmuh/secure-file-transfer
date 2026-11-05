@@ -65,6 +65,8 @@ NOT_AUDITED: Final[dict[str, str]] = {
     "idempotency_keys": "Remembering a request isn't an action of its own: the change it records "
     "is audited in the same transaction, and the daily job only deletes expired rows "
     "(architecture 5.4).",
+    "tenant_usage": "A storage reservation changes only with the file it is for: declaring, "
+    "rejecting or removing the file is audited in the same transaction (#114, data model 2.5).",
 }
 
 
