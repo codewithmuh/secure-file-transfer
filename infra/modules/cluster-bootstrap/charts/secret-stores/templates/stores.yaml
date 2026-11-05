@@ -1,0 +1,35 @@
+{{- $env := required "environment is required" .Values.environment -}}
+{{- $region := required "region is required" .Values.region -}}
+{{- $account := required "accountId is required" (toString .Values.accountId) -}}
+{{- if not (has $env (list "dev" "staging" "prod")) }}{{ fail "environment must be dev, staging or prod" }}{{ end -}}
+{{- if not (regexMatch "^[0-9]{12}$" $account) }}{{ fail "accountId must be 12 digits" }}{{ end -}}
+{{- $roles := list -}}
+{{- $namespaces := list -}}
+{{- range $name := keys .Values.stores | sortAlpha }}
+{{- $store := index $.Values.stores $name }}
+{{- if has $store.role $roles }}{{ fail (printf "store %s shares its role with another store" $name) }}{{ end }}
+{{- $roles = append $roles $store.role }}
+{{- range $ns := $store.namespaces }}
+{{- if has $ns $namespaces }}{{ fail (printf "namespace %s may use only one store" $ns) }}{{ end }}
+{{- $namespaces = append $namespaces $ns }}
+{{- end }}
+---
+# Reads Secrets Manager in this Region as sft-{{ $env }}-external-secrets-{{ $store.role }}, which the controller
+# assumes; that role may read only this store's secrets (encryption 6.4).
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: {{ $name }}
+spec:
+  conditions:
+    - namespaces: {{ toJson $store.namespaces }}
+  provider:
+    aws:
+      service: SecretsManager
+      region: {{ $region }}
+      role: {{ printf "arn:aws:iam::%s:role/sft-%s-external-secrets-%s" $account $env $store.role }}
+{{- end }}
+{{- range .Values.manifests }}
+---
+{{ toYaml . }}
+{{- end }}

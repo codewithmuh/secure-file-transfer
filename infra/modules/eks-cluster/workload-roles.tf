@@ -105,6 +105,8 @@ locals {
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
   ]
+  # What the application store gives the API as environment variables (#106): its two keyrings and its Region's client.
+  api_store_secrets = concat(local.app_secrets["email-hmac"], local.app_secrets["csrf-hmac"], local.idp_client_secrets)
 
   valkey_caches = [for r, p in local.regional_prefixes : "arn:aws:elasticache:${r}:${var.account_id}:serverlesscache:${p}-valkey"]
 
@@ -122,10 +124,10 @@ locals {
     }
   }
 
-  # Valkey by IAM authentication, as its own user, for the four workloads that use it (ADR-0014; the sign-in triggers
-  # are the edge layer's).
+  # Valkey by IAM authentication, as its own user, for the workloads in the cluster that use it (ADR-0014; the
+  # sign-in triggers are the edge layer's). The operator API keeps its own rate limits there (authn-authz 8.2).
   valkey = {
-    for w in ["api", "scan", "notify"] : w => {
+    for w in ["api", "scan", "notify", "operator"] : w => {
       Sid    = "ConnectToValkeyAsOwnUser"
       Effect = "Allow"
       Action = ["elasticache:Connect"]
@@ -390,6 +392,7 @@ locals {
         Resource = local.objects["audit-archive"]
       },
       local.database["operator"],
+      local.valkey["operator"],
       {
         Sid       = "AuditKeyThroughS3"
         Effect    = "Allow"
@@ -425,20 +428,14 @@ locals {
       },
     ]
 
-    # Platform component secrets only, through Secrets Manager (encryption 6.1).
+    # The controller reads no secret itself: it only assumes the role of the store an ExternalSecret names
+    # (cluster-bootstrap, charts/secret-stores; encryption 6.4).
     external_secrets = [
       {
-        Sid      = "PlatformSecrets"
+        Sid      = "AssumeTheSecretStoreRoles"
         Effect   = "Allow"
-        Action   = ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"]
-        Resource = local.platform_secrets
-      },
-      {
-        Sid       = "SecretsKeyForPlatformSecrets"
-        Effect    = "Allow"
-        Action    = ["kms:Decrypt"]
-        Resource  = local.key_arns
-        Condition = { "ForAnyValue:StringEquals" = local.key_alias["secrets"], StringEquals = { "kms:ViaService" = local.via["secretsmanager"] }, StringLike = { "kms:EncryptionContext:SecretARN" = local.platform_secrets } }
+        Action   = ["sts:AssumeRole"]
+        Resource = [local.role_arns.external_secrets_platform, local.role_arns.external_secrets_app]
       },
     ]
 
@@ -525,4 +522,67 @@ resource "aws_eks_pod_identity_association" "this" {
   }
 
   depends_on = [aws_iam_role.pod_identity, aws_iam_role_policy.pod_identity]
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The secret stores' roles (encryption 6.4)
+# ---------------------------------------------------------------------------------------------------------------------
+
+# One role per External Secrets store, each reading only that store's secrets, so a store can't hand one namespace's
+# secrets to another whatever key an ExternalSecret names. Only the controller's role may assume them, by its exact
+# ARN; they carry the workload boundary like every role here.
+locals {
+  secret_store_secrets = {
+    external_secrets_platform = { secrets = local.platform_secrets, description = "platform-secrets store: sft/<env>/platform/* only" }
+    external_secrets_app      = { secrets = local.api_store_secrets, description = "application-secrets store: the API's keyrings and this Region's client only" }
+  }
+
+  secret_store_policies = {
+    for k, s in local.secret_store_secrets : k => [
+      {
+        Sid      = "ReadThisStoresSecrets"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"]
+        Resource = s.secrets
+      },
+      {
+        Sid       = "SecretsKeyForThisStoresSecrets"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["secrets"], StringEquals = { "kms:ViaService" = local.via["secretsmanager"] }, StringLike = { "kms:EncryptionContext:SecretARN" = s.secrets } }
+      },
+    ]
+  }
+}
+
+data "aws_iam_policy_document" "secret_store_trust" {
+  for_each = var.create_iam ? local.secret_store_secrets : {}
+
+  statement {
+    sid     = "ExternalSecretsControllerOnly"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.pod_identity["external_secrets"].arn]
+    }
+  }
+}
+
+resource "aws_iam_role" "secret_store" {
+  for_each = var.create_iam ? local.secret_store_secrets : {}
+
+  name                 = local.role_names[each.key]
+  description          = "External Secrets ${each.value.description}, in ${var.global_name_prefix}; assumed by the controller only."
+  assume_role_policy   = data.aws_iam_policy_document.secret_store_trust[each.key].json
+  permissions_boundary = var.permissions_boundary_arn
+}
+
+resource "aws_iam_role_policy" "secret_store" {
+  for_each = var.create_iam ? local.secret_store_policies : {}
+
+  name   = "secret-store"
+  role   = aws_iam_role.secret_store[each.key].name
+  policy = jsonencode({ Version = "2012-10-17", Statement = each.value })
 }

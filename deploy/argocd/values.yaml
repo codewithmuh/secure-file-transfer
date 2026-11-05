@@ -1,0 +1,17 @@
+# Set by the root Application (cluster-bootstrap stack, #104). Nothing account-specific is committed.
+environment: "" # dev | staging | prod
+region: "" # ap-northeast-1 | ap-northeast-3
+cluster:
+  registry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com
+  databaseHost: "" # the Aurora cluster endpoint in this region
+  accountId: "" # this environment's account, quoted
+  operatorRoleName: "" # the IAM role of the Operator permission set
+  serviceDomain: "" # sft.<domain> in prod, <env>.sft.<domain> elsewhere (edge stack, #105)
+  valkeyHost: "" # the counter store's endpoint in this region
+  filesKeyArn: "" # the files key in this region
+  userPoolId: "" # this region's user pool; empty until it exists
+  cognitoLoginDomain: "" # its managed login domain; empty until it exists
+
+repoURL: https://github.com/codewithmuh/secure-file-transfer.git
+# Argo CD syncs only reviewed main (ADR-0005, T-72).
+targetRevision: main

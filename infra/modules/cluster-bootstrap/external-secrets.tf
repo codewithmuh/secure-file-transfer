@@ -1,12 +1,16 @@
-# External Secrets (ADR-0004) and its one store, for platform components' secrets only (encryption 6, A31): it reads
-# sft/<env>/platform/* through the Secrets Manager endpoint, with the role the cluster layer binds to
-# external-secrets/external-secrets by Pod Identity. Application pods read their own secrets directly, so no
-# application namespace may use the store.
+# External Secrets (ADR-0004) and its two stores (encryption 6.4, A31), reading Secrets Manager through its endpoint.
+# The controller's own role, bound to external-secrets/external-secrets by Pod Identity, reads no secret: it may only
+# assume the two store roles the cluster layer creates, and each store names its own (charts/secret-stores):
+#
+# - platform-secrets assumes sft-<env>-external-secrets-platform, which reads only sft/<env>/platform/*, for argocd,
+#   monitoring and grafana.
+# - application-secrets assumes sft-<env>-external-secrets-app, which reads only the API's csrf-hmac, email-hmac and
+#   this Region's idp-client (#106), for the sft namespace only.
+#
+# So an ExternalSecret in a platform namespace can't reach an application secret, nor one in sft a platform secret,
+# whatever key it names: the namespace conditions pick the store, and the store's role decides what it can read.
 
 locals {
-  # Namespaces that may use the platform store: Argo CD (its notifications key) and the observability stack (ADR-0009).
-  platform_secret_namespaces = ["argocd", "monitoring", "grafana"]
-
   external_secrets_component = {
     nodeSelector = local.main_scheduling.nodeSelector
     tolerations  = local.main_scheduling.tolerations
@@ -21,43 +25,28 @@ locals {
     tag        = local.image_tag["external_secrets"]
   }
 
-  # The store and, with notifications on, the Argo CD notifications Secret (ADR-0005).
-  external_secrets_manifests = concat(
-    [{
-      apiVersion = "external-secrets.io/v1"
-      kind       = "ClusterSecretStore"
-      metadata   = { name = "platform-secrets" }
-      spec = {
-        conditions = [{ namespaces = local.platform_secret_namespaces }]
-        provider = {
-          aws = {
-            service = "SecretsManager"
-            region  = var.region
-          }
+  # With notifications on, the Argo CD notifications Secret (ADR-0005), from the platform store. The stores themselves
+  # and their namespaces are in charts/secret-stores.
+  external_secrets_manifests = var.github_app == null ? [] : [{
+    apiVersion = "external-secrets.io/v1"
+    kind       = "ExternalSecret"
+    metadata   = { name = "argocd-notifications-secret", namespace = "argocd" }
+    spec = {
+      refreshInterval = "1h"
+      secretStoreRef  = { kind = "ClusterSecretStore", name = "platform-secrets" }
+      target = {
+        name           = "argocd-notifications-secret"
+        creationPolicy = "Owner"
+        template = {
+          metadata = { labels = { "app.kubernetes.io/part-of" = "argocd" } }
         }
       }
-    }],
-    var.github_app == null ? [] : [{
-      apiVersion = "external-secrets.io/v1"
-      kind       = "ExternalSecret"
-      metadata   = { name = "argocd-notifications-secret", namespace = "argocd" }
-      spec = {
-        refreshInterval = "1h"
-        secretStoreRef  = { kind = "ClusterSecretStore", name = "platform-secrets" }
-        target = {
-          name           = "argocd-notifications-secret"
-          creationPolicy = "Owner"
-          template = {
-            metadata = { labels = { "app.kubernetes.io/part-of" = "argocd" } }
-          }
-        }
-        data = [{
-          secretKey = "github-privateKey"
-          remoteRef = { key = "${local.platform_secret_prefix}/argocd/github-app-private-key" }
-        }]
-      }
-    }],
-  )
+      data = [{
+        secretKey = "github-privateKey"
+        remoteRef = { key = "${local.platform_secret_prefix}/argocd/github-app-private-key" }
+      }]
+    }
+  }]
 }
 
 resource "helm_release" "external_secrets" {
@@ -92,14 +81,19 @@ resource "helm_release" "external_secrets" {
 
 resource "helm_release" "external_secrets_store" {
   name             = "external-secrets-store"
-  chart            = "${path.module}/charts/manifests"
+  chart            = "${path.module}/charts/secret-stores"
   namespace        = kubernetes_namespace_v1.platform["external-secrets"].metadata[0].name
   create_namespace = false
   atomic           = true
   wait             = true
   timeout          = 300
 
-  values = [yamlencode({ manifests = local.external_secrets_manifests })]
+  values = [yamlencode({
+    environment = var.environment
+    region      = var.region
+    accountId   = var.account_id
+    manifests   = local.external_secrets_manifests
+  })]
 
   depends_on = [helm_release.external_secrets, kubernetes_namespace_v1.platform]
 }

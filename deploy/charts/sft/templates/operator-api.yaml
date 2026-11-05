@@ -1,0 +1,33 @@
+{{- if eq .Values.part "operator" }}
+{{- /*
+The operator API (FR-34, authn-authz 8.2): namespace sft-operator, which runs nothing else. No Service, no load
+balancer: operators reach it with `kubectl port-forward`, which only the Operator group may do here.
+*/}}
+{{- $w := .Values.operatorApi }}
+{{- $env := merge (dict
+  "OPERATOR_ENVIRONMENT" .Values.environment
+  "OPERATOR_AWS_ACCOUNT_ID" (toString .Values.cluster.accountId)
+  "OPERATOR_ROLE_NAME" .Values.cluster.operatorRoleName) $w.env }}
+{{- $containers := include "sft.appContainer" (dict "root" $ "name" "operator-api" "module" $w.module "publicPort" 8000 "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $env "preStop" true "resources" $w.resources) }}
+{{ include "sft.deployment" (dict "root" $ "name" "operator-api" "component" "operator-api" "replicas" $w.replicas "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds "containers" $containers) }}
+---
+{{ include "sft.pdb" (dict "root" $ "name" "operator-api" "component" "operator-api") }}
+---
+# The Operator permission set's group may port-forward here and nowhere else in the application namespaces
+# (ADR-0004, authn-authz 8.1). The ClusterRole is the cluster-bootstrap stack's (#104).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: operator-portforward
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "operator-api") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sft:portforward
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: sft:operator
+{{- end }}

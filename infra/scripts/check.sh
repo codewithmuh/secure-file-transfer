@@ -146,13 +146,16 @@ tflint() {
 trivy() {
   # --skip-check-update uses the checks built into this Trivy version, so results change only when the image does;
   # Trivy logs "Falling back to embedded checks" as an error, which is expected. The variables are placeholders, an
-  # account that can't exist, so Trivy evaluates every expression; no real account ID is ever needed here. Osaka's
-  # data stacks get a placeholder primary for every key class (TF_VAR_primary_key_arns, infra/README.md).
+  # account that can't exist and a reserved domain, so Trivy evaluates every expression; no real account ID is ever
+  # needed here. Osaka's data stacks get a placeholder primary for every key class (TF_VAR_primary_key_arns,
+  # infra/README.md).
   local key=arn:aws:kms:ap-northeast-1:000000000000:key/mrk-00000000000000000000000000000000 primaries='' class
   for class in files fields database audit logs secrets platform; do primaries+="${primaries:+,}\"$class\":\"$key\""; done
   container none \
     --env TF_VAR_account_id=000000000000 \
     --env TF_VAR_shared_account_id=000000000000 \
+    --env TF_VAR_management_account_id=000000000000 \
+    --env TF_VAR_domain=example.com \
     --env 'TF_VAR_admin_principal_arn_patterns=["arn:aws:iam::000000000000:role/placeholder-admin"]' \
     --env TF_VAR_tfstate_primary_key_arn="$key" \
     --env TF_VAR_primary_key_arns="{$primaries}" \

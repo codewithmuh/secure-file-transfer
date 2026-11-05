@@ -24,11 +24,12 @@ variable "user_name_prefix" {
 variable "workloads" {
   description = <<-EOT
     The workloads that may use the store, one IAM-authenticated user each, named <user_name_prefix>-<workload> like
-    their IAM roles: the API, the sign-in triggers, the scan worker (scan leases) and the notification worker
-    (per-address caps across tenants), and nothing else (ADR-0014).
+    their IAM roles: the API, the sign-in triggers, the scan worker (scan leases), the notification worker
+    (per-address caps across tenants) and the operator API (its rate limits, authn-authz 8.2), and nothing else
+    (ADR-0014).
   EOT
   type        = set(string)
-  default     = ["api", "signin-trigger", "scan", "notify"]
+  default     = ["api", "signin-trigger", "scan", "notify", "operator"]
 
   validation {
     condition     = length(var.workloads) > 0 && alltrue([for w in var.workloads : can(regex("^[a-z][a-z0-9-]{1,23}$", w))])

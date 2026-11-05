@@ -60,6 +60,9 @@ module "terraform_roles" {
 
   # The network layer's permissions (#56), in the Regions where this account has network stacks.
   network_regions = ["ap-northeast-1", "ap-northeast-3"]
+
+  # The edge layer (#105) writes its records in the shared zone through DNS roles there.
+  shared_account_id = var.shared_account_id
 }
 
 module "key_admin" {

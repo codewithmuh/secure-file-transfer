@@ -1,0 +1,8 @@
+apiVersion: v2
+name: secret-stores
+description: >-
+  External Secrets' two ClusterSecretStores, each assuming its own IAM role so that a store can read only its own
+  secrets, and the ExternalSecrets Terraform hands it (infra/modules/cluster-bootstrap, encryption 6.4). A Helm release
+  rather than kubernetes_manifest, which needs the CRDs at plan time.
+type: application
+version: 0.1.0

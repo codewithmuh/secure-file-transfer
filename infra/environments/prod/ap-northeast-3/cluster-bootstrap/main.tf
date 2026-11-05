@@ -137,7 +137,18 @@ module "cluster_bootstrap" {
   database_host      = data.terraform_remote_state.data.outputs.aurora_endpoint.host
   operator_role_name = one(data.aws_iam_roles.operator.names)
 
+  # What the application's settings need besides the database (deploy/charts/sft): the environment's names in the
+  # shared zone (the edge stack's service_domain), the counter store and the files key, from the data layer.
+  service_domain = "sft.${var.domain}"
+  valkey_host    = data.terraform_remote_state.data.outputs.valkey_endpoint.address
+  files_key_arn  = data.terraform_remote_state.data.outputs.kms_key_arns["files"]
+
+  # clamd's image (mirror/clamav/clamav 1.5.4-debian), the one third-party image the application runs; the same
+  # digest as deploy/charts/sft/values.yaml, which deploy/tests checks (ADR-0007).
+  additional_mirror_digests = ["sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1"]
+
   identity_center_saml = var.identity_center_saml
   github_app           = var.github_app
   cognito_login_domain = var.cognito_login_domain
+  cognito_user_pool_id = var.cognito_user_pool_id
 }

@@ -47,6 +47,7 @@
           { "context": "Contract (generated spec)", "integration_id": 15368 },
           { "context": "Contract (breaking changes)", "integration_id": 15368 },
           { "context": "Terraform (fmt, validate, tflint, Trivy)", "integration_id": 15368 },
+          { "context": "Deploy config (helm lint, template, kubeconform, runtime contract)", "integration_id": 15368 },
           { "context": "promotion-gate", "integration_id": 15368 }
         ]
       }

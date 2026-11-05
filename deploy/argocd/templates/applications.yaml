@@ -1,0 +1,45 @@
+{{- $values := printf "../../environments/%s/%s/values.yaml" .Values.environment .Values.region }}
+{{- range $app := list (dict "name" "sft" "namespace" "sft" "part" "application") (dict "name" "sft-operator" "namespace" "sft-operator" "part" "operator") }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ $app.name }}
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io] # pruning the Application prunes what it made
+spec:
+  project: sft
+  source:
+    repoURL: {{ $.Values.repoURL | quote }}
+    targetRevision: {{ $.Values.targetRevision }}
+    path: deploy/charts/sft
+    helm:
+      releaseName: sft
+      # The chart's defaults, then this cluster's file, which pins the image digest (ADR-0005).
+      valueFiles: [{{ $values | quote }}]
+      valuesObject:
+        environment: {{ $.Values.environment }}
+        region: {{ $.Values.region }}
+        part: {{ $app.part }}
+        cluster:
+          {{- toYaml $.Values.cluster | nindent 10 }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $app.namespace }}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - CreateNamespace=true
+      - PruneLast=true
+      - FailOnSharedResource=true
+    managedNamespaceMetadata:
+      labels: # Pod Security Admission at restricted (ADR-0004)
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/enforce-version: latest
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/warn: restricted
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+  revisionHistoryLimit: 10
+{{- end }}

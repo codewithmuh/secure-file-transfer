@@ -9,7 +9,8 @@ misconfigurations:
     statement: >-
       The Terraform state buckets record access through CloudTrail S3 data events, not S3 server access logs. The
       organization trail, which the shared stack creates as CloudTrail's delegated administrator (#55), logs data
-      events on every sft-*-tfstate-* bucket into the shared account's log archive under Object Lock, where a read or write by anyone but the Terraform roles stands out (T-73, T-75). Server access
+      events on every sft-*-tfstate-* bucket into the shared account's log archive under Object Lock, where a read
+      or write by anyone but the Terraform roles stands out (T-73, T-75; modules/log-archive, #105). Server access
       logs would need a log bucket in every account and Region, before the state bucket exists, that is itself a
       bucket without logging.
   - id: AVD-AWS-0143 # IAM policy attached directly to a user
@@ -66,3 +67,58 @@ misconfigurations:
       boundary lets a cluster-layer role pass only the Karpenter node role, which Karpenter's own policy also limits to
       ec2.amazonaws.com. The roles that can be passed all carry the same boundary, which allows no IAM change and no
       sts:AssumeRole, so passing one gains nothing beyond the workload's own rights (T-71).
+  - id: AVD-AWS-0053 # public load balancer
+    paths:
+      - "**/modules/edge/load-balancer.tf"
+    statement: >-
+      The API's load balancer is internet-facing by design: recipients and uploaders reach the API from anywhere
+      (ADR-0021, abuse 3.1). It has one HTTPS listener with the TLS 1.3 post-quantum policy, drops invalid headers,
+      runs desync mitigation in strictest mode and fails closed when WAF can't be reached; the API web ACL's managed
+      and rate rules sit in front of it, and its security group reaches only the API's two ports on the main nodes,
+      never the scan nodes (T-53, AB-10).
+  - id: AVD-AWS-0132 # S3 encryption with a customer managed key
+    paths:
+      - "**/modules/edge/logs.tf"
+      - "**/modules/edge/web-bucket.tf"
+    statement: >-
+      Two buckets use SSE-S3 on purpose (encryption 3.1). The load balancer's access logs support only SSE-S3, the
+      exception to NFR-13 recorded in encryption 3.1; they hold no tokens, which travel in the URL fragment. The web
+      bundle buckets hold public content that every browser downloads; CloudFront reads them through origin access
+      control and only the release pipeline writes them (ADR-0008, T-02). The WAF log bucket in logs.tf uses the
+      environment's logs key.
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/modules/edge/logs.tf"
+      - "**/modules/edge/web-bucket.tf"
+      - "**/modules/log-archive/main.tf"
+    statement: >-
+      Log buckets don't log to more log buckets, which would only move the question one bucket on: the edge's WAF and
+      load balancer log buckets and the organization's log archive are written by AWS's log delivery services and
+      read by people only through their own sessions, which the organization trail records as management events and
+      KMS calls (T-75). The web bundle buckets hold public content; CloudFront's own standard logs record every read,
+      and only the release pipeline writes them (ADR-0008, T-02). Changes to any of them are management events in the
+      organization trail.
+  - id: AVD-AWS-0162 # CloudTrail to CloudWatch Logs
+    paths:
+      - "**/modules/log-archive/main.tf"
+    statement: >-
+      The organization trail delivers to the Object Lock log archive only. Alerts on the events that matter (sign-ins,
+      break-glass, changes to logging and keys) come from EventBridge rules in each account (authn-authz 8.3, ADR-0006),
+      which see every management event without a log group; a CloudWatch Logs copy of the whole organization's trail
+      would add cost and a second, mutable store of the same records (T-75).
+  - id: AVD-AWS-0163 # CloudTrail bucket access logging
+    paths:
+      - "**/modules/log-archive/main.tf"
+    statement: >-
+      The trail's bucket is the log archive itself, under Object Lock in compliance mode for 90 days, so no record can
+      be changed or deleted, whoever reads it (T-75). Reads by people go through AuditReader sessions that the trail
+      records as management events and KMS decrypt calls; server access logs would need yet another bucket outside
+      the lock.
+  - id: AVD-AWS-0031 # ECR immutable tags
+    paths:
+      - "**/modules/registry/main.tf"
+    statement: >-
+      Tags are immutable except one pattern, sha256-*, cosign's fallback tags for signatures and attestations
+      (sha256-<digest>.sig and .att), which a re-sign must rewrite (#107). Images are deployed by digest, never by
+      tag, and admission accepts only digests with a valid signature from our build identity or a listed vendor, so
+      a rewritten fallback tag can't change what runs (ADR-0007, T-70).

@@ -29,7 +29,7 @@ locals {
     for name in [
       "api", "scan", "notify", "relay", "jobs", "archive", "operator", "recovery", "key-rotation", "db-bootstrap",
       "s3-replication", "malware-protection", "events-delivery", "signin-trigger", "karpenter", "ebs-csi",
-      "external-secrets", "eks-cluster", "loki", "tempo",
+      "external-secrets", "external-secrets-platform", "external-secrets-app", "eks-cluster", "loki", "tempo",
     ] :
     name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
   }

@@ -29,15 +29,18 @@ locals {
     ebs_csi          = "${var.global_name_prefix}-ebs-csi"
     lb_controller    = "${var.global_name_prefix}-lb-controller"
     external_secrets = "${var.global_name_prefix}-external-secrets"
-    kyverno          = "${var.global_name_prefix}-kyverno"
-    api              = "${var.global_name_prefix}-api"
-    relay            = "${var.global_name_prefix}-relay"
-    scan             = "${var.global_name_prefix}-scan"
-    notify           = "${var.global_name_prefix}-notify"
-    jobs             = "${var.global_name_prefix}-jobs"
-    archive          = "${var.global_name_prefix}-archive"
-    migrate          = "${var.global_name_prefix}-migrate"
-    operator         = "${var.global_name_prefix}-operator"
+    # The two secret stores' roles, which only the External Secrets controller may assume (workload-roles.tf).
+    external_secrets_platform = "${var.global_name_prefix}-external-secrets-platform"
+    external_secrets_app      = "${var.global_name_prefix}-external-secrets-app"
+    kyverno                   = "${var.global_name_prefix}-kyverno"
+    api                       = "${var.global_name_prefix}-api"
+    relay                     = "${var.global_name_prefix}-relay"
+    scan                      = "${var.global_name_prefix}-scan"
+    notify                    = "${var.global_name_prefix}-notify"
+    jobs                      = "${var.global_name_prefix}-jobs"
+    archive                   = "${var.global_name_prefix}-archive"
+    migrate                   = "${var.global_name_prefix}-migrate"
+    operator                  = "${var.global_name_prefix}-operator"
   }
   role_arns = { for k, n in local.role_names : k => "arn:aws:iam::${var.account_id}:role/${n}" }
 

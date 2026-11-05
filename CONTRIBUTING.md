@@ -42,7 +42,7 @@ make up         # run all services locally
 
 The `protect-main` ruleset lives in [`.github/rulesets/protect-main.json`](.github/rulesets/protect-main.json). It
 requires these checks, each a job that reports on every pull request: Repo checks, Python, Web app, Web app
-accessibility, Local stack, Mail adapter, both Contract checks, Terraform and `promotion-gate`. The image build runs only when the code it packages
+accessibility, Local stack, Mail adapter, both Contract checks, Terraform, Deploy config and `promotion-gate`. The image build runs only when the code it packages
 changes, so it isn't required. When you rename or add a job, update that file in the same pull request:
 `.github/scripts/check-ruleset.sh`, run in Repo checks, fails if a required check isn't a job that reports on every
 pull request. After the change merges, the maintainer runs `.github/scripts/apply-github-settings.sh` to apply it,

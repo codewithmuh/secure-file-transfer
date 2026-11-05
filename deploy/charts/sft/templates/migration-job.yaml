@@ -1,0 +1,26 @@
+{{- if and (eq .Values.part "application") (not .Values.pilotLight) }}
+{{- /*
+The migration job (ADR-0005, data model 7): an Argo CD PreSync hook, so it runs before any other object of the sync
+changes, and a failure stops the sync. `sft.data.migrate` upgrades when the image's head is newer than the database's,
+does nothing when they match, and after a rollback skips only if the database lists the image's revision as
+compatible. Not in the pilot light: Osaka's database is a read-only replica until a failover promotes it.
+*/}}
+{{- $m := .Values.migration }}
+{{- $env := printf "- name: MIGRATION_DATABASE_URL\n  value: %s" (include "sft.databaseUrl" (dict "root" $ "role" $m.databaseRole) | quote) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "migrate") | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # Kept until the next sync replaces it, so its logs can be read after a failure.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0 # the job retries lock timeouts itself; anything else needs a person, and stops the sync
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  template:
+    {{- include "sft.jobPod" (dict "root" $ "component" "migrate" "module" $m.module "serviceAccount" $m.serviceAccount "env" $env "resources" $m.resources) | nindent 4 }}
+{{- end }}

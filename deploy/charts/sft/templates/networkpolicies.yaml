@@ -1,0 +1,90 @@
+{{- /*
+Network policies (ADR-0021): default deny in the namespace, then one policy per workload naming everything it may
+reach, never the whole VPC. Every workload may reach CoreDNS, its own proxy listener, the endpoint subnets on 443,
+the data stores it uses on their ports, and the Pod Identity agent; those that use S3 may reach addresses outside the
+VPC on 443, which the node security groups narrow to S3's prefix list. The DLP inspector gets no egress at all.
+*/}}
+{{- $n := .Values.network }}
+{{- $rules := dict
+  "dns" (printf "- to:\n    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: %s } }\n      podSelector: { matchLabels: %s }\n  ports:\n    - { port: 53, protocol: UDP }\n    - { port: 53, protocol: TCP }" $n.dns.namespace (toJson $n.dns.podLabels))
+  "endpoints" (printf "- to:\n    - ipBlock: { cidr: %s }\n  ports:\n    - { port: 443, protocol: TCP }" $n.endpointSubnetsCidr)
+  "postgres" (printf "- to:\n    - ipBlock: { cidr: %s }\n  ports:\n    - { port: %v, protocol: TCP }" $n.isolatedSubnetsCidr .Values.database.port)
+  "valkey" (printf "- to:\n    - ipBlock: { cidr: %s }\n  ports:\n    - { port: 6379, protocol: TCP }" $n.isolatedSubnetsCidr)
+  "s3" (printf "- to:\n    - ipBlock: { cidr: 0.0.0.0/0, except: [%s, 169.254.0.0/16] }\n  ports:\n    - { port: 443, protocol: TCP }" $n.vpcCidr)
+  "podIdentity" (printf "- to:\n    - ipBlock: { cidr: %s }\n  ports:\n    - { port: 80, protocol: TCP }" $n.podIdentityAgent)
+  "fromMonitoring" (printf "- from:\n    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: %s } }\n      podSelector: { matchLabels: %s }\n  ports:\n    - { port: internal, protocol: TCP }" $n.monitoring.namespace (toJson $n.monitoring.podLabels))
+  "fromLoadBalancer" (printf "- from:\n    - ipBlock: { cidr: %s }\n  ports:\n    - { port: http, protocol: TCP }\n    - { port: internal, protocol: TCP }" $n.publicSubnetsCidr)
+}}
+{{- $proxy := dict }}
+{{- range $listener, $port := $n.egressProxy.ports }}
+{{- $_ := set $proxy $listener (printf "- to:\n    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: %s } }\n      podSelector: { matchLabels: %s }\n  ports:\n    - { port: %v, protocol: TCP }" $n.egressProxy.namespace (toJson $n.egressProxy.podLabels) $port) }}
+{{- end }}
+{{- $pods := dict
+  "toClamd" (printf "- to:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: clamd } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.clamd.port)
+  "toInspector" (printf "- to:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: dlp-inspector } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.dlpInspector.port)
+  "toMirror" (printf "- to:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: signature-mirror } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.signatureMirror.port)
+  "fromWorkerToClamd" (printf "- from:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: scan-worker } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.clamd.port)
+  "fromWorkerToInspector" (printf "- from:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: scan-worker } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.dlpInspector.port)
+  "fromClamd" (printf "- from:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: clamd } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.signatureMirror.port)
+}}
+{{- $base := list $rules.dns $rules.endpoints $rules.postgres $rules.podIdentity }}
+{{- $policies := list }}
+{{- if eq .Values.part "application" }}
+{{- $policies = list
+  (dict "component" "api" "ingress" (list $rules.fromLoadBalancer $rules.fromMonitoring) "egress" (concat $base (list $proxy.api $rules.valkey $rules.s3)))
+  (dict "component" "relay" "ingress" (list $rules.fromMonitoring) "egress" $base)
+  (dict "component" "notifier" "ingress" (list $rules.fromMonitoring) "egress" (concat $base (list $proxy.notifier $rules.valkey)))
+  (dict "component" "scan-worker" "ingress" (list $rules.fromMonitoring) "egress" (concat $base (list $rules.valkey $rules.s3 $pods.toClamd $pods.toInspector)))
+  (dict "component" "clamd" "ingress" (list $pods.fromWorkerToClamd) "egress" (list $rules.dns $pods.toMirror))
+  (dict "component" "dlp-inspector" "ingress" (list $pods.fromWorkerToInspector) "egress" (list))
+  (dict "component" "signature-mirror" "ingress" (list $pods.fromClamd) "egress" (list $rules.dns $proxy.signatureMirror))
+  (dict "component" "migrate" "ingress" (list) "egress" $base)
+}}
+{{- range $name := keys .Values.lifecycleJobs | sortAlpha }}
+{{- $job := index $.Values.lifecycleJobs $name }}
+{{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $base $rules.s3) $base $job.s3)) }}
+{{- end }}
+{{- else }}
+{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (append $base $rules.valkey)) }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "network") | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+{{- range $p := $policies }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $p.component }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" $p.component) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sft.selectorLabels" (dict "component" $p.component) | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  {{- if $p.ingress }}
+  ingress:
+    {{- range $rule := $p.ingress }}
+    {{- $rule | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
+  {{- if $p.egress }}
+  egress:
+    {{- range $rule := $p.egress }}
+    {{- $rule | nindent 4 }}
+    {{- end }}
+  {{- else }}
+  egress: []
+  {{- end }}
+{{- end }}

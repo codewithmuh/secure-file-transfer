@@ -1,5 +1,5 @@
 # One Region's counter store (ADR-0014): ElastiCache Serverless for Valkey, encrypted at rest with the platform key and
-# always TLS in transit, with IAM authentication for the four workloads that use it and nothing else. Nothing in it
+# always TLS in transit, with IAM authentication for the five workloads that use it and nothing else. Nothing in it
 # must survive, so it keeps no snapshots and nothing replicates to the other Region (abuse 4.2).
 
 locals {

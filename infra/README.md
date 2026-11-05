@@ -46,11 +46,10 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 | `data` | Aurora, the files buckets, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
 | `cluster-bootstrap` | Argo CD and its root Application, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
-| `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | |
+| `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | [`modules/edge`](modules/edge/README.md) and [`modules/web-cdn`](modules/web-cdn/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
 | `retained` | See above | prod only, one root for both Regions |
 
-The `network`, `data`, `cluster` and `cluster-bootstrap` layers are written; `edge` is still a skeleton: providers,
-backend and conventions, with a header comment naming the issue that fills it. The bootstrap stacks are complete.
+Every layer is written, and so are the `shared` stack and the bootstrap stacks.
 
 Two deliberate exceptions to "one root per Region": `shared` and `retained` each hold a few Osaka (and us-east-1)
 resources through provider aliases. Neither is in the failover path, and `retained` is one unit by design: its archive
@@ -67,15 +66,21 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `terraform-oidc-roles` | The GitHub OIDC provider, the plan role and the deploy role |
 | `key-admin-role` | `sft-<env>-keyadmin`, which only BreakGlass may assume (encryption 4.4, rule 6) |
 | `emergency-user` | `sft-<env>-emergency` under `/sft-emergency/`, the account's way in when Identity Center can't be reached (authn-authz 8.4) |
+| `dns-zone` | The public zone `sft.<domain>` with DNSSEC and CAA, and each environment's narrow DNS roles ([README](modules/dns-zone/README.md), #105) |
+| `edge` | One environment's edge in one Region: the API load balancer, its certificate and web ACL, the sign-in web ACL, the edge's log buckets, the web bundle bucket, the API records and the health check ([README](modules/edge/README.md), #105) |
 | `eks-cluster` | One EKS cluster per account and Region: private API, control-plane logs, the `system` node group, Karpenter's IAM, queue and node pools, Pod Identity roles, access entries, the tunnel's session document ([README](modules/eks-cluster/README.md), #103) |
 | `events-delivery-role` | `sft-<env>-events-delivery`, the role every EventBridge rule delivers into our queues and topics through (encryption 4.4, #102) |
 | `files-buckets` | One Region's files and large-files buckets: policies, lifecycle safety nets, replication with RTC from Tokyo, GuardDuty Malware Protection on large files and its results rule ([README](modules/files-buckets/README.md), #102) |
+| `key-policy` | Nothing: the common part of a key policy for a key a deploy role creates ([README](modules/key-policy/README.md), #105) |
 | `kms-keys` | The environment's keys, one per data class: primaries in Tokyo, replicas in Osaka, with the key policies of encryption 4.4 ([README](modules/kms-keys/README.md), #102) |
+| `log-archive` | The organization's log archive under Object Lock, its logs key and the organization trail with the state buckets' data events ([README](modules/log-archive/README.md), #105) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
 | `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
 | `data-stack` | One environment and Region's data layer: calls `aurora`, `valkey` and `queues` with the network stack's subnets and groups, so every `data` root passes only what differs (#101) |
 | `queues` | Every SQS queue of ADR-0013 and its dead-letter queue, with a queue policy that admits only its one sender ([README](modules/queues/README.md), #101) |
+| `registry` | ECR repositories, the registry key, the cross-account pull policy, the lifecycle rules, the push role and Osaka replication ([README](modules/registry/README.md), #105) |
 | `valkey` | One Region's counter store: ElastiCache Serverless for Valkey, its IAM-authenticated users and security group ([README](modules/valkey/README.md), #101) |
+| `web-cdn` | The CloudFront distribution for the web bundle, with Osaka failover, its us-east-1 certificate and web ACL, its logs and the app record ([README](modules/web-cdn/README.md), #105) |
 
 ## Apply order
 
@@ -104,7 +109,14 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    (`terraform import 'module.data.aws_iam_service_linked_role.volumes["autoscaling"]' <role ARN>`).
    Tokyo's `cluster` makes the account's IAM roles and Osaka's refers to them, so Osaka's goes after it; both need
    `data` first, for the keys' aliases and EventBridge's delivery role. `cluster-bootstrap` reaches the cluster API
-   only through the Systems Manager tunnel, as the deploy role (modules/cluster-bootstrap).
+   only through the Systems Manager tunnel, as the deploy role (modules/cluster-bootstrap). It needs
+   `TF_VAR_domain` for the application's names and, once the user pool exists, `TF_VAR_cognito_user_pool_id` and
+   `TF_VAR_cognito_login_domain`; until then Argo CD can't render the application part (deploy/README.md).
+   `edge` needs nothing from the cluster stacks: the Load Balancer Controller finds the API's target group by name
+   (`sft-<env>-<region-short>-api`), so its pods register whenever both exist. In staging and prod, Osaka's `edge`
+   runs after Tokyo's, with `TF_VAR_web_distribution_arn` set to Tokyo's `web_distribution_arn` output: the Osaka web
+   bucket's only reader is that distribution. The edge roots need `TF_VAR_shared_account_id` and `TF_VAR_domain`, and
+   `TF_VAR_terraform_role=deploy` in an apply job.
 
 Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
 deletion protection off, skips the final snapshot and drops the master secret's recovery window, then the destroy.
@@ -160,8 +172,8 @@ bootstrap's `backend_override.tf` is the one override ever used, and it is gone 
 
 | Role | Trust (T-71) | May |
 |---|---|---|
-| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network, data, storage and cluster layers (below) |
-| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network, data, storage and cluster layers (below) |
+| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network, data, storage, cluster and edge layers; in shared, the shared stack (below) |
+| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network, data, storage, cluster and edge layers; in shared, the shared stack (below) |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
 
 All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
@@ -367,6 +379,22 @@ comment.
   cluster's tunnel document and only on instances tagged `eks:nodegroup-name = sft-<env>-<rs>-system`, with the
   document check on; ending or resuming only its own sessions. The cluster API admits it through the cluster layer's
   access entry. The plan role gets nothing: the layer is planned only on `main`.
+- **Edge** (#105), in the same Regions, plus us-east-1 for CloudFront's certificate, web ACL and log delivery. Managed
+  policies `sft-<env>-terraform-edge-read` and `-write` under `/sft-bootstrap/`
+  (`modules/terraform-oidc-roles/permissions-edge.tf`): load balancers, ACM, WAF, CloudFront, Route 53 health checks,
+  CloudWatch Logs delivery and the edge's own buckets; deletes of load balancer resources only when tagged
+  `managed-by = terraform`. The plan role may assume `sft-shared-dns-<env>-plan` in the shared account, the deploy role
+  `sft-shared-dns-<env>-deploy` (bootstrap input `shared_account_id`).
+- **Shared** (#105), in the shared account (`shared_stack = true`): managed policies `sft-shared-terraform-shared-read`
+  and `-write` (`permissions-shared.tf`) for ECR in Tokyo and Osaka, creating KMS keys and aliases (each key's own
+  policy then makes the deploy role its administrator), the zone and DNSSEC, IAM roles under `/sft-shared/` only, the
+  log archive bucket and the organization trail.
+
+**IAM quotas.** With the edge, an environment's deploy role has 10 managed policies (data 1, storage 3, cluster 3,
+cluster bootstrap 1, edge 2), IAM's default limit per role, and its plan role 4. The next layer that needs one must
+merge two of them or raise the account's quota first (Service Quotas, "Managed policies per role", up to 20). Each
+managed policy must stay under IAM's 6,144 characters; counted from their statements, the edge's two come to about
+2,000 and 5,000 in staging and prod. No static check measures the rendered JSON, so the bootstrap apply is the test.
 
 These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
 `/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply

@@ -50,20 +50,23 @@ dropped**: ECR is the only registry for our images.
   tags every digest `main` pins, and `promote.yml` repeats it for the digest it copies, which has already landed in
   the previous environment. A build whose dev proposal is replaced before it merges is never tagged. The
   highest-priority lifecycle rule selects `deployed-*` with a count no repository reaches, so a deployed image never
-  expires, whichever environment still pins it; only builds never tagged deployed expire, beyond the newest 30 (A40).
+  expires, whichever environment still pins it; only tagged builds never tagged deployed expire, beyond the newest 30
+  (A40). No rule selects untagged images (next point), so a build that failed its scan, which is never tagged, stays
+  until someone deletes it.
   Mirror repositories keep every digest that Git pins. A CI check fails a deploy config that names a digest not in
   ECR, and a daily check alerts on a pinned digest without its `deployed-` tag.
 - **Signatures and attestations under the lifecycle.** cosign v3 (v3.0.6, from `cosign-installer` v4.1.2) stores each
   signature as a Sigstore bundle in an OCI 1.1 referrer: an untagged artifact whose subject is the image index. ECR's
-  lifecycle never expires a referrer while its subject is kept, and removes it within 24 hours after the subject
-  expires; the SBOM and provenance are manifests inside the index, which ECR won't expire before the index. So the
-  count rule, which also selects untagged images, can't take a kept image's signature or attestations. Tag-based
-  signatures could be taken: cosign's legacy `sha256-<digest>.sig` tags, or the `sha256-<digest>` tag that the OCI
-  referrers fallback writes for a registry without the referrers API, are tagged images the count rule could expire
-  while the image they sign is kept. ECR serves the referrers API, so none should appear; the lifecycle policy
-  ([#105](https://github.com/codewithmuh/secure-file-transfer/issues/105)) still keeps every `sha256-` tag, in a rule
-  above the count rule. The first build milestone checks with the lifecycle preview that no signature or attestation
-  of a kept image is selected, and how many images a build adds to the count.
+  lifecycle removes a referrer within 24 hours after its subject expires (the ECR user guide, "Lifecycle policy
+  evaluation rules"); the SBOM and provenance are manifests inside the index, which ECR won't expire before the index.
+  The guide doesn't say that a rule selecting untagged images skips referrers whose subject is kept, so the lifecycle
+  policy ([#105](https://github.com/codewithmuh/secure-file-transfer/issues/105)) has no such rule: its count rule
+  selects only tagged images, and a kept image's signature, untagged, is never selected. Tag-based signatures could be
+  taken: cosign's legacy `sha256-<digest>.sig` tags, or the `sha256-<digest>` tag that the OCI referrers fallback
+  writes for a registry without the referrers API, are tagged images. ECR serves the referrers API, so none should
+  appear; the policy still keeps every `sha256-` tag, in a rule above the count rule. The first build milestone checks
+  with the lifecycle preview that no signature or attestation of a kept image is selected, and how many images a
+  build adds to the count; if AWS documents that untagged rules skip referrers, a rule for failed builds can follow.
 - **Build and sign** ([ADR-0005](0005-terraform-github-actions-argo-cd.md)). On every merge to `main` that changes
   code, CI builds once, fails on a critical or high Trivy finding, pushes `sft/app:<git-sha>` through an OIDC role in
   shared that may push only to `sft/*`, and signs the digest. The SBOM (SPDX) and provenance are attached as artifacts

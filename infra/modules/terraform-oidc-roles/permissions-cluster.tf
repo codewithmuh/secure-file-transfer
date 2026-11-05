@@ -9,8 +9,9 @@
 #
 # The cluster layer creates IAM roles, which is how a deploy role could widen its own reach. Three things stop that:
 # it may create and change only the roles the cluster layer names (sft-<env>-<workload>, path /); every one of them must
-# carry the workload permissions boundary below, which allows no IAM change, no sts:AssumeRole and only the services
-# the workloads use; and it may attach only the AWS managed policies the module uses.
+# carry the workload permissions boundary below, which allows no IAM change, no sts:AssumeRole except into the two
+# External Secrets store roles (themselves under the boundary), and only the services the workloads use; and it may
+# attach only the AWS managed policies the module uses.
 # ---------------------------------------------------------------------------------------------------------------------
 
 locals {
@@ -24,12 +25,18 @@ locals {
     for r in [
       "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
       "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
+      "external-secrets-platform", "external-secrets-app",
     ] : "${local.cluster_env_prefix}-${r}"
   ]
   cluster_role_arns = [for n in local.cluster_role_names : "arn:aws:iam::${var.account_id}:role/${n}"]
 
   cluster_boundary_name = "${local.cluster_env_prefix}-workload-boundary"
   cluster_boundary_arn  = "arn:aws:iam::${var.account_id}:policy${var.iam_path}${local.cluster_boundary_name}"
+
+  # The External Secrets stores' roles: the one thing a cluster-layer role may assume (encryption 6.4).
+  cluster_secret_store_role_arns = [
+    for r in ["external-secrets-platform", "external-secrets-app"] : "arn:aws:iam::${var.account_id}:role/${local.cluster_env_prefix}-${r}"
+  ]
 
   cluster_managed_policy_arns = [
     "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
@@ -328,7 +335,7 @@ data "aws_iam_policy_document" "workload_boundary" {
 
   # The services the cluster, its nodes, its controllers and its workloads use (architecture 3.1, ADR-0004), and
   # sns:Publish for the data layer's EventBridge delivery role, which carries this boundary too: no IAM change, no
-  # sts:AssumeRole, no Organizations, CloudTrail, Config or GuardDuty.
+  # sts:AssumeRole but into the secret stores' roles, no Organizations, CloudTrail, Config or GuardDuty.
   statement {
     sid = "WorkloadServices"
     actions = [
@@ -366,11 +373,26 @@ data "aws_iam_policy_document" "workload_boundary" {
     )
   }
 
+  # External Secrets assumes its stores' roles, each of which reads only its own secrets (encryption 6.4). Each store
+  # role trusts only the controller's role, and only the controller's own policy asks for this.
+  statement {
+    sid       = "AssumeOnlySecretStoreRoles"
+    actions   = ["sts:AssumeRole"]
+    resources = local.cluster_secret_store_role_arns
+  }
+
+  statement {
+    sid           = "NeverAssumeAnyOtherRole"
+    effect        = "Deny"
+    actions       = ["sts:AssumeRole"]
+    not_resources = local.cluster_secret_store_role_arns
+  }
+
   # Changing IAM is not something any workload does, even if a policy above ever allowed it.
   statement {
     sid       = "NeverChangeIam"
     effect    = "Deny"
-    actions   = ["iam:Add*", "iam:Attach*", "iam:Create*", "iam:Delete*", "iam:Detach*", "iam:Put*", "iam:Remove*", "iam:Set*", "iam:Tag*", "iam:Untag*", "iam:Update*", "sts:AssumeRole"]
+    actions   = ["iam:Add*", "iam:Attach*", "iam:Create*", "iam:Delete*", "iam:Detach*", "iam:Put*", "iam:Remove*", "iam:Set*", "iam:Tag*", "iam:Untag*", "iam:Update*"]
     resources = ["*"]
 
     condition {

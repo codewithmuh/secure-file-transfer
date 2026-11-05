@@ -1,0 +1,27 @@
+# dev: Tokyo only, the smallest sizes (architecture 3.3); torn down when idle.
+# The chart's defaults are in deploy/charts/sft/values.yaml; the root Application adds environment, region and cluster.
+
+# The promotion workflow edits only the digest line (ADR-0005, #107). The all-zeros digest means "never built".
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# Fencing after a failover sets this to true (ADR-0004, T-78).
+pilotLight: false
+
+network: # infra/modules/network: VPC 10.10.0.0/16 (ADR-0021)
+  vpcCidr: 10.10.0.0/16
+  publicSubnetsCidr: 10.10.128.0/21
+  endpointSubnetsCidr: 10.10.144.0/24
+  isolatedSubnetsCidr: 10.10.136.0/21
+
+api:
+  replicas: 2
+relay:
+  replicas: 1
+notifier:
+  replicas: 1
+scanPools:
+  small: { replicas: 1 }
+  large: { replicas: 1 }
+signatureMirror:
+  replicas: 1

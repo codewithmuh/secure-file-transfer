@@ -82,3 +82,20 @@ variable "plan_policy_json" {
     error_message = "plan_policy_json must be a JSON policy document."
   }
 }
+
+variable "shared_account_id" {
+  description = "ID of the shared account (#105). With network_regions, the roles may assume this environment's DNS roles there. Null for none."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.shared_account_id == null || can(regex("^[0-9]{12}$", var.shared_account_id))
+    error_message = "shared_account_id must be a 12-digit AWS account ID or null."
+  }
+}
+
+variable "shared_stack" {
+  description = "True in the shared account: the roles get the shared stack's permissions (#105)."
+  type        = bool
+  default     = false
+}

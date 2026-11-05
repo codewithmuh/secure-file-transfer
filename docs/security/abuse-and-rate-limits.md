@@ -391,7 +391,7 @@ ever put in front of the API, the rate rules must switch to the forwarded-IP set
 | 2 | `AWSManagedRulesAnonymousIpList` | Count (labels only) | Labels VPNs, Tor and hosting providers. Corporate recipients often reach the internet through cloud proxies that look like hosting providers, so these aren't blocked by default. |
 | 3 | `AWSManagedRulesKnownBadInputsRuleSet` | Block | Log4j, Java deserialization and similar exploit patterns |
 | 4 | `AWSManagedRulesCommonRuleSet` | Block, with `SizeRestrictions_BODY` set to Count | OWASP-style patterns; its 8 KB body rule is replaced by rule 5 |
-| 5 | `body-size`: requests labelled by the core rule set's body size rule, except `POST /v1/transfers`, `POST /v1/upload-requests` and `PATCH /v1/tenant/policy` | Block | Bodies over 8 KB only where they are legitimate: 50 recipients, a 2,000-character message, 1,000 policy domains |
+| 5 | `body-size`: requests labelled by the core rule set's body size rule, except the paths `/v1/transfers`, `/v1/upload-requests` and `/v1/tenant/policy` (one regex: WAF nests and, or and not only two deep, so the rule can't also match the method; the API answers other methods with `405`) | Block | Bodies over 8 KB only where they are legitimate: 50 recipients, a 2,000-character message, 1,000 policy domains |
 | 6 | `rate-links-ip`: `/v1/links/` per IP, 100 in 60 s | Block, `429` | Flood backstop above the app's 60 a minute |
 | 7 | `rate-api-ip`: whole API per IP, 6,000 in 300 s | Block, `429` | Flood backstop above the per-tenant budget |
 | 8 | `rate-links-asn`: `/v1/links/` per ASN, 3,000 in 300 s | Count | Shows distributed guessing from one network |

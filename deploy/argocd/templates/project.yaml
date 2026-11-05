@@ -1,0 +1,33 @@
+{{- if and (eq .Values.environment "dev") (eq .Values.region "ap-northeast-3") }}{{ fail "dev runs in Tokyo only (architecture 3.3)" }}{{ end }}
+# What the application's two Applications may do: this repository only, their two namespaces only, and only the kinds
+# the chart renders. No Secrets (External Secrets writes the API's one), no Roles, nothing cluster-scoped but the
+# Namespaces that CreateNamespace makes.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: sft
+  namespace: argocd
+  # Deleting the project before its Applications would orphan them.
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  description: secure-file-transfer in {{ .Values.environment }}, {{ .Values.region }}
+  sourceRepos: [{{ .Values.repoURL | quote }}]
+  destinations:
+    - { server: https://kubernetes.default.svc, namespace: sft }
+    - { server: https://kubernetes.default.svc, namespace: sft-operator }
+  clusterResourceWhitelist:
+    - { group: "", kind: Namespace }
+  namespaceResourceWhitelist:
+    - { group: apps, kind: Deployment }
+    - { group: batch, kind: Job }
+    - { group: batch, kind: CronJob }
+    - { group: "", kind: Service }
+    - { group: "", kind: ServiceAccount }
+    - { group: "", kind: ConfigMap }
+    - { group: policy, kind: PodDisruptionBudget }
+    - { group: networking.k8s.io, kind: NetworkPolicy }
+    - { group: elbv2.k8s.aws, kind: TargetGroupBinding } # the API's targets in the edge stack's target group (#105)
+    - { group: external-secrets.io, kind: ExternalSecret } # the API's secrets, which External Secrets writes (encryption 6.4)
+    - { group: rbac.authorization.k8s.io, kind: RoleBinding } # sft-operator's port-forward binding (authn-authz 8.1)
+  # Nobody syncs, changes or rolls back an Application by hand: every change comes from Git (ADR-0004, ADR-0005).
+  roles: []

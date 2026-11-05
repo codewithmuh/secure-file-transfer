@@ -35,12 +35,14 @@ rate-based rules** in front for coarse per-IP floods. PostgreSQL keeps the secur
   a sorted set of leases for concurrent streams and scans. Limits run narrowest first, one script per key. GCRA admits
   a burst of ⌊N/2⌋ + 1 requests for a limit of N per period, then ⌈N/2⌉ per period, evenly spaced, so no window of
   one period holds more than N.
-- **Access.** IAM authentication over TLS for four workloads only, each with its own role, through a security group
+- **Access.** IAM authentication over TLS for five workloads only, each with its own role, through a security group
   open to them:
   - the API;
   - the sign-in triggers;
   - the scan worker, for scan leases;
-  - the notification worker, for the per-address caps across tenants.
+  - the notification worker, for the per-address caps across tenants;
+  - the operator API, for its own rate limits (authentication and authorization 8.2; added with #106, when the
+    chart wired the operator API's settings).
 
   Nothing is replicated between regions; Osaka's cache idles at its minimum until a failover.
 - **Failure.** 50 ms per call; after 5 errors in a row the API stops calling the store for 10 seconds. Link steps

@@ -402,3 +402,51 @@ jobs:
           docker logs smoke-relay | tail -n 8
           test "$(docker inspect --format '{{.State.ExitCode}}' smoke-relay)" = 0
           if docker logs smoke-relay | grep --quiet 'outbox batch failed'; then exit 1; fi
+
+  # The deploy config of ADR-0005: the chart and the Argo CD Applications under deploy/. It runs on every pull request,
+  # promotion pull requests (#107) included, which change only deploy/.
+  deploy:
+    name: Deploy config (helm lint, template, kubeconform, runtime contract)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    env:
+      # Argo CD renders with Helm 3; the checksums are the release's own (get.helm.sh, kubeconform's CHECKSUMS).
+      HELM_VERSION: v3.22.0
+      HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+      KUBECONFORM_VERSION: v0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install helm and kubeconform, checked against their checksums
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --output helm.tar.gz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file helm.tar.gz --strip-components 1 --directory bin linux-amd64/helm
+          curl --fail --silent --show-error --location --output kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file kubeconform.tar.gz --directory bin kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: helm lint and helm template for every cluster, kubeconform on the output
+        run: deploy/check.sh "$RUNNER_TEMP/rendered"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: services/api/uv.lock
+      - name: Every rendered container meets the runtime contract (architecture 8)
+        run: uv run --project services/api --locked pytest -p no:cacheprovider deploy/tests
+      - name: Every rendered pod passes the cluster's admission policies (Kyverno CLI, ADR-0004)
+        run: deploy/policies.sh "$RUNNER_TEMP/rendered"
+      - name: Scan every cluster's rendered manifests for misconfigurations
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: ${{ runner.temp }}/rendered
+          severity: CRITICAL,HIGH
+          exit-code: "1"

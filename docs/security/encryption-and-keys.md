@@ -308,7 +308,8 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Key rotation job | — | — | — | — | — | E D, keyrings and identity provider client secrets | — | — |
 | Database bootstrap job | — | — | — | — | — | D, master password only | — | — |
 | Migrations job | — | — | — | — | — | — | — | — |
-| External Secrets (platform) | — | — | — | — | — | D, platform component secrets | — | — |
+| External Secrets `platform-secrets` store role (`sft-<env>-external-secrets-platform`, 6.4) | — | — | — | — | — | D, platform component secrets only | — | — |
+| External Secrets `application-secrets` store role (`sft-<env>-external-secrets-app`, 6.4) | — | — | — | — | — | D, the API's `csrf-hmac`, `email-hmac` and its Region's `idp-client` only | — | — |
 | S3 replication role | D Tokyo, E D Osaka | — | — | D Tokyo, E D Osaka (in prod, the retained stack's own role) | — | — | — | D Tokyo, E D Osaka |
 | GuardDuty Malware Protection role (decision 15) | E D, through S3, large-file buckets only | — | — | — | — | — | — | — |
 | EventBridge delivery role | — | — | — | — | — | — | E D, named queues and topics | — |
@@ -696,7 +697,7 @@ A phase 4 ADR records this decision.
 | `sft/{env}/app/email-hmac` | Keyring for pseudonymous email IDs in logs, rate-limit keys and the suppression list | API, notification worker | Key rotation job | Every year; overlaps in 6.5 |
 | `sft/{env}/app/link-hmac` | Keyring `K_link` for deriving link tokens (decision 10, data model 2.2) | Notification worker only: it derives each token and stores its hash. The API looks up the SHA-256 of a presented token and needs no key. | Key rotation job | Every 90 days; an old version stays loaded at least 14 days |
 | `sft/{env}/app/csrf-hmac` | Keyring `K_csrf` for deriving CSRF tokens from session tokens (decision 8) | API | Key rotation job | Every 90 days; the old key verifies for 24 hours |
-| `sft/{env}/app/idp-client/ap-northeast-1` | App client ID and secret of the Tokyo user pool, for the authorization-code flow | API in Tokyo | Key rotation job | Every year; Cognito allows two active client secrets, so the switch has no gap |
+| `sft/{env}/app/idp-client/ap-northeast-1` | App client ID and secret of the Tokyo user pool, for the authorization-code flow, as JSON with `client_id` and `client_secret` | API in Tokyo | Key rotation job | Every year; Cognito allows two active client secrets, so the switch has no gap |
 | `sft/{env}/app/idp-client/ap-northeast-3` | App client ID and secret of the Osaka standby pool (staging and prod; authentication and authorization 2.6). It lives only in Osaka, so it stays writable while Tokyo is down. | API in Osaka | Key rotation job, through the Osaka endpoint | Every year, like the Tokyo client |
 | `sft/{env}/db/master` | Aurora master user password | The database bootstrap job, once per environment, to create the login roles; then BreakGlass only, apart from the deploy role's read-back at apply (6.3) | Terraform deploy role, with write-only arguments (6.3) | After every use and every 90 days |
 | `sft/{env}/platform/*`, for example the Grafana admin password | Per component | Platform components, through External Secrets and Kubernetes Secrets | Terraform deploy role, with write-only arguments | Per component |
@@ -759,6 +760,19 @@ What is deliberately not a secret here:
 - The application reads its secrets from Secrets Manager through the VPC endpoint at start and every 5 minutes, and
   keeps them only in memory. Not through environment variables or Kubernetes Secrets: that keeps them out of etcd and
   lets the application hold several keyring versions at once.
+- **Until then (as built, #106).** The API reads its settings from environment variables only (architecture 8), so
+  for now its secrets reach it through External Secrets. The cluster-bootstrap stack's `application-secrets` store,
+  which only the `sft` namespace may use, reads `csrf-hmac`, `email-hmac` and the Region's `idp-client` as its own
+  role, `sft-<env>-external-secrets-app`, which may read exactly those ARNs and nothing else. The
+  `platform-secrets` store, for `argocd`, `monitoring` and `grafana`, reads as `sft-<env>-external-secrets-platform`,
+  which may read only `sft/{env}/platform/*`. The controller's own Pod Identity role reads no secret: it may only
+  assume those two roles, each of which trusts only it, and the workload boundary allows no other `sts:AssumeRole`.
+  So an ExternalSecret can't cross from one store's secrets to the other's, whatever key it names. They land in one
+  Secret, `api-secrets`, which EKS encrypts in etcd with the secrets key (envelope encryption, #103), and the API's
+  pod reads it as environment variables at start. So a new keyring version reaches the API only when its pods
+  restart: the key rotation job must roll the API's Deployment after it writes, and before the overlap in 6.5 ends.
+  When the application reads Secrets Manager itself, the ExternalSecret, the store and those statements go, and the
+  API's role (which already may read them) is the only reader again.
 - Each role can read only its own secrets: `secretsmanager:GetSecretValue` on named ARNs, and Decrypt limited by
   `kms:EncryptionContext:SecretARN`.
 - In Osaka the same names resolve to the replicas. Replicas are read-only, and the key rotation job runs only in Tokyo.

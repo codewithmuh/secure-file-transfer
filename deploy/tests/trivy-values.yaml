@@ -1,0 +1,21 @@
+# Values for Trivy's misconfiguration scan of the charts (trivy.yaml), which renders each chart on its own. The same
+# obviously fake cluster facts as deploy/render.sh, with dev's network. Not used by Argo CD.
+environment: dev
+region: ap-northeast-1
+cluster:
+  registry: 000000000000.dkr.ecr.ap-northeast-1.amazonaws.com
+  databaseHost: sft-dev.cluster-example.ap-northeast-1.rds.amazonaws.com
+  accountId: "000000000000"
+  operatorRoleName: AWSReservedSSO_Operator_0000000000000000
+  serviceDomain: dev.sft.example.com
+  valkeyHost: sft-dev-valkey-example.serverless.ap-northeast-1.cache.amazonaws.com
+  filesKeyArn: arn:aws:kms:ap-northeast-1:000000000000:key/mrk-00000000000000000000000000000000
+  userPoolId: ap-northeast-1_Example0
+  cognitoLoginDomain: sft-dev-example.auth.ap-northeast-1.amazoncognito.com
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+network:
+  vpcCidr: 10.10.0.0/16
+  publicSubnetsCidr: 10.10.128.0/21
+  endpointSubnetsCidr: 10.10.144.0/24
+  isolatedSubnetsCidr: 10.10.136.0/21
