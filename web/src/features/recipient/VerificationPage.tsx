@@ -114,14 +114,14 @@ export function VerificationPage({ mode }: VerificationPageProps) {
           {mode === 'recipient' ? t('recipient.title') : t('uploader.title')}
         </h1>
         <p className="mt-1 text-sm text-gray-500">
-          {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.subtitle', { name: 'Someone' })}
+          {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.subtitle', { name: t('uploader.someone') })}
         </p>
       </div>
 
       <Card>
         {step === 'resolve' && !token && (
           <div className="py-8 text-center">
-            <p className="text-sm text-gray-500">Invalid or missing link.</p>
+            <p className="text-sm text-gray-500">{t('recipient.invalidLink')}</p>
           </div>
         )}
 
@@ -144,7 +144,7 @@ export function VerificationPage({ mode }: VerificationPageProps) {
                 <div className="w-full border-t border-gray-200" />
               </div>
               <div className="relative flex justify-center text-sm">
-                <span className="bg-white px-4 text-gray-400">then</span>
+                <span className="bg-white px-4 text-gray-500">{t('recipient.then')}</span>
               </div>
             </div>
 

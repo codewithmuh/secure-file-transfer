@@ -54,6 +54,22 @@ web-check: ## Web app: clean install, type check, lint, tests, build and generat
 	  cmp -s "$$before" web/src/api/schema.ts || { echo "error: web/src/api/schema.ts was out of date with" \
 	    "docs/api/openapi.yaml; it is regenerated now: review it and commit it with the contract" >&2; exit 1; }
 
+# axe accessibility checks in English and Japanese (NFR-22, FR-33), as CI's web-a11y job runs them. Install, build,
+# `vite preview` and the browser all run in the pinned Playwright image, so no browser is installed on the host. web/
+# is mounted read-only and copied, without node_modules, dist and test-results, to a path inside the container, so the
+# run writes nothing to the host: no root-owned files on a Linux host, and the host's node_modules is untouched.
+# PLAYWRIGHT_VERSION must equal @playwright/test in web/package.json: the target checks that first.
+PLAYWRIGHT_VERSION := 1.64.0
+PLAYWRIGHT_IMAGE := mcr.microsoft.com/playwright:v$(PLAYWRIGHT_VERSION)-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
+.PHONY: web-a11y
+web-a11y: ## Web app: axe accessibility checks on every page, in English and Japanese (needs Docker)
+	docker run --rm --init --ipc=host --volume "$(CURDIR)/web:/src/web:ro" --workdir /web \
+	  $(PLAYWRIGHT_IMAGE) bash -euo pipefail -c 'tar -C /src/web --exclude=./node_modules --exclude=./dist \
+	    --exclude=./test-results -cf - . | tar -xf - \
+	    && npm ci --ignore-scripts \
+	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
+	    && npm run build && npx playwright test'
+
 # The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
 # The breaking-change check compares the working tree's contract with the one at the merge base of
 # HEAD and CONTRACT_BASE. OASDIFF_IMAGE is the workflow's: keep the two in step.

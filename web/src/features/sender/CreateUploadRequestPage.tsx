@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Upload } from 'lucide-react';
 import { PageShell } from '@/components/layout';
@@ -17,7 +17,7 @@ export function CreateUploadRequestPage() {
     if (!email) return;
     setSending(true);
     await new Promise((resolve) => setTimeout(resolve, 1000));
-    toast('success', 'Upload request sent');
+    toast('success', t('sender.uploadRequestSent'));
     navigate('/upload-requests');
   };
 
@@ -27,7 +27,8 @@ export function CreateUploadRequestPage() {
         <Card>
           <div className="space-y-4">
             <Input
-              label="Recipient email"
+              id="uploader-email"
+              label={t('sender.uploaderEmail')}
               type="email"
               placeholder={t('auth.emailPlaceholder')}
               value={email}
@@ -45,24 +46,24 @@ export function CreateUploadRequestPage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700">{t('sender.expiry')}</label>
-              <select
+              <label htmlFor="expiry" className="block text-sm font-medium text-gray-700">{t('sender.expiry')}</label>
+              <select id="expiry"
                 className="input-field mt-1"
                 value={expiryDays}
                 onChange={(e) => setExpiryDays(e.target.value)}
               >
-                <option value="1">1 day</option>
-                <option value="3">3 days</option>
-                <option value="7">7 days</option>
-                <option value="14">14 days</option>
-                <option value="30">30 days</option>
+                <option value="1">{t('common.days', { count: 1 })}</option>
+                <option value="3">{t('common.days', { count: 3 })}</option>
+                <option value="7">{t('common.days', { count: 7 })}</option>
+                <option value="14">{t('common.days', { count: 14 })}</option>
+                <option value="30">{t('common.days', { count: 30 })}</option>
               </select>
             </div>
           </div>
         </Card>
         <Button onClick={handleCreate} className="w-full" loading={sending} disabled={!email}>
           <Upload className="mr-2 h-4 w-4" />
-          Create upload request
+          {t('sender.createUploadRequest')}
         </Button>
       </div>
     </PageShell>

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { renderToString } from 'react-dom/server';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router';
 import { csrfToken, currentMember, setUpApi } from '@/test/apiHarness';
 import { ProtectedRoute } from './ProtectedRoute';
 

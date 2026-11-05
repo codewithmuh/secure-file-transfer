@@ -125,12 +125,15 @@ describe('signOutMember: with the session restored on load, sign-out must end it
     expect(api.location.assign).not.toHaveBeenCalled();
   });
 
-  it('ignores a logout URL that is not https', async () => {
-    const api = await setUpApi(() => ({ status: 200, data: { logout_url: 'javascript:alert(1)' } }));
-    useAuthStore.getState().setAuth(member, token);
+  it.each(['javascript:alert(1)', 'http://auth.example.com/logout', 'not a url'])(
+    'ignores a logout URL that is not https: %s',
+    async (logoutUrl) => {
+      const api = await setUpApi(() => ({ status: 200, data: { logout_url: logoutUrl } }));
+      useAuthStore.getState().setAuth(member, token);
 
-    await signOutMember();
+      await signOutMember();
 
-    expect(api.location.assign).toHaveBeenCalledWith('/sign-in');
-  });
+      expect(api.location.assign).toHaveBeenCalledWith('/sign-in');
+    },
+  );
 });

@@ -1,4 +1,4 @@
-import { createBrowserRouter } from 'react-router-dom';
+import { createBrowserRouter } from 'react-router';
 import { AppLayout, PublicLayout } from '@/components/layout';
 import { ProtectedRoute } from '@/features/auth';
 import { SignInPage, SignInCallbackPage } from '@/features/auth';

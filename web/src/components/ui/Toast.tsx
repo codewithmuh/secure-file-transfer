@@ -1,6 +1,7 @@
 import { useEffect, useCallback } from 'react';
 import { cn } from '@/lib/cn';
 import { CheckCircle, AlertCircle, XCircle, X, Info } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 import { create } from 'zustand';
 
 type ToastType = 'success' | 'error' | 'warning' | 'info';
@@ -49,6 +50,7 @@ const styles = {
 
 function ToastItem({ toast: t, onDismiss }: { toast: Toast; onDismiss: () => void }) {
   const Icon = icons[t.type];
+  const { t: translate } = useTranslation();
 
   useEffect(() => {
     const timer = setTimeout(onDismiss, 5000);
@@ -59,7 +61,7 @@ function ToastItem({ toast: t, onDismiss }: { toast: Toast; onDismiss: () => voi
     <div className={cn('flex items-center gap-3 rounded-lg p-4 shadow-lg ring-1 ring-inset', styles[t.type])}>
       <Icon className="h-5 w-5 shrink-0" />
       <p className="text-sm font-medium">{t.message}</p>
-      <button onClick={onDismiss} className="ml-auto shrink-0 rounded p-1 hover:bg-black/5">
+      <button onClick={onDismiss} aria-label={translate('common.dismiss')} className="ml-auto shrink-0 rounded-sm p-1 hover:bg-black/5">
         <X className="h-4 w-4" />
       </button>
     </div>

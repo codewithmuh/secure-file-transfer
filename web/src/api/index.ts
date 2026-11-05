@@ -7,6 +7,7 @@ import type { Schema } from './client';
 export { api } from './client';
 export type { ApiPath, ApiPaths, HttpMethod, Operation, PathsWith, RequestOptions, ResponseBody, Schema } from './client';
 
+export type ActorType = Schema<'ActorType'>;
 export type ApiKey = Schema<'ApiKey'>;
 export type ApiKeyScope = Schema<'ApiKeyScope'>;
 export type AuditEvent = Schema<'AuditEvent'>;

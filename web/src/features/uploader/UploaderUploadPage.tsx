@@ -65,7 +65,7 @@ export function UploaderUploadPage() {
     <div className="space-y-6">
       <div className="text-center">
         <Upload className="mx-auto h-10 w-10 text-brand-600" />
-        <h2 className="mt-3 text-xl font-bold text-gray-900">{t('uploader.title')}</h2>
+        <h1 className="mt-3 text-xl font-bold text-gray-900">{t('uploader.title')}</h1>
       </div>
 
       <Card>
@@ -76,7 +76,7 @@ export function UploaderUploadPage() {
           onClick={() => !uploading && fileInputRef.current?.click()}
           className="mt-3 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-gray-300 p-8 text-center transition-colors hover:border-brand-400 hover:bg-brand-50/50"
         >
-          <Upload className="mb-3 h-10 w-10 text-gray-400" />
+          <Upload className="mb-3 h-10 w-10 text-gray-500" />
           <p className="text-sm font-medium text-gray-700">{t('sender.dragDrop')}</p>
           <p className="mt-1 text-xs text-gray-500">{t('sender.maxFileSize')}</p>
           <input
@@ -97,7 +97,7 @@ export function UploaderUploadPage() {
                   {entry.status === 'complete' ? (
                     <CheckCircle className="h-5 w-5 text-green-500" />
                   ) : (
-                    <FileIcon className="h-5 w-5 text-gray-400" />
+                    <FileIcon className="h-5 w-5 text-gray-500" />
                   )}
                   <div>
                     <p className="text-sm font-medium text-gray-900">{entry.file.name}</p>
@@ -105,7 +105,7 @@ export function UploaderUploadPage() {
                   </div>
                 </div>
                 {entry.status === 'pending' && (
-                  <button onClick={() => removeFile(entry.id)} className="rounded p-1 text-gray-400 hover:bg-gray-200 hover:text-gray-600">
+                  <button onClick={() => removeFile(entry.id)} aria-label={t('common.remove')} className="rounded-sm p-1 text-gray-500 hover:bg-gray-200 hover:text-gray-600">
                     <X className="h-4 w-4" />
                   </button>
                 )}
@@ -120,7 +120,7 @@ export function UploaderUploadPage() {
         )}
 
         <div className="mt-4 flex items-center justify-between">
-          <p className="text-sm text-gray-500">{files.length} files · {formatFileSize(totalSize)}</p>
+          <p className="text-sm text-gray-500">{t('common.fileCount', { count: files.length })} · {formatFileSize(totalSize)}</p>
           <Button onClick={handleUpload} loading={uploading} disabled={files.length === 0 || allComplete}>
             <Upload className="mr-2 h-4 w-4" />
             {allComplete ? t('uploader.uploadComplete') : uploading ? t('uploader.uploading') : t('uploader.uploadFiles')}

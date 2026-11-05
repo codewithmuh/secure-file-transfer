@@ -1,17 +1,29 @@
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { Send, Upload, FileText, ArrowUpRight } from 'lucide-react';
 import { Card, CardTitle, Button } from '@/components/ui';
 import { PageShell } from '@/components/layout';
 
 const stats = [
-  { label: 'Active Transfers', value: '12', icon: Send, color: 'text-blue-600 bg-blue-100' },
-  { label: 'Upload Requests', value: '3', icon: Upload, color: 'text-purple-600 bg-purple-100' },
-  { label: 'Files Sent', value: '47', icon: FileText, color: 'text-green-600 bg-green-100' },
+  { labelKey: 'sender.activeTransfers', value: '12', icon: Send, color: 'text-blue-600 bg-blue-100' },
+  { labelKey: 'sender.uploadRequests', value: '3', icon: Upload, color: 'text-purple-600 bg-purple-100' },
+  { labelKey: 'sender.filesSent', value: '47', icon: FileText, color: 'text-green-600 bg-green-100' },
 ];
 
+// Mock data; `hoursAgo` is shown in the page's language with Intl.RelativeTimeFormat.
+const recentTransfers = [
+  { id: '1', recipients: 'alice@example.com', files: 3, status: 'sent', hoursAgo: 2 },
+  { id: '2', recipients: 'bob@example.com, carol@example.com', files: 1, status: 'held', hoursAgo: 5 },
+  { id: '3', recipients: 'dave@example.com', files: 5, status: 'expired', hoursAgo: 48 },
+] as const;
+
+function timeAgo(hoursAgo: number, language: string): string {
+  const format = new Intl.RelativeTimeFormat(language, { numeric: 'auto' });
+  return hoursAgo < 24 ? format.format(-hoursAgo, 'hour') : format.format(-Math.round(hoursAgo / 24), 'day');
+}
+
 export function DashboardPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const navigate = useNavigate();
 
   return (
@@ -31,14 +43,14 @@ export function DashboardPage() {
     >
       {/* Stats */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        {stats.map(({ label, value, icon: Icon, color }) => (
-          <Card key={label}>
+        {stats.map(({ labelKey, value, icon: Icon, color }) => (
+          <Card key={labelKey}>
             <div className="flex items-center gap-4">
               <div className={`flex h-12 w-12 items-center justify-center rounded-xl ${color}`}>
                 <Icon className="h-6 w-6" />
               </div>
               <div>
-                <p className="text-sm text-gray-500">{label}</p>
+                <p className="text-sm text-gray-500">{t(labelKey)}</p>
                 <p className="text-2xl font-bold text-gray-900">{value}</p>
               </div>
             </div>
@@ -49,21 +61,17 @@ export function DashboardPage() {
       {/* Recent transfers */}
       <Card>
         <div className="flex items-center justify-between mb-4">
-          <CardTitle>Recent Transfers</CardTitle>
+          <CardTitle>{t('sender.recentTransfers')}</CardTitle>
           <button
             onClick={() => navigate('/transfers')}
             className="flex items-center gap-1 text-sm text-brand-600 hover:text-brand-700"
           >
-            View all
+            {t('common.viewAll')}
             <ArrowUpRight className="h-4 w-4" />
           </button>
         </div>
         <div className="space-y-3">
-          {[
-            { id: '1', recipients: 'alice@example.com', files: 3, status: 'sent', date: '2 hours ago' },
-            { id: '2', recipients: 'bob@example.com, carol@example.com', files: 1, status: 'held', date: '5 hours ago' },
-            { id: '3', recipients: 'dave@example.com', files: 5, status: 'expired', date: '2 days ago' },
-          ].map((transfer) => (
+          {recentTransfers.map((transfer) => (
             <div
               key={transfer.id}
               onClick={() => navigate(`/transfers/${transfer.id}`)}
@@ -71,14 +79,14 @@ export function DashboardPage() {
             >
               <div>
                 <p className="text-sm font-medium text-gray-900">{transfer.recipients}</p>
-                <p className="text-xs text-gray-500">{transfer.files} files · {transfer.date}</p>
+                <p className="text-xs text-gray-500">{t('common.fileCount', { count: transfer.files })} · {timeAgo(transfer.hoursAgo, i18n.language)}</p>
               </div>
               <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
                 transfer.status === 'sent' ? 'bg-green-50 text-green-700' :
                 transfer.status === 'held' ? 'bg-yellow-50 text-yellow-800' :
                 'bg-gray-100 text-gray-700'
               }`}>
-                {transfer.status}
+                {t(`codes.${transfer.status}`)}
               </span>
             </div>
           ))}

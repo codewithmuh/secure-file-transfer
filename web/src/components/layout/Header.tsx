@@ -21,7 +21,7 @@ export function Header() {
         <button
           onClick={toggleSidebar}
           className="rounded-lg p-2 text-gray-500 hover:bg-gray-100 lg:hidden"
-          aria-label="Toggle sidebar"
+          aria-label={t('common.toggleSidebar')}
         >
           <Menu className="h-5 w-5" />
         </button>

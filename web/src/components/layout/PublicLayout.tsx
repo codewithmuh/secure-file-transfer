@@ -1,4 +1,4 @@
-import { Outlet } from 'react-router-dom';
+import { Outlet } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Shield } from 'lucide-react';
 
@@ -18,7 +18,7 @@ export function PublicLayout() {
           <Outlet />
         </div>
       </main>
-      <footer className="border-t border-gray-200 bg-white py-4 text-center text-xs text-gray-400">
+      <footer className="border-t border-gray-200 bg-white py-4 text-center text-xs text-gray-500">
         {t('common.appName')}
       </footer>
     </div>

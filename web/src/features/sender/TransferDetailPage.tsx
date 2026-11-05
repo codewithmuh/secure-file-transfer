@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, Shield, Mail, FileIcon, AlertTriangle } from 'lucide-react';
 import { PageShell } from '@/components/layout';
@@ -36,16 +36,16 @@ export function TransferDetailPage() {
   ];
 
   const deliveryBadge = {
-    pending: { variant: 'default' as const, label: 'Pending' },
-    notified: { variant: 'info' as const, label: 'Notified' },
-    verified: { variant: 'warning' as const, label: 'Verified' },
-    downloaded: { variant: 'success' as const, label: 'Downloaded' },
-    locked: { variant: 'danger' as const, label: 'Locked' },
+    pending: { variant: 'default' as const, labelKey: 'sender.deliveryPending' },
+    notified: { variant: 'info' as const, labelKey: 'sender.deliveryNotified' },
+    verified: { variant: 'warning' as const, labelKey: 'sender.deliveryVerified' },
+    downloaded: { variant: 'success' as const, labelKey: 'sender.deliveryDownloaded' },
+    locked: { variant: 'danger' as const, labelKey: 'sender.deliveryLocked' },
   };
 
   return (
     <PageShell
-      title={transfer.message ?? 'Transfer'}
+      title={transfer.message ?? t('sender.transfer')}
       actions={
         <div className="flex gap-2">
           <Button variant="ghost" onClick={() => navigate('/transfers')}>
@@ -65,14 +65,14 @@ export function TransferDetailPage() {
           {/* Recipients */}
           <Card>
             <CardTitle>{t('sender.recipients')}</CardTitle>
-            <Table>
+            <Table label={t('sender.recipients')}>
               <TableHead>
                 <tr>
-                  <TableHeader>Email</TableHeader>
+                  <TableHeader>{t('common.email')}</TableHeader>
                   <TableHeader>{t('common.status')}</TableHeader>
-                  <TableHeader>Notified</TableHeader>
-                  <TableHeader>Verified</TableHeader>
-                  <TableHeader>Downloaded</TableHeader>
+                  <TableHeader>{t('sender.notifiedAt')}</TableHeader>
+                  <TableHeader>{t('sender.verifiedAt')}</TableHeader>
+                  <TableHeader>{t('sender.downloadedAt')}</TableHeader>
                 </tr>
               </TableHead>
               <TableBody>
@@ -82,11 +82,11 @@ export function TransferDetailPage() {
                     <TableRow key={r.id}>
                       <TableCell>
                         <div className="flex items-center gap-2">
-                          <Mail className="h-4 w-4 text-gray-400" />
+                          <Mail className="h-4 w-4 text-gray-500" />
                           <span className="font-medium">{r.email}</span>
                         </div>
                       </TableCell>
-                      <TableCell><Badge variant={badge.variant}>{badge.label}</Badge></TableCell>
+                      <TableCell><Badge variant={badge.variant}>{t(badge.labelKey)}</Badge></TableCell>
                       <TableCell>{r.notified_at ? formatDate(r.notified_at) : '—'}</TableCell>
                       <TableCell>{r.verified_at ? formatDate(r.verified_at) : '—'}</TableCell>
                       <TableCell>{r.first_downloaded_at ? formatDate(r.first_downloaded_at) : '—'}</TableCell>
@@ -104,7 +104,7 @@ export function TransferDetailPage() {
               {files.map((file) => (
                 <li key={file.id} className="flex items-center justify-between rounded-lg bg-gray-50 p-3">
                   <div className="flex items-center gap-3">
-                    <FileIcon className="h-5 w-5 text-gray-400" />
+                    <FileIcon className="h-5 w-5 text-gray-500" />
                     <div>
                       <p className="text-sm font-medium text-gray-900">{file.name}</p>
                       <p className="text-xs text-gray-500">{formatFileSize(file.size)}</p>
@@ -112,7 +112,7 @@ export function TransferDetailPage() {
                   </div>
                   <Badge variant={file.scan_state === 'clean' ? 'success' : 'warning'}>
                     <Shield className="mr-1 h-3 w-3" />
-                    {file.scan_state}
+                    {t(`codes.${file.scan_state}`)}
                   </Badge>
                 </li>
               ))}
@@ -123,11 +123,11 @@ export function TransferDetailPage() {
         {/* Details sidebar */}
         <div>
           <Card>
-            <CardTitle>Details</CardTitle>
+            <CardTitle>{t('common.details')}</CardTitle>
             <dl className="mt-3 space-y-3 text-sm">
               <div>
                 <dt className="text-gray-500">{t('common.status')}</dt>
-                <dd className="mt-0.5"><Badge variant="success">{transfer.status}</Badge></dd>
+                <dd className="mt-0.5"><Badge variant="success">{t(`codes.${transfer.status}`)}</Badge></dd>
               </div>
               <div>
                 <dt className="text-gray-500">{t('common.expiresAt')}</dt>
@@ -135,14 +135,14 @@ export function TransferDetailPage() {
               </div>
               <div>
                 <dt className="text-gray-500">{t('sender.downloadLimit')}</dt>
-                <dd className="mt-0.5 font-medium">{transfer.download_limit ?? 'No limit'}</dd>
+                <dd className="mt-0.5 font-medium">{transfer.download_limit ?? t('common.noLimit')}</dd>
               </div>
               <div>
-                <dt className="text-gray-500">Total size</dt>
+                <dt className="text-gray-500">{t('common.totalSize')}</dt>
                 <dd className="mt-0.5 font-medium">{formatFileSize(transfer.total_size)}</dd>
               </div>
               <div>
-                <dt className="text-gray-500">Sent</dt>
+                <dt className="text-gray-500">{t('sender.sentAt')}</dt>
                 <dd className="mt-0.5 font-medium">{transfer.submitted_at ? formatDate(transfer.submitted_at) : '—'}</dd>
               </div>
             </dl>
