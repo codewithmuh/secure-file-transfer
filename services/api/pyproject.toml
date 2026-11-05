@@ -6,12 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
 dependencies = [
-  "fastapi>=0.143",
+  "fastapi>=0.162.0",
   "uvicorn>=0.54",
   "prometheus-client>=0.23",
   "pydantic-settings>=2.16",
   # SQLAlchemy 2.0 as ADR-0002 names it; 2.1 is a deliberate upgrade, not a Dependabot bump.
-  "sqlalchemy[asyncio]>=2.0.55,<2.1",
+  "sqlalchemy[asyncio]>=2.1.6,<2.2",
   # The binary wheel bundles libpq, so the slim image needs no system packages.
   "psycopg[binary]>=3.3.6",
   "alembic>=1.20.1",
@@ -26,26 +26,26 @@ dependencies = [
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
-  "boto3>=1.43.120",
+  "boto3>=1.43.121",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
 ]
 
 [dependency-groups]
 dev = [
-  "httpx2>=2.13",
+  "httpx2>=2.16.0",
   "import-linter>=2.15",
-  "mypy>=1.18",
-  "pytest>=8.4",
+  "mypy>=2.4.1",
+  "pytest>=9.2.0",
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
-  "ruff>=0.17",
-  "types-boto3[sesv2,sqs]>=1.43.120",  # mypy types for the SQS and SES clients
+  "ruff>=0.17.3",
+  "types-boto3[sesv2,sqs]>=1.43.121",  # mypy types for the SQS and SES clients
   "types-pyyaml>=6.0.12.20260906",
 ]
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
