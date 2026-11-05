@@ -16,8 +16,8 @@ info:
     The operator API (`/operator` paths) is a separate workload with its own server entry: no load balancer routes to
     it, and operators reach it only through a port-forward (authn-authz section 8.2).
   license:
-    name: MIT
-    identifier: MIT
+    name: PolyForm Noncommercial 1.0.0
+    identifier: PolyForm-Noncommercial-1.0.0
   contact:
     name: secure-file-transfer maintainers
     url: https://github.com/codewithmuh/secure-file-transfer

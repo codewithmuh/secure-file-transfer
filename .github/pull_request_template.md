@@ -18,3 +18,4 @@ Closes #
 - [ ] Tests added or updated; `make check` passes
 - [ ] Docs, runbooks or an ADR updated if behaviour or architecture changed
 - [ ] No secrets, credentials or personal data in the diff
+- [ ] I agree to the [contribution licensing terms](https://github.com/codewithmuh/secure-file-transfer/blob/main/CONTRIBUTING.md#licensing-of-contributions)

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "The secure-file-transfer backend: the API service now, and the workers later, from one codebase (ADR-0002)."
 readme = "README.md"
 requires-python = ">=3.13"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 dependencies = [
   "fastapi>=0.162.0",
   "uvicorn>=0.54",

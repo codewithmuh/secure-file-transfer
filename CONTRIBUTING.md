@@ -56,3 +56,19 @@ anything else.
 - Record significant decisions as an ADR in `docs/adr/` (copy `0000-template.md`).
 - Update the runbook when you add an alert, and the architecture doc when you add a component.
 - Never commit secrets — use `.env` locally (git-ignored) and a secret manager in the cloud.
+
+## Licensing of contributions
+
+The project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE), and the author also offers
+commercial licences ([COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)). So that every contribution can be offered both
+ways, opening a pull request means you agree that:
+
+1. You wrote the contribution, or have the right to submit it, and it doesn't include code under terms that conflict
+   with these.
+2. You keep the copyright in your contribution, and you grant Muhammad Rashid a perpetual, worldwide, non-exclusive,
+   royalty-free and irrevocable licence to use, copy, change, distribute and sublicense it, under the project's licence
+   or any other licence, including commercial ones.
+3. Your contribution comes as is, without warranty.
+
+If you can't agree to these terms, for example because your employer owns your work, say so in the pull request
+before it is merged.
