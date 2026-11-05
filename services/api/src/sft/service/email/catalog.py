@@ -123,7 +123,10 @@ def format_time(value: datetime, locale: Locale) -> str:
 
 # ---- checks: messages name the field, never the value ----
 
-_ADDRESS = re.compile(r"[^\s@<>\",;]+@[^\s@<>\",;]+")
+# No whitespace (which covers line and paragraph separators), no control or invisible format
+# characters such as a bidi override: an address goes into a header as it is.
+_ADDRESS_CHAR = r"[^\s@<>\",;\x00-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"
+_ADDRESS = re.compile(f"{_ADDRESS_CHAR}+@{_ADDRESS_CHAR}+")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{22,128}")  # base64url, at least 128 bits (NFR-14)
 _CODE = re.compile(r"[0-9]{6,10}")  # at least 6 digits (NFR-14)
 _PASSWORD = re.compile(r"[!-~]{8,128}")  # printable ASCII, no spaces
@@ -135,8 +138,10 @@ def _check(name: str, ok: bool) -> None:
 
 
 def _one_line(value: str, limit: int) -> bool:
+    """Non-empty, at most `limit` long, and no control, format, line or paragraph separator."""
+    # Zl and Zp are U+2028 and U+2029, which break a header as \n does.
     return 0 < len(value) <= limit and not any(
-        unicodedata.category(c).startswith("C") for c in value
+        unicodedata.category(c)[0] == "C" or unicodedata.category(c) in ("Zl", "Zp") for c in value
     )
 
 

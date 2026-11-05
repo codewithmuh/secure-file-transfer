@@ -61,7 +61,7 @@ class EmailRenderer:
         subject = "".join(
             text_template.blocks["subject"](text_template.new_context(context))
         ).strip()
-        if not subject or "\n" in subject:
+        if subject.splitlines() != [subject]:  # every line break, U+2028 included
             raise ValueError(f"the subject of {email.TYPE} ({locale}) must be one line")
         text = text_template.render(context)
         html = self._env.get_template(f"{locale}/{email.TYPE}.html").render(

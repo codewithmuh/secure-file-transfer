@@ -219,6 +219,10 @@ def test_times_are_shown_in_japan_time() -> None:
         (lambda: VerificationCode(tenant_name=TENANT, code="12345"), "code"),
         (lambda: VerificationCode(tenant_name="Bad\r\nBcc: x@y.example", code=CODE), "tenant_name"),
         (lambda: VerificationCode(tenant_name="", code=CODE), "tenant_name"),
+        # A line or paragraph separator breaks a header as \n does; a bidi override hides text.
+        (lambda: VerificationCode(tenant_name="Acme\u2028X", code=CODE), "tenant_name"),
+        (lambda: VerificationCode(tenant_name="Acme\u2029X", code=CODE), "tenant_name"),
+        (lambda: VerificationCode(tenant_name="Acme\u202eX", code=CODE), "tenant_name"),
         (lambda: VerificationCode(tenant_name=TENANT, code=CODE, valid_minutes=0), "valid_minutes"),
         (
             lambda: TransferLink(

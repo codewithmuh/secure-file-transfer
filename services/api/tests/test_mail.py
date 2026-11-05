@@ -74,6 +74,9 @@ def test_outgoing_email_keeps_its_content_out_of_the_repr() -> None:
         ({"reply_to": "not-an-address"}, "reply_to must be"),
         ({"subject": "one\r\nBcc: x@y.example"}, "subject must be"),
         ({"subject": ""}, "subject must be"),
+        ({"subject": "one\u2028two"}, "subject must be"),
+        ({"to": "x\x00@y.example"}, "to must be"),
+        ({"to": "x\u202e@y.example"}, "to must be"),
         ({"email_type": "transfer link"}, "email_type must be"),
         ({"tags": {"tenant_id": "other"}}, "reserved"),
         ({"tags": {"recipient": "a b"}}, "reserved or not a valid"),
@@ -92,6 +95,7 @@ def test_mail_errors_say_whether_to_retry() -> None:
     assert MailError(MailErrorKind.THROTTLED, "x").retryable
     assert MailError(MailErrorKind.UNAVAILABLE, "x").retryable
     assert not MailError(MailErrorKind.PAUSED, "x").retryable
+    assert not MailError(MailErrorKind.MISCONFIGURED, "x").retryable
     assert not MailError(MailErrorKind.REJECTED, "x").retryable
     assert str(MailError(MailErrorKind.REJECTED, "MessageRejected")) == "rejected: MessageRejected"
 
@@ -174,11 +178,15 @@ def test_ses_without_tenant_management_or_reply_to(ses: tuple[SesMailer, Stubber
         ("SendingPausedException", 400, MailErrorKind.PAUSED),
         ("AccountSuspendedException", 400, MailErrorKind.PAUSED),
         ("MessageRejected", 400, MailErrorKind.REJECTED),
-        ("MailFromDomainNotVerifiedException", 400, MailErrorKind.REJECTED),
-        ("NotFoundException", 404, MailErrorKind.REJECTED),
         ("BadRequestException", 400, MailErrorKind.REJECTED),
+        # Our setup, not the message: every send fails until it is fixed, so nothing is dropped.
+        ("MailFromDomainNotVerifiedException", 400, MailErrorKind.MISCONFIGURED),
+        ("NotFoundException", 404, MailErrorKind.MISCONFIGURED),
+        ("AccessDeniedException", 403, MailErrorKind.MISCONFIGURED),
+        ("ExpiredTokenException", 400, MailErrorKind.MISCONFIGURED),
+        ("UnrecognizedClientException", 403, MailErrorKind.MISCONFIGURED),
         ("InternalFailure", 500, MailErrorKind.UNAVAILABLE),
-        ("SomethingNew", 400, MailErrorKind.REJECTED),
+        ("SomethingNew", 400, MailErrorKind.UNAVAILABLE),  # unknown: retried, never dropped
     ],
 )
 def test_ses_errors_name_a_kind_and_never_the_address(
@@ -247,21 +255,30 @@ def test_ses_needs_a_configuration_set() -> None:
 class FakeSmtp:
     sent: list[EmailMessage]
     error: Exception | None = None
+    greeting = 220
+    quit_error: Exception | None = None
     opened: list[tuple[str, int, float]]
+    ended: list[str]  # "quit" or "close", once per session
 
-    def __init__(self, host: str, port: int, timeout: float) -> None:
-        type(self).opened.append((host, port, timeout))
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
 
-    def __enter__(self) -> "FakeSmtp":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        return None
+    def connect(self, host: str, port: int) -> tuple[int, bytes]:
+        type(self).opened.append((host, port, self.timeout))
+        return self.greeting, b"mail ESMTP"
 
     def send_message(self, message: EmailMessage) -> None:
         if self.error is not None:
             raise self.error
         type(self).sent.append(message)
+
+    def quit(self) -> None:
+        if self.quit_error is not None:
+            raise self.quit_error
+        type(self).ended.append("quit")
+
+    def close(self) -> None:
+        type(self).ended.append("close")
 
 
 @pytest.fixture
@@ -269,6 +286,9 @@ def fake_smtp(monkeypatch: pytest.MonkeyPatch) -> type[FakeSmtp]:
     FakeSmtp.sent = []
     FakeSmtp.opened = []
     FakeSmtp.error = None
+    FakeSmtp.greeting = 220
+    FakeSmtp.quit_error = None
+    FakeSmtp.ended = []
     monkeypatch.setattr(smtplib, "SMTP", FakeSmtp)
     return FakeSmtp
 
@@ -282,6 +302,7 @@ def smtp_mailer() -> SmtpMailer:
 def test_smtp_sends_a_multipart_message(fake_smtp: type[FakeSmtp], json_logs: Logs) -> None:
     message_id = smtp_mailer().send(email())
     assert fake_smtp.opened == [("mail", 2525, 5)]
+    assert fake_smtp.ended == ["quit"]
     [message] = fake_smtp.sent
     assert message["From"] == FROM
     assert message["To"] == TO
@@ -313,6 +334,11 @@ def test_smtp_without_reply_to(fake_smtp: type[FakeSmtp]) -> None:
         (
             smtplib.SMTPRecipientsRefused({TO: (550, b"no such user " + TO.encode())}),
             MailErrorKind.REJECTED,
+            "SMTPRecipientsRefused",
+        ),
+        (
+            smtplib.SMTPRecipientsRefused({TO: (450, b"mailbox busy " + TO.encode())}),
+            MailErrorKind.UNAVAILABLE,
             "SMTPRecipientsRefused",
         ),
         (smtplib.SMTPDataError(554, b"rejected"), MailErrorKind.REJECTED, "SMTPDataError:554"),
@@ -347,3 +373,48 @@ def test_smtp_errors_name_a_kind_and_never_the_address(
     assert_nothing_personal(str(caught.value))
     [line] = json_logs()
     assert_nothing_personal(str(line))
+
+
+def test_smtp_ends_the_session_after_a_failure(fake_smtp: type[FakeSmtp]) -> None:
+    fake_smtp.error = smtplib.SMTPDataError(554, b"rejected")
+    with pytest.raises(MailError):
+        smtp_mailer().send(email())
+    assert fake_smtp.ended == ["quit"]
+
+
+def test_a_refused_greeting_is_the_server_not_the_message(fake_smtp: type[FakeSmtp]) -> None:
+    fake_smtp.greeting = 554
+    with pytest.raises(MailError) as caught:
+        smtp_mailer().send(email())
+    assert (caught.value.kind, caught.value.code) == (
+        MailErrorKind.UNAVAILABLE,
+        "SMTPConnectError:554",
+    )
+    assert fake_smtp.sent == []
+
+
+def test_a_failed_quit_after_the_server_took_the_message_is_still_a_send(
+    fake_smtp: type[FakeSmtp],
+) -> None:
+    # Raising here would make the worker send the email a second time.
+    fake_smtp.quit_error = smtplib.SMTPServerDisconnected("gone")
+    message_id = smtp_mailer().send(email())
+    assert [m["Message-ID"] for m in fake_smtp.sent] == [message_id]
+    assert fake_smtp.ended == ["close"]
+
+
+def test_a_header_the_email_package_refuses_is_a_mail_error(
+    fake_smtp: type[FakeSmtp], monkeypatch: pytest.MonkeyPatch, json_logs: Logs
+) -> None:
+    mailer = smtp_mailer()
+
+    def refuse(_: OutgoingEmail) -> EmailMessage:
+        raise ValueError(f"Header values may not contain linefeed or carriage return: {TO}")
+
+    monkeypatch.setattr(mailer, "message", refuse)
+    with pytest.raises(MailError) as caught:
+        mailer.send(email())
+    assert (caught.value.kind, caught.value.code) == (MailErrorKind.REJECTED, "ValueError")
+    assert_nothing_personal(str(caught.value))
+    assert_nothing_personal(str(json_logs()))
+    assert fake_smtp.opened == []

@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # NFR-7 hands an email to SES within 10 s at p95: short timeouts, and botocore's standard retries
-# for throttling and faults, with the worker's own backoff after that.
+# for throttling and faults, with the worker's own backoff after that. SendEmail takes no
+# idempotency key, so a retry after a read timeout can send an email twice: sends are at least once.
 _CONFIG = Config(
     connect_timeout=2,
     read_timeout=5,
@@ -40,10 +41,23 @@ _KINDS = {
     "ThrottlingException": MailErrorKind.THROTTLED,
     "SendingPausedException": MailErrorKind.PAUSED,
     "AccountSuspendedException": MailErrorKind.PAUSED,
+    # Only these say something about the message itself.
     "MessageRejected": MailErrorKind.REJECTED,
-    "MailFromDomainNotVerifiedException": MailErrorKind.REJECTED,
-    "NotFoundException": MailErrorKind.REJECTED,
     "BadRequestException": MailErrorKind.REJECTED,
+    # These fail every send until someone fixes our setup: an IAM regression, an expired pod
+    # identity, a configuration set or SES tenant missing (after a failover to Osaka, say).
+    "MailFromDomainNotVerifiedException": MailErrorKind.MISCONFIGURED,
+    "NotFoundException": MailErrorKind.MISCONFIGURED,
+    "AccessDeniedException": MailErrorKind.MISCONFIGURED,
+    "AccessDenied": MailErrorKind.MISCONFIGURED,
+    "ExpiredTokenException": MailErrorKind.MISCONFIGURED,
+    "ExpiredToken": MailErrorKind.MISCONFIGURED,
+    "UnrecognizedClientException": MailErrorKind.MISCONFIGURED,
+    "InvalidClientTokenId": MailErrorKind.MISCONFIGURED,
+    "InvalidSignatureException": MailErrorKind.MISCONFIGURED,
+    "SignatureDoesNotMatch": MailErrorKind.MISCONFIGURED,
+    "IncompleteSignature": MailErrorKind.MISCONFIGURED,
+    "MissingAuthenticationTokenException": MailErrorKind.MISCONFIGURED,
 }
 
 _AUTO_SUBMITTED = {"Name": "Auto-Submitted", "Value": "auto-generated"}  # RFC 3834: no auto-replies
@@ -105,10 +119,9 @@ class SesMailer:
             response = self._client.send_email(**self.request(email))
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", "Unknown"))
-            status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
-            kind = _KINDS.get(code)
-            if kind is None:
-                kind = MailErrorKind.UNAVAILABLE if status >= 500 else MailErrorKind.REJECTED
+            # An unknown code is retried, never dropped: the worker's retry cap and the
+            # dead-letter queue end it if it never clears.
+            kind = _KINDS.get(code, MailErrorKind.UNAVAILABLE)
             log.warning(
                 "email not sent",
                 extra={"provider": "ses", "email_type": email.email_type, "error": code},

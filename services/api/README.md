@@ -364,9 +364,12 @@ message_id = mailer_from_settings(settings).send(email)  # blocks: call it from 
   exactly its email's keys, that each secret (link token, code, temporary password) appears only in its own email,
   and that every URL points to the web app.
 - **No personal data in logs.** Rendering logs nothing. The adapters log the email type, the provider and its message
-  ID, or an error code. Their `MailError` carries a kind (`throttled`, `unavailable`, `paused`, `rejected`) and the
-  provider's error code, raised `from None`, because a provider's message can quote the address. `OutgoingEmail`,
-  `RenderedEmail` and the email classes keep addresses and secrets out of their reprs.
+  ID, or an error code. Their `MailError` carries a kind (`throttled`, `unavailable`, `paused`, `misconfigured`,
+  `rejected`) and the provider's error code, raised `from None`, because a provider's message can quote the address.
+  Only `rejected` drops an email, and only for an error about that message; our own setup being wrong (credentials,
+  permissions, a missing configuration set or SES tenant) is `misconfigured`, which holds every email, and an unknown
+  error is retried. `OutgoingEmail`, `RenderedEmail` and the email classes keep addresses and secrets out of their
+  reprs.
 - **SES** (`sft/data/mail/ses.py`): `SendEmail` with the region's configuration set, the SES tenant named by our
   tenant ID, and the tags `tenant_id` and `email_type`, plus any the caller adds, so delivery events find their row.
   Tested with botocore's Stubber; nothing calls AWS.

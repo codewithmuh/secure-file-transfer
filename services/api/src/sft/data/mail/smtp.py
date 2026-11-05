@@ -56,16 +56,31 @@ class SmtpMailer:
         return message
 
     def send(self, email: OutgoingEmail) -> str:
-        message = self.message(email)
         try:
-            with smtplib.SMTP(self._host, self._port, timeout=_TIMEOUT_SECONDS) as smtp:
-                smtp.send_message(message)
-        except smtplib.SMTPResponseException as exc:  # sender refused, data refused, …
-            self._fail(email, MailErrorKind.REJECTED if exc.smtp_code >= 500 else None, exc)
-        except smtplib.SMTPRecipientsRefused as exc:  # its message holds the address
+            message = self.message(email)
+        except ValueError as exc:  # a header the email package refuses: this message never goes
             self._fail(email, MailErrorKind.REJECTED, exc)
+        smtp = smtplib.SMTP(timeout=_TIMEOUT_SECONDS)
+        try:
+            code, reply = smtp.connect(self._host, self._port)
+            if (
+                code != 220
+            ):  # what SMTP(host, port) would raise, but with `smtp` still ours to close
+                raise smtplib.SMTPConnectError(code, reply)
+            smtp.send_message(message)
+        except (
+            smtplib.SMTPConnectError
+        ) as exc:  # the greeting refused us: the server, not the message
+            self._fail(email, None, exc)
+        except smtplib.SMTPResponseException as exc:  # sender refused, data refused, …
+            self._fail(email, _kind(exc.smtp_code), exc)
+        except smtplib.SMTPRecipientsRefused as exc:  # its message holds the address
+            codes = [code for code, _ in exc.recipients.values()]
+            self._fail(email, _kind(min(codes, default=550)), exc)
         except (OSError, smtplib.SMTPException) as exc:  # connection refused, timeout, …
             self._fail(email, None, exc)
+        finally:
+            _quit(smtp)
         message_id = str(message["Message-ID"])
         log.info(
             "email handed to the provider",
@@ -83,3 +98,17 @@ class SmtpMailer:
             extra={"provider": "smtp", "email_type": email.email_type, "error": code},
         )
         raise MailError(kind or MailErrorKind.UNAVAILABLE, code) from None
+
+
+def _kind(smtp_code: int) -> MailErrorKind | None:
+    """A 5xx refusal is permanent; a 4xx one is temporary, so the send is retried."""
+    return MailErrorKind.REJECTED if smtp_code >= 500 else None
+
+
+def _quit(smtp: smtplib.SMTP) -> None:
+    """End the session. Once the server has accepted the message, a failed QUIT changes nothing:
+    raising here would send the email again."""
+    try:
+        smtp.quit()
+    except (OSError, smtplib.SMTPException):
+        smtp.close()
