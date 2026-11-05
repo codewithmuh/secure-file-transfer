@@ -69,6 +69,10 @@ no network, one beside each scan worker, fed by the same pass that streams the f
   archive members; 4 GiB decompressed and a 100:1 ratio per member; 256 MiB of extracted text; 5,000 PDF pages;
   10 minutes of CPU and 15 of wall-clock time; 2 GiB of memory. Past a limit, the rest isn't inspected, the file is
   `partial` with the reason `limit_exceeded`, and the findings so far count. A limit is never a pass.
+- **Tenant pattern budget per file** (#147). Each tenant pattern may spend 0.5 s of CPU plus 50 ms per MiB of text
+  it scans, and make 100,000 matches; past that, it alone stops for the rest of the file and the result names it,
+  with no match, for the tenant admin. The file's state doesn't change, and every other detector carries on
+  ([detectors](../design/dlp-detectors.md) 5).
 - **Parsers.** `zipfile` and `tarfile` from the standard library behind our own limit checks; XML through `lxml` with
   DTDs, entity expansion and network access off; PDF text through PDFium (`pypdfium2`, Apache-2.0 or BSD-3-Clause), a
   build without JavaScript or XFA. No parser with a copyleft licence, and none that shells out.
@@ -78,11 +82,12 @@ no network, one beside each scan worker, fed by the same pass that streams the f
   system, no capabilities, no privilege escalation and the `RuntimeDefault` seccomp profile, on the scan node pool
   whose volumes use the files key.
 - **A fresh process per file.** The inspector's parent process only receives the stream and writes it to a 4 GiB
-  scratch volume; it never parses. For each file it forks a child that sets resource limits (address space, CPU time,
-  file size, no core dumps), installs a seccomp filter that refuses new sockets, `execve` and `ptrace`, then extracts,
-  runs the detectors and writes the result to a pipe. The parent kills a child that passes the wall-clock limit, and
-  deletes the scratch files after every file. An exploited parser can falsify only its own file's result, and holds
-  nothing to authenticate with.
+  scratch volume; it never parses. For each file it starts a child, a fresh Python interpreter (`sft.dlp.child`) rather
+  than a fork, so nothing of the parent's memory carries over. The child sets resource limits (address space, CPU time,
+  file size, open files, no core dumps), installs a seccomp filter that refuses new sockets, `execve`, `ptrace` and new
+  processes (`sft.dlp.seccomp`), then extracts, runs the detectors and writes the result to a pipe. The parent kills a
+  child that passes the wall-clock limit, and deletes the scratch files after every file. An exploited parser can
+  falsify only its own file's result, and holds nothing to authenticate with.
 - **Untrusted output.** The scan worker treats the inspector's answer as hostile input: a strict schema, known detector
   IDs only, bounded counts, at most 10 location hints and 3 masked previews per detector, bounded lengths. Anything
   else counts as an engine error: retried, then `failed`, which blocks the file and alerts an operator (FR-47), as

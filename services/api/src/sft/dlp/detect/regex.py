@@ -64,8 +64,11 @@ class Regex:
         """
         return max(int(self._compiled.programsize), int(self._compiled.reverseprogramsize))
 
-    def finditer(self, text: str) -> Iterator[Span]:
-        for match in self._compiled.finditer(text):
+    def finditer(self, text: str, pos: int = 0, endpos: int | None = None) -> Iterator[Span]:
+        """The matches in `text[pos:endpos]`, with the text around it as context: `^` and `$`
+        still mean the ends of `text`, and a match never runs past `endpos`."""
+        end = len(text) if endpos is None else endpos
+        for match in self._compiled.finditer(text, pos, end):
             start, end = match.span()
             yield Span(start, end, tuple(match.groups()))
 

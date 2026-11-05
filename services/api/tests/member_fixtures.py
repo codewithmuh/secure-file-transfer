@@ -1,9 +1,11 @@
-"""Tenants, users and callers for the member routes' tests and the authorization matrix.
+"""Tenants, users and callers for the member and transfer routes' tests and the authorization
+matrix.
 
 Rows are seeded as the superuser, which neither row-level security nor the audit trigger applies
 to, so seeding is never mistaken for the code under test. Requests go through the real app over
-ASGI, with the caller dependency (#113's session resolution) replaced by the caller under test and
-the rate limiter by `RecordingLimiter`, which admits every request and keeps what it was asked.
+ASGI, with the caller dependency (#113's session resolution) replaced by the caller under test, the
+rate limiter by `RecordingLimiter`, which admits every request and keeps what it was asked, and the
+files buckets by `FakeObjects` (object_fixtures.py).
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import httpx2 as httpx
 from fastapi import FastAPI
 
 from api_settings import EMAIL_HMAC_KEYRING
+from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.api.app import create_app
 from sft.api.caller import get_caller
@@ -30,6 +33,7 @@ from sft.data.models import Role
 from sft.data.roles import API
 from sft.service.caller import AuthMethod, Caller
 from sft.service.rate_limits.limits import KeyType, KeyValue, Limit
+from sft.service.uploads import UploadPolicy
 
 EMAIL_KEYRING = EmailKeyring.from_json(EMAIL_HMAC_KEYRING)
 """The `email-hmac` keyring of the apps these tests build, from api_settings."""
@@ -114,10 +118,14 @@ def app_for(
     database: Database,
     caller: Callable[[], Caller | None],
     limiter: RecordingLimiter | None = None,
+    objects: FakeObjects | None = None,
+    policy: UploadPolicy | None = None,
 ) -> FastAPI:
     app = create_app()
     app.state.database = database
     app.state.email_keyring = EMAIL_KEYRING
+    app.state.objects = objects or FakeObjects()
+    app.state.upload_policy = policy or UploadPolicy()
     recording = limiter or RecordingLimiter()
 
     def resolve() -> Caller:
@@ -136,10 +144,11 @@ async def client(
     db: ScratchDatabase,
     caller: Callable[[], Caller | None],
     limiter: RecordingLimiter | None = None,
+    objects: FakeObjects | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     database = Database.connect(db.url(API), pool_size=2)
     try:
-        transport = httpx.ASGITransport(app=app_for(database, caller, limiter))
+        transport = httpx.ASGITransport(app=app_for(database, caller, limiter, objects))
         async with httpx.AsyncClient(transport=transport, base_url="http://api.test") as http:
             yield http
     finally:

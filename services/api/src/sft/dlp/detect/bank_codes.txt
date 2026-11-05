@@ -1,0 +1,7 @@
+# Japanese bank and branch codes for jp_bank_account (docs/design/dlp-detectors.md 4.4).
+# One 7-digit code per line: the 4-digit bank code, then the 3-digit branch code.
+# Written by tools/bank_codes.py; refresh steps in services/api/README.md.
+# Nothing is bundled yet (#146): no source whose licence allows redistribution has been confirmed.
+# source: none
+# licence: none
+# retrieved: none

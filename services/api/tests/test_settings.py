@@ -32,6 +32,9 @@ ENV_NAMES = (
     "OIDC_DISCOVERY_URL",
     "OIDC_REVOCATION_URL",
     "ADMIN_PASSKEY_RULE",
+    "AWS_REGION",
+    "S3_ENDPOINT_URL",
+    "TENANT_STORAGE_QUOTA_BYTES",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -70,6 +73,9 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.trusted_proxies == ()
     assert (s.oidc_discovery_url, s.oidc_revocation_url) == (None, None)
     assert s.admin_passkey_rule is False
+    assert s.aws_region == "ap-northeast-1"
+    assert s.s3_endpoint_url is None
+    assert s.tenant_storage_quota_bytes == 2 * 10**12
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -148,7 +154,9 @@ def test_the_valkey_url_is_required(clean_env: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("name", [n for n in API_ENV if n != "VALKEY_URL"])
-def test_every_sign_in_setting_is_required(clean_env: pytest.MonkeyPatch, name: str) -> None:
+def test_every_sign_in_and_files_bucket_setting_is_required(
+    clean_env: pytest.MonkeyPatch, name: str
+) -> None:
     clean_env.delenv(name)
     with pytest.raises(ValidationError, match=name.lower()):
         Settings()
@@ -180,6 +188,23 @@ def test_a_bad_keyring_stops_the_api_and_is_never_echoed(
         Settings()
     assert [e["loc"] for e in error.value.errors()] == [(name.lower(),)]
     assert key not in str(error.value.errors(include_input=False))
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("S3_FILES_BUCKET", "Sft_Files"),  # not a bucket name
+        ("S3_LARGE_FILES_BUCKET", "ab"),  # too short
+        ("S3_ENDPOINT_URL", "s3mock:9090"),  # no scheme
+        ("TENANT_STORAGE_QUOTA_BYTES", "0"),
+    ],
+)
+def test_a_bad_files_bucket_setting_stops_the_api(
+    clean_env: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    clean_env.setenv(name, value)
+    with pytest.raises(ValidationError, match=name.lower()):
+        Settings()
 
 
 def test_the_operator_api_reads_none_of_the_sign_in_settings() -> None:

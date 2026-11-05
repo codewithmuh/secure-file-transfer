@@ -20,6 +20,7 @@ import pytest
 from fastapi.routing import iter_route_contexts
 
 from member_fixtures import Tenant, client, seed_tenant, session_caller
+from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.api.app import create_app
 from sft.data.models import Role
@@ -38,9 +39,52 @@ API_KEY_SCOPES = (
 
 
 @dataclass(frozen=True)
+class Draft:
+    """A draft of `Tenant.target` with one file whose single part is uploaded (#114)."""
+
+    transfer: uuid.UUID
+    file: uuid.UUID
+    upload: str
+
+
+@dataclass(frozen=True)
 class World:
     mine: Tenant
     theirs: Tenant
+    draft: Draft
+
+
+FILE_SIZE = 10
+
+
+def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Draft:
+    """As the superuser, like the isolation suite's seed; the part is in `objects`."""
+    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}")
+    db.sql(
+        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in) "
+        "VALUES (:id, :tenant, :owner, 'draft', interval '7 days')",
+        id=draft.transfer,
+        tenant=tenant.id,
+        owner=tenant.target,
+    )
+    db.sql(
+        "INSERT INTO files (id, tenant_id, transfer_id, display_name_ct, content_type, "
+        "declared_size, storage_class, storage_key, s3_upload_id, part_size, part_count, state) "
+        "VALUES (:id, :tenant, :transfer, '\\x0061', 'text/plain', :size, 'standard', "
+        "'tenants/' || :tenant || '/files/' || :id, :upload, 5242880, 1, 'uploading')",
+        id=draft.file,
+        tenant=tenant.id,
+        transfer=draft.transfer,
+        size=FILE_SIZE,
+        upload=draft.upload,
+    )
+    db.sql(
+        "INSERT INTO tenant_usage (tenant_id, bytes_reserved) VALUES (:tenant, :size)",
+        tenant=tenant.id,
+        size=FILE_SIZE,
+    )
+    objects.put_part(draft.upload, 1, FILE_SIZE)
+    return draft
 
 
 CallerFor = Callable[[World], Caller | None]
@@ -108,12 +152,57 @@ def admin_row(ok: int, *, step_up: bool, item: bool) -> dict[str, int]:
     }
 
 
+# Callers the tenant routes don't accept at all; API keys are told apart by their scopes.
+NOT_A_TENANT_CALLER = {name: 401 for name in ("no_credential", "recipient", "uploader", "operator")}
+NO_KEY_SCOPE = {name: 403 for name in CALLERS if name.startswith("api_key")}
+
+
+def create_row(ok: int) -> dict[str, int]:
+    """`transfer.create`: any member or admin, and a key with `transfers:write`."""
+    members = ("member", "member_self", "admin_passkey", "admin_totp", "admin_stale")
+    return {
+        **NOT_A_TENANT_CALLER,
+        **NO_KEY_SCOPE,
+        **dict.fromkeys(members, ok),
+        "admin_other_tenant": ok,  # a draft of their own tenant
+        "api_key_transfers:write": ok,
+    }
+
+
+def own_row(ok: int, *, scopes: tuple[str, ...] = ("transfers:write",)) -> dict[str, int]:
+    """A `file.*` operation on the target's draft: Own for everyone (authn and authz 6.3, 6.4).
+
+    Another member, and an admin signed in without a passkey (who acts as a member), can't see
+    the draft: 404. An admin acting as one sees the tenant's transfers, so 403; a key with a scope
+    of the operation is the admin's, sees no transfer without `transfers:read`, so 404.
+    """
+    return {
+        **NOT_A_TENANT_CALLER,
+        **NO_KEY_SCOPE,
+        "member": 404,
+        "member_self": ok,
+        "admin_passkey": 403,
+        "admin_totp": 404,
+        "admin_stale": 403,
+        "admin_other_tenant": 404,
+        **{f"api_key_{scope}": 404 for scope in scopes},
+    }
+
+
+USER_OPERATIONS = frozenset({"inviteUser", "listUsers", "getUser", "updateUser", "deactivateUser"})
+
 EXPECTED: dict[str, dict[str, int]] = {
     "inviteUser": admin_row(201, step_up=True, item=False),
     "listUsers": admin_row(200, step_up=False, item=False),
     "getUser": admin_row(200, step_up=False, item=True),
     "updateUser": admin_row(200, step_up=True, item=True),
     "deactivateUser": admin_row(200, step_up=True, item=True),
+    "createTransfer": create_row(201),
+    "addTransferFile": own_row(201),
+    "requestUploadPartUrls": own_row(200),
+    "listUploadedParts": own_row(200),
+    "completeUpload": own_row(200),
+    "deleteFile": own_row(204, scopes=("transfers:write", "upload_requests:write")),
 }
 
 # The session's own operations read the session cookie itself, not a caller the matrix can put in
@@ -129,13 +218,38 @@ CODES = {401: {"authentication_required", "reauthentication_required"}, 404: {"n
 
 def request_for(operation: str, world: World) -> tuple[str, str, dict[str, object] | None]:
     target = f"/v1/users/{world.mine.target}"
+    file = f"/v1/files/{world.draft.file}"
     return {
         "inviteUser": ("POST", "/v1/users", {"email": f"{uuid.uuid4().hex}@example.test"}),
         "listUsers": ("GET", "/v1/users", None),
         "getUser": ("GET", target, None),
         "updateUser": ("PATCH", target, {"role": "admin"}),
         "deactivateUser": ("POST", f"{target}/deactivate", None),
+        "createTransfer": (
+            "POST",
+            "/v1/transfers",
+            {"recipients": [{"email": "partner@example.test"}]},
+        ),
+        "addTransferFile": (
+            "POST",
+            f"/v1/transfers/{world.draft.transfer}/files",
+            {"display_name": "a.txt", "size": FILE_SIZE},
+        ),
+        "requestUploadPartUrls": ("POST", f"{file}/parts", {"part_numbers": [1]}),
+        "listUploadedParts": ("GET", f"{file}/parts", None),
+        "completeUpload": ("POST", f"{file}/complete", None),
+        "deleteFile": ("DELETE", file, None),
     }[operation]
+
+
+STATE = """
+    SELECT 'user', id, role || '/' || status FROM users WHERE tenant_id = :t
+    UNION ALL SELECT 'transfer', id, state FROM transfers WHERE tenant_id = :t
+    UNION ALL SELECT 'file', id, state || '/' || (removed_at IS NULL)
+                FROM files WHERE tenant_id = :t
+    UNION ALL SELECT 'usage', tenant_id, bytes_reserved::text FROM tenant_usage WHERE tenant_id = :t
+    ORDER BY 1, 2
+"""
 
 
 def test_the_matrix_covers_every_operation_the_app_serves_and_every_caller() -> None:
@@ -155,13 +269,13 @@ CELLS = [(op, caller) for op, row in EXPECTED.items() for caller in row]
 async def test_authorization_matrix(
     operation: str, caller_name: str, migrated_db: ScratchDatabase
 ) -> None:
-    world = World(seed_tenant(migrated_db), seed_tenant(migrated_db))
+    objects = FakeObjects()
+    mine = seed_tenant(migrated_db)
+    world = World(mine, seed_tenant(migrated_db), seed_draft(migrated_db, mine, objects))
     caller = CALLERS[caller_name](world)
     method, path, body = request_for(operation, world)
-    before = migrated_db.sql(
-        "SELECT id, role, status FROM users WHERE tenant_id = :t ORDER BY id", t=world.mine.id
-    )
-    async with client(migrated_db, lambda: caller) as http:
+    before = migrated_db.sql(STATE, t=world.mine.id)
+    async with client(migrated_db, lambda: caller, objects=objects) as http:
         response = await http.request(method, path, json=body)
     expected = EXPECTED[operation][caller_name]
     assert response.status_code == expected, response.text
@@ -171,14 +285,12 @@ async def test_authorization_matrix(
         else:
             assert response.json()["code"] in CODES[expected]
         assert response.headers["content-type"] == "application/problem+json"
-        after = migrated_db.sql(
-            "SELECT id, role, status FROM users WHERE tenant_id = :t ORDER BY id",
-            t=world.mine.id,
-        )
-        assert after == before, "a refused call changed users"
-    if caller_name == "admin_totp":
+        after = migrated_db.sql(STATE, t=world.mine.id)
+        assert after == before, "a refused call changed users, transfers or files"
+    if caller_name == "admin_totp" and operation in USER_OPERATIONS:
         assert response.json()["code"] == "passkey_required"
     if caller_name == "admin_other_tenant":
-        # Another tenant's admin never sees or changes this tenant's users.
+        # Another tenant's admin never sees or changes this tenant's users or transfers.
         assert str(world.mine.target) not in response.text
         assert str(world.mine.admin) not in response.text
+        assert str(world.draft.file) not in response.text

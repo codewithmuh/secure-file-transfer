@@ -670,6 +670,6 @@ def test_table_rows_use_their_column_headers(rng: random.Random) -> None:
 
 def test_the_public_surface() -> None:
     assert len(BUILTIN_DETECTORS) == 13
-    assert DETECTORS_VERSION == "1"
+    assert DETECTORS_VERSION == "2.banks-none"  # no bank code list is bundled yet (#146)
     assert inspect_text("") == []
     assert inspect_text("ordinary text with no data") == []

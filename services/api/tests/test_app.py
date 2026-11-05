@@ -11,6 +11,8 @@ from api_settings import API_SETTINGS
 from sft.api.app import API_TITLE, API_VERSION, create_app, get_database
 from sft.core.settings import Settings
 from sft.data.database import Database
+from sft.runtime.s3 import S3Objects
+from sft.service.uploads import UploadPolicy
 
 CONTRACT = Path(__file__).resolve().parents[3] / "docs" / "api" / "openapi.yaml"
 
@@ -70,3 +72,28 @@ def test_the_lifespan_opens_the_pool_and_closes_it(monkeypatch: pytest.MonkeyPat
 def test_an_app_without_settings_has_no_database() -> None:
     client = TestClient(app_with_database_route(None), raise_server_exceptions=False)
     assert client.get("/v1/pool").status_code == 500
+
+
+def test_the_lifespan_opens_the_files_buckets_and_closes_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[S3Objects] = []
+    original = S3Objects.close
+
+    async def record_close(self: S3Objects) -> None:
+        closed.append(self)
+        await original(self)
+
+    monkeypatch.setattr(S3Objects, "close", record_close)
+    settings = Settings(
+        database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"),
+        tenant_storage_quota_bytes=10**9,
+        **API_SETTINGS,  # type: ignore[arg-type]
+    )
+    app = create_app(settings)
+    with TestClient(app):
+        # Creating the client connects to nothing, so this works with no S3 at all.
+        assert isinstance(app.state.objects, S3Objects)
+        assert app.state.upload_policy == UploadPolicy(storage_quota=10**9)
+        assert closed == []
+    assert closed == [app.state.objects]

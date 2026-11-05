@@ -9,7 +9,7 @@ Each entry point reads only the settings it needs: `Settings` for the API and `O
 for the operator API (both build on `ServerSettings`), `RelaySettings` for the outbox relay (and
 `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
 `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
-notification worker).
+notification worker), `InspectorSettings` for the DLP inspector.
 """
 
 from __future__ import annotations
@@ -49,6 +49,9 @@ def _postgres_url(value: SecretStr) -> SecretStr:
 # A PostgreSQL URL. In AWS it names the login role and has no password: the role signs in with IAM
 # database authentication (encryption and keys 6.3). Locally it may hold a fake password.
 PostgresUrl = Annotated[SecretStr, AfterValidator(_postgres_url)]
+
+# An S3 bucket name: 3 to 63 lower-case letters, digits, dots and hyphens.
+_BUCKET = r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
 
 _VALKEY_SCHEMES = ("redis://", "rediss://", "valkey://", "valkeys://")
 
@@ -159,9 +162,9 @@ _HTTP_URL = r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[^\s?#]*)?(\?[^\s#]*)?$"
 
 
 class Settings(ServerSettings):
-    """The public API's settings: the server's, and member sign-in's (ADR-0016; authentication and
-    authorization 2.4 and 3). Locally Keycloak stands in for the Cognito user pool
-    (docs/local-development.md)."""
+    """The public API's settings: the server's, member sign-in's (ADR-0016; authentication and
+    authorization 2.4 and 3) and the files buckets' (#114). Locally Keycloak stands in for the
+    Cognito user pool and S3Mock for S3 (docs/local-development.md)."""
 
     web_origin: str = Field(
         pattern=_ORIGIN,
@@ -216,6 +219,32 @@ class Settings(ServerSettings):
         default=False,
         description="The launch switch of ADR-0016: a local admin acts as an admin only in a "
         "session signed in with a passkey. Off until both pools issue `amr`.",
+    )
+    # Object storage for file uploads (#114, ADR-0012): the region's two files buckets and the
+    # files key. Required, so a deploy without them stops at startup instead of failing uploads.
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    s3_files_bucket: str = Field(
+        pattern=_BUCKET,
+        description="The files bucket for files up to 2 GB, e.g. `sft-dev-files`.",
+    )
+    s3_large_files_bucket: str = Field(
+        pattern=_BUCKET,
+        description="The files bucket for files over 2 GB, which GuardDuty scans (ADR-0019).",
+    )
+    s3_files_kms_key_id: str = Field(
+        min_length=1,
+        max_length=2048,
+        description="The files key for SSE-KMS. S3Mock takes only its bare key ID (local dev 4).",
+    )
+    s3_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock. In AWS the SDK finds S3's endpoint itself.",
+    )
+    tenant_storage_quota_bytes: int = Field(
+        default=2 * 10**12,
+        ge=1,
+        description="Each tenant's storage quota, the same for every tenant (abuse 6.1): 2 TB.",
     )
 
     @field_validator("csrf_keyring")
@@ -416,6 +445,30 @@ class MailSettings(_Base):
         if self.mail_backend == "ses" and not self.ses_configuration_set:
             raise ValueError("MAIL_BACKEND=ses needs SES_CONFIGURATION_SET")
         return self
+
+
+class InspectorSettings(_Base):
+    """The DLP inspector's settings (ADR-0022). It has no secrets: it holds no credentials."""
+
+    # 127.0.0.1 keeps a laptop run off the network; the pod sets BIND_HOST=0.0.0.0, and its
+    # network policy admits only the scan workers.
+    bind_host: str = "127.0.0.1"
+    inspector_port: int = Field(
+        default=8070,
+        ge=1,
+        le=65535,
+        description="Where scan workers connect; one file per connection (sft.dlp.protocol).",
+    )
+    inspector_scratch_dir: str = Field(
+        min_length=1,
+        description="The 4 GiB scratch volume, the only writable path. No default: choose.",
+    )
+    inspector_io_timeout_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=900,
+        description="How long a scan worker may leave the connection idle before it is dropped.",
+    )
 
 
 EXIT_BAD_SETTINGS = 2

@@ -14,8 +14,9 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
-    dependencies.py   get_database, the route dependency for the process's database
+    dependencies.py   get_database, get_objects and the other dependencies for what the lifespan opens
     members.py        the member routes: invite, list, read, change and deactivate users (FR-22)
+    transfers.py      the draft transfer and upload routes; transfer_schemas.py holds their bodies (#114)
     caller.py         get_caller, the request's Caller (a placeholder until #113's sessions)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     observability.py  request and trace IDs, the request span, request metrics, one log line per request
@@ -30,10 +31,13 @@ src/sft/
     process.py        WorkerProcess: probes, SIGTERM and the drain for every worker
   runtime/      what api and workers both need to run as a pod
     internal.py       /healthz, /readyz, /metrics on the internal port
+    s3.py             the files buckets behind ObjectStore (boto3 in a thread pool)
   service/      business rules and permission checks
     caller.py         Caller: who is calling and how they signed in; its audit actor and rate-limit keys
     permissions.py    the permission registry (authn and authz 6.3) and authorize()
     members.py        the member rules: the last active admin, invitations, role and approver changes
+    transfers.py      draft transfers and their views; uploads.py: declare, part URLs, complete, remove
+    objects.py        ObjectStore, the object storage the service sees; fields.py seals names and messages
     email/            every email, rendered in English and Japanese as text and HTML (Email below)
     rate_limits/      the limits as data, the limiter and its per-pod fallback
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations; Valkey counters
@@ -42,6 +46,7 @@ src/sft/
     access.py         the rules on top: who opens which scope, in_scope(), TenantOwned
     tenants.py        data-access functions for tenants (one module per table or aggregate)
     users.py          data-access functions for users and their invitations
+    transfers.py      transfers and recipients; files.py the files' state changes; usage.py the quota
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
@@ -52,9 +57,13 @@ src/sft/
     migrations/       the Alembic revisions; migrate.py is the migration job
     counters.py       Valkey: the rate-limit counter scripts, with a timeout and a rest after failures
     mail/             the mail adapter: SES API v2 in AWS, SMTP to Mailpit locally (Email below)
-  dlp/          beside data: the DLP detectors, pure code with no I/O, for the service and the inspector (ADR-0022)
+  dlp/          beside data: DLP (ADR-0022), the detectors for the service and the inspector, and the inspector itself
     units.py          text units, keyword lists and findings: what goes in and what comes out
     detect/           the built-in detectors of docs/design/dlp-detectors.md and tenant detectors, on RE2
+    extract/          text from every ADR-0022 format, with the per-file limits (limits.py) and a reason for the rest
+    inspector.py      the inspector service (`python -m sft.dlp.inspector`): one fresh child per file
+    child.py          the child: rlimits and a seccomp filter (sandbox.py, seccomp.py), then extract and detect
+    protocol.py       the strict-schema frames between scan worker, inspector and child; client.py is the worker's side
   core/         settings, logging, tracing and UUIDv7 IDs, used by every layer
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
     pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
@@ -114,6 +123,12 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `CSRF_KEYRING` | none, required | K_csrf (`sft/{env}/app/csrf-hmac`): a JSON list of `{id, state, key}`, exactly one `active`; a secret |
 | `EMAIL_HMAC_KEYRING` | none, required | The `email-hmac` keyring (`sft/{env}/app/email-hmac`), the shape of `CSRF_KEYRING` with `activated_at` on the active key: per-address rate limits count under its pseudonyms, never an address; a secret |
 | `ADMIN_PASSKEY_RULE` | `false` | ADR-0016's launch switch: a local admin acts as an admin only after a passkey sign-in |
+| `AWS_REGION` | `ap-northeast-1` | The region of the files buckets |
+| `S3_FILES_BUCKET` | none, required | The files bucket for files up to 2 GB |
+| `S3_LARGE_FILES_BUCKET` | none, required | The files bucket for files over 2 GB, which GuardDuty scans (ADR-0019) |
+| `S3_FILES_KMS_KEY_ID` | none, required | The files key for SSE-KMS; S3Mock takes only the bare key ID |
+| `S3_ENDPOINT_URL` | none | Local only, for S3Mock; in AWS the SDK finds S3's endpoint |
+| `TENANT_STORAGE_QUOTA_BYTES` | `2000000000000` | Each tenant's storage quota (abuse and rate limits 6.1) |
 
 Whatever sends email (the notification worker) also reads `MailSettings`:
 
@@ -127,6 +142,15 @@ Whatever sends email (the notification worker) also reads `MailSettings`:
 | `SES_CONFIGURATION_SET` | none | The region's configuration set; required for `ses` |
 | `SES_TENANTS` | `true` | Name the tenant's SES tenant on every send (ADR-0015); `false` only where SES has no tenant management |
 | `SMTP_HOST`, `SMTP_PORT` | `127.0.0.1`, `1025` | Mailpit, for `smtp` |
+
+The DLP inspector (`python -m sft.dlp.inspector`) reads `InspectorSettings`, which hold no secret:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BIND_HOST` | `127.0.0.1` | The pod sets `0.0.0.0`; its network policy admits only the scan workers |
+| `INSPECTOR_PORT` | `8070` | Where scan workers connect, one file per connection |
+| `INSPECTOR_SCRATCH_DIR` | none, required | The 4 GiB scratch volume, the only writable path |
+| `INSPECTOR_IO_TIMEOUT_SECONDS` | `60` | How long a connection may stay idle before it is dropped (1 to 900) |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
 `BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
@@ -461,6 +485,37 @@ code under test never seeds itself. `tests/isolation_fixture.py` holds stand-in 
 a child, that prove the harness, the composite keys and the lookup mechanism until the real tables arrive;
 `tests/test_isolation_harness.py` breaks each layer in turn and checks that the suite fails.
 
+## DLP
+
+### Tenant pattern budget
+
+Each tenant pattern has a scan-time budget per file (`PatternBudget` in `src/sft/dlp/detect/tenant.py`, #147): 0.5 s
+of CPU plus 50 ms per MiB of text it scans, and 100,000 matches, checked after every 64 KiB chunk. A pattern past it
+stops for the rest of the file, the others carry on, and the inspector's result lists it in `budget_exceeded`, by
+detector ID only. The file's state doesn't change. An RE2 memory budget at save time (`max_mem`) was tried as a
+tighter check and doesn't refuse the slow patterns: the issue's example compiles even at 64 KiB.
+
+### DLP bank and branch codes
+
+`jp_bank_account` is high when a valid bank and branch code pair is near the account
+([DLP detectors 4.4](../../docs/design/dlp-detectors.md)). The pairs live in `src/sft/dlp/detect/bank_codes.txt`: a
+header with `source`, `licence` and `retrieved`, then one 7-digit code per line (bank, then branch), sorted, each
+once. The file's retrieval
+date is part of `DETECTORS_VERSION`, so every file records which list inspected it.
+
+**Nothing is bundled yet (#146)**: no source whose licence allows redistribution has been confirmed, so the file holds
+only its header and the detector stays at medium. To bundle or refresh a list, before each release and at least every
+three months:
+
+1. Obtain the list from a source whose terms allow redistributing it inside the inspector image, and record the terms.
+   A list compiled from a site whose terms are silent on reuse doesn't qualify.
+2. Save it as UTF-8 CSV with `bank_code` (4 digits) and `branch_code` (3 digits) columns, leading zeros kept.
+3. `uv run python -m tools.bank_codes codes.csv --source "<publisher, URL>" --licence "<terms>" --retrieved YYYY-MM-DD`
+   rewrites the file, sorted and checked.
+4. Run `uv run pytest tests/test_dlp_bank_codes.py tests/test_dlp_detect.py tests/test_dlp_corpus.py` and record the
+   source and licence in the pull request. The corpus uses its own synthetic list (`tests/bank_codes_fixture.txt`),
+   so its results don't depend on the bundled one.
+
 ## Email
 
 Every email the PRD names, in English and Japanese, as plain text and HTML (FR-33, abuse 7.1), and one adapter to
@@ -507,8 +562,51 @@ README 5). The key's row in `idempotency_keys` (revision 0007) keeps the request
 body), the status and the created resource's ID for 24 hours, never a response body. A retry with the same request
 gets the first status and the resource as it is now, and creates, audits and charges nothing; another request with
 the key gets `409 idempotency_conflict`; one sent while the first still runs gets `409 idempotency_in_progress`,
-from a transaction-scoped advisory lock. `inviteUser` is the first user. `delete_expired_keys` is the daily job's step,
+from a transaction-scoped advisory lock. `inviteUser`, `createTransfer` and `addTransferFile` use it; an operation
+that works outside its transaction first (`addTransferFile` starts an S3 upload) checks for a stored answer with
+`replay` before that work. `delete_expired_keys` is the daily job's step,
 as `sft_jobs`; the jobs worker that schedules it comes later.
+
+## Transfers and uploads
+
+`src/sft/api/transfers.py` serves `createTransfer`, `addTransferFile`, `requestUploadPartUrls`, `listUploadedParts`,
+`completeUpload` and `deleteFile` (#114). The routes only translate; `sft.service.transfers` and
+`sft.service.uploads` check the caller with `authorize` and then the state, and `sft.runtime.s3` is the S3 adapter
+behind `sft.service.objects.ObjectStore`.
+
+- **Who may.** A member session or an API key (`get_tenant_caller`). `createTransfer` is open to every member and to a
+  key with `transfers:write`; the file operations are Own: the transfer's sender, or a key of theirs. Anyone else who
+  may read every transfer of the tenant (an admin acting as one, a key with `transfers:read`) gets `403`; the rest
+  `404`.
+- **Rate limits.** `createTransfer` and `deleteFile` are group H. The four upload operations are group F (600 a minute
+  per caller, 1,200 per IP) and count in the tenant's group H budget.
+- **Idempotency.** `createTransfer` and `addTransferFile` take `Idempotency-Key`. A retried `addTransferFile` is
+  answered from the key before any S3 call, so it starts no second upload.
+- **Adding a file** reserves its declared size against the tenant's quota and starts a multipart upload, in the
+  standard bucket up to 2 GB and the large-files bucket above. The plan is whole-MiB parts of at least 5 MiB, at most
+  1,000 of them.
+- **Part URLs** are signed for one part's exact size and live 15 minutes (abuse and rate limits 6.2).
+- **Completion** runs in three phases (architecture 4.1, data model 3.1): a short transaction under the transfer's row
+  lock moves the file to `completing`; then, with no transaction open, S3's own part list is checked against the plan
+  and assembled; then a second locked transaction re-checks the transfer and the file. A revocation or removal that
+  landed meanwhile, a size mismatch or a vanished upload rejects the file and releases its reservation; missing parts
+  send it back to `uploading`. Otherwise it moves to `scanning` and the scan message goes to the outbox in the same
+  transaction. A retry is safe at every point.
+
+### Tests against S3Mock
+
+`tests/test_transfers.py` runs every route against PostgreSQL with an in-memory object store
+(`tests/object_fixtures.py`). `tests/test_s3_s3mock.py` runs the adapter, and one upload end to end, against S3Mock;
+it needs `TEST_S3_ENDPOINT_URL`, makes its own versioned buckets, and is skipped locally without it and fails in CI,
+where S3Mock is a service container on the Python job.
+
+```bash
+docker run --detach --name sft-test-s3mock --publish 127.0.0.1:59090:9090 \
+  --env COM_ADOBE_TESTING_S3MOCK_STORE_REGION=ap-northeast-1 \
+  --env COM_ADOBE_TESTING_S3MOCK_STORE_VALID_KMS_KEYS=arn:aws:kms:ap-northeast-1:000000000000:key/00000000-0000-4000-8000-000000000001 \
+  adobe/s3mock:5.2.3
+TEST_S3_ENDPOINT_URL=http://127.0.0.1:59090 TEST_DATABASE_URL=… uv run pytest
+```
 
 ## Member sign-in and sessions
 

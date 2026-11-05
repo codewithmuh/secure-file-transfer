@@ -119,10 +119,22 @@ jobs:
         options: >-
           --health-cmd "valkey-cli -a vk-${{ github.run_id }}-${{ github.run_attempt }} --no-auth-warning ping"
           --health-interval 2s --health-timeout 5s --health-retries 30
+      # S3Mock, the local S3 (as in compose.yaml), for the S3 adapter and the upload path (#114). It
+      # takes no credentials and accepts only the files key; the tests make their own buckets.
+      s3mock:
+        image: adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
+        env:
+          COM_ADOBE_TESTING_S3MOCK_STORE_REGION: ap-northeast-1
+          COM_ADOBE_TESTING_S3MOCK_STORE_VALID_KMS_KEYS: arn:aws:kms:ap-northeast-1:000000000000:key/00000000-0000-4000-8000-000000000001
+        ports: ["9090:9090"]
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://127.0.0.1:9090/favicon.ico"
+          --health-interval 2s --health-timeout 5s --health-retries 60
     env:
       TEST_DATABASE_URL: postgresql://postgres:pg-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/postgres
       TEST_SQS_ENDPOINT_URL: http://127.0.0.1:9324
       TEST_VALKEY_URL: redis://:vk-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:6379/0
+      TEST_S3_ENDPOINT_URL: http://127.0.0.1:9090
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -137,7 +149,7 @@ jobs:
       - run: uv run ruff check --output-format=github .
       - run: uv run mypy
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
-      - run: uv run pytest # against the PostgreSQL and ElasticMQ services; fails below 80% coverage
+      - run: uv run pytest # against the PostgreSQL, ElasticMQ, Valkey and S3Mock services; fails below 80% coverage
 
   mail:
     name: Mail adapter (SMTP to Mailpit)
@@ -270,9 +282,10 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
-          # The API needs DATABASE_URL, VALKEY_URL and the sign-in settings to start, but connects to
-          # each only when a request needs it, so nothing has to listen on these addresses. Every
-          # value is an obviously fake one for CI; the CSRF key is 32 bytes of "x", the email one of "y".
+          # The API needs DATABASE_URL, VALKEY_URL, the sign-in settings and the files buckets to start,
+          # but connects to each only when a request needs it, so nothing has to listen on these
+          # addresses. Every value is an obviously fake one for CI; the CSRF key is 32 bytes of "x",
+          # the email one of "y".
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
             --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 --env WEB_ORIGIN=https://app.sft.test \
@@ -282,6 +295,8 @@ jobs:
             --env OIDC_LOGOUT_URL=https://idp.sft.test/logout \
             --env 'CSRF_KEYRING=[{"id":"ci","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]' \
             --env 'EMAIL_HMAC_KEYRING=[{"id":"ci","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]' \
+            --env S3_FILES_BUCKET=sft-ci-files --env S3_LARGE_FILES_BUCKET=sft-ci-large-files \
+            --env S3_FILES_KMS_KEY_ID=00000000-0000-4000-8000-000000000001 \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi

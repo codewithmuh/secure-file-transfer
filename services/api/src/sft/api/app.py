@@ -1,15 +1,16 @@
 """The public API app: the routes of the API contract, docs/api/openapi.yaml.
 
-Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py) and
-the member routes (#112, members.py). Probes and metrics live on the internal port
-(sft.runtime.internal). The interactive docs and the OpenAPI document aren't served either:
-ADR-0002 keeps them off the public load balancer, and CI builds the document from
-`create_app().openapi()`.
+Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py),
+the member routes (#112, members.py), and draft transfers and file uploads (#114, transfers.py).
+Probes and metrics live on the internal port (sft.runtime.internal). The interactive docs and the
+OpenAPI document aren't served either: ADR-0002 keeps them off the public load balancer, and CI
+builds the document from `create_app().openapi()`.
 
-With settings, the app's lifespan opens the database pool, the rate-limit counter store and the
-sign-in service (its OIDC client and state store) at startup, without connecting, and closes them
-at shutdown, after uvicorn has drained the requests; it also loads the `email-hmac` keyring. A
-route reaches them through the `get_database` and `get_email_keyring` (dependencies.py),
+With settings, the app's lifespan opens the database pool, the rate-limit counter store, the
+sign-in service (its OIDC client and state store) and the files buckets' S3 client at startup,
+without connecting, and closes them at shutdown, after uvicorn has drained the requests; it also
+loads the `email-hmac` keyring and the upload policy. A route reaches them through the
+`get_database`, `get_email_keyring`, `get_objects` and `get_upload_policy` (dependencies.py),
 `get_rate_limiter` and `sign_in_service` (caller.py) dependencies, or names its limits with
 `rate_limit` (rate_limits.py). Without settings there is none of them: that app is for generating
 the OpenAPI document and for tests of routes that don't need them.
@@ -30,7 +31,7 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import auth, members
+from sft.api import auth, members, transfers
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
@@ -38,7 +39,9 @@ from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
+from sft.runtime.s3 import S3Objects
 from sft.service.rate_limits import RateLimiter
+from sft.service.uploads import UploadPolicy
 
 _NO_FASTAPI_TELEMETRY: TelemetryConfig = {
     "tracing": False,
@@ -72,9 +75,20 @@ def _lifespan(
         app.state.email_keyring = EmailKeyring.from_json(
             settings.email_hmac_keyring.get_secret_value()
         )
+        # The files buckets (#114). Creating the client opens no connection either.
+        objects = S3Objects.create(
+            region=settings.aws_region,
+            files_bucket=settings.s3_files_bucket,
+            large_files_bucket=settings.s3_large_files_bucket,
+            kms_key_id=settings.s3_files_kms_key_id,
+            endpoint_url=settings.s3_endpoint_url,
+        )
+        app.state.objects = objects
+        app.state.upload_policy = UploadPolicy(storage_quota=settings.tenant_storage_quota_bytes)
         try:
             yield
         finally:
+            await objects.close()
             await app.state.sign_in.aclose()
             await store.close()
             await database.dispose()
@@ -100,4 +114,5 @@ def create_app(
     install_rate_limits(app)
     auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)
     members.register(app)  # members, roles and invitations (#112)
+    transfers.register(app)  # draft transfers and file uploads (#114)
     return app

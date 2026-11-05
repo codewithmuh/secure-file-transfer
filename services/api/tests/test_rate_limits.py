@@ -114,6 +114,16 @@ def test_the_nfr_14_values() -> None:
     assert limits.H_FAILED_AUTH.rule == Quota(100, 300, "failures", 900)
 
 
+def test_group_f_counts_uploads_apart_from_group_h_but_in_the_tenant_budget() -> None:
+    # Abuse and rate limits 2.2, F: 600 a minute per caller or link session, 1,200 per IP; the
+    # tenant's 1,000 a minute counts groups D to K too.
+    assert limits.F_CALLER.rule == Rate(600, 60)
+    assert limits.F_CALLER.keys == (KeyType.ACCOUNT, KeyType.API_KEY, KeyType.LINK_SESSION)
+    assert limits.F_IP.rule == Rate(1200, 60)
+    assert limits.UPLOAD == (limits.F_CALLER, limits.F_IP, limits.H_TENANT)
+    assert limits.H_CALLER not in limits.UPLOAD
+
+
 def test_bundles_run_narrowest_first() -> None:
     # The caller's own keys, then IP, then the address, then the tenant (abuse design 4.4).
     rank = {
@@ -130,6 +140,7 @@ def test_bundles_run_narrowest_first() -> None:
         limits.TENANT_OPERATION,
         limits.SAFETY_ACTION,
         limits.INVITE_USER,
+        limits.UPLOAD,
     )
     for bundle in bundles:
         ranks = [rank[limit.keys[0]] for limit in bundle]

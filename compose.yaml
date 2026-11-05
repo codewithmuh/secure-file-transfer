@@ -48,6 +48,14 @@ services:
       CSRF_KEYRING: '[{"id":"local","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]'
       # The email-hmac keyring (#145), per-address rate limits' pseudonyms: 32 bytes of "y".
       EMAIL_HMAC_KEYRING: '[{"id":"local","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]'
+      # The files buckets (#114, ADR-0012) on the S3 stand-in, with the files key's bare ID. The SDK signs part
+      # URLs with fake keys; S3Mock checks no signature. Part URLs name the in-network host `s3`.
+      S3_ENDPOINT_URL: http://s3:9090
+      S3_FILES_BUCKET: sft-local-files
+      S3_LARGE_FILES_BUCKET: sft-local-large-files
+      S3_FILES_KMS_KEY_ID: 00000000-0000-4000-8000-000000000001
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
