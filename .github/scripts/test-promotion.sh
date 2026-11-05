@@ -183,6 +183,14 @@ if ! grep -qE '^  push:' "$promote_yml"; then
 else
   not_ok "promote.yml: never runs on a push"
 fi
+# The gate runs the base commit's script, so a pull request can't rewrite its own gate (#132).
+# shellcheck disable=SC2016 # the literal text of the workflow, not an expansion
+if grep -qF 'git show "$BASE:.github/scripts/promotion.sh"' "$promote_yml" \
+  && ! grep -qE '\.github/scripts/promotion\.sh gate' "$promote_yml"; then
+  ok "promote.yml: promotion-gate runs the base commit's promotion.sh, not the pull request's"
+else
+  not_ok "promote.yml: promotion-gate runs the base commit's promotion.sh, not the pull request's"
+fi
 # mark-deployed.yml runs on a promotion merge, so it must never write to Git or open a pull request.
 if grep -qE '^      - "deploy/environments/\*\*"$' "$mark_yml" && grep -qE '^    branches: \[main\]$' "$mark_yml" &&
   ! grep -qE '^  (pull_request|pull_request_target|workflow_run|workflow_dispatch):' "$mark_yml" &&

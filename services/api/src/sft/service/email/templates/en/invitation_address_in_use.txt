@@ -1,0 +1,10 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your invitation from {{ tenant_name }} to Secure File Transfer{% endblock %}
+{% block body %}
+{{ tenant_name }} has invited this address to Secure File Transfer. This
+address already signs in with a password for another organisation, and an
+address can hold only one such sign-in.
+
+To accept, ask {{ tenant_name }} to invite another address of yours, or to
+set up single sign-on for its members.
+{% endblock %}

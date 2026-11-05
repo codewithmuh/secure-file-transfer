@@ -1,0 +1,7 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">送信が保留になり、受信者にはまだ通知されていません。共有できないファイルがあるか、{{ tenant_name }}の情報漏えい対策（DLP）のルールにより送信がブロックされています。原因のファイルまたはルールとその理由は、送信の詳細ページで確認できます。</p>
+<p style="margin:0 0 16px;">そのファイルを削除して残りを送信するか、送信を取り消すことができます。</p>
+{{ button(transfer_url, '送信の詳細を見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

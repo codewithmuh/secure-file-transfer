@@ -1,0 +1,13 @@
+{# The DLP policy changes a policy-change email lists (PolicyChange). #}
+{% set change_labels = {
+  "rule_added": "A rule was added",
+  "rule_changed": "A rule was changed",
+  "rule_removed": "A rule was removed",
+  "detector_added": "A detector or keyword list was added",
+  "detector_changed": "A detector or keyword list was changed",
+  "detector_removed": "A detector or keyword list was removed",
+  "trusted_domains_changed": "The trusted domains were changed",
+  "mode_changed": "The policy mode (monitor or enforce) was changed",
+  "approvers_changed": "The approvers were changed",
+  "approval_timeout_changed": "The approval timeout was changed",
+} %}

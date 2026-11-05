@@ -1,0 +1,8 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}承認を依頼できない送信がありました{% endblock %}
+{% block body %}
+{{ tenant_name }}のメンバーが送信の承認を依頼しましたが、承認できる人がいません。情報漏えい対策（DLP）のルールが必要とする承認者の数が、送信者を除いた承認者の数を上回っています。DLPの設定で承認者を追加してください。
+
+DLPの設定を開く：
+{{ dlp_policy_url }}
+{% endblock %}

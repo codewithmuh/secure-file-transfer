@@ -1,0 +1,10 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{% if is_transfer %}受信者{% else %}アップロード依頼の相手{% endif %}がロックされました{% endblock %}
+{% block body %}
+{{ tenant_name }}の{% if is_transfer %}送信の受信者{% else %}アップロード依頼の相手{% endif %}が、確認コードを規定の回数以上間違えたため、ロックされました。第三者がリンクを入手している可能性があります。
+
+{% if is_transfer %}送信者{% else %}依頼者{% endif %}またはテナント管理者がロックを解除できます。解除すると新しいリンクが送られ、古いリンクは使えなくなります。
+
+{{ '送信の詳細を見る' if is_transfer else 'アップロード依頼を見る' }}：
+{{ page_url }}
+{% endblock %}

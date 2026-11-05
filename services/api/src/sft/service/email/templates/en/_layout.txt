@@ -1,0 +1,6 @@
+{% block body %}{% endblock %}
+
+--
+Secure File Transfer sent this automated email for {{ tenant_name }}.
+It never attaches files to emails, and never asks you to reply with a code
+or a password.

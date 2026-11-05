@@ -1,0 +1,8 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{% if approved %}送信が承認されました{% else %}送信が却下されました{% endif %}{% endblock %}
+{% block body %}
+{% if approved %}承認者が送信を承認しました。受信者への通知を開始します。{% else %}承認者が送信を却下したため、送信は保留になっています。承認者のコメントは送信の詳細ページで確認できます。ファイルを削除するか、送信を取り消すことができます。{% endif %}
+
+送信の詳細を見る：
+{{ transfer_url }}
+{% endblock %}

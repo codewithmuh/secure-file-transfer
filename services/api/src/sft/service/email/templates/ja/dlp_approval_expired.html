@@ -1,0 +1,6 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">期限までに承認依頼への判断がなかったため、依頼は失効し、送信は再びあなたの確認待ちになりました。承認を再度依頼する（1件の送信につき3回まで）、ファイルを削除する、または送信を取り消すことができます。</p>
+{{ button(transfer_url, '送信の詳細を見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

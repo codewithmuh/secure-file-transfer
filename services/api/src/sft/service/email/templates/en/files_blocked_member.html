@@ -1,0 +1,6 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{% if file_count == 1 %}A file uploaded to your request was blocked and isn't{% else %}{{ file_count }} files uploaded to your request were blocked and aren't{% endif %} available. The upload request page shows why. The uploader has been told only that {{ tenant_name }}'s policy blocked it.</p>
+{{ button(upload_request_url, 'View the upload request', 'Or copy this address into your browser:') }}
+{% endblock %}

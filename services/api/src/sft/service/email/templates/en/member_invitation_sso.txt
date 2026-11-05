@@ -1,0 +1,12 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{{ tenant_name }} invited you to Secure File Transfer{% endblock %}
+{% block body %}
+{{ tenant_name }} has invited you to Secure File Transfer, where you send
+and receive confidential files. You sign in with your organisation's single
+sign-on.
+
+Accept the invitation:
+{{ invitation_url }}
+
+The link works once and expires on {{ expires_at }}.
+{% endblock %}

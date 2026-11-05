@@ -1,0 +1,15 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{{ tenant_name }} asks you to upload files{% endblock %}
+{% block body %}
+{{ sender_email }} at {{ tenant_name }} asks you to upload files through
+Secure File Transfer.
+
+Upload files:
+{{ link_url }}
+
+Before you upload, we email a code to this address to confirm it is you. The
+link expires on {{ expires_at }}.
+
+If you weren't expecting this from {{ tenant_name }}, you can ignore this
+email. Replies to it go to {{ sender_email }}.
+{% endblock %}

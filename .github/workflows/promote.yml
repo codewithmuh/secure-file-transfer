@@ -9,7 +9,8 @@ name: promote
 #   prod's digest. One that does passes only if it changes no other environment's digest and either copies the digest
 #   the previous environment pins on main, with that environment synced, healthy and probed on it, or restores a digest
 #   the environment ran before on main (a revert, which passes at once so a rollback merges within NFR-18's 10
-#   minutes). It reads the pull request's own head commit, so a re-run re-checks the same proposal.
+#   minutes). It reads the pull request's own head commit, so a re-run re-checks the same proposal, and runs the
+#   gate script from the base commit, so a pull request can't change how its own gate decides (#132).
 #
 # Nothing here runs on a push, so a promotion merge starts no build or promotion; build.yml ignores it too. The merge
 # runs only mark-deployed.yml, which tags what main now pins deployed and changes nothing in Git.
@@ -107,7 +108,13 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          decisions=$(.github/scripts/promotion.sh gate "$BASE" "$HEAD")
+          # The gate's own logic comes from the base commit, never from the pull request it judges: a pull
+          # request can't change how its own gate decides, and a branch made before the script existed still
+          # gets checked (#132). Only the deploy config is read from the head.
+          gate="$RUNNER_TEMP/promotion.sh"
+          git show "$BASE:.github/scripts/promotion.sh" > "$gate"
+          chmod +x "$gate"
+          decisions=$("$gate" gate "$BASE" "$HEAD")
           promotions=""
           {
             echo "### promotion-gate"

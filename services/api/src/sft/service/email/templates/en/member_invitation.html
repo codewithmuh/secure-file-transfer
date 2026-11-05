@@ -1,0 +1,8 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }} has invited you to Secure File Transfer, where you send and receive confidential files.</p>
+{{ secret('Your temporary password', temporary_password) }}
+<p style="margin:0 0 16px;">It works for {{ valid_days }} {% if valid_days == 1 %}day{% else %}days{% endif %}. When you first sign in with it, you choose your own password and set up an authenticator app.</p>
+{{ button(sign_in_url, 'Sign in', 'Or copy this address into your browser:') }}
+{% endblock %}

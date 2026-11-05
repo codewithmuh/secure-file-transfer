@@ -1,0 +1,15 @@
+{% extends "ja/_layout.txt" %}
+{% from "ja/_labels.txt" import change_labels %}
+{% block subject %}{{ tenant_name }}のDLPポリシーが変更されました{% endblock %}
+{% block body %}
+{{ tenant_name }}の情報漏えい対策（DLP）ポリシーに次の変更がありました。
+
+{% for change in changes %}
+- {{ change_labels[change] }}
+{% endfor %}
+
+誰がいつ変更したかは、監査ログで確認できます。心当たりのない変更があれば、すぐに確認してください。
+
+DLPの設定を開く：
+{{ dlp_policy_url }}
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}A file you uploaded for {{ tenant_name }} wasn't accepted{% endblock %}
+{% block body %}
+One or more of the files you uploaded for {{ tenant_name }} weren't
+accepted, because of {{ tenant_name }}'s policy.
+
+If you have questions, contact {{ sender_email }}, who asked you for the
+files. Replies to this email go to them.
+{% endblock %}

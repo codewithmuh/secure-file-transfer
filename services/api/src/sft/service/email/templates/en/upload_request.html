@@ -1,0 +1,8 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ sender_email }} at {{ tenant_name }} asks you to upload files through Secure File Transfer.</p>
+{{ button(link_url, 'Upload files', 'Or copy this address into your browser:') }}
+<p style="margin:0 0 16px;">Before you upload, we email a code to this address to confirm it is you. The link expires on {{ expires_at }}.</p>
+<p style="margin:0 0 16px;">If you weren't expecting this from {{ tenant_name }}, you can ignore this email. Replies to it go to {{ sender_email }}.</p>
+{% endblock %}

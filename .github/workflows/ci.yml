@@ -136,6 +136,38 @@ jobs:
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
       - run: uv run pytest # against the PostgreSQL and ElasticMQ services; fails below 80% coverage
 
+  mail:
+    name: Mail adapter (SMTP to Mailpit)
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    defaults:
+      run:
+        working-directory: services/api
+    services:
+      mailpit:
+        image: axllent/mailpit:v1.33.0@sha256:9b3a463be15354c0f0eba91697d80e3e0d8a5623ef0e627cacc836bc17fd5231
+        env:
+          MP_SMTP_DISABLE_RDNS: "true"
+        ports: ["1025:1025", "8025:8025"]
+        options: >-
+          --health-cmd "/mailpit readyz"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      TEST_MAIL_CATCHER_URL: http://127.0.0.1:8025
+      TEST_SMTP_PORT: "1025"
+      MAIL_TESTS_REQUIRED: "1" # fail, rather than skip, if the variables above go missing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+          cache-dependency-glob: services/api/uv.lock
+      - run: uv sync --locked
+      # Only the integration test, so the coverage gate (which the python job applies) is off here.
+      - run: uv run pytest --no-cov tests/test_mail_mailpit.py
+
   # Always runs and reports, so it can be a required check (#59). A pull request that changes nothing under web/,
   # not the API contract (the source of the web app's generated client) and not this workflow skips the steps, and
   # the job still passes; a job-level `if:` would report "skipped".

@@ -1,0 +1,6 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{% if approved %}承認者が送信を承認しました。受信者への通知を開始します。{% else %}承認者が送信を却下したため、送信は保留になっています。承認者のコメントは送信の詳細ページで確認できます。ファイルを削除するか、送信を取り消すことができます。{% endif %}</p>
+{{ button(transfer_url, '送信の詳細を見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

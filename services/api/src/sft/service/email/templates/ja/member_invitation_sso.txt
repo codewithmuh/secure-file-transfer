@@ -1,0 +1,10 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}からSecure File Transferへの招待が届いています{% endblock %}
+{% block body %}
+{{ tenant_name }}から、機密ファイルを安全に送受信できるSecure File Transferに招待されました。サインインには組織のシングルサインオンを使います。
+
+招待を承諾する：
+{{ invitation_url }}
+
+このリンクは1回だけ使用でき、{{ expires_at }}に失効します。
+{% endblock %}

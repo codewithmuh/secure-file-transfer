@@ -1,0 +1,8 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }}から、機密ファイルを安全に送受信できるSecure File Transferに招待されました。</p>
+{{ secret('仮パスワード', temporary_password) }}
+<p style="margin:0 0 16px;">仮パスワードの有効期間は{{ valid_days }}日間です。初回のサインイン時に、ご自身のパスワードと認証アプリを設定してください。</p>
+{{ button(sign_in_url, 'サインイン', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

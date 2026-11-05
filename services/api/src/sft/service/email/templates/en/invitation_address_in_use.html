@@ -1,0 +1,6 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }} has invited this address to Secure File Transfer. This address already signs in with a password for another organisation, and an address can hold only one such sign-in.</p>
+<p style="margin:0 0 16px;">To accept, ask {{ tenant_name }} to invite another address of yours, or to set up single sign-on for its members.</p>
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}A transfer couldn't be sent for approval{% endblock %}
+{% block body %}
+A member of {{ tenant_name }} asked for approval of a transfer, but nobody
+can approve it: a data loss prevention rule needs more approvers than
+{{ tenant_name }} has besides the sender. Name more approvers in the DLP
+settings.
+
+Open the DLP settings:
+{{ dlp_policy_url }}
+{% endblock %}

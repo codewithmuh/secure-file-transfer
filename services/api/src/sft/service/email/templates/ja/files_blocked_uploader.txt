@@ -1,0 +1,7 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}アップロードしたファイルが{{ tenant_name }}に受け付けられませんでした{% endblock %}
+{% block body %}
+{{ tenant_name }}にアップロードしたファイルのうち1つ以上が、{{ tenant_name }}のポリシーにより受け付けられませんでした。
+
+ご不明な点は、ファイルを依頼した{{ sender_email }}にお問い合わせください。このメールへの返信も依頼者に届きます。
+{% endblock %}

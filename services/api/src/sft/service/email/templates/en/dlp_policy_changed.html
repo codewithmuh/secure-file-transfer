@@ -1,0 +1,13 @@
+{% extends "en/_layout.html" %}
+{% from "en/_labels.txt" import change_labels %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">These changes were made to the data loss prevention policy of {{ tenant_name }}:</p>
+<ul style="margin:0 0 16px;padding-left:24px;">
+{% for change in changes %}
+<li>{{ change_labels[change] }}</li>
+{% endfor %}
+</ul>
+<p style="margin:0 0 16px;">The audit log shows who made each change, and when. If you don't recognise a change, review it now.</p>
+{{ button(dlp_policy_url, 'Open the DLP settings', 'Or copy this address into your browser:') }}
+{% endblock %}

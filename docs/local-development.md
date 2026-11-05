@@ -144,11 +144,14 @@ role with the same password.
 
 ### Email (Mailpit)
 
-- **SMTP locally, the SES API v2 in AWS.** The notification worker needs a sender adapter with both.
+- **SMTP locally, the SES API v2 in AWS.** One adapter has both (`sft.data.mail`, #100): `MAIL_BACKEND=smtp` with
+  `SMTP_HOST` and `SMTP_PORT` here, `ses` in AWS. Mailpit's reverse DNS lookup of the client is off
+  (`MP_SMTP_DISABLE_RDNS`), because on Docker Desktop it can outlast the adapter's 5 s timeout.
 - **No SES features.** No configuration sets and their bounce, complaint, delivery and delay events, no SES tenants,
   no suppression lists, quotas or throttling. Tests put recorded SES events on `sft-local-ses-events`.
 - Every message is caught, whatever the address: nothing leaves the laptop. Tests read messages from the catcher's
-  API (`MAIL_CATCHER_URL`).
+  API (`MAIL_CATCHER_URL` in the smoke test; `TEST_MAIL_CATCHER_URL` and `TEST_SMTP_PORT` for the adapter's
+  integration test, `services/api/README.md`, Email).
 
 ### Member sign-in (Keycloak)
 

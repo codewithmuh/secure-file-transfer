@@ -7,7 +7,8 @@ default. In the cloud, secrets come from AWS Secrets Manager, never from git.
 
 Each entry point reads only the settings it needs: `Settings` for the API, `RelaySettings` for the
 outbox relay (and `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the
-migration job, `BootstrapSettings` for the database bootstrap job.
+migration job, `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends
+email (the notification worker).
 """
 
 from __future__ import annotations
@@ -217,6 +218,79 @@ class BootstrapSettings(_Base):
         description="True on Aurora: the login roles sign in with IAM database authentication. "
         "False locally, where they get passwords some other way. No default: choose.",
     )
+
+
+# Email stays in Japan (NFR-21): Tokyo, and Osaka for failover (ADR-0015).
+SesRegion = Literal["ap-northeast-1", "ap-northeast-3"]
+
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+_ADDRESS = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
+_DISPLAY_NAME = re.compile(r"[A-Za-z0-9 .-]{1,64}")
+_WEB_APP_URL = re.compile(r"(?P<scheme>https?)://(?P<host>[A-Za-z0-9.-]+|\[::1\])(:[0-9]{1,5})?")
+
+
+class MailSettings(_Base):
+    """How the notification worker sends email (ADR-0015, #100); its settings class adds these."""
+
+    mail_backend: Literal["ses", "smtp"] = Field(
+        description="`ses` in AWS; `smtp` only for the local stack's Mailpit. No default: choose.",
+    )
+    mail_from_address: str = Field(
+        description="The `From` address, on our sending subdomain (`no-reply@mail.<domain>`).",
+    )
+    mail_from_name: str = Field(
+        default="Secure File Transfer",
+        description="The `From` display name: ASCII letters, digits, spaces, dots and dashes.",
+    )
+    web_app_url: str = Field(
+        description="The web app's origin, the only place emails link to (abuse 7.5), such as "
+        "`https://app.<domain>`. `http` only for localhost.",
+    )
+    ses_region: SesRegion = Field(
+        default="ap-northeast-1",
+        description="The region whose SES identity sends: Tokyo, or Osaka after a failover.",
+    )
+    ses_configuration_set: str | None = Field(
+        default=None,
+        description="The region's configuration set (TLS required, events). Required for `ses`.",
+    )
+    ses_tenants: bool = Field(
+        default=True,
+        description="Name the sending tenant's SES tenant in every send. False only in a region "
+        "without SES tenant management (ADR-0015, consequences).",
+    )
+    smtp_host: str = Field(default="127.0.0.1", description="Mailpit's SMTP host, for `smtp`.")
+    smtp_port: int = Field(default=1025, ge=1, le=65535, description="Mailpit's SMTP port.")
+
+    @field_validator("mail_from_address")
+    @classmethod
+    def _address(cls, value: str) -> str:
+        if not _ADDRESS.fullmatch(value):
+            raise ValueError("must be a plain email address, such as no-reply@mail.example.com")
+        return value
+
+    @field_validator("mail_from_name")
+    @classmethod
+    def _display_name(cls, value: str) -> str:
+        if not _DISPLAY_NAME.fullmatch(value):
+            raise ValueError("must be 1 to 64 ASCII letters, digits, spaces, dots or dashes")
+        return value
+
+    @field_validator("web_app_url")
+    @classmethod
+    def _origin(cls, value: str) -> str:
+        match = _WEB_APP_URL.fullmatch(value)
+        if not match:
+            raise ValueError("must be an origin with no path or trailing slash, like https://app.x")
+        if match["scheme"] == "http" and match["host"] not in _LOCAL_HOSTS:
+            raise ValueError("must use https, except for localhost")
+        return value
+
+    @model_validator(mode="after")
+    def _ses_needs_a_configuration_set(self) -> Self:
+        if self.mail_backend == "ses" and not self.ses_configuration_set:
+            raise ValueError("MAIL_BACKEND=ses needs SES_CONFIGURATION_SET")
+        return self
 
 
 EXIT_BAD_SETTINGS = 2

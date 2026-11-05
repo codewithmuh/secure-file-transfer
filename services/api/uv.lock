@@ -610,6 +610,18 @@ wheels = [
 ]
 
 [[package]]
+name = "jinja2"
+version = "3.1.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markupsafe" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz", hash = "sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d", size = 245115, upload-time = "2025-03-05T20:05:02.478Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl", hash = "sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67", size = 134899, upload-time = "2025-03-05T20:05:00.369Z" },
+]
+
+[[package]]
 name = "jmespath"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1398,6 +1410,7 @@ dependencies = [
     { name = "alembic" },
     { name = "boto3" },
     { name = "fastapi" },
+    { name = "jinja2" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
@@ -1418,7 +1431,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pyyaml" },
     { name = "ruff" },
-    { name = "types-boto3", extra = ["sqs"] },
+    { name = "types-boto3", extra = ["sesv2", "sqs"] },
     { name = "types-pyyaml" },
 ]
 
@@ -1427,6 +1440,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.20.1" },
     { name = "boto3", specifier = ">=1.43.120" },
     { name = "fastapi", specifier = ">=0.143" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "opentelemetry-api", specifier = "==1.45.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = "==1.45.1" },
     { name = "opentelemetry-sdk", specifier = "==1.45.1" },
@@ -1447,7 +1461,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=7.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.17" },
-    { name = "types-boto3", extras = ["sqs"], specifier = ">=1.43.120" },
+    { name = "types-boto3", extras = ["sesv2", "sqs"], specifier = ">=1.43.120" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20260906" },
 ]
 
@@ -1534,8 +1548,20 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+sesv2 = [
+    { name = "types-boto3-sesv2" },
+]
 sqs = [
     { name = "types-boto3-sqs" },
+]
+
+[[package]]
+name = "types-boto3-sesv2"
+version = "1.43.110"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2b/0d/30710951e9fa817750009fde1f836f53000257480a328a815449a88aae85/types_boto3_sesv2-1.43.110.tar.gz", hash = "sha256:f9c98e42c646d625f5a371ceb472508ff955a3c499c454180d7dff27cfdaa973", size = 49843, upload-time = "2026-10-08T22:26:43.884Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/14/017be5e7583bd30b0dfb5c9d6975328b52b8f3e632f86a6dcbfa37736164/types_boto3_sesv2-1.43.110-py3-none-any.whl", hash = "sha256:3b6fe34fd32807fe786053ca59b6720f5b9fe7a7cd41451795f9f9c1728f12ec", size = 55655, upload-time = "2026-10-08T22:26:41.529Z" },
 ]
 
 [[package]]

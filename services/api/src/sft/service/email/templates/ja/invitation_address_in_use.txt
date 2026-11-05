@@ -1,0 +1,7 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}からのSecure File Transferへの招待について{% endblock %}
+{% block body %}
+{{ tenant_name }}から、このメールアドレスがSecure File Transferに招待されました。ただし、このアドレスは別の組織でのパスワードによるサインインにすでに使われており、1つのアドレスで持てるこのサインインは1つだけです。
+
+招待を受けるには、{{ tenant_name }}に別のメールアドレスでの招待か、メンバー向けのシングルサインオンの設定を依頼してください。
+{% endblock %}
