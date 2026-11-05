@@ -33,13 +33,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections.abc import Callable
 
 import uvicorn
+from prometheus_client import CollectorRegistry
 from starlette.types import ASGIApp
 
 from sft.api.app import create_app
 from sft.api.observability import HttpMetrics, RequestContextMiddleware
-from sft.core.settings import Settings
+from sft.core.settings import ServerSettings, Settings
 from sft.runtime.internal import Readiness, Server, create_internal_app, internal_config
 
 log = logging.getLogger(__name__)
@@ -64,13 +66,25 @@ def _config(app: ASGIApp, host: str, port: int, *, drain: int) -> uvicorn.Config
 
 
 class ApiServer:
-    def __init__(self, settings: Settings, app: ASGIApp | None = None) -> None:
+    def __init__(
+        self,
+        settings: ServerSettings,
+        app: ASGIApp | None = None,
+        *,
+        make_app: Callable[[CollectorRegistry], ASGIApp] | None = None,
+    ) -> None:
+        """`app` is the public listener's app; by default the public API's. `make_app` builds it
+        instead, given the registry /metrics serves, so the app's own metrics are scraped too."""
         self.settings = settings
         self.readiness = Readiness()
         self.metrics = HttpMetrics.create()
-        public_app = RequestContextMiddleware(
-            app or create_app(settings, registry=self.metrics.registry), self.metrics
-        )
+        if make_app is not None:
+            app = make_app(self.metrics.registry)
+        if app is None:
+            if not isinstance(settings, Settings):
+                raise TypeError("the public app needs the public API's Settings")
+            app = create_app(settings, registry=self.metrics.registry)
+        public_app = RequestContextMiddleware(app, self.metrics)
         internal_app = create_internal_app(self.readiness, self.metrics.registry)
         self._public = Server(
             _config(

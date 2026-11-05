@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import isolation_fixture as fx
 from isolation import Case, Cases, Mode, Tenants, World, pool, seed_tenant, world_database
 from pg import (
+    EXEMPT_FOREIGN_KEYS,
     ScratchDatabase,
     definer_function_problems,
     definer_functions,
@@ -181,7 +182,7 @@ async def test_a_lookup_is_refused_by_the_data_layer_outside_lookup_scope(
 
 def test_the_stand_in_schema_passes_the_catalog_checks(isolation_world: World) -> None:
     db = isolation_world.database(Mode.AS_BUILT)
-    assert foreign_keys_without_tenant(db) == []
+    assert foreign_keys_without_tenant(db, EXEMPT_FOREIGN_KEYS) == []
     assert "lookup_widget(bytea)" in [f for f, *_ in definer_functions(db)]
     assert definer_function_problems(db) == []
 
@@ -267,7 +268,7 @@ async def test_a_reference_across_tenants_fails_without_a_composite_key(
     with pytest.raises(AssertionError, match=r"refers to theirs from \['widget_notes.widget_id'\]"):
         await world.check(Case("note", add_a_note_to_their_widget, {API: [TENANT]}), Mode.AS_BUILT)
     # And the catalog check fails the build before any test has to try it.
-    assert foreign_keys_without_tenant(broken) == [
+    assert foreign_keys_without_tenant(broken, EXEMPT_FOREIGN_KEYS) == [
         "widget_notes_widget_id_fkey: widget_notes (widget_id) -> widgets (id)"
     ]
 

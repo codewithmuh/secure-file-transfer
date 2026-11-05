@@ -34,6 +34,20 @@ services:
       # The rate-limit counters (ADR-0014), as the stack's local ACL user. Required; connected on
       # first use, so the API starts without it, and limits that fail open then count per pod.
       VALKEY_URL: redis://sft-local:local-only-valkey-password@valkey:6379/0
+      # Member sign-in (ADR-0016, #113): the sign-in state lives in Valkey, Keycloak stands in for the
+      # pool. The browser knows the issuer by its host name; the API reads its configuration in-network.
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      OIDC_ISSUER: http://localhost:8180/realms/sft
+      OIDC_DISCOVERY_URL: http://oidc:8080/realms/sft/.well-known/openid-configuration
+      OIDC_CLIENT_ID: sft-api-local
+      OIDC_CLIENT_SECRET: local-only-oidc-client-secret
+      OIDC_REDIRECT_URI: http://localhost:8000/v1/auth/callback
+      OIDC_LOGOUT_URL: http://localhost:8180/realms/sft/protocol/openid-connect/logout
+      OIDC_PROVIDER_NAME: local-keycloak
+      # K_csrf: one obviously fake key, 32 bytes of "x" in base64.
+      CSRF_KEYRING: '[{"id":"local","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]'
+      # The email-hmac keyring (#145), per-address rate limits' pseudonyms: 32 bytes of "y".
+      EMAIL_HMAC_KEYRING: '[{"id":"local","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]'
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain

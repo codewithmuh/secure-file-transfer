@@ -76,13 +76,13 @@ against the stack's database (`docker compose stop api` first: it holds the port
 ```bash
 cd services/api
 uv sync
-DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft \
-  VALKEY_URL=redis://sft-local:local-only-valkey-password@127.0.0.1:6379/0 uv run python -m sft.api
+set -a; source ../../.env; set +a   # the local sign-in settings, from .env.example
+DATABASE_URL=postgresql://sft_api:test-only-password@127.0.0.1:5432/sft uv run python -m sft.api
 curl -s localhost:8001/readyz   # API on 127.0.0.1:8000, probes and metrics on 127.0.0.1:8001
 ```
 
-The API needs `DATABASE_URL` and `VALKEY_URL` to start, but opens no connection until a request needs one, and
-`/readyz` checks neither: an outage mustn't take every pod out of the load balancer at once.
+The API needs `DATABASE_URL`, `VALKEY_URL` and the sign-in settings to start, but opens no connection until a request
+needs one, and `/readyz` checks none of them: an outage mustn't take every pod out of the load balancer at once.
 
 ## Settings
 
@@ -102,6 +102,18 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `VALKEY_URL` | none, required | The rate-limit counter store with its credentials, `redis://`, `rediss://`, `valkey://` or `valkeys://`; a secret |
 | `TRUSTED_PROXIES` | empty | Our load balancer's subnets, comma-separated; only their requests have the client address read from `X-Forwarded-For` (ADR-0002) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | The collector's OTLP/HTTP base URL, e.g. `http://<node>:4318`; spans go to `<endpoint>/v1/traces`. Unset or empty: nothing is exported |
+| `WEB_ORIGIN` | none, required | The web app's origin; CORS and the CSRF `Origin` check allow only it (authn and authz 3.4) |
+| `OIDC_ISSUER` | none, required | The user pool's issuer; an ID token's `iss` must equal it (ADR-0016) |
+| `OIDC_DISCOVERY_URL` | under the issuer | Where to read the OpenID configuration, if not under the issuer (locally the in-network address) |
+| `OIDC_CLIENT_ID` | none, required | The confidential app client |
+| `OIDC_CLIENT_SECRET` | none, required | Its secret (`sft/{env}/app/idp-client/<region>`); a secret |
+| `OIDC_REDIRECT_URI` | none, required | This API's `/v1/auth/callback`, as registered with the client |
+| `OIDC_LOGOUT_URL` | none, required | The pool's logout URL that `signOut` returns |
+| `OIDC_REVOCATION_URL` | from discovery | The token revocation endpoint (Cognito's isn't in its discovery document) |
+| `OIDC_PROVIDER_NAME` | none, required | The pool's `idp_connections.provider_name` (`local-keycloak` locally) |
+| `CSRF_KEYRING` | none, required | K_csrf (`sft/{env}/app/csrf-hmac`): a JSON list of `{id, state, key}`, exactly one `active`; a secret |
+| `EMAIL_HMAC_KEYRING` | none, required | The `email-hmac` keyring (`sft/{env}/app/email-hmac`), the shape of `CSRF_KEYRING` with `activated_at` on the active key: per-address rate limits count under its pseudonyms, never an address; a secret |
+| `ADMIN_PASSKEY_RULE` | `false` | ADR-0016's launch switch: a local admin acts as an admin only after a passkey sign-in |
 
 Whatever sends email (the notification worker) also reads `MailSettings`:
 
@@ -388,9 +400,10 @@ each operation's bundle is listed there, narrowest first. A route applies its bu
 tenant. Limits on keys a handler finds itself (a link's subject, an invited address as `EmailPseudonyms`) run there:
 `await limiter.check(REQUEST_CODE, keys)`, with `limiter = Depends(get_rate_limiter)`. A refusal is `429 rate_limited`
 with `Retry-After`; while Valkey is unavailable, groups A and B answer `503` with `Retry-After: 5` and the rest count
-in the pod at a third of each limit (abuse design 4.5). Every `401` but a step-up's `reauthentication_required` counts
-against the client's IP (group H), and an IP blocked after 100 of them gets `429` on every route, checked before
-routing and authentication.
+in the pod at a third of each limit (abuse design 4.5). Every failed authentication, a `401 credentials_invalid` (a
+credential presented that matches no live one), counts against the client's IP (group H); no credential, an ended
+session and a step-up don't. An IP blocked after 100 of them gets `429` on every route, checked before routing and
+authentication.
 
 The counter store (`sft/data/counters.py`) runs GCRA for rates and a sliding log for small quotas, one Lua script per
 key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). A rate of N per period admits a
@@ -485,6 +498,55 @@ message_id = mailer_from_settings(settings).send(email)  # blocks: call it from 
 - **SMTP** (`sft/data/mail/smtp.py`): plain SMTP to Mailpit, tags as `X-Sft-Tag-*` headers. Its integration test runs
   against Mailpit in CI's mail job, and locally after `make up` with
   `TEST_MAIL_CATCHER_URL=http://127.0.0.1:8025 TEST_SMTP_PORT=1025 uv run pytest tests/test_mail_mailpit.py`.
+
+## Idempotency keys
+
+A creating `POST` that the contract gives `Idempotency-Key` takes `IdempotencyDep` (`sft.api.idempotency`) and runs
+its work through `sft.service.idempotency.once`, in the transaction that creates the resource (architecture 5.4, API
+README 5). The key's row in `idempotency_keys` (revision 0007) keeps the request's fingerprint (method, path, canonical
+body), the status and the created resource's ID for 24 hours, never a response body. A retry with the same request
+gets the first status and the resource as it is now, and creates, audits and charges nothing; another request with
+the key gets `409 idempotency_conflict`; one sent while the first still runs gets `409 idempotency_in_progress`,
+from a transaction-scoped advisory lock. `inviteUser` is the first user. `delete_expired_keys` is the daily job's step,
+as `sft_jobs`; the jobs worker that schedules it comes later.
+
+## Member sign-in and sessions
+
+The OIDC code flow with PKCE against the environment's user pool, Keycloak locally (ADR-0016, authn and authz 2.4 and
+3): `startSignIn` (`GET /v1/auth/sign-in`) stores the state, verifier and nonce in Valkey for 10 minutes under the
+SHA-256 of a new `__Host-sft_auth` cookie, and `completeSignIn` (`GET /v1/auth/callback`) takes that record once,
+exchanges the code, revokes the refresh token, checks the ID token with joserfc and finds the identity by
+`(connection, subject)`, never by a claim. Every refusal is audited with its reason; the browser only sees
+`error=sign_in_failed`. A sign-in creates a member session: 256 random bits in the `__Host-sft_session` cookie, only
+its SHA-256 in `member_sessions`, 12 hours at most, 30 minutes idle, 10 per user (`sft.data.member_sessions`).
+
+Every member route resolves the cookie through `sft.api.caller` (one credential per request, a live session), and an
+unsafe method also needs `Origin` equal to `WEB_ORIGIN`, a JSON body and `X-CSRF-Token`, the HMAC of the session
+token under `CSRF_KEYRING` that `GET /v1/me` returns. `signOut` ends this session or all of them. A role change, a
+deactivation and a tenant's suspension revoke the sessions they affect in the same transaction.
+
+## The operator API
+
+`python -m sft.api.operator`: a second app from the same image (FR-34, architecture 2). It runs as its own Deployment
+in `sft-operator`, logs in as `sft_operator`, and sits behind no load balancer; operators reach it by `kubectl
+port-forward`. It serves only the contract's operator operations, and the public app serves none of them; the
+generated-spec check (`tools/contract_check.py`) holds each app to its own server.
+
+| Operation | What it does |
+|---|---|
+| `createOperatorToken` | A signed STS `GetCallerIdentity` request in, a 15-minute operator token out (authn and authz 8.2) |
+| `createTenant` | Creates the tenant with its settings and invites its first admin, in one transaction |
+| `listTenants`, `getTenant` | Reads tenants, newest first, a page at a time, optionally by status |
+| `suspendTenant` | Suspends a tenant and revokes every member session it has |
+
+Every call is audited, including refusals; every operation but the token exchange needs the token. Every refused
+token exchange answers the same `401 credentials_invalid`, and the audit event records why.
+
+Settings: the server's (the listeners, `DATABASE_URL`, `DATABASE_POOL_SIZE`, `VALKEY_URL`, `TRUSTED_PROXIES`), none of
+member sign-in's, and its own. `DATABASE_URL` names `sft_operator`; `OPERATOR_ENVIRONMENT` (`dev`, `staging`,
+`prod`; operators sign the audience `operator-api-<env>`); `OPERATOR_AWS_ACCOUNT_ID` and `OPERATOR_ROLE_NAME`, the
+account and `Operator` permission set role STS must answer with; `AWS_REGION`; and `OPERATOR_STS_ENDPOINT_URL`, by
+default the regional STS endpoint, never taken from a request.
 
 ## Workers
 

@@ -9,12 +9,12 @@ answers the contract gives it (`problem_responses`).
 Rate limits (abuse and rate limits 2.2): every route counts against the caller's and the tenant's
 budget (`TENANT_OPERATION`, group H), except `deactivateUser`, a safety action that only the
 caller's own limit applies to (`SAFETY_ACTION`). `inviteUser` also applies group G's invitation
-limits, in the service once the caller may invite (`sft.service.members.INVITE_LIMITS`).
+limits, the per-address one keyed by the address's pseudonym under the `email-hmac` keyring, in the
+service once the caller may invite (`sft.service.members.INVITE_LIMITS`).
 
-Not yet: `inviteUser` accepts `Idempotency-Key`, as the contract has it, but doesn't keep it. The
-replay of the first `201` and `409 idempotency_conflict` (API README 5, architecture 5.4) need the
-`idempotency_keys` table and its helper, which every creating `POST` shares and which comes with
-its own issue. Until then a retry gets `409 user_exists`.
+`inviteUser` takes `Idempotency-Key` (`sft.api.idempotency`, API README 5): a retry with the same
+key and body after a lost answer gets the first `201`, its `Location` and the user as they are now,
+and invites no one again.
 """
 
 from __future__ import annotations
@@ -23,16 +23,18 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from sft.api.caller import get_tenant_caller
 from sft.api.client_ip import client_address
-from sft.api.dependencies import get_database
+from sft.api.dependencies import get_database, get_email_keyring
 from sft.api.errors import problem_responses
+from sft.api.idempotency import IdempotencyDep
 from sft.api.rate_limits import get_rate_limiter, rate_limit
 from sft.core.addresses import is_plain_address
+from sft.core.pseudonyms import EmailKeyring
 from sft.data.audit import Origin
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
@@ -45,7 +47,6 @@ PREFIX: Final = "/v1"
 TAG: Final = "Tenant admin"
 
 _EMAIL_SCHEMA: Final[dict[str, Any]] = {"format": "email"}
-_IDEMPOTENCY_KEY = r"^[\x21-\x7E]+$"
 
 
 def _origin(request: Request) -> Origin:
@@ -64,6 +65,7 @@ def _now() -> datetime:
 CallerDep = Annotated[Caller, Depends(get_tenant_caller)]
 DatabaseDep = Annotated[Database, Depends(get_database)]
 LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
+EmailKeyringDep = Annotated[EmailKeyring, Depends(get_email_keyring)]
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 SAFETY_LIMITS: Final = rate_limit(SAFETY_ACTION, caller=get_tenant_caller)
 
@@ -166,22 +168,23 @@ async def invite_user(
     caller: CallerDep,
     database: DatabaseDep,
     limiter: LimiterDep,
-    idempotency_key: Annotated[
-        str | None,
-        Header(alias="Idempotency-Key", min_length=1, max_length=255, pattern=_IDEMPOTENCY_KEY),
-    ] = None,
+    emails: EmailKeyringDep,
+    idempotency: IdempotencyDep,
 ) -> UserOut:
-    user = await members.invite_user(
+    outcome = await members.invite_user(
         database,
         caller,
         email=body.email,
         role=body.role,
         limiter=limiter,
+        emails=emails,
         origin=_origin(request),
         now=_now(),
+        idempotency=idempotency,
     )
-    response.headers["Location"] = f"{PREFIX}/users/{user.id}"
-    return UserOut.of(user)
+    response.status_code = outcome.status
+    response.headers["Location"] = f"{PREFIX}/users/{outcome.value.id}"
+    return UserOut.of(outcome.value)
 
 
 @router.get(

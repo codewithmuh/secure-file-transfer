@@ -2292,8 +2292,12 @@ paths:
 
         Rate limits: 100 invitations an hour per tenant and 3 a day per address (`429`).
 
+        **Retries:** with an `Idempotency-Key`, a retry of the same request after a lost answer gets the first `201`
+        and `Location` again, with the user as they are now, and invites no one a second time: no second email, audit
+        event or charge of the invitation limits.
+
         Errors: `401 reauthentication_required`, `403 passkey_required`, `409 user_exists`,
-        `409 idempotency_conflict`, `429 rate_limited`.
+        `409 idempotency_conflict`, `409 idempotency_in_progress`, `429 rate_limited`.
 
         Requirements: FR-22, FR-25, FR-26, NFR-12.
       x-permission: user.invite
@@ -3712,9 +3716,14 @@ paths:
         (abuse-and-rate-limits 7.3). Operators never get access to file contents through this API (FR-35). Rate
         limit: 30 new tenants an hour per operator.
 
-        Errors: `409 idempotency_conflict`, `429 rate_limited`.
+        The tenant, its policy, the first admin's invitation, the invitation email's outbox message and the tenant's
+        audit event commit in one transaction, in the new tenant's scope; then the platform audit event is written.
+        If that second write fails, the tenant exists, with its record in the tenant's log, and the call still returns
+        `201`: a retry would create a second tenant. The missing platform event is logged and alerts.
 
-        Requirements: FR-34, FR-35.
+        Errors: `409 idempotency_conflict`, `429 rate_limited`, `503 service_unavailable`.
+
+        Requirements: FR-34, FR-35, FR-27.
       x-permission: operator.tenant.create
       security:
         - operatorToken: []
@@ -3748,6 +3757,123 @@ paths:
           $ref: '#/components/responses/UnprocessableContent'
         '429':
           $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Operator]
+      operationId: listTenants
+      summary: List tenants
+      description: |
+        Lists tenants, newest first, from the tenant directory: the one read across tenants the operator API makes
+        (authn-authz 7.2). It returns the tenant rows only, never a tenant's users, transfers, files or audit log.
+        Audited as a platform event.
+
+        Requirements: FR-34, FR-27.
+      x-permission: operator.tenant.read
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/TenantStatusFilter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of tenants.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /operator/tenants/{tenant_id}:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [Operator]
+      operationId: getTenant
+      summary: Get a tenant
+      description: |
+        One tenant from the tenant directory (`listTenants`). Audited as a platform event.
+
+        Requirements: FR-34, FR-27.
+      x-permission: operator.tenant.read
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /operator/tenants/{tenant_id}/suspend:
+    servers:
+      - url: http://127.0.0.1:{local_port}/v1
+        description: |
+          The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
+          balancer or ingress routes to it.
+        variables:
+          local_port:
+            default: "8443"
+            description: The local port the operator chose for the port-forward.
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      tags: [Operator]
+      operationId: suspendTenant
+      summary: Suspend a tenant
+      description: |
+        Suspends the tenant: its members can no longer sign in or use the API, every session of the tenant ends
+        (data model 2.4), and its links stop working. Nothing is deleted; retention and deletion carry on as before.
+        Audited in the tenant's audit log, where its admins can see it, and as a platform event. Suspending a tenant
+        that is already suspended changes nothing and returns `200` with the tenant, so a retry is always safe.
+
+        Both records are written in turn, because a tenant's events and platform events are written in different
+        scopes. If the platform event can't be written, the suspension has still taken effect, with its record in the
+        tenant's log, and the call returns `503`; retry it.
+
+        Errors: `404 not_found`, `503 service_unavailable`.
+
+        Requirements: FR-34, FR-27.
+      x-permission: operator.tenant.suspend
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The suspended tenant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /operator/tenants/{tenant_id}/sso:
     servers:
@@ -4184,6 +4310,13 @@ components:
         Every `/session` operation takes it except `getSessionDownloadContent`, which a navigation starts.
       schema:
         $ref: '#/components/schemas/Id'
+    TenantStatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Return only tenants in this state.
+      schema:
+        $ref: '#/components/schemas/TenantStatus'
     TenantId:
       name: tenant_id
       in: path
@@ -5829,10 +5962,13 @@ components:
         name:
           type: string
         status:
-          type: string
-          enum: [active, suspended]
+          $ref: '#/components/schemas/TenantStatus'
         created_at:
           $ref: '#/components/schemas/Timestamp'
+
+    TenantStatus:
+      type: string
+      enum: [active, suspended]
 
     User:
       type: object
@@ -6139,6 +6275,17 @@ components:
           $ref: '#/components/schemas/Tenant'
         first_admin:
           $ref: '#/components/schemas/User'
+
+    TenantPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tenant'
+        next_cursor:
+          $ref: '#/components/schemas/NextCursor'
 
     # Sign-in
 

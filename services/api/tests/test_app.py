@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI
 from pydantic import SecretStr
 from starlette.testclient import TestClient
 
+from api_settings import API_SETTINGS
 from sft.api.app import API_TITLE, API_VERSION, create_app, get_database
 from sft.core.settings import Settings
 from sft.data.database import Database
@@ -55,7 +56,7 @@ def test_the_lifespan_opens_the_pool_and_closes_it(monkeypatch: pytest.MonkeyPat
     settings = Settings(
         database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"),
         database_pool_size=3,
-        valkey_url=SecretStr("redis://u:p@127.0.0.1:1/0"),
+        **API_SETTINGS,  # type: ignore[arg-type]
     )
     app = app_with_database_route(settings)
     with TestClient(app) as client:

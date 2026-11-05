@@ -12,6 +12,7 @@ from httpx2 import Response
 from pydantic import SecretStr
 from starlette.testclient import TestClient
 
+from api_settings import API_SETTINGS
 from sft.api.app import create_app
 from sft.api.client_ip import rate_limit_ip
 from sft.api.rate_limits import get_rate_limiter, rate_limit
@@ -39,8 +40,14 @@ class Member:
 
 
 def member_session(request: Request) -> Member:
-    if request.headers.get("authorization") != "Bearer ok":
-        raise HTTPException(401)
+    # As sft.api.caller answers: no credential, a wrong one, or one whose session has ended.
+    sent = request.headers.get("authorization")
+    if sent is None:
+        raise Unauthenticated("authentication_required")
+    if sent == "Bearer ended":
+        raise Unauthenticated("session_expired")
+    if sent != "Bearer ok":
+        raise Unauthenticated("credentials_invalid", bearer=True)
     return Member()
 
 
@@ -48,16 +55,16 @@ def app_with_routes(valkey_url: str, *, trusted_proxies: str = "") -> FastAPI:
     app = create_app(
         Settings(
             database_url=SecretStr("postgresql://sft_api@127.0.0.1:1/sft"),
-            valkey_url=SecretStr(valkey_url),
+            **{**API_SETTINGS, "valkey_url": valkey_url},  # type: ignore[arg-type]
             trusted_proxies=trusted_proxies,  # type: ignore[arg-type]  # split by its validator
         )
     )
 
-    @app.post("/v1/auth/sign-in", dependencies=[rate_limit(SIGN_IN_START)])
+    @app.post("/v1/test/sign-in", dependencies=[rate_limit(SIGN_IN_START)])
     async def sign_in() -> dict[str, str]:
         return {"ok": "sign-in"}
 
-    @app.get("/v1/me", dependencies=[rate_limit(TENANT_OPERATION, caller=member_session)])
+    @app.get("/v1/test/me", dependencies=[rate_limit(TENANT_OPERATION, caller=member_session)])
     async def me(member: Annotated[Member, Depends(member_session)]) -> dict[str, str]:
         return {"ok": "me"}
 
@@ -113,7 +120,7 @@ def until_refused(send: Callable[[], Response], limit: int) -> Response:
 
 
 def test_over_the_limit_is_a_429_problem(client: TestClient) -> None:
-    response = until_refused(lambda: client.post("/v1/auth/sign-in"), 60)
+    response = until_refused(lambda: client.post("/v1/test/sign-in"), 60)
     assert response.status_code == 429
     assert response.headers["content-type"] == "application/problem+json"
     assert response.headers["retry-after"] in ("1", "2")  # the rest of a 2 s interval
@@ -126,7 +133,7 @@ def test_over_the_limit_is_a_429_problem(client: TestClient) -> None:
 
 def test_the_caller_keys_come_from_the_authentication_dependency(client: TestClient) -> None:
     auth = {"authorization": "Bearer ok"}
-    assert until_refused(lambda: client.get("/v1/me", headers=auth), 300).status_code == 429
+    assert until_refused(lambda: client.get("/v1/test/me", headers=auth), 300).status_code == 429
 
 
 def test_a_handler_applies_the_limits_whose_keys_it_finds(client: TestClient) -> None:
@@ -146,19 +153,32 @@ def test_a_step_up_401_is_no_failed_authentication(client: TestClient) -> None:
             401,
             "reauthentication_required",
         )
-    assert client.get("/v1/me", headers={"authorization": "Bearer ok"}).status_code == 200
+    assert client.get("/v1/test/me", headers={"authorization": "Bearer ok"}).status_code == 200
+
+
+WRONG = {"authorization": "Bearer wrong"}
+
+
+@pytest.mark.parametrize("headers", [{}, {"authorization": "Bearer ended"}])
+def test_no_credential_or_an_ended_session_is_no_failed_authentication(
+    client: TestClient, headers: dict[str, str]
+) -> None:
+    # Signed-out page loads and returning members behind one NAT mustn't block their office.
+    for _ in range(120):
+        assert client.get("/v1/test/me", headers=headers).status_code == 401
+    assert client.get("/v1/test/me", headers={"authorization": "Bearer ok"}).status_code == 200
 
 
 def test_100_failed_authentications_block_the_ip_on_every_route(client: TestClient) -> None:
     for _ in range(100):
-        assert client.get("/v1/me").status_code == 401
+        assert client.get("/v1/test/me", headers=WRONG).status_code == 401
     # The block is checked before authentication: the 101st bad credential gets no 401 to learn
     # from, and a valid member, another route or no route at all from that IP waits 15 minutes.
     for response in (
-        client.get("/v1/me"),
-        client.get("/v1/me", headers={"authorization": "Bearer wrong"}),
-        client.get("/v1/me", headers={"authorization": "Bearer ok"}),
-        client.post("/v1/auth/sign-in"),
+        client.get("/v1/test/me"),
+        client.get("/v1/test/me", headers=WRONG),
+        client.get("/v1/test/me", headers={"authorization": "Bearer ok"}),
+        client.post("/v1/test/sign-in"),
         client.get("/v1/nowhere"),
     ):
         assert response.status_code == 429
@@ -169,8 +189,8 @@ def test_100_failed_authentications_block_the_ip_on_every_route(client: TestClie
 
 def test_failed_authentications_block_per_pod_when_the_store_is_down(down: TestClient) -> None:
     for _ in range(fallback_limit(100)):
-        assert down.get("/v1/me").status_code == 401
-    response = down.get("/v1/me")
+        assert down.get("/v1/test/me", headers=WRONG).status_code == 401
+    response = down.get("/v1/test/me", headers=WRONG)
     assert response.status_code == 429
     assert response.headers["retry-after"] == "900"
 
@@ -180,16 +200,16 @@ def test_clients_behind_the_load_balancer_are_blocked_apart(valkey_url: str) -> 
     app = app_with_routes(valkey_url, trusted_proxies="10.0.0.0/20")
     # The load balancer's address as a dual-stack socket gives it, and entries with a port.
     with TestClient(app, client=("::ffff:10.0.1.5", 50000)) as balancer:
-        guesser = {"x-forwarded-for": "198.51.100.1, 203.0.113.9:4321"}
+        guesser = {"x-forwarded-for": "198.51.100.1, 203.0.113.9:4321", **WRONG}
         for _ in range(100):
-            assert balancer.get("/v1/me", headers=guesser).status_code == 401
-        assert balancer.get("/v1/me", headers=guesser).status_code == 429
+            assert balancer.get("/v1/test/me", headers=guesser).status_code == 401
+        assert balancer.get("/v1/test/me", headers=guesser).status_code == 429
         member = {"x-forwarded-for": "203.0.113.10:5555", "authorization": "Bearer ok"}
-        assert balancer.get("/v1/me", headers=member).status_code == 200
+        assert balancer.get("/v1/test/me", headers=member).status_code == 200
 
 
 def test_sign_in_fails_closed_when_the_store_is_down(down: TestClient) -> None:
-    response = down.post("/v1/auth/sign-in")
+    response = down.post("/v1/test/sign-in")
     assert response.status_code == 503
     assert response.headers["retry-after"] == "5"
     assert response.json()["code"] == "service_unavailable"
@@ -197,25 +217,25 @@ def test_sign_in_fails_closed_when_the_store_is_down(down: TestClient) -> None:
 
 def test_tenant_calls_carry_on_per_pod_when_the_store_is_down(down: TestClient) -> None:
     auth = {"authorization": "Bearer ok"}
-    response = until_refused(lambda: down.get("/v1/me", headers=auth), fallback_limit(300))
+    response = until_refused(lambda: down.get("/v1/test/me", headers=auth), fallback_limit(300))
     assert response.status_code == 429
 
 
 def test_an_app_without_settings_has_no_limiter() -> None:
     app = create_app()
 
-    @app.post("/v1/auth/sign-in", dependencies=[rate_limit(SIGN_IN_START)])
+    @app.post("/v1/test/sign-in", dependencies=[rate_limit(SIGN_IN_START)])
     async def sign_in() -> None: ...
 
     client = TestClient(app, raise_server_exceptions=False)
-    assert client.post("/v1/auth/sign-in").status_code == 500
+    assert client.post("/v1/test/sign-in").status_code == 500
 
     # And a 401 without a limiter is just a 401.
-    @app.get("/v1/me")
+    @app.get("/v1/test/me")
     async def me() -> None:
         raise HTTPException(401)
 
-    assert client.get("/v1/me").status_code == 401
+    assert client.get("/v1/test/me").status_code == 401
 
 
 def test_the_lifespan_closes_the_store(valkey_url: str) -> None:

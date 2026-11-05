@@ -34,6 +34,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute, iter_route_contexts
 
 from sft.api.app import create_app
+from sft.api.operator.app import create_operator_app
 
 CONTRACT: Final = Path(__file__).resolve().parents[3] / "docs" / "api" / "openapi.yaml"
 
@@ -68,11 +69,8 @@ Json = Any  # a parsed JSON or YAML value
 
 
 def service_apps() -> dict[str, FastAPI]:
-    """Each app the service runs, by the contract server it serves.
-
-    M1 adds the operator API here, under OPERATOR_SERVER.
-    """
-    return {PUBLIC_SERVER: create_app()}
+    """Each app the service runs, by the contract server it serves."""
+    return {PUBLIC_SERVER: create_app(), OPERATOR_SERVER: create_operator_app()}
 
 
 class ContractError(Exception):

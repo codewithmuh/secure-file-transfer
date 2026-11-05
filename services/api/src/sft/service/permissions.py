@@ -297,6 +297,8 @@ REGISTRY: Final[tuple[Permission, ...]] = (
         api_key_reach=ANY,
     ),
     Permission("operator.tenant.create", ("createTenant",), operator=True),
+    Permission("operator.tenant.read", ("listTenants", "getTenant"), operator=True),
+    Permission("operator.tenant.suspend", ("suspendTenant",), operator=True),
     Permission("account.sign_out", ("signOut",), member=SELF, admin=SELF),
     Permission("user.sign_out", ("signOutUser",), admin=TENANT),
     Permission("user.reset_sign_in", ("resetUserSignIn",), admin=TENANT),

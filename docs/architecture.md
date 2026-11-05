@@ -820,7 +820,9 @@ to the caller (member, API key or link session) and stored for 24 hours with a *
 with its resource IDs filled in, and the body**, plus the response status and the ID of what was created. A retry with
 the same key, method, path and body gets the same status, with the response rebuilt from the resource as it is now.
 The same key with any of them different is rejected with `409 idempotency_conflict`, so a key reused with the same
-body on another transfer is refused, not answered with the first transfer's response.
+body on another transfer is refused, not answered with the first transfer's response. While the first request runs,
+its transaction holds a lock on the key, and a second request with it gets `409 idempotency_in_progress` at once
+rather than wait.
 
 **A response that holds a secret is never stored.** Response bodies are never kept, and API key creation, whose
 response holds the key in plain text, takes no `Idempotency-Key` at all; if that response is lost, the key is revoked

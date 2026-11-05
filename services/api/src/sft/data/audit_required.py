@@ -62,6 +62,9 @@ NOT_AUDITED: Final[dict[str, str]] = {
     "audited in the same transaction, and the relay only marks rows sent (ADR-0013).",
     "processed_messages": "Recording a delivery isn't an action of its own: the handler's change "
     "in the same transaction is audited where it is security-relevant (ADR-0013).",
+    "idempotency_keys": "Remembering a request isn't an action of its own: the change it records "
+    "is audited in the same transaction, and the daily job only deletes expired rows "
+    "(architecture 5.4).",
 }
 
 

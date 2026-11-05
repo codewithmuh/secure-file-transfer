@@ -49,7 +49,7 @@ from sft.data import access
 from sft.data.access import SCOPES_BY_ROLE, NotFoundError, ScopeNotAllowedError
 from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
-from sft.data.roles import MIGRATE
+from sft.data.roles import MIGRATE, OPERATOR
 from sft.data.scope import Scope, ScopeKind, Subject
 
 
@@ -70,6 +70,9 @@ REFUSED = frozenset({"42501", "23503"})
 # what was read; the lookup's own tests check it returns IDs and status only. Recovery re-applies
 # records across tenants and has its own policy tests, so no case runs in it.
 _ACROSS = frozenset({ScopeKind.SYSTEM, ScopeKind.LOOKUP})
+# The operator API's tenant directory (#111): `sft_operator` reads tenant rows in platform scope, by
+# design, when a case says so with `across=`. No other role or scope may be named there.
+_ACROSS_ON_REQUEST = {ScopeKind.PLATFORM: frozenset({OPERATOR})}
 _TENANTLESS = (ScopeKind.PLATFORM, ScopeKind.LOOKUP)
 
 
@@ -102,6 +105,8 @@ class Case:
     """For each workload role, the scopes the function is used in."""
     subject: Callable[[Seeded], Subject] | None = None
     """Mine's subject in resource scope; by default one that reaches nothing below the tenant."""
+    across: frozenset[ScopeKind] = frozenset()
+    """Named scopes this case reads across tenants in by design: the operator's directory."""
 
     def __str__(self) -> str:
         return self.name
@@ -109,6 +114,11 @@ class Case:
     def attempts(self) -> list[tuple[str, ScopeKind, bool]]:
         """Each (role, scope, named): the scopes named, then the tenant-less ones the role opens."""
         tried = []
+        for kind in self.across:
+            allowed_roles = _ACROSS_ON_REQUEST.get(kind, frozenset())
+            naming = {role for role, kinds in self.scopes.items() if kind in kinds}
+            if not naming <= allowed_roles:
+                raise ValueError(f"{self.name}: only {sorted(allowed_roles)} read across in {kind}")
         for role, kinds in self.scopes.items():
             allowed = SCOPES_BY_ROLE[role]
             for kind in kinds:
@@ -132,9 +142,10 @@ class Cases:
         *,
         scopes: Mapping[str, Sequence[ScopeKind]],
         subject: Callable[[Seeded], Subject] | None = None,
+        across: Sequence[ScopeKind] = (),
     ) -> Callable[[Call], Call]:
         def register(call: Call) -> Call:
-            self._cases.append(Case(call.__name__, call, scopes, subject))
+            self._cases.append(Case(call.__name__, call, scopes, subject, frozenset(across)))
             return call
 
         return register
@@ -255,6 +266,59 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
         email=f"{marker}@example.test",
         token=str(rows["invitation"]),
     )
+    # The tenant's policy and recovery contact (#111), the contact holding the marker.
+    db.sql(
+        "UPDATE tenants SET recovery_contact = :marker WHERE id = :tenant",
+        marker=marker,
+        tenant=tenant_id,
+    )
+    db.sql(
+        "INSERT INTO tenant_policies (tenant_id, default_locale) VALUES (:tenant, 'ja')",
+        tenant=tenant_id,
+    )
+    # Member sign-in (#113): the tenant's own SSO connection, named with the marker, the user's
+    # identity there, and a live session, whose token is the SHA-256 of the session's row name.
+    rows["connection"], rows["identity"], rows["session"] = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    rows["session_token"] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO idp_connections (id, tenant_id, kind, provider_name, issuer, status) "
+        "VALUES (:id, :tenant, 'oidc', :marker, :marker, 'active')",
+        id=rows["connection"],
+        tenant=tenant_id,
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO user_identities (id, tenant_id, user_id, idp_connection_id, subject) "
+        "VALUES (:id, :tenant, :user, :connection, :marker)",
+        id=rows["identity"],
+        tenant=tenant_id,
+        user=rows["user"],
+        connection=rows["connection"],
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO member_sessions (id, tenant_id, user_id, identity_id, session_hash, "
+        "auth_time, auth_method, expires_at, user_agent) VALUES (:id, :tenant, :user, :identity, "
+        "sha256(convert_to(:token, 'UTF8')), now(), 'sso', now() + interval '12 hours', :marker)",
+        id=rows["session"],
+        tenant=tenant_id,
+        user=rows["user"],
+        identity=rows["identity"],
+        token=str(rows["session_token"]),
+        marker=marker,
+    )
+    # Idempotency keys (#144): the user's live key, named with the marker, and an expired one.
+    for key, expires in ((marker, "1 day"), (f"{marker}-old", "-1 day")):
+        db.sql(
+            "INSERT INTO idempotency_keys (tenant_id, caller_type, caller_id, key, "
+            "request_fingerprint, response_status, resource_type, resource_id, created_at, "
+            "expires_at) VALUES (:tenant, 'member', :user, :key, sha256(convert_to(:key, 'UTF8')), "
+            "201, 'user', :user, now() - interval '2 days', now() + CAST(:expires AS interval))",
+            tenant=tenant_id,
+            user=rows["user"],
+            key=key,
+            expires=expires,
+        )
     return Seeded(tenant_id, marker, rows)
 
 
@@ -391,7 +455,7 @@ class World:
         tenants: Tenants,
     ) -> None:
         where = f"{case.name} as {role} in {kind} scope, {mode}"
-        across = named and kind in _ACROSS
+        across = named and (kind in _ACROSS or kind in case.across)
         # A scope that reads across tenants must change neither.
         watched = [tenants.theirs, tenants.mine] if across else [tenants.theirs]
         before = snapshot(admin, watched)

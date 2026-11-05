@@ -62,9 +62,10 @@ keeps the moving parts few: one API service plus workers, and one system of reco
 
 ## How changes flow
 
-Issue first, one branch per issue, then a pull request with a Conventional Commit title that closes the issue. It needs
-a code review and green CI before a squash merge into `main`. [CONTRIBUTING.md](CONTRIBUTING.md) has the details,
-including the `main` ruleset and its one temporary exception ([#6]).
+Issue first, one branch per issue (or per batch of related issues), then a pull request with a Conventional Commit
+title that closes them. It needs a code review and green CI before a squash merge into `main`.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the details, including the `main` ruleset and its one temporary exception
+([#6]).
 
 release-please keeps a Release PR open. Merging it tags the version, and `release.yml` publishes a signed image with
 an SBOM to GHCR, until M4 moves images to ECR in the shared account ([ADR-0007](docs/adr/0007-container-registry-ecr.md)).

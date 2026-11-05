@@ -5,15 +5,32 @@ is `isolation.py`; the README's "The isolation suite" says how to add a case.
 """
 
 import hashlib
+import secrets
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Tenants
+from sft.data import audit, idempotency, member_sessions
 from sft.data.access import in_scope
 from sft.data.audit import Actor
+from sft.data.identities import find_connection, find_identity
+from sft.data.member_sessions import (
+    create_session,
+    get_live_session,
+    lookup_session,
+    revoke_session,
+    revoke_tenant_sessions,
+    revoke_user_sessions,
+)
 from sft.data.models import ActorType, ProcessedMessage, Role
+from sft.data.operator_sessions import (
+    create_operator_session,
+    find_operator_session,
+    signature_seen,
+)
 from sft.data.outbox import (
     Queue,
     Topic,
@@ -26,7 +43,13 @@ from sft.data.outbox import (
 from sft.data.processed import record_processed
 from sft.data.roles import API, ARCHIVE, JOBS, NOTIFY, OPERATOR, RELAY, SCAN
 from sft.data.scope import ScopeKind
-from sft.data.tenants import get_tenant
+from sft.data.tenants import (
+    directory_tenant,
+    get_tenant,
+    insert_tenant,
+    list_directory,
+    suspend_tenant,
+)
 from sft.data.users import (
     accept_invitation,
     change_role,
@@ -42,7 +65,7 @@ from sft.data.users import (
 )
 
 TENANT, RESOURCE, SYSTEM = ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.SYSTEM
-LOOKUP = ScopeKind.LOOKUP
+LOOKUP, PLATFORM = ScopeKind.LOOKUP, ScopeKind.PLATFORM
 
 cases = Cases()
 
@@ -185,6 +208,157 @@ async def name_another_tenants_fallback(session: AsyncSession, tenants: Tenants)
 @cases.add(scopes=USER_WRITERS)
 async def deactivate_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
     return await deactivate_user(session, tenants.theirs.rows["user"], actor=ADMIN)
+
+
+# ---- the operator API (#111) ----
+
+
+@cases.add(scopes={OPERATOR: [TENANT]})
+async def create_a_tenant_over_mine(session: AsyncSession, tenants: Tenants) -> object:
+    # The new tenant's ID is the scope's, so the most it can reach is mine, which exists: nothing.
+    return await insert_tenant(
+        session, name="isolation", recovery_contact="isolation", default_locale="en"
+    )
+
+
+@cases.add(scopes={OPERATOR: [TENANT]})
+async def suspend_mine_not_theirs(session: AsyncSession, tenants: Tenants) -> object:
+    suspended = await suspend_tenant(session)
+    # As the service does: the change commits only with its audit event (audit_required).
+    await audit.record(session, action="tenant.suspended", actor=Actor(ActorType.SYSTEM))
+    return suspended
+
+
+# The directory reads tenant rows across tenants by design, and changes nothing. In every other
+# scope, and for every other role, it is refused.
+@cases.add(scopes={OPERATOR: [PLATFORM, TENANT], API: [TENANT, RESOURCE]}, across=[PLATFORM])
+async def read_the_directory(session: AsyncSession, tenants: Tenants) -> object:
+    return [
+        await directory_tenant(session, tenants.theirs.tenant_id),
+        await list_directory(session, limit=100),
+    ]
+
+
+@cases.add(scopes={OPERATOR: [PLATFORM], API: [PLATFORM]})
+async def operator_sessions_hold_no_tenant_rows(session: AsyncSession, tenants: Tenants) -> object:
+    signature = secrets.token_bytes(32)
+    created = await create_operator_session(
+        session,
+        token_hash=secrets.token_bytes(32),
+        signature_hash=signature,
+        aws_account_id="111111111111",
+        operator_name="isolation",
+        expires_at=datetime.now(UTC) + timedelta(minutes=15),
+    )
+    return [
+        created,
+        await signature_seen(session, signature),
+        await find_operator_session(session, secrets.token_bytes(32)),
+    ]
+
+
+# ---- member sign-in (#113) ----
+
+SESSION_WRITERS = {API: [TENANT, RESOURCE], OPERATOR: [TENANT], NOTIFY: [TENANT], SCAN: [TENANT]}
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_another_tenants_connection_and_identity(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # Across tenants by design: the lookups must change nothing.
+    theirs = tenants.theirs
+    connection = await find_connection(session, theirs.marker)
+    return [connection, await find_identity(session, theirs.rows["connection"], theirs.marker)]
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_another_tenants_session(session: AsyncSession, tenants: Tenants) -> object:
+    return await lookup_session(session, str(tenants.theirs.rows["session_token"]))
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE], OPERATOR: [TENANT]})
+async def read_another_tenants_session(session: AsyncSession, tenants: Tenants) -> object:
+    their_session = tenants.theirs.rows["session"]
+    return [
+        await get_live_session(session, their_session),
+        await member_sessions.expires_at(session, their_session),
+    ]
+
+
+@cases.add(scopes=SESSION_WRITERS)
+async def create_a_session_for_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs
+    created = await create_session(
+        session,
+        user_id=theirs.rows["user"],
+        identity_id=theirs.rows["identity"],
+        auth_method="sso",
+        auth_time=datetime.now(UTC),
+        created_ip=None,
+        user_agent=None,
+    )
+    await audit.record(session, action="member.signed_in", actor=ADMIN)
+    return created
+
+
+@cases.add(scopes=SESSION_WRITERS)
+async def revoke_another_tenants_sessions(session: AsyncSession, tenants: Tenants) -> object:
+    reason = member_sessions.RevokedReason.SIGNED_OUT_BY_ADMIN
+    ended = [
+        await revoke_session(session, tenants.theirs.rows["session"], reason=reason),
+        await revoke_user_sessions(session, tenants.theirs.rows["user"], reason=reason),
+        await revoke_tenant_sessions(session, reason=reason),
+    ]
+    await audit.record(session, action="user.signed_out", actor=ADMIN)
+    return ended
+
+
+# ---- idempotency keys (#144) ----
+
+# Every role but the API and the jobs: none may reach the keys at all.
+NOT_THE_KEY_ROLES = {OPERATOR: [TENANT], SCAN: [TENANT], NOTIFY: [TENANT]}
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE], **NOT_THE_KEY_ROLES})
+async def read_another_tenants_key(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    return [
+        await idempotency.find(session, "member", theirs.rows["user"], theirs.marker),
+        # The lock names the scope's tenant, so theirs is never held here.
+        await idempotency.lock(session, "member", theirs.rows["user"], theirs.marker),
+    ]
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE], **NOT_THE_KEY_ROLES})
+async def overwrite_another_tenants_key(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    return [
+        await idempotency.save(
+            session,
+            "member",
+            theirs.rows["user"],
+            key,
+            fingerprint=secrets.token_bytes(32),
+            status=201,
+            resource_type="user",
+            resource_id=theirs.rows["user"],
+        )
+        for key in (theirs.marker, f"{theirs.marker}-old")
+    ]
+
+
+# The job finds across tenants in system scope by design, and changes nothing there.
+@cases.add(scopes={JOBS: [SYSTEM], **NOT_THE_KEY_ROLES})
+async def find_tenants_with_expired_keys(session: AsyncSession, tenants: Tenants) -> object:
+    return await idempotency.tenants_with_expired(session)
+
+
+@cases.add(scopes={JOBS: [TENANT], API: [TENANT], **NOT_THE_KEY_ROLES})
+async def delete_another_tenants_expired_keys(session: AsyncSession, tenants: Tenants) -> object:
+    return await idempotency.delete_expired(session)
 
 
 test_isolation = cases.test()

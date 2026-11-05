@@ -1575,8 +1575,12 @@ export interface paths {
          *
          *     Rate limits: 100 invitations an hour per tenant and 3 a day per address (`429`).
          *
+         *     **Retries:** with an `Idempotency-Key`, a retry of the same request after a lost answer gets the first `201`
+         *     and `Location` again, with the user as they are now, and invites no one a second time: no second email, audit
+         *     event or charge of the invitation limits.
+         *
          *     Errors: `401 reauthentication_required`, `403 passkey_required`, `409 user_exists`,
-         *     `409 idempotency_conflict`, `429 rate_limited`.
+         *     `409 idempotency_conflict`, `409 idempotency_in_progress`, `429 rate_limited`.
          *
          *     Requirements: FR-22, FR-25, FR-26, NFR-12.
          */
@@ -2406,7 +2410,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * List tenants
+         * @description Lists tenants, newest first, from the tenant directory: the one read across tenants the operator API makes
+         *     (authn-authz 7.2). It returns the tenant rows only, never a tenant's users, transfers, files or audit log.
+         *     Audited as a platform event.
+         *
+         *     Requirements: FR-34, FR-27.
+         */
+        get: operations["listTenants"];
         put?: never;
         /**
          * Provision a tenant and its first admin
@@ -2417,11 +2429,75 @@ export interface paths {
          *     (abuse-and-rate-limits 7.3). Operators never get access to file contents through this API (FR-35). Rate
          *     limit: 30 new tenants an hour per operator.
          *
-         *     Errors: `409 idempotency_conflict`, `429 rate_limited`.
+         *     The tenant, its policy, the first admin's invitation, the invitation email's outbox message and the tenant's
+         *     audit event commit in one transaction, in the new tenant's scope; then the platform audit event is written.
+         *     If that second write fails, the tenant exists, with its record in the tenant's log, and the call still returns
+         *     `201`: a retry would create a second tenant. The missing platform event is logged and alerts.
          *
-         *     Requirements: FR-34, FR-35.
+         *     Errors: `409 idempotency_conflict`, `429 rate_limited`, `503 service_unavailable`.
+         *
+         *     Requirements: FR-34, FR-35, FR-27.
          */
         post: operations["createTenant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/operator/tenants/{tenant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Get a tenant
+         * @description One tenant from the tenant directory (`listTenants`). Audited as a platform event.
+         *
+         *     Requirements: FR-34, FR-27.
+         */
+        get: operations["getTenant"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/operator/tenants/{tenant_id}/suspend": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Suspend a tenant
+         * @description Suspends the tenant: its members can no longer sign in or use the API, every session of the tenant ends
+         *     (data model 2.4), and its links stop working. Nothing is deleted; retention and deletion carry on as before.
+         *     Audited in the tenant's audit log, where its admins can see it, and as a platform event. Suspending a tenant
+         *     that is already suspended changes nothing and returns `200` with the tenant, so a retry is always safe.
+         *
+         *     Both records are written in turn, because a tenant's events and platform events are written in different
+         *     scopes. If the platform event can't be written, the suspension has still taken effect, with its record in the
+         *     tenant's log, and the call returns `503`; retry it.
+         *
+         *     Errors: `404 not_found`, `503 service_unavailable`.
+         *
+         *     Requirements: FR-34, FR-27.
+         */
+        post: operations["suspendTenant"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3167,10 +3243,11 @@ export interface components {
         Tenant: {
             id: components["schemas"]["Id"];
             name: string;
-            /** @enum {string} */
-            status: "active" | "suspended";
+            status: components["schemas"]["TenantStatus"];
             created_at: components["schemas"]["Timestamp"];
         };
+        /** @enum {string} */
+        TenantStatus: "active" | "suspended";
         User: {
             id: components["schemas"]["Id"];
             email: components["schemas"]["EmailAddress"];
@@ -3324,6 +3401,10 @@ export interface components {
         TenantCreated: {
             tenant: components["schemas"]["Tenant"];
             first_admin: components["schemas"]["User"];
+        };
+        TenantPage: {
+            items: components["schemas"]["Tenant"][];
+            next_cursor: components["schemas"]["NextCursor"];
         };
         SignInRedirect: {
             /**
@@ -4205,6 +4286,8 @@ export interface components {
          *     Every `/session` operation takes it except `getSessionDownloadContent`, which a navigation starts.
          */
         LinkSessionId: components["schemas"]["Id"];
+        /** @description Return only tenants in this state. */
+        TenantStatusFilter: components["schemas"]["TenantStatus"];
         /** @description ID of the tenant. */
         TenantId: components["schemas"]["Id"];
         /**
@@ -6850,6 +6933,39 @@ export interface operations {
             503: components["responses"]["ServiceUnavailable"];
         };
     };
+    listTenants: {
+        parameters: {
+            query?: {
+                /** @description Return only tenants in this state. */
+                status?: components["parameters"]["TenantStatusFilter"];
+                /**
+                 * @description Opaque cursor from `next_cursor` of the previous page. Leave it out for the first page. An invalid or
+                 *     expired cursor returns `400 invalid_cursor`.
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /** @description Largest number of items to return. */
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of tenants. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
     createTenant: {
         parameters: {
             query?: never;
@@ -6891,6 +7007,60 @@ export interface operations {
             409: components["responses"]["Conflict"];
             422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTenant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tenant"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    suspendTenant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The suspended tenant. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Tenant"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     configureTenantSso: {

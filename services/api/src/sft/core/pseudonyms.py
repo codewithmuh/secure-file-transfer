@@ -7,8 +7,9 @@ key is a secret like any other, and so is a pseudonym's link to its address.
 The keys form a keyring that rotates once a year (encryption and keys 6.5). For 25 hours after a
 new key becomes active, each per-address rate limit adds the previous key's count to the new one's,
 so a rotation never resets a cap: `EmailKeyring.for_limits` gives the active pseudonym and those
-still in that overlap. Loading the keyring from Secrets Manager (`sft/{env}/app/email-hmac`) comes
-with the first route that uses it.
+still in that overlap. The API reads the keyring (`sft/{env}/app/email-hmac`) from its settings
+(`EMAIL_HMAC_KEYRING`, `EmailKeyring.from_json`), in the shape of every HMAC keyring
+(`sft.core.keyrings`), with `activated_at` on the active key.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
+
+from sft.core.keyrings import EMAIL_KEY_ID, parse_keyring
 
 LIMIT_OVERLAP = timedelta(hours=25)
 """How long a per-address limit still counts the previous key's pseudonym after a rotation."""
@@ -60,6 +63,12 @@ class EmailKey:
 
 
 class EmailKeyring:
+    @classmethod
+    def from_json(cls, raw: str) -> EmailKeyring:
+        """Read the keyring; `KeyringError`, which never holds a key, if it is malformed."""
+        entries = parse_keyring(raw, name="email", key_id=EMAIL_KEY_ID, needs_activation=True)
+        return cls([EmailKey(e.id, e.key, e.state, e.activated_at) for e in entries])
+
     def __init__(self, keys: list[EmailKey]) -> None:
         active = [k for k in keys if k.state == "active"]
         if len(active) != 1 or active[0].activated_at is None:

@@ -18,8 +18,9 @@ IDs come from the log context (`sft.core.logs`). The database sets `tx_id` and `
 code can't backdate an event or pin it on another transaction.
 
 Nothing secret or personal beyond FR-27's fields goes in: `details` takes IDs, enums, numbers,
-flags and times, never free text, so a file name, message, email address, token or code can't
-reach it by accident (data model 2.5). Action names and target types are short lower-case codes.
+flags, times and an operator's name (`OperatorName`), never free text, so a file name, message,
+email address, token or code can't reach it by accident (data model 2.5). Action names and
+target types are short lower-case codes.
 
 Partition upkeep for the lifecycle job (data model 6) is here too: `create_partitions` and
 `partition_status`, as `sft_jobs` in system scope.
@@ -61,6 +62,7 @@ __all__ = [
     "Actor",
     "ActorType",
     "Detail",
+    "OperatorName",
     "Origin",
     "Outcome",
     "PartitionStatus",
@@ -121,9 +123,29 @@ class Origin:
             raise TypeError("source_ip is an ipaddress address, parsed by the caller")
 
 
-Detail = uuid.UUID | int | bool | datetime | StrEnum | IntEnum | None
-"""A value in `details`: an ID, a `StrEnum` or `IntEnum` member, a number, a flag or a time.
-Never free text."""
+# An IAM role session name: what STS allows, 2 to 64 of these characters.
+_ROLE_SESSION_NAME = re.compile(r"[\w+=,.@-]{2,64}", re.ASCII)
+
+
+class OperatorName(str):
+    """An operator's IAM Identity Center user name, the role session name STS returned.
+
+    The one text value `details` takes (authentication and authorization 8.2): every operator
+    event names the person, because the operator session it refers to is deleted after a day.
+    It is an identifier STS checked, never text from a request.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, value: str) -> OperatorName:
+        if not isinstance(value, str) or not _ROLE_SESSION_NAME.fullmatch(value):
+            raise ValueError("an operator name is an IAM role session name")
+        return super().__new__(cls, value)
+
+
+Detail = uuid.UUID | int | bool | datetime | StrEnum | IntEnum | OperatorName | None
+"""A value in `details`: an ID, a `StrEnum` or `IntEnum` member, a number, a flag, a time or an
+operator's name. Never free text."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,6 +279,8 @@ def _details(details: Mapping[str, Detail]) -> dict[str, object]:
         _code("a details key", key)
         if isinstance(value, StrEnum | IntEnum):
             out[key] = value.value
+        elif isinstance(value, OperatorName):
+            out[key] = str(value)
         elif isinstance(value, Enum):
             raise TypeError(
                 f"details[{key!r}] is a {type(value).__name__}: use a StrEnum or IntEnum"

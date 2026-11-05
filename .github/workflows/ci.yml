@@ -270,11 +270,18 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
-          # The API needs DATABASE_URL and VALKEY_URL to start, but connects to each only when a
-          # request needs it, so nothing has to listen on these addresses.
+          # The API needs DATABASE_URL, VALKEY_URL and the sign-in settings to start, but connects to
+          # each only when a request needs it, so nothing has to listen on these addresses. Every
+          # value is an obviously fake one for CI; the CSRF key is 32 bytes of "x", the email one of "y".
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
-            --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 \
+            --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 --env WEB_ORIGIN=https://app.sft.test \
+            --env OIDC_ISSUER=https://idp.sft.test --env OIDC_CLIENT_ID=sft-api-ci \
+            --env OIDC_CLIENT_SECRET=ci-only-fake --env OIDC_PROVIDER_NAME=ci \
+            --env OIDC_REDIRECT_URI=https://api.sft.test/v1/auth/callback \
+            --env OIDC_LOGOUT_URL=https://idp.sft.test/logout \
+            --env 'CSRF_KEYRING=[{"id":"ci","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]' \
+            --env 'EMAIL_HMAC_KEYRING=[{"id":"ci","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]' \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi
