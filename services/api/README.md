@@ -51,6 +51,9 @@ src/sft/
     migrations/       the Alembic revisions; migrate.py is the migration job
     counters.py       Valkey: the rate-limit counter scripts, with a timeout and a rest after failures
     mail/             the mail adapter: SES API v2 in AWS, SMTP to Mailpit locally (Email below)
+  dlp/          beside data: the DLP detectors, pure code with no I/O, for the service and the inspector (ADR-0022)
+    units.py          text units, keyword lists and findings: what goes in and what comes out
+    detect/           the built-in detectors of docs/design/dlp-detectors.md and tenant detectors, on RE2
   core/         settings, logging, tracing and UUIDv7 IDs, used by every layer
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
     pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
@@ -59,7 +62,8 @@ src/sft/
 
 `api` and `workers` never import each other. `service`, `data` and `core` never import FastAPI, Starlette or uvicorn;
 `runtime` sits between them and the entry points, so both entry points share the probes without either knowing the
-other.
+other. `data` and `dlp` never import each other, and `dlp` imports no database, counter store, AWS, HTTP, metrics or
+tracing client, because the inspector's sandbox has none of them.
 
 ## Run and check
 
