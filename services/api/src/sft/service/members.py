@@ -7,9 +7,11 @@ for an invitation, the outbox message commit together (`sft.data.users` writes t
 The rules of the contract's member operations live here:
 
 - An invitation never changes an existing user; the address is checked within the tenant only.
-- The tenant always keeps at least one active admin (`409 last_admin`). Every change that could
-  break that locks the tenant's active admins first, so two at once can't both pass.
+- The tenant always keeps at least one active admin (`409 last_admin`). A change that could break
+  that (demoting or deactivating an active admin) locks the tenant's active admins before the
+  user, so two at once can't both pass; any other change locks only the user (`_change`).
 - A deactivated user can't be changed (`409 invalid_state`); deactivating one again returns them.
+  Deactivation clears `dlp_approver` and `sso_fallback`.
 - Setting the values a user already has changes nothing and writes no event.
 - `sso_fallback` needs a tenant that uses SSO, which arrives in M6, so naming a fallback admin is
   `422 validation_failed` for now. `dlp_approver` names only an active user.
@@ -25,11 +27,13 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
 from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import (
     Conflict,
@@ -50,7 +54,7 @@ from sft.service.permissions import authorize
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import INVITE_USER, KeyType
 
-MAX_PAGE = 100
+MAX_PAGE: Final = users.MAX_PAGE
 
 INVITE_LIMITS: Final = tuple(lim for lim in INVITE_USER if KeyType.TENANT_EMAIL not in lim.keys)
 """`INVITE_USER` without the per-address cap, which needs the `email-hmac` keyring the API doesn't
@@ -107,16 +111,19 @@ async def invite_user(
 ) -> User:
     """`inviteUser`: a new `invited` user, its audit event and its invitation email.
 
-    The invitation limits (abuse and rate limits 2.2, G) count only a caller allowed to invite,
-    so a member can't use up their tenant's invitations.
+    The invitation limits (abuse and rate limits 2.2, G) count only an invitation that is made:
+    after `authorize`, so a member can't use up their tenant's invitations, and after the insert,
+    so a `409 user_exists` uses none. A refusal raises inside the transaction, which then writes
+    nothing. Only a commit that fails after the count (a database outage) costs one.
     """
     authorize(caller, "inviteUser", now=now)
-    await limiter.check(INVITE_LIMITS, caller.rate_limit_keys())
     try:
         async with database.transaction(_tenant_scope(caller)) as session:
-            return await users.create_invitation(
+            user = await users.create_invitation(
                 session, email=email, role=role, actor=caller.actor(), origin=origin
             )
+            await limiter.check(INVITE_LIMITS, caller.rate_limit_keys())
+            return user
     except users.UserExistsError as exc:
         raise Conflict("user_exists", "The address is already a user of this tenant.") from exc
 
@@ -132,13 +139,9 @@ async def list_users(
     limit: int = 25,
     now: datetime,
 ) -> UserPage:
-    """`listUsers`: one page of the tenant's users, oldest first."""
+    """`listUsers`: one page of the tenant's users, oldest first. `limit` is 1 to `MAX_PAGE`, as
+    the route's query validation has it; `users.list_users` refuses any other."""
     authorize(caller, "listUsers", now=now)
-    if not 1 <= limit <= MAX_PAGE:
-        # The route's query validation refuses it first; a bad parameter is a 400 (API README 3.1).
-        raise InvalidRequest(
-            "malformed_request", errors=[FieldError("limit is 1 to 100", parameter="limit")]
-        )
     after = None if cursor is None else decode_cursor(cursor)
     async with database.transaction(_tenant_scope(caller)) as session:
         found = await users.list_users(
@@ -147,7 +150,7 @@ async def list_users(
             status=status,
             dlp_approver=dlp_approver,
             after=after,
-            limit=limit + 1,
+            limit=limit,
         )
     items = found[:limit]
     more = len(found) > limit
@@ -164,6 +167,52 @@ async def get_user(database: Database, caller: Caller, user_id: UUID, *, now: da
     return user
 
 
+class _AdminAtStake(Exception):  # noqa: N818 - a signal, not an error
+    """The user became an active admin between the first read and the lock: start again, with
+    the tenant's active admins locked first."""
+
+
+async def _change(
+    database: Database,
+    caller: Caller,
+    user_id: UUID,
+    *,
+    at_stake: Callable[[User], bool],
+    apply: Callable[[AsyncSession, User, Sequence[UUID]], Awaitable[User]],
+) -> User:
+    """Run `apply` on the user, locked, in one transaction of the caller's tenant.
+
+    `at_stake` says whether the change could take an active admin away. Only then are the tenant's
+    active admins locked, before the user: one lock order for every such change, so two at once
+    run one after the other. The user is read first to decide, then locked and read again. If the
+    user became an active admin in between, the transaction is rolled back and run again with the
+    admins locked first, since locking them after the user could deadlock with another change.
+    `apply` gets the locked admins' IDs, or none.
+    """
+    lock_admins = False
+    while True:
+        try:
+            async with database.transaction(_tenant_scope(caller)) as session:
+                if not lock_admins:
+                    seen = await users.get_user(session, user_id)
+                    if seen is None:
+                        raise NotFound
+                    lock_admins = at_stake(seen)
+                admins = await users.lock_active_admins(session) if lock_admins else ()
+                user = await users.get_user(session, user_id, for_update=True)
+                if user is None:
+                    raise NotFound
+                if at_stake(user) and not lock_admins:
+                    raise _AdminAtStake
+                return await apply(session, user, admins)
+        except _AdminAtStake:
+            lock_admins = True
+
+
+def _active_admin(user: User) -> bool:
+    return user.status == UserStatus.ACTIVE and user.role == Role.ADMIN
+
+
 async def update_user(
     database: Database,
     caller: Caller,
@@ -178,12 +227,11 @@ async def update_user(
     """`updateUser`: the role, the fallback admin flag and the DLP approver flag."""
     authorize(caller, "updateUser", now=now)
     actor = caller.actor()
-    async with database.transaction(_tenant_scope(caller)) as session:
-        # The tenant's active admins first, then the user: one lock order for every change.
-        admins = await users.lock_active_admins(session) if role is not None else ()
-        user = await users.get_user(session, user_id, for_update=True)
-        if user is None:
-            raise NotFound
+
+    def demotes_an_admin(user: User) -> bool:
+        return role is Role.MEMBER and _active_admin(user)
+
+    async def apply(session: AsyncSession, user: User, admins: Sequence[UUID]) -> User:
         if user.status == UserStatus.DEACTIVATED:
             raise Conflict(
                 "invalid_state",
@@ -200,7 +248,7 @@ async def update_user(
             raise _invalid("dlp_approver", "Only an active user can be a DLP approver.")
 
         if new_role.value != user.role:
-            if new_role is Role.MEMBER and list(admins) == [user.id]:
+            if demotes_an_admin(user) and list(admins) == [user.id]:
                 raise _last_admin()
             user = await users.change_role(session, user.id, new_role, actor=actor, origin=origin)
             # Here every session of the user ends, once member sessions exist (#113), and a
@@ -215,22 +263,22 @@ async def update_user(
             )
         return user
 
+    return await _change(database, caller, user_id, at_stake=demotes_an_admin, apply=apply)
+
 
 async def deactivate_user(
     database: Database, caller: Caller, user_id: UUID, *, origin: Origin, now: datetime
 ) -> User:
     """`deactivateUser`: the user can't sign in any more; a retry returns the same user."""
     authorize(caller, "deactivateUser", now=now)
-    async with database.transaction(_tenant_scope(caller)) as session:
-        admins = await users.lock_active_admins(session)
-        user = await users.get_user(session, user_id, for_update=True)
-        if user is None:
-            raise NotFound
+
+    async def apply(session: AsyncSession, user: User, admins: Sequence[UUID]) -> User:
         if user.status == UserStatus.DEACTIVATED:
             return user
-        if list(admins) == [user.id]:
+        if _active_admin(user) and list(admins) == [user.id]:
             raise _last_admin()
-        user = await users.deactivate_user(session, user.id, actor=caller.actor(), origin=origin)
         # Here every session of the user ends (#113) and every key they own is revoked (M5), in
         # this transaction.
-        return user
+        return await users.deactivate_user(session, user.id, actor=caller.actor(), origin=origin)
+
+    return await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)

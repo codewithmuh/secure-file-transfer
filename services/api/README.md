@@ -14,6 +14,7 @@ One package, `sft`, in layers. A layer imports only the layers below it, and `li
 src/sft/
   api/          FastAPI routes and the dependencies that work out who the caller is; the runtime contract
     app.py            the public app (the API routes)
+    dependencies.py   get_database, the route dependency for the process's database
     members.py        the member routes: invite, list, read, change and deactivate users (FR-22)
     caller.py         get_caller, the request's Caller (a placeholder until #113's sessions)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
@@ -387,8 +388,9 @@ each operation's bundle is listed there, narrowest first. A route applies its bu
 tenant. Limits on keys a handler finds itself (a link's subject, an invited address as `EmailPseudonyms`) run there:
 `await limiter.check(REQUEST_CODE, keys)`, with `limiter = Depends(get_rate_limiter)`. A refusal is `429 rate_limited`
 with `Retry-After`; while Valkey is unavailable, groups A and B answer `503` with `Retry-After: 5` and the rest count
-in the pod at a third of each limit (abuse design 4.5). Every `401` counts against the client's IP (group H), and an
-IP blocked after 100 of them gets `429` on every route, checked before routing and authentication.
+in the pod at a third of each limit (abuse design 4.5). Every `401` but a step-up's `reauthentication_required` counts
+against the client's IP (group H), and an IP blocked after 100 of them gets `429` on every route, checked before
+routing and authentication.
 
 The counter store (`sft/data/counters.py`) runs GCRA for rates and a sliding log for small quotas, one Lua script per
 key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). A rate of N per period admits a

@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
 import httpx2 as httpx
 import pytest
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from member_fixtures import (
     RecordingLimiter,
@@ -25,7 +27,8 @@ from pg import ScratchDatabase
 from sft.api.app import create_app
 from sft.api.observability import HttpMetrics, RequestContextMiddleware
 from sft.api.rate_limits import get_rate_limiter
-from sft.core.errors import Conflict, Forbidden, InvalidRequest
+from sft.core.errors import Conflict, Forbidden
+from sft.data import users
 from sft.data.audit import Origin
 from sft.data.database import Database
 from sft.data.models import Role
@@ -70,6 +73,8 @@ async def test_an_admin_invites_a_member_and_the_email_is_queued(
         }
         again = await http.post("/v1/users", json={"email": "new.person@example.com"})
         assert (again.status_code, again.json()["code"]) == (409, "user_exists")
+        plus = await http.post("/v1/users", json={"email": "first.last+tag@sub.example.co.jp"})
+        assert plus.status_code == 201, plus.text
     user_id = uuid.UUID(user["id"])
     assert events(migrated_db, user_id) == [("user.invited", "admin", tenant.admin, False)]
     [(user_agent,)] = migrated_db.sql(
@@ -90,6 +95,15 @@ async def test_an_admin_invites_a_member_and_the_email_is_queued(
         {"email": "a@example.com", "role": "owner"},
         {"email": "a@example.com", "extra": True},
         {"email": "x" * 250 + "@example.com"},
+        {"email": "x" * 65 + "@example.com"},
+        {"email": "a@example."},
+        # What the mail adapter refuses in a header (sft.core.addresses), so it's never invited.
+        *({"email": f"a{c}b@example.com"} for c in ',;<>"'),
+        *(
+            {"email": f"ab{c}@example.com"}
+            for c in ("\u202a", "\u202e", "\u200b", "\u200f", "\u2060", "\u206f", "\ufeff")
+        ),
+        {"email": "a\u00adb@example.com"},
         {},
     ],
 )
@@ -316,9 +330,9 @@ async def test_the_service_guards_what_the_route_already_refuses(
     now = datetime.now(UTC)
     database = Database.connect(migrated_db.url(API), pool_size=1)
     try:
-        with pytest.raises(InvalidRequest) as bad_limit:
+        # The route refuses a bad limit with a 400; one that gets past it is a bug.
+        with pytest.raises(ValueError, match="page"):
             await members.list_users(database, admin, limit=0, now=now)
-        assert [e.parameter for e in bad_limit.value.errors] == ["limit"]
         # The system actor passes authorize; without a tenant it reaches no user.
         with pytest.raises(Forbidden):
             await members.list_users(database, Caller(CallerKind.SYSTEM), now=now)
@@ -408,3 +422,105 @@ async def test_an_invitation_is_one_trace_without_the_address(
     assert {span.context.trace_id for span in finished if span.context} == {trace_id}
     assert any(span.kind is SpanKind.CLIENT for span in finished), "no database spans"
     assert "traced@example.test" not in str([span.to_json() for span in finished])
+
+
+async def test_an_existing_address_uses_none_of_the_invitations(
+    migrated_db: ScratchDatabase,
+) -> None:
+    tenant = seed_tenant(migrated_db)
+    seed_user(migrated_db, tenant.id, email="taken@example.test")
+    admin = session_caller(tenant.id, tenant.admin, Role.ADMIN)
+    limiter = RecordingLimiter()
+    async with client(migrated_db, lambda: admin, limiter) as http:
+        response = await http.post("/v1/users", json={"email": "Taken@example.test"})
+    assert (response.status_code, response.json()["code"]) == (409, "user_exists")
+    assert [limits for limits, _ in limiter.checks] == [("H.caller_requests", "H.tenant_requests")]
+
+
+async def test_deactivation_clears_the_approver_and_fallback_flags(
+    migrated_db: ScratchDatabase,
+) -> None:
+    tenant = seed_tenant(migrated_db)
+    flagged = seed_user(migrated_db, tenant.id, role="admin")
+    migrated_db.sql(
+        "UPDATE users SET dlp_approver = true, sso_fallback = true WHERE id = :id", id=flagged
+    )
+    admin = session_caller(tenant.id, tenant.admin, Role.ADMIN)
+    async with client(migrated_db, lambda: admin) as http:
+        response = await http.post(f"/v1/users/{flagged}/deactivate")
+    body = response.json()
+    assert (body["status"], body["dlp_approver"], body["sso_fallback"]) == (
+        "deactivated",
+        False,
+        False,
+    )
+    assert migrated_db.sql(
+        "SELECT dlp_approver, sso_fallback FROM users WHERE id = :id", id=flagged
+    ) == [(False, False)]
+
+
+async def test_an_operator_token_on_a_member_route_gets_the_bearer_challenge(
+    migrated_db: ScratchDatabase,
+) -> None:
+    operator = Caller(CallerKind.OPERATOR, credential_id=uuid.uuid4())
+    async with client(migrated_db, lambda: operator) as http:
+        response = await http.get("/v1/users")
+    assert (response.status_code, response.json()["code"]) == (401, "authentication_required")
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+class LockSpy:
+    """Counts `lock_active_admins`, and can promote the target between the read and the lock."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, before_lock: Callable[[], None]) -> None:
+        self.admin_locks = 0
+        self.reads = 0
+        lock, get = users.lock_active_admins, users.get_user
+
+        async def counted_lock(session: AsyncSession) -> Sequence[uuid.UUID]:
+            self.admin_locks += 1
+            return await lock(session)
+
+        async def read(session: AsyncSession, user_id: uuid.UUID, **kwargs: bool) -> object:
+            found = await get(session, user_id, **kwargs)
+            self.reads += 1
+            if self.reads == 1:
+                before_lock()
+            return found
+
+        monkeypatch.setattr(users, "lock_active_admins", counted_lock)
+        monkeypatch.setattr(users, "get_user", read)
+
+
+async def test_only_a_change_that_can_lose_an_admin_locks_the_admins(
+    migrated_db: ScratchDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant = seed_tenant(migrated_db)
+    spy = LockSpy(monkeypatch, lambda: None)
+    admin = session_caller(tenant.id, tenant.admin, Role.ADMIN)
+    async with client(migrated_db, lambda: admin) as http:
+        assert (await http.patch(f"/v1/users/{tenant.target}", json={"role": "admin"})).is_success
+        assert (await http.post(f"/v1/users/{tenant.member}/deactivate")).is_success
+        assert spy.admin_locks == 0
+        # Demoting an active admin locks them, so it can be refused as the last one.
+        demote = await http.patch(f"/v1/users/{tenant.admin}", json={"role": "member"})
+        assert demote.is_success
+        assert spy.admin_locks == 1
+
+
+async def test_a_user_promoted_meanwhile_is_locked_again_with_the_admins(
+    migrated_db: ScratchDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant = seed_tenant(migrated_db)
+
+    def promote() -> None:
+        # Another admin's promotion commits between this request's first read and its lock.
+        migrated_db.sql("UPDATE users SET role = 'admin' WHERE id = :id", id=tenant.target)
+
+    spy = LockSpy(monkeypatch, promote)
+    admin = session_caller(tenant.id, tenant.admin, Role.ADMIN)
+    async with client(migrated_db, lambda: admin) as http:
+        response = await http.post(f"/v1/users/{tenant.target}/deactivate")
+    assert (response.status_code, response.json()["status"]) == (200, "deactivated")
+    # Read, lock (now an admin, so start again), then the admins and the user, locked.
+    assert (spy.reads, spy.admin_locks) == (3, 1)

@@ -28,5 +28,5 @@ async def get_caller() -> Caller:
 async def get_tenant_caller(caller: Annotated[Caller, Depends(get_caller)]) -> Caller:
     """A member session or an API key of a tenant; 401 for any other caller."""
     if caller.kind not in (CallerKind.MEMBER, CallerKind.API_KEY) or caller.tenant_id is None:
-        raise Unauthenticated("authentication_required")
+        raise Unauthenticated("authentication_required", bearer=caller.bearer)
     return caller

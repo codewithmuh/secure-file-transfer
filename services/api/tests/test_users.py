@@ -17,6 +17,7 @@ from sft.data.database import Database
 from sft.data.models import ActorType, Role, UserStatus
 from sft.data.scope import Scope
 from sft.data.users import (
+    MAX_PAGE,
     InvitationMatch,
     UserExistsError,
     accept_invitation,
@@ -196,8 +197,9 @@ async def test_reads_list_filter_and_page(api_db: Database, migrated_db: Scratch
         assert [u.id for u in await list_users(session)] == [u.id for u in made]
         members = await list_users(session, role=Role.MEMBER)
         assert [u.id for u in members] == [made[1].id, made[2].id]
+        # A page of one, and one more to tell that more follow.
         page = await list_users(session, after=made[0].id, limit=1)
-        assert [u.id for u in page] == [made[1].id]
+        assert [u.id for u in page] == [made[1].id, made[2].id]
         assert await list_users(session, status=UserStatus.ACTIVE) == []
         assert await list_users(session, dlp_approver=True) == []
         assert (await get_user(session, made[1].id)) is not None
@@ -205,8 +207,9 @@ async def test_reads_list_filter_and_page(api_db: Database, migrated_db: Scratch
         found = await get_user_by_email(session, "U2@Example.com")
         assert found is not None
         assert found.id == made[2].id
-        with pytest.raises(ValueError, match="page"):
-            await list_users(session, limit=0)
+        for limit in (0, MAX_PAGE + 1):
+            with pytest.raises(ValueError, match="page"):
+                await list_users(session, limit=limit)
 
 
 async def test_changes_write_their_events(api_db: Database, migrated_db: ScratchDatabase) -> None:

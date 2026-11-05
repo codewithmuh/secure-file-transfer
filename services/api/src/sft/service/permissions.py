@@ -366,7 +366,9 @@ def authorize(caller: Caller | None, operation_id: str, *, now: datetime) -> Rea
     if permission.public:
         return ANY
     if caller is None or not permission.accepts(caller.kind):
-        raise Unauthenticated("authentication_required", bearer=_bearer(caller))
+        raise Unauthenticated(
+            "authentication_required", bearer=caller is not None and caller.bearer
+        )
     if caller.kind is CallerKind.SYSTEM:
         return TENANT
     if caller.kind is CallerKind.MEMBER:
@@ -386,11 +388,6 @@ def _allowed(allowed: bool, reach: Reach) -> Reach:
     if not allowed:
         raise Forbidden("permission_denied")
     return reach
-
-
-def _bearer(caller: Caller | None) -> bool:
-    """An API key or an operator token came as a bearer token: its 401 carries the challenge."""
-    return caller is not None and caller.kind in (CallerKind.API_KEY, CallerKind.OPERATOR)
 
 
 def _member(permission: Permission, caller: Caller, operation_id: str, now: datetime) -> Reach:

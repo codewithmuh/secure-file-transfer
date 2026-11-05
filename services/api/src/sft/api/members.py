@@ -10,11 +10,15 @@ Rate limits (abuse and rate limits 2.2): every route counts against the caller's
 budget (`TENANT_OPERATION`, group H), except `deactivateUser`, a safety action that only the
 caller's own limit applies to (`SAFETY_ACTION`). `inviteUser` also applies group G's invitation
 limits, in the service once the caller may invite (`sft.service.members.INVITE_LIMITS`).
+
+Not yet: `inviteUser` accepts `Idempotency-Key`, as the contract has it, but doesn't keep it. The
+replay of the first `201` and `409 idempotency_conflict` (API README 5, architecture 5.4) need the
+`idempotency_keys` table and its helper, which every creating `POST` shares and which comes with
+its own issue. Until then a retry gets `409 user_exists`.
 """
 
 from __future__ import annotations
 
-import re
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 from uuid import UUID
@@ -23,11 +27,12 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Respons
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from sft.api import app as app_module
 from sft.api.caller import get_tenant_caller
 from sft.api.client_ip import client_address
+from sft.api.dependencies import get_database
 from sft.api.errors import problem_responses
 from sft.api.rate_limits import get_rate_limiter, rate_limit
+from sft.core.addresses import is_plain_address
 from sft.data.audit import Origin
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
@@ -39,15 +44,8 @@ from sft.service.rate_limits.limits import SAFETY_ACTION, TENANT_OPERATION
 PREFIX: Final = "/v1"
 TAG: Final = "Tenant admin"
 
-# One address: a local part and a domain with a dot, no spaces, no control characters. The mail
-# system is the final judge; this only refuses what can't be an address (contract: format email).
-_EMAIL = re.compile(r"[^@\s\x00-\x1f\x7f]{1,64}@[^@\s\x00-\x1f\x7f]+\.[^@\s\x00-\x1f\x7f.]+")
 _EMAIL_SCHEMA: Final[dict[str, Any]] = {"format": "email"}
 _IDEMPOTENCY_KEY = r"^[\x21-\x7E]+$"
-
-
-def _database(request: Request) -> Database:
-    return app_module.get_database(request)
 
 
 def _origin(request: Request) -> Origin:
@@ -64,7 +62,7 @@ def _now() -> datetime:
 # The caller comes first, so a request without a credential gets 401 before anything else runs;
 # the rate limit next, before the handler. FastAPI resolves the caller once for both.
 CallerDep = Annotated[Caller, Depends(get_tenant_caller)]
-DatabaseDep = Annotated[Database, Depends(_database)]
+DatabaseDep = Annotated[Database, Depends(get_database)]
 LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 SAFETY_LIMITS: Final = rate_limit(SAFETY_ACTION, caller=get_tenant_caller)
@@ -119,7 +117,11 @@ class UserInvite(BaseModel):
     @field_validator("email")
     @classmethod
     def _an_address(cls, value: str) -> str:
-        if not _EMAIL.fullmatch(value):
+        # The mail adapter's rule (sft.core.addresses), so an invitation can always be sent; and
+        # the shape the contract's `format: email` asks for: a local part of at most 64
+        # characters, and a domain with a dot.
+        local, _, domain = value.rpartition("@")
+        if not (is_plain_address(value) and len(local) <= 64 and "." in domain.strip(".")):
             raise ValueError("not an email address")
         return value
 
@@ -197,7 +199,7 @@ async def list_users(
     status: UserStatus | None = None,
     dlp_approver: bool | None = None,
     cursor: Annotated[str | None, Query(max_length=512)] = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    limit: Annotated[int, Query(ge=1, le=members.MAX_PAGE)] = 25,
 ) -> UserPageOut:
     page = await members.list_users(
         database,
