@@ -54,6 +54,9 @@ jobs:
       - name: Dry-run the promotion scripts and build.yml's trigger filters (#107)
         if: ${{ !cancelled() }}
         run: .github/scripts/test-promotion.sh
+      - name: Check the ruleset's required checks are jobs that report on every PR (#59)
+        if: ${{ !cancelled() }}
+        run: .github/scripts/check-ruleset.sh
 
   local-stack:
     name: Local stack (up, smoke checks)
