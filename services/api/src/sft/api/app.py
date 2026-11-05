@@ -1,8 +1,9 @@
 """The public API app: the routes of the API contract, docs/api/openapi.yaml.
 
-It has no routes yet; the first arrive in M1. Probes and metrics live on the internal port
-(internal.py). The interactive docs and the OpenAPI document aren't served either: ADR-0002 keeps
-them off the public load balancer, and CI builds the document from `create_app().openapi()`.
+The member routes (#112) are the first; each feature registers its own. Probes and metrics live
+on the internal port (internal.py). The interactive docs and the OpenAPI document aren't served
+either: ADR-0002 keeps them off the public load balancer, and CI builds the document from
+`create_app().openapi()`.
 
 With settings, the app's lifespan opens the database pool and the rate-limit counter store at
 startup, without connecting, and closes them at shutdown, after uvicorn has drained the requests. A
@@ -26,6 +27,7 @@ from fastapi import FastAPI, Request
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
+from sft.api import members
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
 from sft.core.settings import Settings
@@ -94,4 +96,5 @@ def create_app(
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
+    members.register(app)  # members, roles and invitations (#112)
     return app

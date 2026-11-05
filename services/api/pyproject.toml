@@ -92,6 +92,9 @@ addopts = "-q --cov=sft --cov=tools --cov-report=term-missing --cov-fail-under=8
 
 [tool.coverage.run]
 branch = true
+# SQLAlchemy's asyncio runs the driver in greenlets; without this, lines after an await inside a
+# transaction go unmeasured.
+concurrency = ["thread", "greenlet"]
 # Also measure the server started as a real process by the signal tests.
 patch = ["subprocess"]
 

@@ -244,6 +244,17 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
         message=str(rows["processed_message"]),
         tenant=tenant_id,
     )
+    # Users (#112): an invited member with a live invitation link, whose address holds the marker.
+    rows["user"], rows["invitation"] = uuid.uuid4(), uuid.uuid4()
+    db.sql(
+        "INSERT INTO users (id, tenant_id, email, email_normalized, role, status, "
+        "invitation_token_hash, invitation_expires_at) VALUES (:id, :tenant, :email, :email, "
+        "'member', 'invited', sha256(convert_to(:token, 'UTF8')), now() + interval '7 days')",
+        id=rows["user"],
+        tenant=tenant_id,
+        email=f"{marker}@example.test",
+        token=str(rows["invitation"]),
+    )
     return Seeded(tenant_id, marker, rows)
 
 

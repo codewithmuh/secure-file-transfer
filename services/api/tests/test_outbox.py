@@ -19,6 +19,7 @@ from sft.data.audit import Actor, Target, record
 from sft.data.database import Database
 from sft.data.models import ActorType, Outbox, Tenant
 from sft.data.outbox import (
+    MEMBER_INVITED,
     TOPICS,
     InvalidMessageError,
     OutboxMessage,
@@ -51,8 +52,10 @@ def test_a_registry_refuses_a_topic_twice() -> None:
         topic_registry(TOPIC, Topic("file.scan", Queue.SCAN_LARGE))
 
 
-def test_the_service_has_no_topics_until_features_add_them() -> None:
-    assert TOPICS == {}
+def test_the_service_names_each_topic_it_sends() -> None:
+    # Each feature adds its topics, with the queue that carries them.
+    assert TOPICS == {"member.invited": MEMBER_INVITED}
+    assert MEMBER_INVITED.queue is Queue.NOTIFY
 
 
 def test_only_the_scan_queues_are_fair() -> None:

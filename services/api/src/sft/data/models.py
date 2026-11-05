@@ -25,10 +25,13 @@ from sqlalchemy import (
     CheckConstraint,
     ColumnElement,
     DateTime,
+    ForeignKey,
     Index,
+    LargeBinary,
     MetaData,
     PrimaryKeyConstraint,
     Text,
+    UniqueConstraint,
     func,
     text,
     true,
@@ -222,3 +225,69 @@ class ProcessedMessage(TenantOwned, Base):
     message_id: Mapped[str] = mapped_column(Text, primary_key=True)
     tenant_id: Mapped[uuid.UUID]
     processed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class Role(StrEnum):
+    """A user's role in their tenant (data model 2.1, authn and authz 6.2). One list: the CHECK
+    below is built from it, and a test checks the migration's literal CHECK against it."""
+
+    ADMIN = "admin"
+    MEMBER = "member"
+
+
+class UserStatus(StrEnum):
+    """Where a user is: invited until their first sign-in, then active, or deactivated."""
+
+    INVITED = "invited"
+    ACTIVE = "active"
+    DEACTIVATED = "deactivated"
+
+
+class User(TenantOwned, Base):
+    """A member or admin of one tenant, with their role and invitation (data model 2.1, FR-22).
+
+    `sft.data.users` writes and reads it; every change commits only with its audit event. Link
+    sessions reach no user (the default `reach`).
+    """
+
+    __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(f"role IN {sql_values(Role)}", name="role"),
+        CheckConstraint(f"status IN {sql_values(UserStatus)}", name="status"),
+        CheckConstraint("char_length(email) BETWEEN 3 AND 254", name="email"),
+        CheckConstraint("NOT sso_fallback OR role = 'admin'", name="sso_fallback"),
+        CheckConstraint(
+            "(invitation_token_hash IS NULL) = (invitation_expires_at IS NULL)", name="invitation"
+        ),
+        CheckConstraint(
+            "invitation_token_hash IS NULL "
+            "OR (octet_length(invitation_token_hash) = 32 AND status = 'invited')",
+            name="invitation_token_hash",
+        ),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "email_normalized"),
+        UniqueConstraint("invitation_token_hash"),
+        Index(
+            "users_invitation_expires_at_idx",
+            "invitation_expires_at",
+            postgresql_where=text("invitation_token_hash IS NOT NULL"),
+        ),
+        Index(
+            "users_dlp_approver_idx",
+            "tenant_id",
+            postgresql_where=text("dlp_approver AND status = 'active'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    email: Mapped[str] = mapped_column(Text)
+    email_normalized: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    sso_fallback: Mapped[bool] = mapped_column(server_default=text("false"))
+    dlp_approver: Mapped[bool] = mapped_column(server_default=text("false"))
+    invitation_token_hash: Mapped[bytes | None] = mapped_column(LargeBinary)
+    invitation_expires_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
