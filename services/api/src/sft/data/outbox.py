@@ -92,7 +92,11 @@ def topic_registry(*topics: Topic) -> Mapping[str, Topic]:
     return registry
 
 
-TOPICS: Final[Mapping[str, Topic]] = topic_registry()
+MEMBER_INVITED: Final = Topic("member.invited", Queue.NOTIFY)
+"""A user was invited (FR-22): the notification worker creates their sign-in and emails the
+invitation (authn and authz 2.5). Payload `{"user_id": …}`."""
+
+TOPICS: Final[Mapping[str, Topic]] = topic_registry(MEMBER_INVITED)
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.
 The relay leaves a row whose topic isn't here unpublished and counts it as a failure, which the
