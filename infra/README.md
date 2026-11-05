@@ -67,6 +67,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `emergency-user` | `sft-<env>-emergency` under `/sft-emergency/`, the account's way in when Identity Center can't be reached (authn-authz 8.4) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
 | `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
+| `data-stack` | One environment and Region's data layer: calls `aurora`, `valkey` and `queues` with the network stack's subnets and groups, so every `data` root passes only what differs (#101) |
 | `queues` | Every SQS queue of ADR-0013 and its dead-letter queue, with a queue policy that admits only its one sender ([README](modules/queues/README.md), #101) |
 | `valkey` | One Region's counter store: ElastiCache Serverless for Valkey, its IAM-authenticated users and security group ([README](modules/valkey/README.md), #101) |
 
@@ -88,7 +89,9 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    runs twice: first without a flow log, then, once `data` has made the log bucket, with
    `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
    In staging and prod Tokyo's `data` also runs twice: first with `TF_VAR_replicate_master_secret=false`, then, once
-   Osaka's `data` has made the key replicas, again, so that the master secret's Osaka replica has its key.
+   Osaka's `data` has made the key replicas, again, so that the master secret's Osaka replica has its key. Both runs
+   take that key's ARN explicitly, `TF_VAR_master_secret_replica_kms_key_arn`, until #102's keys module provides it;
+   it must be the Tokyo secrets key's ID in ap-northeast-3, which `modules/data-stack` checks.
 
 Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
 deletion protection off, skips the final snapshot and drops the master secret's recovery window, then the destroy.
@@ -318,9 +321,13 @@ comment.
   `secretsmanager:GetRandomPassword`, because the master password's ephemeral resource opens during plans too. The
   deploy role also creates and changes `sft-*` clusters, instances, global clusters, subnet and parameter groups,
   serverless caches, users and user groups, queues, the `sft/*/db/*` secrets and the `/aws/rds/cluster/sft-*` log
-  groups; deletes only those tagged `managed-by = terraform` and `project = secure-file-transfer`; creates the RDS and
-  ElastiCache service-linked roles; and uses KMS keys only through RDS, ElastiCache, Secrets Manager and SQS
-  (`kms:ViaService`), with grants for AWS resources only. Its security groups use the network layer's EC2 permissions.
+  groups (including `ResetDBClusterParameterGroup`, which the provider calls when a parameter is removed); deletes only
+  those tagged `managed-by = terraform` and `project = secure-file-transfer`, except the final snapshot
+  `sft-*-aurora-final`, which a delete creates untagged and so is allowed by name; reads the master secret's value
+  (`sft/*/db/master-*` only) for the read-back that sets the cluster's password at apply (modules/aurora); creates the
+  RDS and ElastiCache service-linked roles; and uses KMS keys only through RDS, ElastiCache, Secrets Manager and SQS
+  (`kms:ViaService`), with grants for AWS resources only, and `Encrypt` for the master secret's Osaka replica. Its
+  security groups use the network layer's EC2 permissions.
 
 These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
 `/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply

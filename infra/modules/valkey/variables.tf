@@ -38,13 +38,16 @@ variable "workloads" {
 
 variable "access_string" {
   description = <<-EOT
-    What each user may do: only keys under rl: (ADR-0014's key format), only reads, writes, scripts and connection
-    commands, and nothing dangerous (no KEYS, FLUSHALL, CONFIG, DEBUG or MONITOR). -@all also leaves out pub/sub.
-    CLUSTER SLOTS and CLUSTER SHARDS are the two read-only topology calls a cluster client makes at start, and a
-    serverless cache runs in cluster mode (ADR-0014), so they are allowed by name after -@dangerous.
+    What each user may do: only keys under rl: (ADR-0014's key format), only reads, writes and connection commands,
+    and nothing dangerous (no KEYS, FLUSHALL, CONFIG, DEBUG or MONITOR). -@all also leaves out pub/sub.
+    -function takes FUNCTION LOAD, DELETE and FLUSH back out of +@write. Of the scripting commands only the two the
+    service sends: EVALSHA, and SCRIPT LOAD when the cache doesn't know a script yet (valkey-py's Script, used by
+    sft.data.counters), so no EVAL, FCALL, SCRIPT FLUSH or SCRIPT KILL. CLUSTER SLOTS and CLUSTER SHARDS are the two
+    read-only topology calls a cluster client makes at start; a serverless cache runs in cluster mode (ADR-0014).
+    Checked with ACL DRYRUN against Valkey 9.0.7 (the README's table).
   EOT
   type        = string
-  default     = "on ~rl:* -@all +@read +@write +@scripting +@connection -@dangerous +cluster|slots +cluster|shards"
+  default     = "on ~rl:* -@all +@read +@write +@connection -@dangerous -function +evalsha +script|load +cluster|slots +cluster|shards"
 }
 
 variable "major_engine_version" {

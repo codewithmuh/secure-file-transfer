@@ -316,7 +316,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Log and trace stores | — | — | — | — | E D | — | — | — |
 | AWS service principals in the key policy | — | — | — | CloudTrail, for the retained trail (8.4) | CloudWatch Logs, CloudTrail, log delivery | — | CloudWatch alarms, SES, SNS into SQS | — |
 | AWS services through grants | EBS | — | RDS | — | — | EKS | EBS, ElastiCache | — |
-| Terraform deploy role | A | A | A G | A (in prod, the retained stack's own deploy role) | A | A G; E for the secrets it writes (6.4) | A G | E D, through S3, its state bucket only; the bootstrap `Admin` role administers the key |
+| Terraform deploy role | A | A | A G | A (in prod, the retained stack's own deploy role) | A | A G; E for the secrets it writes, D for the master password's read-back (6.4) | A G | E D, through S3, its state bucket only; the bootstrap `Admin` role administers the key |
 | Terraform plan role (ADR-0005) | — | — | — | — | — | — | — | D and `GenerateDataKey`, through S3, its state bucket only, for the lock files it writes |
 | Audit reader (investigations, time-limited) | — | — | — | D | D | — | — | — |
 | BreakGlass permission set | R, D | R | R | R, D | R, D | R, D (master password) | R | R |
@@ -609,7 +609,7 @@ How the other keys differ:
 | database | No workload principals. RDS uses the key through grants that the deploy role creates for the cluster (`kms:ViaService` = RDS, `kms:GrantIsForAWSResource`). |
 | audit | Writers (archive job, API, operator API) get `kms:GenerateDataKey` only; readers (recovery job, audit reader, BreakGlass) get `kms:Decrypt`. All through S3, limited to the archive bucket ARN. In prod the key and its policy live in the retained stack and are administered by that stack's own deploy role (8.4). The same key protects the retained stack's state bucket (its deploy role, through S3, that bucket only), its trail (`cloudtrail.amazonaws.com` with `aws:SourceArn` = that trail and the `aws:cloudtrail:arn` context) and its alert topic (its own EventBridge delivery role, through SNS). |
 | logs | Service principals (`logs.<region>.amazonaws.com`, `cloudtrail.amazonaws.com`, `delivery.logs.amazonaws.com`), each limited by `aws:SourceAccount` and its own encryption context (`aws:logs:arn`, `aws:cloudtrail:arn`), plus the log and trace store roles through S3, and the lifecycle jobs role (Decrypt through S3 for CloudTrail log files only, 4.3). |
-| secrets | Each workload may Decrypt only through Secrets Manager and only for its own secrets (`kms:EncryptionContext:SecretARN`). The writers in 6.4: the key rotation job encrypts and decrypts for the keyrings and the identity provider client secrets; the deploy role encrypts (`GenerateDataKey`) for the master password and the platform component secrets, and may decrypt only Secrets Manager's key-access check (`kms:EncryptionContext:SecretVersionId` = `RequestToValidateKeyAccess`), which runs when a secret is created. EKS uses the key for etcd through a grant the deploy role creates. |
+| secrets | Each workload may Decrypt only through Secrets Manager and only for its own secrets (`kms:EncryptionContext:SecretARN`). The writers in 6.4: the key rotation job encrypts and decrypts for the keyrings and the identity provider client secrets; the deploy role encrypts (`GenerateDataKey`, and `Encrypt` for the master password's Osaka replica) for the master password and the platform component secrets, and may decrypt only Secrets Manager's key-access check (`kms:EncryptionContext:SecretVersionId` = `RequestToValidateKeyAccess`), which runs when a secret is created, and the master password (`kms:EncryptionContext:SecretARN`), for its read-back at apply (6.3). EKS uses the key for etcd through a grant the deploy role creates. |
 | platform | Producers and consumers through SQS (`aws:sqs:arn`): the relay, the workers, the sign-in triggers and the EventBridge delivery role. The service statements above for SNS. The node provisioner for EBS root volumes, as in the files key. ElastiCache through grants. |
 | tfstate | The deploy role encrypts and decrypts through S3 for the state bucket only; the plan role decrypts and generates data keys the same way, for its lock files; the bootstrap `Admin` role administers the key and uses it for the bootstrap stack's own state, and on Osaka's replica so does the account's emergency user, by its exact ARN (authn-authz 8.4, #81); the replication role as for the files key. AWS Config's service-linked role may `DescribeKey` and `GetKeyRotationStatus` for its rules (9.2), matched by `aws:PrincipalArn` through the account principal, because the role doesn't exist yet when the bootstrap creates the key. The other keys need the same statement once Config runs. |
 | registry (shared stack) | Administered by the shared stack's deploy role, which also creates the repositories (`CreateGrant` for AWS resources and `DescribeKey`; `RetireGrant` in its IAM policy for deletions). ECR encrypts pushed layers and decrypts pulled ones through the grants it creates for each repository. The environments' node roles may only `kms:Decrypt` through ECR (`kms:ViaService` = ECR, `kms:EncryptionContext:aws:ecr:arn` = our repositories), so no environment can encrypt with or administer the key. The key lives until the shared stack is destroyed after the last environment (capacity 5.4), with the 30-day wait. |
@@ -666,7 +666,7 @@ A phase 4 ADR records this decision.
 | `sft/{env}/app/csrf-hmac` | Keyring `K_csrf` for deriving CSRF tokens from session tokens (decision 8) | API | Key rotation job | Every 90 days; the old key verifies for 24 hours |
 | `sft/{env}/app/idp-client/ap-northeast-1` | App client ID and secret of the Tokyo user pool, for the authorization-code flow | API in Tokyo | Key rotation job | Every year; Cognito allows two active client secrets, so the switch has no gap |
 | `sft/{env}/app/idp-client/ap-northeast-3` | App client ID and secret of the Osaka standby pool (staging and prod; authentication and authorization 2.6). It lives only in Osaka, so it stays writable while Tokyo is down. | API in Osaka | Key rotation job, through the Osaka endpoint | Every year, like the Tokyo client |
-| `sft/{env}/db/master` | Aurora master user password | The database bootstrap job, once per environment, to create the login roles; then BreakGlass only | Terraform deploy role, with write-only arguments (6.3) | After every use and every 90 days |
+| `sft/{env}/db/master` | Aurora master user password | The database bootstrap job, once per environment, to create the login roles; then BreakGlass only, apart from the deploy role's read-back at apply (6.3) | Terraform deploy role, with write-only arguments (6.3) | After every use and every 90 days |
 | `sft/{env}/platform/*`, for example the Grafana admin password | Per component | Platform components, through External Secrets and Kubernetes Secrets | Terraform deploy role, with write-only arguments | Per component |
 
 All live in Secrets Manager in Tokyo, encrypted with the secrets key, and are replicated to Osaka, where each replica is
@@ -710,13 +710,17 @@ What is deliberately not a secret here:
   `sft_jobs`, `sft_archive`, `sft_migrate`, `sft_operator`) with IAM database authentication. The pod's role signs a
   15-minute connection token locally; IAM authentication requires TLS.
 - Aurora can manage the master password in Secrets Manager, but AWS doesn't support that for clusters in an Aurora
-  global database. So the deploy role sets it with Terraform write-only arguments: an ephemeral random password goes to
-  the cluster's `master_password_wo` and to the secret's `secret_string_wo`, and it never reaches the plan or the
-  state. Rotating means raising the write-only version in a reviewed change; the runbook does that after every use and
-  every 90 days.
+  global database. So the deploy role sets it with Terraform write-only arguments, and the secret is the password's
+  one source. A new ephemeral random password goes into the secret's `secret_string_wo`. The cluster's
+  `master_password_wo` then gets the value read back from that secret version, never from the generator. If an apply
+  stops between the two, the next apply reads the same version and sends the cluster the same password, so the two
+  can't drift apart (infra/modules/aurora). The password never reaches the plan or the state.
+- The read-back happens only at apply, by the deploy role. Its secret ID is unknown until apply, so Terraform defers the
+  read, and the plan role, which runs on pull requests, never reads the value. Rotating means raising the write-only
+  version in a reviewed change; the runbook does that after every use and every 90 days.
 - The database bootstrap job (`sft-{env}-db-bootstrap`) reads the master password once per environment to create the
-  login roles. After that only BreakGlass reads it, and every read raises an alert (authentication and authorization
-  8.3).
+  login roles. After that only BreakGlass reads it, apart from the deploy role's read-back during data-layer applies.
+  Every other read raises an alert (authentication and authorization 8.3).
 
 ### 6.4 How workloads read and write secrets
 
@@ -739,8 +743,15 @@ What is deliberately not a secret here:
     `DeleteUserPoolClientSecret` on the two app clients only. It writes the first version of every keyring.
   - The **Terraform deploy role** creates every secret, without a value, and writes the values of the master password
     and the platform component secrets, only through write-only arguments: `PutSecretValue` on those ARNs and
-    `GenerateDataKey` for them, plus Decrypt only for Secrets Manager's key-access check (4.4). It has no
-    `GetSecretValue` on any secret.
+    `GenerateDataKey` for them, plus Decrypt for Secrets Manager's key-access check (4.4). Its only `GetSecretValue`,
+    and its only other Decrypt, is on the master password, for the read-back at apply (6.3). It has `Encrypt` for the
+    master password's Osaka replica, because Secrets Manager calls `Encrypt` with the caller's credentials when it
+    replicates a secret.
+  - The master password's resource policy enforces this. It denies `GetSecretValue` to everyone but the bootstrap job,
+    BreakGlass and the deploy role. It denies every change to everyone but the deploy role: the value, rotation,
+    staging labels, tags, the policy itself, replication, promoting the Osaka replica, and deletion. Without the policy
+    and replication actions, a principal with broad Secrets Manager rights could drop the policy, or promote the replica
+    out from under it, and then read the value.
   - Nobody else writes a secret.
 - **State holds no live secret value.** Terraform writes values only through write-only arguments. When it creates a
   Cognito app client, Cognito generates a first client secret that does land in state; the key rotation job's first run

@@ -12,7 +12,7 @@ variable "kms_key_arns" {
   description = <<-EOT
     This Region's keys by class (encryption 4.1), until #102 merges and module.kms.key_arns replaces this variable:
     database (Aurora), logs (its log group), secrets (the master password) and platform (queues and the counter
-    store). Each is a multi-Region key; in Osaka, the replica.
+    store). Each is a multi-Region key in ap-northeast-1; modules/data-stack checks them.
   EOT
   type = object({
     database = string
@@ -20,13 +20,6 @@ variable "kms_key_arns" {
     secrets  = string
     platform = string
   })
-
-  validation {
-    condition = alltrue([
-      for arn in values(var.kms_key_arns) : can(regex("^arn:aws:kms:ap-northeast-1:[0-9]{12}:key/mrk-[0-9a-f]{32}$", arn))
-    ])
-    error_message = "Each key must be a multi-Region key ARN in ap-northeast-1."
-  }
 }
 
 variable "teardown" {

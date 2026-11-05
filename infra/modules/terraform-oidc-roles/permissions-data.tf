@@ -39,9 +39,12 @@ locals {
     ])
     sqs = [for region in var.network_regions : "arn:aws:sqs:${region}:${var.account_id}:sft-*"]
     # sft/<env>/db/master and its replica; Secrets Manager adds a random suffix to the name.
-    secrets  = [for region in var.network_regions : "arn:aws:secretsmanager:${region}:${var.account_id}:secret:sft/*/db/*"]
-    logs     = [for region in var.network_regions : "arn:aws:logs:${region}:${var.account_id}:log-group:/aws/rds/cluster/sft-*"]
-    kms_keys = [for region in var.network_regions : "arn:aws:kms:${region}:${var.account_id}:key/*"]
+    secrets       = [for region in var.network_regions : "arn:aws:secretsmanager:${region}:${var.account_id}:secret:sft/*/db/*"]
+    master_secret = [for region in var.network_regions : "arn:aws:secretsmanager:${region}:${var.account_id}:secret:sft/*/db/master-*"]
+    # The final snapshot that a delete without teardown takes: <cluster identifier>-final (modules/aurora).
+    final_snapshots = [for region in var.network_regions : "arn:aws:rds:${region}:${var.account_id}:cluster-snapshot:sft-*-aurora-final"]
+    logs            = [for region in var.network_regions : "arn:aws:logs:${region}:${var.account_id}:log-group:/aws/rds/cluster/sft-*"]
+    kms_keys        = [for region in var.network_regions : "arn:aws:kms:${region}:${var.account_id}:key/*"]
   }
 
   data_kms_via_services = flatten([
@@ -97,7 +100,8 @@ data "aws_iam_policy_document" "data_read" {
     resources = local.data_arns.sqs
   }
 
-  # Never GetSecretValue: with write-only values the provider reads the version list, not the value (encryption 6.4).
+  # Never GetSecretValue: with secret_string_wo the provider reads the version list (ListSecretVersionIds), never the
+  # value, and the master password's read-back runs only at apply, as the deploy role (modules/aurora, encryption 6.4).
   statement {
     sid       = "MasterSecretMetadata"
     actions   = ["secretsmanager:DescribeSecret", "secretsmanager:GetResourcePolicy", "secretsmanager:ListSecretVersionIds"]
@@ -131,6 +135,8 @@ data "aws_iam_policy_document" "data_deploy" {
       "rds:ModifyDBSubnetGroup",
       "rds:ModifyGlobalCluster",
       "rds:RemoveTagsFromResource",
+      # The provider resets a parameter that is removed from the cluster parameter group.
+      "rds:ResetDBClusterParameterGroup",
     ]
     resources = concat(local.data_arns.rds, local.data_arns.rds_global)
   }
@@ -141,7 +147,15 @@ data "aws_iam_policy_document" "data_deploy" {
     resources = local.data_arns.rds_defaults
   }
 
-  # A final snapshot is taken on delete unless the teardown apply skipped it.
+  # A delete without teardown takes a final snapshot. DeleteDBCluster and CreateDBClusterSnapshot are both authorized
+  # against that snapshot too (the Service Authorization Reference lists cluster-snapshot as a resource of each), and it
+  # has no tags yet, so the tag conditions below would refuse it. This statement allows the snapshot by its name.
+  statement {
+    sid       = "DatabaseFinalSnapshot"
+    actions   = ["rds:CreateDBClusterSnapshot", "rds:DeleteDBCluster"]
+    resources = local.data_arns.final_snapshots
+  }
+
   statement {
     sid = "DatabaseDeleteOwn"
     actions = [
@@ -233,7 +247,7 @@ data "aws_iam_policy_document" "data_deploy" {
   }
 
   # The master secret: created without a value, written only through write-only arguments, replicated to Osaka. The
-  # secret's own policy refuses every write but this role's (modules/aurora).
+  # secret's own policy refuses every change but this role's (modules/aurora).
   statement {
     sid = "MasterSecretWrite"
     actions = [
@@ -250,6 +264,14 @@ data "aws_iam_policy_document" "data_deploy" {
       "secretsmanager:ValidateResourcePolicy",
     ]
     resources = local.data_arns.secrets
+  }
+
+  # The read-back that sets the cluster's password from the secret, at apply only (modules/aurora). The master secret
+  # alone, never the other sft/*/db/* secrets.
+  statement {
+    sid       = "MasterSecretReadBackAtApply"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = local.data_arns.master_secret
   }
 
   statement {
@@ -270,13 +292,16 @@ data "aws_iam_policy_document" "data_deploy" {
   }
 
   # The calls these services make with the deploy role's credentials when it creates an encrypted cluster, cache, queue
-  # or secret: grants for the resource, and data keys. Through the services only, never directly.
+  # or secret: grants for the resource, and data keys. Through the services only, never directly. Encrypt is for
+  # Secrets Manager replicating the master secret to Osaka, which "sends an Encrypt request to AWS KMS" on the caller's
+  # behalf (Secrets Manager user guide, "Secret encryption and decryption"); no ReEncrypt, which none of these calls.
   statement {
     sid = "UseKeysThroughDataServices"
     actions = [
       "kms:CreateGrant",
       "kms:Decrypt",
       "kms:DescribeKey",
+      "kms:Encrypt",
       "kms:GenerateDataKey",
       "kms:GenerateDataKeyWithoutPlaintext",
     ]

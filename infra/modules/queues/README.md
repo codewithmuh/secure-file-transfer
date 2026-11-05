@@ -29,3 +29,11 @@ Names are `sft-<env>-<region-short>-<queue>` and `...-<queue>-dlq`, so the appli
 Redriving a dead-letter queue back to its source queue needs `SendMessage` on the source queue, which only its sender
 has. For the work queues the runbook re-publishes through the outbox instead, which keeps the relay their only sender.
 For the intake queues the dead-letter runbook (phase 6) decides how messages go back.
+
+`guardduty-results` and `ses-tenant-status` admit EventBridge through its execution role, `sft-<env>-events-delivery`,
+not through `events.amazonaws.com`. EventBridge can use either for an SQS target ("For Lambda, Amazon SNS, and Amazon
+SQS targets, you can use either an IAM execution role or a resource-based policy", EventBridge user guide, "Using
+resource-based policies"). With the role, the queue policy matches one principal by `aws:PrincipalArn`, and the
+platform key's policy can name that role, where a statement for the EventBridge service couldn't be narrowed to our
+rules (encryption 4.4). The rules that target these queues must set `RoleArn` to that role; the issue that builds them
+does.
