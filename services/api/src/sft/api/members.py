@@ -12,6 +12,10 @@ caller's own limit applies to (`SAFETY_ACTION`). `inviteUser` also applies group
 limits, the per-address one keyed by the address's pseudonym under the `email-hmac` keyring, in the
 service once the caller may invite (`sft.service.members.INVITE_LIMITS`).
 
+`updateUser` (a demotion) and `deactivateUser` are security-critical records (#177): they answer
+`200` only once the audit archive of both regions holds the record, `503` otherwise, with the change
+kept.
+
 `inviteUser` takes `Idempotency-Key` (`sft.api.idempotency`, API README 5): a retry with the same
 key and body after a lost answer gets the first `201`, its `Location` and the user as they are now,
 and invites no one again.
@@ -29,7 +33,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from sft.api.caller import get_tenant_caller
 from sft.api.client_ip import client_address
-from sft.api.dependencies import get_database, get_email_keyring
+from sft.api.dependencies import get_audit_archive, get_database, get_email_keyring
 from sft.api.errors import problem_responses
 from sft.api.idempotency import IdempotencyDep
 from sft.api.rate_limits import get_rate_limiter, rate_limit
@@ -39,6 +43,7 @@ from sft.data.audit import Origin
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
 from sft.service import members
+from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import SAFETY_ACTION, TENANT_OPERATION
@@ -66,6 +71,7 @@ CallerDep = Annotated[Caller, Depends(get_tenant_caller)]
 DatabaseDep = Annotated[Database, Depends(get_database)]
 LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 EmailKeyringDep = Annotated[EmailKeyring, Depends(get_email_keyring)]
+ArchiveDep = Annotated[AuditArchive, Depends(get_audit_archive)]
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 SAFETY_LIMITS: Final = rate_limit(SAFETY_ACTION, caller=get_tenant_caller)
 
@@ -238,7 +244,12 @@ async def get_user(user_id: UUID, caller: CallerDep, database: DatabaseDep) -> U
     responses=problem_responses(400, 401, 403, 404, 409, 429, 503),
 )
 async def update_user(
-    user_id: UUID, body: UserUpdate, request: Request, caller: CallerDep, database: DatabaseDep
+    user_id: UUID,
+    body: UserUpdate,
+    request: Request,
+    caller: CallerDep,
+    database: DatabaseDep,
+    archive: ArchiveDep,
 ) -> UserOut:
     user = await members.update_user(
         database,
@@ -247,6 +258,7 @@ async def update_user(
         role=body.role,
         sso_fallback=body.sso_fallback,
         dlp_approver=body.dlp_approver,
+        archive=archive,
         origin=_origin(request),
         now=_now(),
     )
@@ -262,10 +274,10 @@ async def update_user(
     responses=problem_responses(401, 403, 404, 409, 429, 503),
 )
 async def deactivate_user(
-    user_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep
+    user_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep, archive: ArchiveDep
 ) -> UserOut:
     user = await members.deactivate_user(
-        database, caller, user_id, origin=_origin(request), now=_now()
+        database, caller, user_id, archive=archive, origin=_origin(request), now=_now()
     )
     return UserOut.of(user)
 

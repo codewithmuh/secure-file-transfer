@@ -92,10 +92,13 @@ account and role) and the secret references win in every workload, and a values 
 dropped. `tests/test_overrides.py` checks this for the API, relay, notifier, scan workers and operator API, and that an
 extra setting still reaches the pod.
 
-The API's four secrets (`CSRF_KEYRING`, `EMAIL_HMAC_KEYRING`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`) come from Secrets
-Manager through the ExternalSecret `api-secrets`, which the cluster-bootstrap stack's `application-secrets` store
-serves to the `sft` namespace only, and reach the pod as `secretKeyRef`s (encryption 6.4, "Until then"). No secret value
-is ever in Git, the values or a rendered manifest. A new keyring version reaches the API when its pods restart.
+The API's five secrets (`CSRF_KEYRING`, `EMAIL_HMAC_KEYRING`, `CODE_HMAC_KEYRING`, `OIDC_CLIENT_ID`,
+`OIDC_CLIENT_SECRET`) come from Secrets Manager through the ExternalSecret `api-secrets`, and the notification
+worker's three keyrings (`EMAIL_HMAC_KEYRING`, `LINK_HMAC_KEYRING`, `CODE_HMAC_KEYRING`, #178, #179) through
+`notifier-secrets`; the cluster-bootstrap stack's `application-secrets` store serves both to the `sft` namespace only,
+and they reach the pods as `secretKeyRef`s (encryption 6.4, "Until then"). Only the notifier's Secret holds K_link. No
+secret value is ever in Git, the values or a rendered manifest. A new keyring version reaches a pod when it restarts.
+The API also gets both regions' audit archive buckets (#177), Tokyo's alone in dev, which has no Osaka.
 
 ## What every pod gets
 

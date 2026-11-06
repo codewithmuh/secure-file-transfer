@@ -54,6 +54,7 @@ ENV = {
     "S3_FILES_BUCKET": "sft-local-files",
     "S3_LARGE_FILES_BUCKET": "sft-local-large-files",
     "S3_AUDIT_BUCKET": "sft-local-audit-archive",
+    "S3_AUDIT_OSAKA_BUCKET": "sft-local-audit-archive-osaka",
     "S3_FILES_KMS_KEY_ID": "00000000-0000-4000-8000-000000000001",
     "SQS_ENDPOINT_URL": "http://127.0.0.1:9324",
     "SQS_QUEUE_PREFIX": "sft-local-",
@@ -158,13 +159,17 @@ def check_api_role() -> str:
 def check_s3() -> str:
     s3 = aws("s3")
     bucket, key = cfg["S3_FILES_BUCKET"], f"tenants/smoke/{uuid.uuid4()}"
-    audit = cfg["S3_AUDIT_BUCKET"]
+    # The audit archive, and its stand-in for Osaka's (#177).
+    archives = (cfg["S3_AUDIT_BUCKET"], cfg["S3_AUDIT_OSAKA_BUCKET"])
     sse = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": cfg["S3_FILES_KMS_KEY_ID"]}
-    for name in (bucket, cfg["S3_LARGE_FILES_BUCKET"], audit):
+    for name in (bucket, cfg["S3_LARGE_FILES_BUCKET"], *archives):
         status = s3.get_bucket_versioning(Bucket=name).get("Status")
         assert status == "Enabled", (name, status)
-    lock = s3.get_object_lock_configuration(Bucket=audit)["ObjectLockConfiguration"]
-    assert lock["ObjectLockEnabled"] == "Enabled", lock
+    for archive in archives:
+        lock = s3.get_object_lock_configuration(Bucket=archive)[
+            "ObjectLockConfiguration"
+        ]
+        assert lock["ObjectLockEnabled"] == "Enabled", (archive, lock)
     try:
         other_key = {
             "ServerSideEncryption": "aws:kms",
@@ -217,7 +222,7 @@ def check_s3() -> str:
     versions = s3.list_object_versions(Bucket=bucket, Prefix=key).get("Versions", [])
     for version in versions:
         s3.delete_object(Bucket=bucket, Key=key, VersionId=version["VersionId"])
-    return "versioning, Object Lock, KMS key check, pre-signed multipart upload and get"
+    return "versioning, Object Lock in both archives, KMS key check, pre-signed multipart upload and get"
 
 
 def check_sqs() -> str:

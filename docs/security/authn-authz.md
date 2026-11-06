@@ -482,6 +482,11 @@ own.
 - **Ending.** `endLinkSession` ends the session named by `X-Link-Session` and removes its token from the cookie, which
   is cleared once no session is left.
 - A recipient may read and download; an uploader may read and upload (section 6.3).
+- **As built (#179).** `__Host-sft_link` has the same attributes everywhere, the local stack included, as
+  `__Host-sft_session` does (#113): browsers treat `http://localhost` as a secure context and keep `Secure` and
+  `__Host-` cookies there, and scripted clients send them as `local/smoke.py` does. A cookie value that isn't a list
+  of well-formed tokens is ignored, never an error. A missing or malformed `X-Link-Session` is
+  `401 authentication_required`. `endLinkSession` passes the CSRF checks of 3.4 with that session's own token.
 
 ### 4.4 Lockout and unlock
 
@@ -495,6 +500,10 @@ own.
   leaked link is cut off; a recipient who mistyped just gets a new email.
 - Lockouts and unlocks are security-critical audit records.
 - **API keys can't unlock** (API contract). A lockout signals a possible attack, so a person decides.
+- **As built (#179).** An API key gets `403 permission_denied` on `unlockRecipient` (the contract's answer), not the
+  `401` a key gets on other operations for web sessions only. A local admin without a passkey gets
+  `403 passkey_required` on another member's recipient. Unlocking a recipient who isn't locked returns them unchanged
+  and sends nothing, and writes the last unlock's archive record if it is still missing.
 
 ## 5. API keys
 

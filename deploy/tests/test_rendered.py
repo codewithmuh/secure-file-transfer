@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings
 from sft.core.settings import (
     InspectorSettings,
     MigrationSettings,
+    NotifySettings,
     OperatorSettings,
     RelaySettings,
     ScanSettings,
@@ -53,6 +54,7 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.data.migrate": MigrationSettings,
     "sft.dlp.inspector": InspectorSettings,
     "sft.workers.scan": ScanSettings,
+    "sft.workers.notify": NotifySettings,
 }
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 
@@ -577,24 +579,44 @@ def test_every_entry_point_gets_its_required_settings(
     assert seen == set(SETTINGS)
 
 
-def test_api_secrets_come_from_external_secrets(
+def test_api_and_notifier_secrets_come_from_external_secrets(
     rendered: dict[tuple[str, str, str], list[Manifest]],
 ) -> None:
-    """The API's keyrings and client secret come from Secrets Manager through the application store (encryption 6.4)."""
+    """The API's and the notification worker's keyrings, and the API's client secret, come from Secrets Manager through
+    the application store (encryption 6.4)."""
     for env, region in CLUSTERS:
         objects = rendered[(env, region, "application")]
-        (external,) = [o for o in objects if o["kind"] == "ExternalSecret"]
-        spec = external["spec"]
-        assert spec["secretStoreRef"] == {
-            "kind": "ClusterSecretStore",
-            "name": "application-secrets",
+        externals = {
+            o["metadata"]["name"]: o["spec"]
+            for o in objects
+            if o["kind"] == "ExternalSecret"
         }
-        assert spec["target"]["name"] == "api-secrets"
-        keys = {d["secretKey"]: d["remoteRef"] for d in spec["data"]}
+        assert set(externals) == {"api-secrets", "notifier-secrets"}
+        for name, spec in externals.items():
+            assert spec["secretStoreRef"] == {
+                "kind": "ClusterSecretStore",
+                "name": "application-secrets",
+            }
+            assert spec["target"]["name"] == name
+        keys = {
+            d["secretKey"]: d["remoteRef"] for d in externals["api-secrets"]["data"]
+        }
         assert keys["CSRF_KEYRING"] == {"key": f"sft/{env}/app/csrf-hmac"}
         assert keys["EMAIL_HMAC_KEYRING"] == {"key": f"sft/{env}/app/email-hmac"}
+        assert keys["CODE_HMAC_KEYRING"] == {"key": f"sft/{env}/app/code-hmac"}
         # Each region's API reads only its own user pool's client (encryption 6.1).
         assert keys["OIDC_CLIENT_SECRET"]["key"] == f"sft/{env}/app/idp-client/{region}"
+        # The API never gets K_link: only the notification worker derives links (data model 2.2).
+        assert "LINK_HMAC_KEYRING" not in keys
+        notifier = {
+            d["secretKey"]: d["remoteRef"]
+            for d in externals["notifier-secrets"]["data"]
+        }
+        assert notifier == {
+            "EMAIL_HMAC_KEYRING": {"key": f"sft/{env}/app/email-hmac"},
+            "LINK_HMAC_KEYRING": {"key": f"sft/{env}/app/link-hmac"},
+            "CODE_HMAC_KEYRING": {"key": f"sft/{env}/app/code-hmac"},
+        }
         assert not [
             o
             for o in rendered[(env, region, "operator")]

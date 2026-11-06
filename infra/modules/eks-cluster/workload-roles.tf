@@ -105,8 +105,13 @@ locals {
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
   ]
-  # What the application store gives the API as environment variables (#106): its two keyrings and its Region's client.
-  api_store_secrets = concat(local.app_secrets["email-hmac"], local.app_secrets["csrf-hmac"], local.idp_client_secrets)
+  # What the application store gives the sft namespace as environment variables: the API's csrf-hmac, email-hmac and
+  # code-hmac and its Region's client (#106, #179), and the notification worker's link-hmac, code-hmac and email-hmac
+  # (#178). Until the application reads Secrets Manager itself (encryption 6.4).
+  api_store_secrets = concat(
+    local.app_secrets["email-hmac"], local.app_secrets["csrf-hmac"], local.app_secrets["code-hmac"],
+    local.app_secrets["link-hmac"], local.idp_client_secrets,
+  )
 
   valkey_caches = [for r, p in local.regional_prefixes : "arn:aws:elasticache:${r}:${var.account_id}:serverlesscache:${p}-valkey"]
 
@@ -534,7 +539,7 @@ resource "aws_eks_pod_identity_association" "this" {
 locals {
   secret_store_secrets = {
     external_secrets_platform = { secrets = local.platform_secrets, description = "platform-secrets store: sft/<env>/platform/* only" }
-    external_secrets_app      = { secrets = local.api_store_secrets, description = "application-secrets store: the API's keyrings and this Region's client only" }
+    external_secrets_app      = { secrets = local.api_store_secrets, description = "application-secrets store: the application's keyrings and this Region's client only" }
   }
 
   secret_store_policies = {

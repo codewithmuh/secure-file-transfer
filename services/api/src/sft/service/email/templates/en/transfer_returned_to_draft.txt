@@ -1,0 +1,13 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}Your transfer is back to draft{% endblock %}
+{% block body %}
+Your transfer went back to draft, and no recipient has been notified. No
+file was left that could be sent: each was removed, or couldn't be uploaded
+or shared. The transfer page shows each file and what happened to it.
+
+You can add files and send the transfer again, or cancel it. When you send
+it again, its expiry starts again.
+
+View the transfer:
+{{ transfer_url }}
+{% endblock %}

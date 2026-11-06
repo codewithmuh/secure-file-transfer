@@ -22,6 +22,9 @@ from sft.data.outbox import (
     FILE_SCAN,
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
+    RECIPIENT_CODE_REQUESTED,
+    RECIPIENT_LINK_DUE,
+    RECIPIENT_LOCKED,
     TOPICS,
     TRANSFER_HELD,
     TRANSFER_RETURNED_TO_DRAFT,
@@ -60,6 +63,7 @@ def test_a_registry_refuses_a_topic_twice() -> None:
 def test_the_service_names_each_topic_it_sends() -> None:
     # Each feature adds its topics, with the queue that carries them: invitations (#112), scans
     # (#114, #175), each to the pool of its size (ADR-0019), and the evaluation's notices (#174).
+    # The notification worker's own messages (#178, #179): per-recipient links, codes, lockouts.
     assert TOPICS == {
         "member.invited": MEMBER_INVITED,
         "file.scan": FILE_SCAN,
@@ -67,11 +71,15 @@ def test_the_service_names_each_topic_it_sends() -> None:
         "transfer.sent": TRANSFER_SENT,
         "transfer.held": TRANSFER_HELD,
         "transfer.returned_to_draft": TRANSFER_RETURNED_TO_DRAFT,
+        "recipient.link_due": RECIPIENT_LINK_DUE,
+        "recipient.code_requested": RECIPIENT_CODE_REQUESTED,
+        "recipient.locked": RECIPIENT_LOCKED,
     }
     assert MEMBER_INVITED.queue is Queue.NOTIFY
     assert FILE_SCAN.queue is Queue.SCAN_SMALL
     assert FILE_SCAN_LARGE.queue is Queue.SCAN_LARGE
-    for topic in (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT):
+    notices = (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT)
+    for topic in (*notices, RECIPIENT_LINK_DUE, RECIPIENT_CODE_REQUESTED, RECIPIENT_LOCKED):
         assert topic.queue is Queue.NOTIFY
 
 
@@ -283,12 +291,22 @@ async def test_the_writers_cannot_write_for_another_tenant_or_read_the_outbox(
 
 
 @pytest.mark.anyio
-async def test_the_notification_worker_writes_no_messages(outbox_db: ScratchDatabase) -> None:
+async def test_the_notification_worker_writes_messages_but_reads_none(
+    outbox_db: ScratchDatabase,
+) -> None:
+    # It writes each recipient's link message and the cap's deferrals (#178), in the message's
+    # tenant, and reads nothing back, as every writer but the relay.
+    tenant_id = uuid.uuid4()
     async with pool(outbox_db, NOTIFY) as notify:
+        async with notify.transaction(Scope.tenant(tenant_id)) as session:
+            await enqueue(session, RECIPIENT_LINK_DUE, {"recipient_id": uuid.uuid4()})
         with pytest.raises(DBAPIError) as caught:
-            async with notify.transaction(Scope.tenant(uuid.uuid4())) as session:
-                await enqueue(session, TOPIC, {"file_id": uuid.uuid4()})
+            async with notify.transaction(Scope.tenant(tenant_id)) as session:
+                await session.execute(select(Outbox.id))
         assert caught.value.orig.sqlstate == INSUFFICIENT_PRIVILEGE  # type: ignore[union-attr]
+    assert outbox_db.sql("SELECT tenant_id, topic FROM outbox") == [
+        (tenant_id, "recipient.link_due")
+    ]
 
 
 async def _enqueue_some(db: ScratchDatabase, count: int) -> None:

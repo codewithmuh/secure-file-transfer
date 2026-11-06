@@ -330,10 +330,10 @@ jobs:
           PORT: ${{ matrix.port }}
           INTERNAL_PORT: ${{ matrix.internal_port }}
         run: |
-          # The API needs DATABASE_URL, VALKEY_URL, the sign-in settings and the files buckets to start,
-          # but connects to each only when a request needs it, so nothing has to listen on these
-          # addresses. Every value is an obviously fake one for CI; the CSRF key is 32 bytes of "x",
-          # the email one of "y".
+          # The API needs DATABASE_URL, VALKEY_URL, the sign-in settings, the files buckets and the audit
+          # archive to start, but connects to each only when a request needs it, so nothing has to listen on
+          # these addresses. Every value is an obviously fake one for CI; the CSRF key is 32 bytes of "x",
+          # the email one of "y", the code one of "z".
           docker run --detach --name smoke --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --env DATABASE_URL=postgresql://sft_api@127.0.0.1:1/sft \
             --env VALKEY_URL=redis://u:p@127.0.0.1:1/0 --env WEB_ORIGIN=https://app.sft.test \
@@ -345,6 +345,8 @@ jobs:
             --env 'EMAIL_HMAC_KEYRING=[{"id":"ci","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]' \
             --env S3_FILES_BUCKET=sft-ci-files --env S3_LARGE_FILES_BUCKET=sft-ci-large-files \
             --env S3_FILES_KMS_KEY_ID=00000000-0000-4000-8000-000000000001 \
+            --env AUDIT_ARCHIVE_TOKYO_BUCKET=sft-ci-audit-archive \
+            --env 'CODE_HMAC_KEYRING=[{"id":"ci","state":"active","key":"enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="}]' \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9001/readyz; then break; fi

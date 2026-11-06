@@ -14,6 +14,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import SpanKind
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from archive_fixtures import fake_archive
 from member_fixtures import (
     RecordingLimiter,
     app_for,
@@ -244,7 +245,13 @@ async def test_two_admins_demoting_each_other_at_once_leave_one_admin(
             caller = session_caller(tenant.id, by, Role.ADMIN)
             try:
                 return await members.update_user(
-                    database, caller, target, role=Role.MEMBER, origin=origin, now=datetime.now(UTC)
+                    database,
+                    caller,
+                    target,
+                    role=Role.MEMBER,
+                    archive=fake_archive(),
+                    origin=origin,
+                    now=datetime.now(UTC),
                 )
             except Conflict as exc:
                 return exc

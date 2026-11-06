@@ -76,7 +76,7 @@ name them exactly (#101, #102), and every one carries the workload permissions b
 | `sft-<env>-lb-controller` | `kube-system` / `aws-load-balancer-controller` | TargetGroupBinding only: describe, and register and deregister targets in the environment's target groups. The edge layer owns the load balancer, its target groups and the security group rule |
 | `sft-<env>-external-secrets` | `external-secrets` / `external-secrets` | No secret read: only assume the two store roles below (encryption 6.4) |
 | `sft-<env>-external-secrets-platform` | none: assumed by the External Secrets role only | Read `sft/<env>/platform/*`, for the `platform-secrets` store (argocd, monitoring, grafana) |
-| `sft-<env>-external-secrets-app` | none: assumed by the External Secrets role only | Read the API's `csrf-hmac`, `email-hmac` and its Region's `idp-client`, for the `application-secrets` store (`sft` only, #106) |
+| `sft-<env>-external-secrets-app` | none: assumed by the External Secrets role only | Read the application's keyrings (`csrf-hmac`, `email-hmac`, `code-hmac`, `link-hmac`) and its Region's `idp-client`, for the `application-secrets` store (`sft` only, #106, #178, #179) |
 | `sft-<env>-kyverno` | `kyverno` / `kyverno-admission-controller`, `kyverno-reports-controller` | Read images and signatures in the organization's `sft/` and `mirror/` repositories; the registry key through ECR |
 | `sft-<env>-vpc-cni`, `sft-<env>-ebs-csi` | `kube-system`, through their EKS add-ons | AWS's managed policies for the two drivers; the EBS driver also the platform key through EC2 |
 | `sft-<env>-eks-cluster` | (EKS) | `AmazonEKSClusterPolicy`; the secrets key through EKS |

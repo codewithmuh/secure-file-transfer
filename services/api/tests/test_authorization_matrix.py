@@ -48,6 +48,7 @@ class Draft:
     file: uuid.UUID
     upload: str
     ready: uuid.UUID
+    recipient: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -64,7 +65,7 @@ def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Dra
     """As the superuser, like the isolation suite's seed; the part is in `objects`."""
     ready, _ = seed_transfer(db, tenant.id, tenant.target)
     seed_file(db, tenant.id, ready, state="scanning")
-    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}", ready)
+    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}", ready, uuid.uuid4())
     db.sql(
         "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in) "
         "VALUES (:id, :tenant, :owner, 'draft', interval '7 days')",
@@ -76,7 +77,7 @@ def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Dra
         "INSERT INTO transfer_recipients (id, tenant_id, transfer_id, email, email_normalized, "
         "locale) VALUES (:id, :tenant, :transfer, 'partner@example.test', "
         "'partner@example.test', 'en')",
-        id=uuid.uuid4(),
+        id=draft.recipient,
         tenant=tenant.id,
         transfer=draft.transfer,
     )
@@ -240,6 +241,22 @@ def policy_read_row() -> dict[str, int]:
     }
 
 
+def unlock_row() -> dict[str, int]:
+    """`recipient.unlock`: Own for a member, Tenant for an admin acting as one, never a key
+    (authn and authz 4.4). A local admin without a passkey gets `403 passkey_required` on another
+    member's transfer, as the contract says; API keys get `403`."""
+    return {
+        **NOT_A_TENANT_CALLER,
+        **{name: 403 for name in CALLERS if name.startswith("api_key")},
+        "member": 404,
+        "member_self": 200,
+        "admin_passkey": 200,
+        "admin_totp": 403,
+        "admin_stale": 200,
+        "admin_other_tenant": 404,
+    }
+
+
 USER_OPERATIONS = frozenset({"inviteUser", "listUsers", "getUser", "updateUser", "deactivateUser"})
 
 EXPECTED: dict[str, dict[str, int]] = {
@@ -262,6 +279,8 @@ EXPECTED: dict[str, dict[str, int]] = {
     "getFileInspection": file_read_row(200),
     "getTenantPolicy": policy_read_row(),
     "updateTenantPolicy": admin_row(200, step_up=True, item=False),
+    "listTransferRecipients": read_row(200, item=True),
+    "unlockRecipient": unlock_row(),
 }
 
 # The session's own operations read the session cookie itself, not a caller the matrix can put in
@@ -269,6 +288,20 @@ EXPECTED: dict[str, dict[str, int]] = {
 # a bearer, both, a revoked or expired session, a missing CSRF token, and the sign-in refusals.
 COVERED_BY_SIGN_IN_TESTS = frozenset(
     {"startSignIn", "completeSignIn", "signOut", "getCurrentMember"}
+)
+# The link steps are public, and the /session routes read the link cookie and `X-Link-Session`
+# themselves (#179): tests/test_links.py runs each with every caller of authn and authz 9.2 that
+# can reach them (no credential, a member's session cookie, a bearer token, a recipient's link
+# session, another recipient's and another tenant's), with real links and sessions.
+COVERED_BY_LINK_TESTS = frozenset(
+    {
+        "resolveLink",
+        "requestVerificationCode",
+        "createLinkSession",
+        "getLinkSession",
+        "endLinkSession",
+        "listSessionFiles",
+    }
 )
 
 # The problem code each refusal carries.
@@ -306,6 +339,12 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
         "getFileInspection": ("GET", f"{file}/inspection", None),
         "getTenantPolicy": ("GET", "/v1/tenant/policy", None),
         "updateTenantPolicy": ("PATCH", "/v1/tenant/policy", {"max_expiry": "P10D"}),
+        "listTransferRecipients": ("GET", f"/v1/transfers/{world.draft.transfer}/recipients", None),
+        "unlockRecipient": (
+            "POST",
+            f"/v1/transfers/{world.draft.transfer}/recipients/{world.draft.recipient}/unlock",
+            None,
+        ),
     }[operation]
 
 
@@ -316,6 +355,8 @@ STATE = """
                 FROM files WHERE tenant_id = :t
     UNION ALL SELECT 'usage', tenant_id, bytes_reserved::text FROM tenant_usage WHERE tenant_id = :t
     UNION ALL SELECT 'policy', tenant_id, max_expiry::text FROM tenant_policies WHERE tenant_id = :t
+    UNION ALL SELECT 'recipient', id, failed_attempts || '/' || (locked_at IS NULL)
+                FROM transfer_recipients WHERE tenant_id = :t
     ORDER BY 1, 2
 """
 
@@ -325,7 +366,7 @@ def test_the_matrix_covers_every_operation_the_app_serves_and_every_caller() -> 
         context.original_route.operation_id  # type: ignore[attr-defined]
         for context in iter_route_contexts(create_app().routes)
     }
-    assert served == set(EXPECTED) | COVERED_BY_SIGN_IN_TESTS
+    assert served == set(EXPECTED) | COVERED_BY_SIGN_IN_TESTS | COVERED_BY_LINK_TESTS
     for operation, row in EXPECTED.items():
         assert set(row) == set(CALLERS), operation
 

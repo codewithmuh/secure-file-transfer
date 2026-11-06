@@ -28,7 +28,10 @@ for bucket in sft-local-files sft-local-large-files; do
   echo "s3-init: $bucket ready (versioning on)"
 done
 
-put sft-local-audit-archive "$LOCATION" "x-amz-bucket-object-lock-enabled: true"
-put "sft-local-audit-archive?versioning" "<VersioningConfiguration $NS><Status>Enabled</Status></VersioningConfiguration>"
-put "sft-local-audit-archive?object-lock" "<ObjectLockConfiguration $NS><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>"
-echo "s3-init: sft-local-audit-archive ready (versioning on, Object Lock governance 1 day)"
+# The audit archive, and a second one standing in for Osaka's (#177): security-critical records go to both.
+for bucket in sft-local-audit-archive sft-local-audit-archive-osaka; do
+  put "$bucket" "$LOCATION" "x-amz-bucket-object-lock-enabled: true"
+  put "$bucket?versioning" "<VersioningConfiguration $NS><Status>Enabled</Status></VersioningConfiguration>"
+  put "$bucket?object-lock" "<ObjectLockConfiguration $NS><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>"
+  echo "s3-init: $bucket ready (versioning on, Object Lock governance 1 day)"
+done

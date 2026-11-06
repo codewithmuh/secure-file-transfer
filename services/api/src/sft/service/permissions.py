@@ -334,6 +334,10 @@ STEP_UP: Final = frozenset(
 PASSKEY_EXEMPT: Final = frozenset({"revokeTransfer", "revokeUploadRequest", "revokeApiKey"})
 """Revocations keep working in an admin's TOTP session: they can only stop sharing (3.3)."""
 
+PEOPLE_ONLY: Final = frozenset({"unlockRecipient", "unlockUploader"})
+"""Operations an API key is refused with `403`, not `401`: a lockout signals a possible attack, so
+a person decides (authn and authz 4.4, the contract's `unlockRecipient`)."""
+
 
 def _by_operation(permissions: tuple[Permission, ...]) -> Mapping[str, Permission]:
     found: dict[str, Permission] = {}
@@ -367,6 +371,8 @@ def authorize(caller: Caller | None, operation_id: str, *, now: datetime) -> Rea
     permission = permission_for(operation_id)
     if permission.public:
         return ANY
+    if caller is not None and caller.kind is CallerKind.API_KEY and operation_id in PEOPLE_ONLY:
+        raise Forbidden("permission_denied", "API keys can't unlock: a person decides.")
     if caller is None or not permission.accepts(caller.kind):
         raise Unauthenticated(
             "authentication_required", bearer=caller is not None and caller.bearer

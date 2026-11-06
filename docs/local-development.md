@@ -39,7 +39,7 @@ weekly. The configuration files are in [`local/`](../local/).
 | Service | Stands in for | Image | Port on 127.0.0.1 | Seeded with |
 |---|---|---|---|---|
 | `postgres` | Aurora PostgreSQL 17 ([ADR-0011](adr/0011-database-aurora-global.md)) | `postgres:17.11-trixie` | 5432 | Database `sft` and login `sft`, a superuser standing in for the master user |
-| `s3` | S3 ([ADR-0012](adr/0012-object-storage-s3.md)) | `adobe/s3mock:5.2.3` | 9090 | Created by `s3-init`: `sft-local-files` and `sft-local-large-files` with versioning on; `sft-local-audit-archive` with versioning and Object Lock (governance, 1 day, as in dev) |
+| `s3` | S3 ([ADR-0012](adr/0012-object-storage-s3.md)) | `adobe/s3mock:5.2.3` | 9090 | Created by `s3-init`: `sft-local-files` and `sft-local-large-files` with versioning on; `sft-local-audit-archive`, and `sft-local-audit-archive-osaka` standing in for Osaka's (#177), each with versioning and Object Lock (governance, 1 day, as in dev) |
 | `sqs` | SQS ([ADR-0013](adr/0013-queues-sqs-outbox.md)) | `softwaremill/elasticmq-native:1.7.1` | 9324 | `sft-local-` plus `scan-small`, `scan-large` and `notify` (work queues) and `signin-events`, `ses-events`, `guardduty-results` and `ses-tenant-status` (intake queues), each with a `-dlq` after 5 receives |
 | `valkey` | ElastiCache Serverless for Valkey ([ADR-0014](adr/0014-rate-limit-counters.md)) | `valkey/valkey:9.1.3-alpine` | 6379 | ACL user `sft-local`; the default user is off |
 | `mail` | SES ([ADR-0015](adr/0015-email-ses.md)) | `axllent/mailpit:v1.33.0` | 1025 (SMTP), 8025 (web UI and API) | Nothing; it catches every message |
@@ -51,7 +51,8 @@ pool, `scan-worker-small` (`:8012`, files up to 100 MB) and `scan-worker-large` 
 each port serving only `/healthz`, `/readyz` and `/metrics`, and `inspector`, the DLP inspector, from the API image.
 The inspector is only on the `inspection` network, which is internal: it can open no connection out and reach neither
 the database nor the counter store, and only the scan workers reach it (`make smoke` checks both). It runs non-root on
-a read-only root file system, with 4 GiB of scratch in memory. `s3-init` is a one-shot container that seeds the S3
+a read-only root file system, with 4 GiB of scratch in memory. The notification worker, `notifier` (`:8014`, #178,
+#179), sends every link, code and notice into Mailpit, linking to `WEB_ORIGIN`. `s3-init` is a one-shot container that seeds the S3
 stand-in on every `make up` and exits; repeating it is safe. So are the three database jobs of section 3, which run
 before the API starts.
 
@@ -119,6 +120,9 @@ role with the same password.
   comes back without them, where AWS applies the bucket's SSE-KMS default.
 - **Object Lock is configuration only.** The audit archive's lock configuration is stored, but no retention is
   applied, so archived records can be deleted locally. Immutability (NFR-15) is tested in AWS.
+- **Both archive regions are one S3Mock.** The API writes each security-critical record to `sft-local-audit-archive`
+  and to `sft-local-audit-archive-osaka` (#177), so a test can stop one, by pointing its setting at a bucket that
+  doesn't exist, and see the `503`. The cross-region route and its IAM are M4's.
 - **CORS allows every origin.** In AWS, browser part uploads need the bucket's CORS rule, which exposes `ETag`
   (Terraform, M3 and M4).
 - **No lifecycle rules, replication to Osaka or GuardDuty Malware Protection.** Large-file scans can't be tested
@@ -179,7 +183,9 @@ role with the same password.
 - **No sign-in triggers**, so no counting of failed sign-ins and no `sign_in.attempted` events. Tests put trigger events
   on `sft-local-signin-events`.
 - **Secure cookies.** Keycloak marks its sign-in cookies `Secure`. Browsers send them to `http://localhost`; scripted
-  clients must send them too, as `local/smoke.py` does.
+  clients must send them too, as `local/smoke.py` does. The API's own cookies (`__Host-sft_session`, and
+  `__Host-sft_link` for recipients' link sessions, #179) are `Secure` and `__Host-` locally too: browsers treat
+  `http://localhost` as a secure context and keep them, so nothing about them differs from AWS.
 - **Nothing persists.** The realm is re-imported from [`local/keycloak/sft-realm.json`](../local/keycloak/sft-realm.json)
   on every start, so change that file, not the admin console.
 

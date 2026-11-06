@@ -20,6 +20,7 @@ import httpx2 as httpx
 from fastapi import FastAPI
 
 from api_settings import EMAIL_HMAC_KEYRING
+from archive_fixtures import fake_archive
 from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.api.app import create_app
@@ -31,6 +32,7 @@ from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
 from sft.data.models import Role
 from sft.data.roles import API
+from sft.service.audit_archive import AuditArchive
 from sft.service.caller import AuthMethod, Caller
 from sft.service.rate_limits import Charge
 from sft.service.rate_limits.limits import KeyType, KeyValue, Limit
@@ -134,12 +136,14 @@ def app_for(
     limiter: RecordingLimiter | None = None,
     objects: FakeObjects | None = None,
     policy: UploadPolicy | None = None,
+    archive: AuditArchive | None = None,
 ) -> FastAPI:
     app = create_app()
     app.state.database = database
     app.state.email_keyring = EMAIL_KEYRING
     app.state.objects = objects or FakeObjects()
     app.state.upload_policy = policy or UploadPolicy()
+    app.state.audit_archive = archive or fake_archive()
     recording = limiter or RecordingLimiter()
 
     def resolve() -> Caller:
@@ -159,10 +163,13 @@ async def client(
     caller: Callable[[], Caller | None],
     limiter: RecordingLimiter | None = None,
     objects: FakeObjects | None = None,
+    archive: AuditArchive | None = None,
 ) -> AsyncIterator[httpx.AsyncClient]:
     database = Database.connect(db.url(API), pool_size=2)
     try:
-        transport = httpx.ASGITransport(app=app_for(database, caller, limiter, objects))
+        transport = httpx.ASGITransport(
+            app=app_for(database, caller, limiter, objects, archive=archive)
+        )
         async with httpx.AsyncClient(transport=transport, base_url="http://api.test") as http:
             yield http
     finally:

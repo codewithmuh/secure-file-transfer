@@ -94,7 +94,9 @@ def topic_registry(*topics: Topic) -> Mapping[str, Topic]:
 
 MEMBER_INVITED: Final = Topic("member.invited", Queue.NOTIFY)
 """A user was invited (FR-22): the notification worker creates their sign-in and emails the
-invitation (authn and authz 2.5). Payload `{"user_id": …}`."""
+invitation (authn and authz 2.5). Payload `{"user_id": …}`. Until Cognito arrives (M4) the
+worker records it and sends nothing: an invitation needs the user pool's user and its temporary
+password, and the user stays `invited`, which is how M4 finds whom to invite (#178)."""
 
 FILE_SCAN: Final = Topic("file.scan", Queue.SCAN_SMALL)
 """A file of up to 100 MB reached `scanning`: a scan worker of the small pool streams it to clamd
@@ -110,8 +112,9 @@ them, and GuardDuty's result on the `guardduty-results` intake queue drives them
 then completion records them `scan_failed` (`large_file_scanning_unavailable`)."""
 
 TRANSFER_SENT: Final = Topic("transfer.sent", Queue.NOTIFY)
-"""The evaluation moved a transfer to `sent`: the notification worker (#178) emails each recipient
-their link (architecture 4.1). Payload `{"transfer_id": …}`."""
+"""The evaluation moved a transfer to `sent`: the notification worker (#178) writes one
+`recipient.link_due` message per recipient, in the transaction that records this one, so each
+email is retried on its own (architecture 4.1). Payload `{"transfer_id": …}`."""
 
 TRANSFER_HELD: Final = Topic("transfer.held", Queue.NOTIFY)
 """The evaluation held a transfer: the notification worker (#178) sends the member the
@@ -121,6 +124,23 @@ TRANSFER_RETURNED_TO_DRAFT: Final = Topic("transfer.returned_to_draft", Queue.NO
 """No counted file was left, so the evaluation moved a transfer back to `draft`: the notification
 worker (#178) tells the member (data model 3.2). Payload `{"transfer_id": …}`."""
 
+RECIPIENT_LINK_DUE: Final = Topic("recipient.link_due", Queue.NOTIFY)
+"""One recipient's link email is due (#178, data model 2.2): the notification worker derives the
+link, emails it and records the delivery. Written by the worker itself for each recipient of a
+`transfer.sent` message, so one message is one email, retried on its own; by an unlock (#179),
+which issues a new link; and by the worker again, delayed, when the address is over the
+cross-tenant cap (abuse 7.2). Payload `{"recipient_id": …}`."""
+
+RECIPIENT_CODE_REQUESTED: Final = Topic("recipient.code_requested", Queue.NOTIFY)
+"""A recipient asked for a verification code (`requestVerificationCode`, #179): the notification
+worker creates the code, supersedes the older ones and emails it to the stored address only
+(data model 2.4). Payload `{"recipient_id": …}`; the code itself never travels."""
+
+RECIPIENT_LOCKED: Final = Topic("recipient.locked", Queue.NOTIFY)
+"""A recipient was locked after 20 failed attempts (#179, NFR-14): the notification worker emails
+`recipient_locked` to the transfer's owner and every active tenant admin. Payload
+`{"recipient_id": …}`."""
+
 TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     MEMBER_INVITED,
     FILE_SCAN,
@@ -128,6 +148,9 @@ TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     TRANSFER_SENT,
     TRANSFER_HELD,
     TRANSFER_RETURNED_TO_DRAFT,
+    RECIPIENT_LINK_DUE,
+    RECIPIENT_CODE_REQUESTED,
+    RECIPIENT_LOCKED,
 )
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.

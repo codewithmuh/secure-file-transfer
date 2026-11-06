@@ -4,8 +4,8 @@
 #
 # - platform-secrets assumes sft-<env>-external-secrets-platform, which reads only sft/<env>/platform/*, for argocd,
 #   monitoring and grafana.
-# - application-secrets assumes sft-<env>-external-secrets-app, which reads only the API's csrf-hmac, email-hmac and
-#   this Region's idp-client (#106), for the sft namespace only.
+# - application-secrets assumes sft-<env>-external-secrets-app, which reads only the application's keyrings (csrf-hmac,
+#   email-hmac, code-hmac and link-hmac) and this Region's idp-client (#106, #178, #179), for the sft namespace only.
 #
 # So an ExternalSecret in a platform namespace can't reach an application secret, nor one in sft a platform secret,
 # whatever key it names: the namespace conditions pick the store, and the store's role decides what it can read.
