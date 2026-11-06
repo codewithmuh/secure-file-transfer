@@ -121,10 +121,18 @@ and checked on every rendered container by `tests/test_rendered.py`:
 - Only the API and the notification worker get `HTTPS_PROXY`, each its own listener. `NO_PROXY` keeps AWS calls on the
   VPC endpoints. Cognito is left out of it, so Cognito calls go through the listener.
 
+## Alerts
+
+`alerts/` holds alert rules in Prometheus rule format, each with its runbook and a `promtool test rules` unit test in
+`alerts/tests/` (`alerts/test.sh`, CI's deploy job): `ScanFailed` (#175) and `DlpInspectorFailing` (#176). The chart
+doesn't load them yet: nothing in the clusters evaluates rules before ADR-0009's monitoring stack and M7's alerting as
+code, which take them from here.
+
 ## Checks
 
 ```bash
-make deploy-check   # helm lint, template and kubeconform per cluster, the runtime-contract test, the admission policies
+make deploy-check   # helm lint, template and kubeconform per cluster, the runtime-contract test, the admission policies,
+                    # the alert rules' unit tests
 ```
 
 It needs helm 3, kubeconform and Docker, at the versions pinned in `.github/workflows/ci.yml` and `policies.sh`.

@@ -35,6 +35,7 @@ ENV_NAMES = (
     "AWS_REGION",
     "S3_ENDPOINT_URL",
     "TENANT_STORAGE_QUOTA_BYTES",
+    "SCAN_SMALL_POOL_MAX_BYTES",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -76,6 +77,7 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.aws_region == "ap-northeast-1"
     assert s.s3_endpoint_url is None
     assert s.tenant_storage_quota_bytes == 2 * 10**12
+    assert s.scan_small_pool_max_bytes == 100_000_000  # ADR-0019's 100 MB split
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:

@@ -1,4 +1,6 @@
-"""Draft transfers: create one, and the views the API returns (UC-1, FR-1 to FR-4; data model 2.2).
+"""Transfers: create a draft, read and list them, and the views the API returns (UC-1, FR-1 to
+FR-5; data model 2.2). Sending and cancelling are `sft.service.sending`; files are
+`sft.service.uploads` and `sft.service.file_reads`.
 
 Every function checks the caller against the permission registry first (`authorize`, authn and
 authz 6.1), then the resource rule (6.4): an item the caller can't see answers 404, one it can see
@@ -9,19 +11,29 @@ Permissions here (authn and authz 6.3, `sft.service.permissions`):
 
 - `transfer.create`: any member or admin; an API key with `transfers:write`. The member, or the
   key's owner, owns the new transfer.
+- `transfer.read` (`getTransfer`, `listTransfers`): Own for a member, Tenant for an admin acting as
+  one and for a key with `transfers:read`. Admins see metadata, never file contents (UC-3).
 - `file.upload` and `file.delete` (`sft.service.uploads`): Own for everyone. A caller who isn't the
   owner gets 404 unless it may read every transfer of its tenant (`transfer.read` at Tenant reach:
   an admin acting as one, or a key with `transfers:read`), which gets 403.
 
-Not here yet, and why: a recipient domain isn't checked against the tenant's allowed and blocked
-domains, nor an address against the suppression list, and `expires_in` isn't capped by the tenant's
-`max_expiry`, because the tenant policy's transfer fields and `email_suppressions` arrive with M2's
-policy and email issues. The default locale is `en` until the tenant's `default_locale` exists.
+**The tenant's policy** (FR-3, FR-23): `expires_in` defaults to 7 days, or the tenant's
+`max_expiry` if that is shorter, and may not exceed it. **The suppression list** (data model 2.5,
+abuse 7.4): an address this tenant suppresses is refused with `422 recipient_undeliverable`,
+pointing at the recipient; another tenant's entry for the same address never counts (NFR-12).
+
+**Expiry is read, not waited for.** A transfer past `expires_at` shows as `expired` at once, before
+the lifecycle job records it (architecture 4.2).
+
+Not here yet: recipient domains against the tenant's allowed and blocked domains (FR-24, M5). The
+default locale is the tenant's `default_locale`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import base64
+import binascii
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final
@@ -33,29 +45,45 @@ from sft.core.errors import (
     Conflict,
     FieldError,
     Forbidden,
+    InvalidRequest,
     NotFound,
     ProblemError,
     Unprocessable,
     json_pointer,
 )
 from sft.core.ids import uuid7
-from sft.data import audit, files, transfers
+from sft.core.pseudonyms import EmailKeyring
+from sft.data import audit, files, findings, suppressions, tenants, transfers
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
-from sft.data.models import File, FileState, Transfer, TransferState
+from sft.data.models import (
+    File,
+    FileState,
+    InspectionReason,
+    InspectionState,
+    ScanDetail,
+    ScanEngine,
+    Transfer,
+    TransferState,
+)
 from sft.data.scope import Scope
 from sft.service import fields
 from sft.service.caller import Caller, CallerKind
+from sft.service.evaluation import is_shareable
 from sft.service.idempotency import IdempotentRequest, Outcome, once
 from sft.service.permissions import Reach, authorize
 
 MIN_EXPIRY: Final = timedelta(hours=1)
 MAX_EXPIRY: Final = timedelta(days=30)
 DEFAULT_EXPIRY: Final = timedelta(days=7)
-"""FR-3. The tenant's `max_expiry` caps both once tenant policies hold it."""
+"""FR-3: 1 hour to 30 days, 7 by default; the tenant's `max_expiry` caps both (FR-23)."""
 
-DEFAULT_LOCALE: Final = "en"
+MAX_PAGE: Final = 100
+"""`listTransfers` returns at most this many per page (the contract's `Limit`)."""
+
+EXPIRES: Final = transfers.EXPIRES_FROM
+"""The states a transfer leaves for `expired` once `expires_at` passes (data model 3.2)."""
 
 TRANSFER: Final = "transfer"
 """The audit target and idempotency resource type of a transfer."""
@@ -88,12 +116,20 @@ class FileView:
     created_at: datetime
     part_size: int
     part_count: int
+    scanned_at: datetime | None = None
+    scan_engine: ScanEngine | None = None
+    scan_detail: ScanDetail | None = None
+    unscannable_allowed: bool = False
+    inspection_state: InspectionState = InspectionState.PENDING
+    inspection_reasons: tuple[InspectionReason, ...] = ()
+    detectors: tuple[str, ...] = ()
+    """The detectors that matched in the file (`File.inspection`), counts in `getFileInspection`."""
 
     @property
     def shareable(self) -> bool:
-        # A file is shareable once its scan and inspection allow it (data model 3.1); neither runs
-        # yet, so no file of this step is.
-        return False
+        """FR-16, data model 3.1. An `unscannable` file allowed by policy is shareable, and the
+        web app shows FR-18's warning from its state."""
+        return is_shareable(self.state, self.unscannable_allowed, self.inspection_state)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +164,16 @@ class TransferView:
         return sum(f.declared_size for f in self.files if f.state is not FileState.REJECTED)
 
 
+def effective_state(
+    state: TransferState, expires_at: datetime | None, now: datetime
+) -> TransferState:
+    """The state as the API shows it: `expired` once `expires_at` has passed, before the lifecycle
+    job records it (data model 3.2)."""
+    if state in EXPIRES and expires_at is not None and expires_at <= now:
+        return TransferState.EXPIRED
+    return state
+
+
 # ---- checks every operation shares ----
 
 
@@ -156,6 +202,13 @@ def require_reach(caller: Caller, reach: Reach, transfer: Transfer, now: datetim
     if sees_tenant(caller, now):
         raise Forbidden("permission_denied", "Only the transfer's sender may change it.")
     raise NotFound
+
+
+def require_visible(caller: Caller, reach: Reach, transfer: Transfer) -> None:
+    """The resource rule of a read (authn and authz 6.4): Own is the creator, for a key its
+    owner; Tenant sees every transfer of the tenant. Anything else is 404."""
+    if reach is not Reach.TENANT and transfer.created_by != caller.user_id:
+        raise NotFound
 
 
 def draft_conflict(transfer: Transfer) -> ProblemError | None:
@@ -189,7 +242,7 @@ def invalid(pointer: str, detail: str) -> Unprocessable:
 # ---- views ----
 
 
-def file_view(tenant_id: UUID, file: File) -> FileView:
+def file_view(tenant_id: UUID, file: File, detectors: Sequence[str] = ()) -> FileView:
     return FileView(
         id=file.id,
         transfer_id=file.transfer_id,
@@ -201,13 +254,25 @@ def file_view(tenant_id: UUID, file: File) -> FileView:
         created_at=file.created_at,
         part_size=file.part_size,
         part_count=file.part_count,
+        scanned_at=file.scanned_at,
+        scan_engine=None if file.scan_engine is None else ScanEngine(file.scan_engine),
+        scan_detail=None if file.scan_detail is None else ScanDetail(file.scan_detail),
+        unscannable_allowed=file.unscannable_allowed,
+        inspection_state=InspectionState(file.inspection_state),
+        inspection_reasons=tuple(InspectionReason(r) for r in file.inspection_reasons),
+        detectors=tuple(detectors),
     )
 
 
-async def transfer_view(session: AsyncSession, tenant_id: UUID, transfer: Transfer) -> TransferView:
+async def transfer_view(
+    session: AsyncSession, tenant_id: UUID, transfer: Transfer, now: datetime | None = None
+) -> TransferView:
     recipients = await transfers.list_recipients(session, transfer.id)
     transfer_files = await files.list_transfer_files(session, transfer.id)
+    detectors = await findings.detectors_by_file(session, [f.id for f in transfer_files])
     state = TransferState(transfer.state)
+    if now is not None:
+        state = effective_state(state, transfer.expires_at, now)
     return TransferView(
         id=transfer.id,
         state=state,
@@ -227,27 +292,73 @@ async def transfer_view(session: AsyncSession, tenant_id: UUID, transfer: Transf
         revoked_at=transfer.ended_at if state is TransferState.REVOKED else None,
         revoked_by=transfer.revoked_by,
         hold_reason=transfer.hold_reason,
-        files=tuple(file_view(tenant_id, f) for f in transfer_files),
+        files=tuple(file_view(tenant_id, f, detectors.get(f.id, ())) for f in transfer_files),
         recipients=tuple(RecipientView(r.id, r.email, r.locale) for r in recipients),
+    )
+
+
+# ---- the tenant's policy and the suppression list ----
+
+
+def check_expiry(expires_in: timedelta, max_expiry: timedelta, *, pointer: str | None) -> None:
+    """FR-3, FR-23: 1 hour to 30 days, and within the tenant's `max_expiry`."""
+    longest = min(MAX_EXPIRY, max_expiry)
+    if not MIN_EXPIRY <= expires_in <= longest:
+        detail = (
+            f"expires_in is between 1 hour and {describe_duration(longest)}, the tenant's maximum."
+        )
+        raise Unprocessable(
+            "expiry_out_of_range",
+            detail,
+            errors=[FieldError(detail, pointer=pointer)] if pointer else [],
+        )
+
+
+def describe_duration(value: timedelta) -> str:
+    """A duration in words, exactly: `1 hour`, `1 hour 30 minutes`, `1 day 12 hours`."""
+    seconds = int(value.total_seconds())
+    parts = []
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute"), (1, "second")):
+        count, seconds = divmod(seconds, size)
+        if count:
+            parts.append(f"{count} {unit}" + ("" if count == 1 else "s"))
+    return " ".join(parts) or "0 seconds"
+
+
+async def undeliverable(
+    session: AsyncSession, emails: EmailKeyring, addresses: Sequence[str]
+) -> int | None:
+    """The index of the first address this tenant suppresses, or None (data model 2.5)."""
+    by_pseudonym: dict[str, int] = {}
+    for index, address in enumerate(addresses):
+        for pseudonym in emails.every_version(address.lower()):
+            by_pseudonym.setdefault(pseudonym, index)
+    found = await suppressions.suppressed(session, by_pseudonym)
+    return min((by_pseudonym[p] for p in found), default=None)
+
+
+def undeliverable_error(index: int) -> Unprocessable:
+    detail = "The recipient's address bounced or complained; a tenant admin can clear it."
+    return Unprocessable(
+        "recipient_undeliverable",
+        detail,
+        errors=[FieldError(detail, pointer=json_pointer("recipients", index, "email"))],
     )
 
 
 # ---- createTransfer ----
 
 
-def _expiry(requested: timedelta | None) -> timedelta:
-    expires_in = DEFAULT_EXPIRY if requested is None else requested
-    if not MIN_EXPIRY <= expires_in <= MAX_EXPIRY:
-        detail = "expires_in is between 1 hour and 30 days."
-        raise Unprocessable(
-            "expiry_out_of_range",
-            detail,
-            errors=[FieldError(detail, pointer=json_pointer("expires_in"))],
-        )
+def _expiry(requested: timedelta | None, max_expiry: timedelta) -> timedelta:
+    """The draft's `expires_in`: as asked, or min(7 days, the tenant's maximum) (FR-3)."""
+    expires_in = min(DEFAULT_EXPIRY, max_expiry) if requested is None else requested
+    check_expiry(expires_in, max_expiry, pointer=json_pointer("expires_in"))
     return expires_in
 
 
-def _recipients(requested: Sequence[RecipientRequest]) -> list[transfers.NewRecipient]:
+def _recipients(
+    requested: Sequence[RecipientRequest], default_locale: str
+) -> list[transfers.NewRecipient]:
     seen: set[str] = set()
     out = []
     for index, recipient in enumerate(requested):
@@ -258,7 +369,7 @@ def _recipients(requested: Sequence[RecipientRequest]) -> list[transfers.NewReci
             )
         seen.add(normalized)
         out.append(
-            transfers.NewRecipient(uuid7(), recipient.email, recipient.locale or DEFAULT_LOCALE)
+            transfers.NewRecipient(uuid7(), recipient.email, recipient.locale or default_locale)
         )
     return out
 
@@ -268,18 +379,19 @@ async def create_transfer(
     caller: Caller,
     request: TransferRequest,
     *,
+    emails: EmailKeyring,
     origin: Origin,
     now: datetime,
     idempotency: IdempotentRequest | None = None,
 ) -> Outcome[TransferView]:
     """`createTransfer`: a new draft with its recipients (FR-1, FR-3, FR-4, FR-8).
 
-    With an `Idempotency-Key`, a retry of the same request gets the first answer, with the
-    transfer as it is now, and creates nothing again (`sft.service.idempotency`).
+    The expiry is checked against the tenant's policy, and every address against its suppression
+    list, under every key version of `emails` (data model 2.5). With an `Idempotency-Key`, a retry
+    of the same request gets the first answer, with the transfer as it is now, and creates
+    nothing again (`sft.service.idempotency`).
     """
     authorize(caller, "createTransfer", now=now)
-    expires_in = _expiry(request.expires_in)
-    recipients = _recipients(request.recipients)
     scope = tenant_scope(caller)
     tenant_id, user_id = scope.tenant_id, caller.user_id
     assert tenant_id is not None  # noqa: S101 - checked by tenant_scope
@@ -287,6 +399,12 @@ async def create_transfer(
     async with database.transaction(scope) as session:
 
         async def create() -> TransferView:
+            policy = await tenants.get_policy(session)
+            expires_in = _expiry(request.expires_in, policy.max_expiry)
+            recipients = _recipients(request.recipients, policy.default_locale)
+            refused = await undeliverable(session, emails, [r.email for r in recipients])
+            if refused is not None:
+                raise undeliverable_error(refused)
             transfer = await transfers.insert_transfer(
                 session,
                 transfer_id=uuid7(),
@@ -313,14 +431,14 @@ async def create_transfer(
                     has_message=request.message is not None,
                 ),
             )
-            return await transfer_view(session, tenant_id, transfer)
+            return await transfer_view(session, tenant_id, transfer, now)
 
         async def rebuild(transfer_id: UUID) -> TransferView | None:
             try:
                 transfer = await transfers.get_transfer(session, transfer_id)
             except NotFoundError:
                 return None
-            return await transfer_view(session, tenant_id, transfer)
+            return await transfer_view(session, tenant_id, transfer, now)
 
         return await once(
             session,
@@ -332,3 +450,107 @@ async def create_transfer(
             rebuild=rebuild,
             resource_id=lambda view: view.id,
         )
+
+
+# ---- getTransfer, listTransfers ----
+
+
+async def get_transfer(
+    database: Database, caller: Caller, transfer_id: UUID, *, now: datetime
+) -> TransferView:
+    """`getTransfer`: the transfer with its files and recipients, each file with its state, so a
+    held transfer shows which file isn't shareable and why (UC-1)."""
+    reach = authorize(caller, "getTransfer", now=now)
+    scope = tenant_scope(caller)
+    tenant_id = scope.tenant_id
+    assert tenant_id is not None  # noqa: S101 - tenant_scope gives a tenant scope
+    async with database.transaction(scope) as session:
+        try:
+            transfer = await transfers.get_transfer(session, transfer_id)
+        except NotFoundError:
+            raise NotFound from None
+        require_visible(caller, reach, transfer)
+        return await transfer_view(session, tenant_id, transfer, now)
+
+
+@dataclass(frozen=True, slots=True)
+class SummaryView:
+    id: UUID
+    state: TransferState
+    created_by: UUID
+    created_at: datetime
+    expires_at: datetime | None
+    sent_at: datetime | None
+    revoked_at: datetime | None
+    file_count: int
+    recipient_count: int
+    total_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class TransferPage:
+    items: tuple[SummaryView, ...]
+    next_cursor: str | None
+
+
+def encode_cursor(transfer_id: UUID) -> str:
+    """An opaque cursor: the last transfer of the page."""
+    return base64.urlsafe_b64encode(transfer_id.bytes).decode().rstrip("=")
+
+
+def decode_cursor(cursor: str) -> UUID:
+    try:
+        return UUID(bytes=base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidRequest("invalid_cursor") from exc
+
+
+async def list_transfers(
+    database: Database,
+    caller: Caller,
+    *,
+    tenant_wide: bool = False,
+    states: Collection[TransferState] = (),
+    cursor: str | None = None,
+    limit: int = 25,
+    now: datetime,
+) -> TransferPage:
+    """`listTransfers`, newest first. `scope=tenant` (`tenant_wide`) needs Tenant reach: an admin
+    acting as one, or an API key; a member gets 403 and a local admin without a passkey
+    `403 passkey_required`. `scope=own` is the caller's own, for a key its owner's."""
+    reach = authorize(caller, "listTransfers", now=now)
+    if tenant_wide and reach is not Reach.TENANT:
+        if caller.is_admin and caller.kind is CallerKind.MEMBER:
+            raise Forbidden("passkey_required", "The admin role needs a passkey sign-in.")
+        raise Forbidden("permission_denied", "scope=tenant needs the admin role or an API key.")
+    if not 1 <= limit <= MAX_PAGE:
+        raise ValueError("a page holds 1 to 100 transfers")
+    before = None if cursor is None else decode_cursor(cursor)
+    async with database.transaction(tenant_scope(caller)) as session:
+        # One query a page: the filter reads expiry from `expires_at`, as the states shown do.
+        found = await transfers.list_transfers(
+            session,
+            created_by=None if tenant_wide else caller.user_id,
+            states=set(states),
+            before=before,
+            limit=limit + 1,
+            now=now,
+        )
+    items = [
+        SummaryView(
+            id=summary.id,
+            state=effective_state(summary.state, summary.expires_at, now),
+            created_by=summary.created_by,
+            created_at=summary.created_at,
+            expires_at=summary.expires_at,
+            sent_at=summary.sent_at,
+            revoked_at=summary.ended_at if summary.state is TransferState.REVOKED else None,
+            file_count=summary.file_count,
+            recipient_count=summary.recipient_count,
+            total_size=summary.total_size,
+        )
+        for summary in found
+    ]
+    more = len(items) > limit
+    page = tuple(items[:limit])
+    return TransferPage(page, encode_cursor(page[-1].id) if more else None)

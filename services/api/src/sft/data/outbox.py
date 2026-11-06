@@ -97,14 +97,38 @@ MEMBER_INVITED: Final = Topic("member.invited", Queue.NOTIFY)
 invitation (authn and authz 2.5). Payload `{"user_id": …}`."""
 
 FILE_SCAN: Final = Topic("file.scan", Queue.SCAN_SMALL)
-"""A file up to 2 GB reached `scanning`: the scan worker streams it to clamd and the DLP inspector
-(architecture 4.1, #114). Payload `{"file_id": …}`."""
+"""A file of up to 100 MB reached `scanning`: a scan worker of the small pool streams it to clamd
+and its DLP inspector (architecture 4.1, ADR-0019, #175). Payload `{"file_id": …}`. A scan over
+its tenant's cap is sent again under the same topic, delayed 30 seconds."""
 
 FILE_SCAN_LARGE: Final = Topic("file.scan_large", Queue.SCAN_LARGE)
-"""A file over 2 GB reached `scanning`: GuardDuty scans it on its own, and the large-file scan
-worker waits for that result (ADR-0019, #114). Payload `{"file_id": …}`."""
+"""A file over 100 MB, up to 2,000,000,000 bytes, reached `scanning`: the same scan, in the large
+pool, so large files don't delay small ones (ADR-0019, #175). Payload `{"file_id": …}`.
 
-TOPICS: Final[Mapping[str, Topic]] = topic_registry(MEMBER_INVITED, FILE_SCAN, FILE_SCAN_LARGE)
+Files over 2,000,000,000 bytes (`storage_class = large`) get no scan message: ClamAV can't scan
+them, and GuardDuty's result on the `guardduty-results` intake queue drives them from M6. Until
+then completion records them `scan_failed` (`large_file_scanning_unavailable`)."""
+
+TRANSFER_SENT: Final = Topic("transfer.sent", Queue.NOTIFY)
+"""The evaluation moved a transfer to `sent`: the notification worker (#178) emails each recipient
+their link (architecture 4.1). Payload `{"transfer_id": …}`."""
+
+TRANSFER_HELD: Final = Topic("transfer.held", Queue.NOTIFY)
+"""The evaluation held a transfer: the notification worker (#178) sends the member the
+`transfer_held` email. Payload `{"transfer_id": …}`."""
+
+TRANSFER_RETURNED_TO_DRAFT: Final = Topic("transfer.returned_to_draft", Queue.NOTIFY)
+"""No counted file was left, so the evaluation moved a transfer back to `draft`: the notification
+worker (#178) tells the member (data model 3.2). Payload `{"transfer_id": …}`."""
+
+TOPICS: Final[Mapping[str, Topic]] = topic_registry(
+    MEMBER_INVITED,
+    FILE_SCAN,
+    FILE_SCAN_LARGE,
+    TRANSFER_SENT,
+    TRANSFER_HELD,
+    TRANSFER_RETURNED_TO_DRAFT,
+)
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.
 The relay leaves a row whose topic isn't here unpublished and counts it as a failure, which the

@@ -11,7 +11,7 @@ attributes, never delete an object (abuse and rate limits 6.2): there is no dele
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Final, Protocol
 
@@ -83,6 +83,36 @@ class ObjectStore(Protocol):
         self, storage_class: StorageClass, key: str, upload_id: str
     ) -> None:
         """Drop an unfinished upload and its parts. Only for an upload no row refers to."""
+        ...
+
+    async def close(self) -> None: ...
+
+
+SCAN_TAG: Final = "scan"
+"""The object tag the scan worker sets once a result is recorded (ADR-0019). The API's role may
+read only objects tagged `clean` or `unscannable_allowed`; the scan worker's only untagged ones."""
+
+
+class ScannedObjects(Protocol):
+    """What the scan worker needs of the files buckets (ADR-0019, ADR-0022): read the version
+    recorded at completion once, and tag it with the result. It never deletes or writes bytes."""
+
+    def read_version(
+        self, storage_class: StorageClass, key: str, version_id: str
+    ) -> AsyncIterator[bytes]:
+        """The bytes of exactly that version, in chunks, never the latest one."""
+        ...
+
+    async def object_tags(
+        self, storage_class: StorageClass, key: str, version_id: str
+    ) -> Mapping[str, str]:
+        """The version's tags, such as the ones GuardDuty sets."""
+        ...
+
+    async def put_object_tags(
+        self, storage_class: StorageClass, key: str, version_id: str, tags: Mapping[str, str]
+    ) -> None:
+        """Replace the version's tags with `tags`."""
         ...
 
     async def close(self) -> None: ...

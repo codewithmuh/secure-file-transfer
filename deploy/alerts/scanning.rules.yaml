@@ -1,0 +1,54 @@
+# Alerts of the scan pipeline (abuse and rate limits 8.2; #175, #176), in Prometheus rule format. Each links to its
+# runbook (NFR-17). Full alerting as code, Alertmanager's routing and the dashboards, arrive with M7; until then these
+# rules are the reviewed, tested source (`promtool test rules`, deploy/alerts/tests, run in CI's deploy job).
+#
+# The series come from the scan worker (sft.workers.scan) and the scan sweep (sft.workers.scan_sweep):
+# scan_results_total{state,reason}, dlp_inspection_results_total{state,reason} and dlp_inspector_failures_total{kind},
+# each label set made at zero when the worker starts, so a first failure shows as an increase. The dead-letter queues'
+# depth is CloudWatch's ApproximateNumberOfMessagesVisible as the CloudWatch exporter names it (ADR-0009, M7).
+groups:
+  - name: scanning
+    rules:
+      # FR-19: a file ended scan_failed, or a scan message reached its dead-letter queue. Files over 2 GB, which no
+      # engine scans until GuardDuty is connected (M6), end scan_failed with their own reason and don't page.
+      - alert: ScanFailed
+        expr: |
+          sum(increase(scan_results_total{state="scan_failed", reason!="large_file_scanning_unavailable"}[15m])) > 0
+          or
+          max(aws_sqs_approximate_number_of_messages_visible_maximum{dimension_QueueName=~"sft-.+-scan-(small|large)-dlq"}) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: A file ended scan_failed, or a scan message is in a dead-letter queue (FR-19).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/scan-failed.md
+
+      # FR-47, abuse 6.5: the inspector fails more than 1 % of its inspections for 10 minutes. Attempts are the
+      # inspections recorded (a skipped one never ran) plus the failed attempts. NFR-23's p95 joins when staging
+      # measures it.
+      - alert: DlpInspectorFailing
+        expr: |
+          sum(rate(dlp_inspector_failures_total[10m]))
+            /
+          clamp_min(
+            sum(rate(dlp_inspection_results_total{state!="failed"}[10m])) + sum(rate(dlp_inspector_failures_total[10m])),
+            1e-9
+          )
+          > 0.01
+        for: 10m
+        labels:
+          severity: page
+          condition: failure_rate
+        annotations:
+          summary: The DLP inspector fails more than 1 % of inspections (FR-47).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-inspector.md
+
+      # FR-47: a file's inspection failed on every attempt, so the file is blocked. The same alert as the failure
+      # rate's, told apart by its `condition` label, so each fires on its own terms.
+      - alert: DlpInspectorFailing
+        expr: sum(increase(dlp_inspection_results_total{state="failed"}[15m])) > 0
+        labels:
+          severity: page
+          condition: failed_inspection
+        annotations:
+          summary: A file's DLP inspection failed on every attempt; the file is blocked (FR-47).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-inspector.md

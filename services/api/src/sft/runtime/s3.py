@@ -15,16 +15,18 @@ Timeouts are short and retries few: completion calls S3 between two short transa
 3.1), and a request should answer within seconds. Checksums are computed only when S3 requires one,
 so a part URL carries no checksum header the browser would have to repeat.
 
-It lives in `sft.runtime` because both entry points need it: the API now, the scan worker in M2.
+It lives in `sft.runtime` because both entry points need it: the API for uploads
+(`sft.service.objects.ObjectStore`), and the scan worker, which reads the recorded version of a
+file once and tags it with its result (`ScannedObjects`, ADR-0019).
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import boto3
 from botocore.config import Config
@@ -42,6 +44,9 @@ if TYPE_CHECKING:
     from types_boto3_s3.client import S3Client
 
 _MISSING: Final = frozenset({"NoSuchUpload", "NoSuchKey", "404", "NotFound"})
+READ_CHUNK: Final = 1024 * 1024
+"""Bytes per read of a streamed object: the scan worker tees each chunk to clamd and the
+inspector, so memory stays a few chunks per scan, whatever the file's size."""
 
 
 def _error(exc: ClientError | BotoCoreError) -> ObjectStoreError:
@@ -58,7 +63,7 @@ class S3Objects:
         client: S3Client,
         buckets: Mapping[StorageClass, str],
         *,
-        kms_key_id: str,
+        kms_key_id: str | None,
         threads: int,
     ) -> None:
         if set(buckets) != set(StorageClass):
@@ -75,11 +80,12 @@ class S3Objects:
         region: str,
         files_bucket: str,
         large_files_bucket: str,
-        kms_key_id: str,
+        kms_key_id: str | None = None,
         endpoint_url: str | None = None,
         threads: int = 8,
     ) -> S3Objects:
-        """A store for one region's files buckets. Credentials come from the pod's IAM role."""
+        """A store for one region's files buckets. Credentials come from the pod's IAM role.
+        `kms_key_id` is the files key, needed only to start uploads (the API)."""
         config = Config(
             region_name=region,
             signature_version="s3v4",
@@ -107,6 +113,8 @@ class S3Objects:
         return self._buckets[StorageClass(storage_class)]
 
     async def create_multipart_upload(self, storage_class: StorageClass, key: str) -> str:
+        if self._kms_key_id is None:
+            raise ValueError("this store has no files key, so it starts no uploads")
         response = await self._call(
             self._client.create_multipart_upload,
             Bucket=self._bucket(storage_class),
@@ -207,6 +215,52 @@ class S3Objects:
             Bucket=self._bucket(storage_class),
             Key=key,
             UploadId=upload_id,
+        )
+
+    async def read_version(
+        self, storage_class: StorageClass, key: str, version_id: str
+    ) -> AsyncIterator[bytes]:
+        """`GetObject` for exactly `version_id`, in chunks; each read runs in the thread pool."""
+        response = await self._call(
+            self._client.get_object,
+            Bucket=self._bucket(storage_class),
+            Key=key,
+            VersionId=version_id,
+        )
+        body: Any = response["Body"]
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                try:
+                    chunk: bytes = await loop.run_in_executor(self._executor, body.read, READ_CHUNK)
+                except (ClientError, BotoCoreError) as exc:
+                    raise _error(exc) from exc
+                if not chunk:
+                    return
+                yield chunk
+        finally:
+            body.close()
+
+    async def object_tags(
+        self, storage_class: StorageClass, key: str, version_id: str
+    ) -> Mapping[str, str]:
+        response = await self._call(
+            self._client.get_object_tagging,
+            Bucket=self._bucket(storage_class),
+            Key=key,
+            VersionId=version_id,
+        )
+        return {tag["Key"]: tag["Value"] for tag in response.get("TagSet", [])}
+
+    async def put_object_tags(
+        self, storage_class: StorageClass, key: str, version_id: str, tags: Mapping[str, str]
+    ) -> None:
+        await self._call(
+            self._client.put_object_tagging,
+            Bucket=self._bucket(storage_class),
+            Key=key,
+            VersionId=version_id,
+            Tagging={"TagSet": [{"Key": k, "Value": v} for k, v in sorted(tags.items())]},
         )
 
     async def close(self) -> None:

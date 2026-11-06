@@ -23,10 +23,17 @@ rule through the transfer (`sft.service.transfers.require_reach`). `addTransferF
 `Idempotency-Key`: a retry is answered from the stored key before any S3 call, so it starts no
 second upload (`sft.service.idempotency.replay`).
 
+**Scanning** (#175): a completed file gets its scan message by its real size, to the small or the
+large ClamAV pool, and a scan deadline that grows with its size (`sft.service.scan_timing`). Above
+2,000,000,000 bytes only GuardDuty scans, which isn't connected before M6, so such a file is
+recorded `scan_failed` (`large_file_scanning_unavailable`) at completion.
+
+**The evaluation** (#174, data model 3.2) runs after every removal of a file from a transfer that
+isn't a draft and after every rejection, under the transfer's row lock, so removing the blocked
+file of a held transfer sends the rest, and removing its last counted file makes it a draft again.
+
 Not here yet: group F's per-file part-URL count and the tenant's daily upload volume (abuse and
-rate limits 2.2, 6.1) are byte and per-item budgets the limiter doesn't count yet; evaluation after
-a removal or a rejection matters only once a transfer can be submitted (`sendTransfer`, M2), so a
-non-draft transfer's files can't change yet.
+rate limits 2.2, 6.1) are byte and per-item budgets the limiter doesn't count yet.
 """
 
 from __future__ import annotations
@@ -56,10 +63,19 @@ from sft.data import audit, files, transfers, usage
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
-from sft.data.models import File, FileState, StorageClass, Transfer
-from sft.data.outbox import FILE_SCAN, FILE_SCAN_LARGE, enqueue
-from sft.service import fields
+from sft.data.models import (
+    File,
+    FileState,
+    InspectionState,
+    ScanDetail,
+    StorageClass,
+    Transfer,
+    TransferState,
+)
+from sft.data.outbox import enqueue
+from sft.service import fields, scan_timing
 from sft.service.caller import Caller
+from sft.service.evaluation import evaluate
 from sft.service.idempotency import IdempotentRequest, Outcome, once, replay
 from sft.service.objects import PART_URL_SECONDS, ObjectStore, ObjectStoreError
 from sft.service.permissions import Reach, authorize
@@ -67,6 +83,7 @@ from sft.service.transfers import (
     FileView,
     audit_details,
     draft_conflict,
+    effective_state,
     file_view,
     invalid,
     require_reach,
@@ -80,7 +97,8 @@ MAX_TOTAL_SIZE: Final = 20_000_000_000
 MAX_FILES: Final = 50
 """FR-1: 50 files per transfer."""
 LARGE_FILE_THRESHOLD: Final = 2_000_000_000
-"""Files over this go to the large-files bucket pair, which GuardDuty scans (ADR-0012, ADR-0019)."""
+"""Files over this go to the large-files bucket pair, which GuardDuty scans (ADR-0012, ADR-0019).
+Only the bucket: the scan pool follows the real size (`sft.service.scan_timing.scan_topic`)."""
 MIN_PART_SIZE: Final = 5 * 1024 * 1024
 """S3's smallest part but the last."""
 MAX_PARTS: Final = 1000
@@ -94,14 +112,17 @@ STORE_RETRY_AFTER: Final = 5
 FILE: Final = "file"
 """The audit target and idempotency resource type of a file."""
 
-# How long a file may stay `scanning` before reconciliation marks it `scan_failed` (data model
-# 3.1): every attempt's timeout, the inspection's 15-minute wall clock included (abuse 6.5), and
-# the backoff between them, for the 5 receives before a message is dead-lettered. GuardDuty
-# publishes no time to result, so large files get longer until staging measures it (ADR-0019).
-SCAN_ATTEMPTS: Final = 5
-SCAN_ATTEMPT_LIMIT: Final = timedelta(minutes=15)
-SCAN_BACKOFF: Final = timedelta(minutes=15)
-LARGE_SCAN_DEADLINE: Final = timedelta(hours=3)
+REMOVABLE: Final = frozenset(
+    {
+        TransferState.DRAFT,
+        TransferState.SUBMITTED,
+        TransferState.HELD,
+        TransferState.AWAITING_CONFIRMATION,
+        TransferState.PENDING_APPROVAL,
+    }
+)
+"""A file can be removed from a transfer in these states, but not once it is sent (data model
+3.2)."""
 
 
 class RejectReason(StrEnum):
@@ -120,6 +141,8 @@ class UploadPolicy:
     """What the API's settings decide about uploads."""
 
     storage_quota: int = DEFAULT_STORAGE_QUOTA
+    small_pool_max: int = scan_timing.SMALL_POOL_MAX_BYTES
+    """The largest file the small scan pool takes (ADR-0019's 100 MB split)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,12 +188,6 @@ def part_sizes(file: File) -> dict[int, int]:
 
 def storage_class_for(size: int) -> StorageClass:
     return StorageClass.LARGE if size > LARGE_FILE_THRESHOLD else StorageClass.STANDARD
-
-
-def scan_deadline(storage_class: StorageClass, now: datetime) -> datetime:
-    if storage_class is StorageClass.LARGE:
-        return now + LARGE_SCAN_DEADLINE
-    return now + SCAN_ATTEMPTS * SCAN_ATTEMPT_LIMIT + SCAN_BACKOFF
 
 
 def _too_many_files() -> Unprocessable:
@@ -250,14 +267,16 @@ async def _owned_file(
     return file, transfer
 
 
-async def _reject(
+async def reject(
     session: AsyncSession,
     caller: Caller,
     file: File,
     reason: RejectReason,
     origin: Origin,
 ) -> File:
-    """Phase 1 or 3 found a reason: the file is `rejected` and its reservation released."""
+    """Phase 1 or 3 found a reason, or the transfer was cancelled: the file is `rejected` and its
+    reservation released. The caller holds the transfer's row lock, and runs the evaluation if the
+    transfer may be past draft (`_reject_and_evaluate`)."""
     rejected = await files.reject_file(session, file.id)
     if rejected is None:  # pragma: no cover - the caller holds the lock and saw the state
         raise RuntimeError("the file changed under the transfer's row lock")
@@ -270,6 +289,28 @@ async def _reject(
         target=Target(FILE, file.id),
         origin=origin,
         details=audit_details(caller, transfer_id=file.transfer_id, reason=reason),
+    )
+    return rejected
+
+
+async def _reject_and_evaluate(
+    session: AsyncSession,
+    caller: Caller,
+    file: File,
+    reason: RejectReason,
+    origin: Origin,
+    now: datetime,
+) -> File:
+    """`reject`, then the evaluation: a rejection changes the transfer's counted files (data model
+    3.1, 3.2). It changes nothing for a draft or an ended transfer."""
+    rejected = await reject(session, caller, file, reason, origin)
+    await evaluate(
+        session,
+        file.transfer_id,
+        actor=caller.actor(),
+        now=now,
+        origin=origin,
+        details=audit_details(caller),
     )
     return rejected
 
@@ -570,6 +611,7 @@ async def complete_upload(
     *,
     origin: Origin,
     now: datetime,
+    small_pool_max: int = scan_timing.SMALL_POOL_MAX_BYTES,
 ) -> FileView:
     """`completeUpload`, in the three phases of data model 3.1. Safe to retry: a file already
     `completing` runs phases 2 and 3 again, and one past `completing` comes back unchanged."""
@@ -592,11 +634,11 @@ async def complete_upload(
         limits = None if conflict else await _limits(session, transfer.id)
         if file.removed_at is not None:
             # Removed while its upload was open: it is gone for the caller, and never assembled.
-            await _reject(session, caller, file, RejectReason.REMOVED, origin)
+            await _reject_and_evaluate(session, caller, file, RejectReason.REMOVED, origin, now)
             error = NotFound()
         elif conflict or limits:
             reason = RejectReason.TRANSFER_NOT_OPEN if conflict else _limit_reason(limits)
-            file = await _reject(session, caller, file, reason, origin)
+            file = await _reject_and_evaluate(session, caller, file, reason, origin, now)
             error = conflict or limits
         elif file.state == FileState.UPLOADING.value:
             started = await files.start_completion(session, file.id)
@@ -645,7 +687,7 @@ async def complete_upload(
                 reason, error = RejectReason.UPLOAD_GONE, _rejected("The upload no longer exists.")
             else:
                 reason, error = RejectReason.SIZE_MISMATCH, _size_mismatch()
-            await _reject(session, caller, file, reason, origin)
+            await _reject_and_evaluate(session, caller, file, reason, origin, now)
         elif isinstance(outcome, _Missing):
             await files.resume_uploading(session, file.id)
             await audit.record(
@@ -658,10 +700,14 @@ async def complete_upload(
             )
             error = _upload_incomplete()
         elif outcome.size != file.declared_size:
-            await _reject(session, caller, file, RejectReason.SIZE_MISMATCH, origin)
+            await _reject_and_evaluate(
+                session, caller, file, RejectReason.SIZE_MISMATCH, origin, now
+            )
             error = _size_mismatch()
         else:
-            return await _to_scanning(session, caller, file, outcome, origin, tenant_id)
+            return await _to_scanning(
+                session, caller, file, outcome, origin, tenant_id, small_pool_max=small_pool_max
+            )
     if error is None:  # pragma: no cover - every branch above sets one or returns
         raise RuntimeError("completion ended without a result")
     raise error
@@ -680,19 +726,26 @@ async def _to_scanning(
     assembled: _Assembled,
     origin: Origin,
     tenant_id: UUID,
+    *,
+    small_pool_max: int,
 ) -> FileView:
     storage_class = StorageClass(file.storage_class)
+    deadline = scan_timing.scan_deadline(
+        assembled.size, datetime.now(UTC), small_pool_max=small_pool_max
+    )
     scanning = await files.mark_scanning(
         session,
         file.id,
         actual_size=assembled.size,
         s3_version_id=assembled.version_id,
-        scan_deadline=scan_deadline(storage_class, datetime.now(UTC)),
+        scan_deadline=deadline,
     )
     if scanning is None:  # pragma: no cover - the lock holds the state seen
         raise RuntimeError("the file changed under the transfer's row lock")
-    topic = FILE_SCAN_LARGE if storage_class is StorageClass.LARGE else FILE_SCAN
-    await enqueue(session, topic, {"file_id": file.id})
+    # By the real size: the small or the large ClamAV pool, or GuardDuty's (no message, M6).
+    topic = scan_timing.scan_topic(assembled.size, small_pool_max=small_pool_max)
+    if topic is not None:
+        await enqueue(session, topic, {"file_id": file.id})
     await transfers.touch_draft(session, file.transfer_id)
     await audit.record(
         session,
@@ -707,7 +760,53 @@ async def _to_scanning(
             storage_class=storage_class,
         ),
     )
+    if topic is None:
+        scanning = await _no_engine_scans_it(session, caller, scanning, origin)
     return file_view(tenant_id, scanning)
+
+
+async def _no_engine_scans_it(
+    session: AsyncSession, caller: Caller, file: File, origin: Origin
+) -> File:
+    """A file over 2,000,000,000 bytes: only GuardDuty scans it, and nothing records its result
+    before M6. Rather than wait out a deadline, it is `scan_failed` at once, with
+    `large_file_scanning_unavailable`, so the member sees why, and the evaluation runs (a draft's
+    is a no-op; a send holds the transfer). It is never shareable (FR-16)."""
+    recorded = await files.record_scan(
+        session,
+        file.id,
+        state=FileState.SCAN_FAILED,
+        engine=None,
+        detail=ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
+        attempts=0,
+        unscannable_allowed=False,
+        inspection_state=InspectionState.SKIPPED,
+    )
+    if not recorded:  # pragma: no cover - the lock holds the state seen
+        raise RuntimeError("the file changed under the transfer's row lock")
+    await audit.record(
+        session,
+        action="file.scanned",
+        actor=caller.actor(),
+        target=Target(FILE, file.id),
+        origin=origin,
+        details=audit_details(
+            caller,
+            transfer_id=file.transfer_id,
+            state=FileState.SCAN_FAILED,
+            scan_detail=ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
+            inspection_state=InspectionState.SKIPPED,
+        ),
+    )
+    await evaluate(
+        session,
+        file.transfer_id,
+        actor=caller.actor(),
+        now=datetime.now(UTC),
+        origin=origin,
+        details=audit_details(caller),
+    )
+    return await files.get_file(session, file.id)
 
 
 # ---- deleteFile ----
@@ -716,8 +815,9 @@ async def _to_scanning(
 async def delete_file(
     database: Database, caller: Caller, file_id: UUID, *, origin: Origin, now: datetime
 ) -> None:
-    """`deleteFile` for a file of a draft: set `removed_at` and `delete_after` and release the
-    reservation (data model 3.2). The deletion job removes the contents. Removing a removed file
+    """`deleteFile` for a file of a transfer that wasn't sent: set `removed_at` and `delete_after`
+    and release the reservation (data model 3.2). On anything but a draft, the evaluation runs
+    next, in the same transaction. The deletion job removes the contents. Removing a removed file
     again changes nothing."""
     reach = authorize(caller, "deleteFile", now=now)
     async with database.transaction(tenant_scope(caller)) as session:
@@ -730,9 +830,9 @@ async def delete_file(
         file = await files.get_file(session, file_id)
         if file.removed_at is not None:
             return
-        conflict = draft_conflict(transfer)
-        if conflict is not None:
-            raise conflict
+        state = effective_state(TransferState(transfer.state), transfer.expires_at, now)
+        if state not in REMOVABLE:
+            raise _not_removable(state)
         await files.remove_file(session, file.id)
         if file.state != FileState.REJECTED.value:
             await usage.release_storage(session, file.declared_size)
@@ -745,3 +845,24 @@ async def delete_file(
             origin=origin,
             details=audit_details(caller, transfer_id=transfer.id, state=FileState(file.state)),
         )
+        if state is not TransferState.DRAFT:
+            await evaluate(
+                session,
+                transfer.id,
+                actor=caller.actor(),
+                now=now,
+                origin=origin,
+                details=audit_details(caller),
+            )
+
+
+def _not_removable(state: TransferState) -> Conflict:
+    if state is TransferState.REVOKED:
+        return Conflict("transfer_revoked", current_state=state.value)
+    if state is TransferState.EXPIRED:
+        return Conflict("transfer_expired", current_state=state.value)
+    return Conflict(
+        "invalid_state",
+        "Files can't be removed once the transfer is sent or cancelled.",
+        current_state=state.value,
+    )

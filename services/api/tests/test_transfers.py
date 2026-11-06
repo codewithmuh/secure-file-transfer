@@ -20,7 +20,7 @@ from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.data.database import Database
 from sft.data.models import Role
-from sft.service import uploads
+from sft.service import scan_timing, uploads
 from sft.service.caller import Caller, CallerKind
 from sft.service.uploads import UploadPolicy, upload_plan
 
@@ -179,17 +179,53 @@ async def test_a_file_uploads_in_parts_and_reaches_scanning_with_its_message(w: 
     assert len(w.actions(file_id)) == 4
 
 
-async def test_a_file_over_2_gb_goes_to_the_large_files_bucket(w: World) -> None:
+@pytest.mark.parametrize(
+    ("size", "storage_class", "topics"),
+    [
+        (5 * 10**6, "standard", ["file.scan"]),  # the small pool
+        (150 * 10**6, "standard", ["file.scan_large"]),  # ClamAV's large pool (ADR-0019)
+        (2 * 10**9, "standard", ["file.scan_large"]),  # ClamAV's side of the boundary
+        (2 * 10**9 + 1, "large", []),  # GuardDuty's (M6): no ClamAV queue
+    ],
+)
+async def test_the_scan_pool_follows_the_real_size(
+    w: World, size: int, storage_class: str, topics: list[str]
+) -> None:
+    w.app.state.upload_policy = UploadPolicy(storage_quota=10**10)
+    transfer_id = await draft(w)
+    file_id = str((await add(w, transfer_id, size))["id"])
+    [(stored_class,)] = w.db.sql("SELECT storage_class FROM files WHERE id = :id", id=file_id)
+    assert stored_class == storage_class
+    upload_everything(w, file_id, size)
+    done = (await w.client.post(f"/v1/files/{file_id}/complete")).json()
+    if topics:
+        assert done["state"] == "scanning"
+    else:
+        # Nothing scans it before GuardDuty (M6): failed at once, with the reason, not left to wait.
+        assert (done["state"], done["scan_detail"]) == (
+            "scan_failed",
+            "large_file_scanning_unavailable",
+        )
+        assert done["inspection"]["state"] == "skipped"
+        assert w.actions(file_id)[-2:] == ["file.uploaded", "file.scanned"]
+    rows = w.db.sql("SELECT topic FROM outbox WHERE payload->>'file_id' = :id", id=file_id)
+    assert [topic for (topic,) in rows] == topics
+    # The deadline grows with the size and covers every attempt (data model 3.1).
+    [(seconds,)] = w.db.sql(
+        "SELECT extract(epoch FROM scan_deadline - now()) FROM files WHERE id = :id", id=file_id
+    )
+    assert float(seconds) > scan_timing.ATTEMPTS * scan_timing.attempt_timeout(size).total_seconds()
+
+
+async def test_a_transfer_with_a_file_over_2_gb_is_held_at_send(w: World) -> None:
     w.app.state.upload_policy = UploadPolicy(storage_quota=10**10)
     transfer_id = await draft(w)
     size = 2 * 10**9 + 1
     file_id = str((await add(w, transfer_id, size))["id"])
-    [(storage_class,)] = w.db.sql("SELECT storage_class FROM files WHERE id = :id", id=file_id)
-    assert storage_class == "large"
     upload_everything(w, file_id, size)
-    assert (await w.client.post(f"/v1/files/{file_id}/complete")).json()["state"] == "scanning"
-    [(topic,)] = w.db.sql("SELECT topic FROM outbox WHERE payload->>'file_id' = :id", id=file_id)
-    assert topic == "file.scan_large"
+    assert (await w.client.post(f"/v1/files/{file_id}/complete")).status_code == 200
+    sent = await w.client.post(f"/v1/transfers/{transfer_id}/send")
+    assert (sent.json()["state"], sent.json()["hold_reason"]) == ("held", "file_blocked")
 
 
 # ---- completion's re-checks ----

@@ -918,7 +918,8 @@ table, except the quota gauge, which has one series per tenant.
 ### 8.2 Alerts
 
 Every alert links to its runbook (NFR-17). The runbooks are written in phase 6 under `docs/runbooks/`, with these
-names; the NFR-17 test fails until each exists.
+names; the NFR-17 test fails until each exists. `ScanFailed` and `DlpInspectorFailing` are written already, as
+Prometheus rules in `deploy/alerts/` with `promtool` unit tests, and their runbooks exist (#175, #176).
 
 | Alert | Fires when | Severity | Runbook |
 |---|---|---|---|
@@ -935,8 +936,9 @@ names; the NFR-17 test fails until each exists.
 | `HttpFlood` | WAF blocks above 10× baseline for 5 minutes, together with an error or latency burn | Page | `http-flood` |
 | `DownloadCapacity` | Active streams above 70 % of the pods' total cap for 10 minutes, or any stream refused with `503` | Ticket | `download-capacity` |
 | `TenantQuota` | A tenant at 80 % of its storage quota, its daily upload volume or its daily granted download bytes | Ticket | `tenant-quota` |
+| `ScanFailed` | Any file ends `scan_failed` for a reason other than `large_file_scanning_unavailable` (a file over 2 GB before GuardDuty is connected, M6), or a scan dead-letter queue isn't empty (FR-19) | Page | `scan-failed` |
 | `ScanEvasion` | A tenant's unscannable rate above 5 % of its files in an hour, or more than 20 limits-exceeded results in an hour | Ticket | `scan-evasion` |
-| `DlpInspectorFailing` | Inspector failures above 1 % of inspections for 10 minutes, any file ending `failed`, or NFR-23's p95 missed for 30 minutes | Page | `dlp-inspector` |
+| `DlpInspectorFailing` | Inspector failures above 1 % of inspections for 10 minutes, any file ending `failed`, or NFR-23's p95 missed for 30 minutes (this one joins when staging measures NFR-23) | Page | `dlp-inspector` |
 | `DlpEvasion` | A tenant's files not fully inspected for `encrypted` or `limit_exceeded` above 5 % in an hour, or one sender with more than 20 warnings confirmed in a day | Ticket | `dlp-evasion` |
 | `DlpApprovalBacklog` | A pending approval request older than half the tenant's approval timeout, or a tenant whose rules need approval with no eligible approver | Ticket | `dlp-approvals` |
 

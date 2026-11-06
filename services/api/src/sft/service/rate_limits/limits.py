@@ -11,10 +11,11 @@ one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every 
 number is a starting value, changed only through deploy config, for every tenant at once.
 
 This page carries the limits of the routes that exist now (groups B, F's request rates, G for
-`inviteUser`, H and J), and group A, whose per-link and per-address keys and fail-closed mode the
-limiter is built around. Groups C, D, E, I and K join with their routes. Concurrent streams
-(leases) and byte budgets are other algorithms: they come with the download issues, and with the
-upload follow-ups for group F's per-file part-URL count and the tenant's daily upload volume.
+`inviteUser` and `sendTransfer`, H and J), and group A, whose per-link and per-address keys and
+fail-closed mode the limiter is built around. Groups C, D, E, I and K join with their routes.
+Concurrent streams (leases) and byte budgets are other algorithms: they come with the download
+issues, and with the upload follow-ups for group F's per-file part-URL count and the tenant's
+daily upload volume.
 """
 
 from __future__ import annotations
@@ -88,10 +89,19 @@ class Rate:
     A fresh key admits a burst of `limit // 2 + 1` at once, then `(limit + 1) // 2` per period,
     evenly spaced, so no window (t - period, t] holds more than `limit` (`gcra_split` in
     `sft.data.counters`). A `cost` above the burst is never admitted.
+
+    `max_cost` is the largest cost one request may carry, such as a send to 50 recipients. The
+    store's burst admits it; the per-pod limit of an outage (4.5) is raised to admit it too, so the
+    largest valid request never fails only because the store is down (#129).
     """
 
     limit: int
     period_seconds: int
+    max_cost: int = 1
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_cost <= self.limit // 2 + 1:
+            raise ValueError("max_cost is at least 1 and within the store's burst")
 
 
 @dataclass(frozen=True)
@@ -174,8 +184,14 @@ F_CALLER = _limit(
 F_IP = _limit(Group.UPLOADS, "ip_requests", KeyType.IP, Rate(1200, MINUTE))
 
 # ---- G. Actions that send email. Recipient emails take a cost: one per address. ----
-G_CALLER_EMAILS = _limit(Group.EMAIL, "caller_emails", CALLER, Rate(200, HOUR))
-G_TENANT_EMAILS = _limit(Group.EMAIL, "tenant_emails", KeyType.TENANT, Rate(2000, HOUR))
+MAX_RECIPIENTS = 50
+"""A transfer's most recipients (the contract's `TransferCreate`): one send's largest cost."""
+G_CALLER_EMAILS = _limit(
+    Group.EMAIL, "caller_emails", CALLER, Rate(200, HOUR, max_cost=MAX_RECIPIENTS)
+)
+G_TENANT_EMAILS = _limit(
+    Group.EMAIL, "tenant_emails", KeyType.TENANT, Rate(2000, HOUR, max_cost=MAX_RECIPIENTS)
+)
 G_ADDRESS_EMAILS = _limit(Group.EMAIL, "address_link_emails", KeyType.TENANT_EMAIL, Quota(20, DAY))
 G_INVITES = _limit(Group.EMAIL, "tenant_invites", KeyType.TENANT, Rate(100, HOUR))
 G_ADDRESS_INVITES = _limit(Group.EMAIL, "address_invites", KeyType.TENANT_EMAIL, Quota(3, DAY))
@@ -229,6 +245,12 @@ UPLOAD = (F_CALLER, F_IP, H_TENANT)
 link-session twins): group F's own budgets, then the tenant's group H budget, which counts group F
 too (abuse and rate limits 2.2)."""
 
+LINK_EMAILS = (G_CALLER_EMAILS, G_TENANT_EMAILS)
+"""`sendTransfer`, after `TENANT_OPERATION`, once the send passes its checks: the caller's, then
+the tenant's recipient emails, each recipient costing one, with `ADDRESS_LINK_EMAILS` between the
+two for every address."""
+ADDRESS_LINK_EMAILS = (G_ADDRESS_EMAILS,)
+"""One address's link emails a day within the tenant (abuse 2.2, G)."""
 INVITE_USER = (G_CALLER_EMAILS, G_ADDRESS_INVITES, G_INVITES)
 """`inviteUser`, after `TENANT_OPERATION`, once the address is known."""
 CREATE_TENANT = (J_TENANTS,)

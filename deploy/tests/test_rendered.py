@@ -20,6 +20,7 @@ from sft.core.settings import (
     MigrationSettings,
     OperatorSettings,
     RelaySettings,
+    ScanSettings,
     Settings,
 )
 
@@ -51,6 +52,7 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.relay": RelaySettings,
     "sft.data.migrate": MigrationSettings,
     "sft.dlp.inspector": InspectorSettings,
+    "sft.workers.scan": ScanSettings,
 }
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 

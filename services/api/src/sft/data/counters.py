@@ -11,6 +11,10 @@ script can't reach keys in different hash slots:
 - `log`: a sliding log in a sorted set, for small event quotas (codes per address or link, failures
   per IP). Exact over the window. A `record` can also start a block for a fixed time.
 
+- `lease`: a capped set of leases in a sorted set, each with its own expiry, for work that runs a
+  while, such as the scans a tenant has running at once (ADR-0019). A lease that isn't released,
+  because its worker died, ends at its expiry.
+
 Each takes the time from the caller in milliseconds (pods keep their clocks within a millisecond
 with the Amazon Time Sync Service), so tests drive time instead of sleeping. A refused request
 changes nothing.
@@ -118,6 +122,25 @@ end
 return {1, 0}
 """
 
+# KEYS[1] the lease set; ARGV now (ms), ttl (ms), cap, member. Expired leases are dropped first. A
+# member that holds a lease already renews it. Returns 1 if the member holds a lease now, 0 if the
+# set is at its cap.
+_LEASE = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local cap = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+if not redis.call('ZSCORE', key, ARGV[4]) and redis.call('ZCARD', key) >= cap then
+  return 0
+end
+redis.call('ZADD', key, now + ttl, ARGV[4])
+if redis.call('PTTL', key) < ttl then
+  redis.call('PEXPIRE', key, ttl)
+end
+return 1
+"""
+
 
 def gcra_split(limit: int) -> tuple[int, int]:
     """GCRA's burst and its sustained rate per period, for at most `limit` in any period.
@@ -152,6 +175,41 @@ class Verdict:
 
 
 LogMode = Literal["hit", "peek", "record"]
+
+
+@dataclass(frozen=True)
+class RateCall:
+    """One `rate` script call in a batch (`CounterStore.run`)."""
+
+    key: str
+    limit: int
+    period_ms: int
+    cost: int
+    peek: bool
+
+
+@dataclass(frozen=True)
+class LogCall:
+    """One `log` script call in a batch."""
+
+    key: str
+    limit: int
+    window_ms: int
+    mode: LogMode
+    member: str
+    block_ms: int = 0
+    others: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScoresCall:
+    """The entry times in one log's window, in a batch."""
+
+    key: str
+    window_ms: int
+
+
+Call = RateCall | LogCall | ScoresCall
 
 
 @dataclass(frozen=True)
@@ -212,6 +270,7 @@ class CounterStore:
         self._clock = clock
         self._rate = client.register_script(_RATE)
         self._log = client.register_script(_LOG)
+        self._lease = client.register_script(_LEASE)
         self._failures = 0
         self._resting_until = 0.0
 
@@ -260,6 +319,60 @@ class CounterStore:
         if not isinstance(result, list):
             raise CounterStoreUnavailableError("unexpected answer from the counter store")
         return [float(score) for member, score in result if member != b"!block"]
+
+    async def acquire_lease(
+        self, key: str, member: str, *, now_ms: int, ttl_ms: int, cap: int
+    ) -> bool:
+        """Take (or renew) `member`'s lease in the set `key`, if fewer than `cap` are live."""
+        args: list[str | int] = [now_ms, ttl_ms, cap, member]
+        result = await self._call(lambda: self._lease(keys=[key], args=args))
+        return bool(result == 1)
+
+    async def release_lease(self, key: str, member: str) -> None:
+        await self._call(lambda: self._client.zrem(key, member))
+
+    async def run(self, calls: Sequence[Call], *, now_ms: int) -> list[Verdict | list[float]]:
+        """Many calls in one round trip: a pipeline, not a transaction, so each script still
+        touches one key, as cluster mode needs. One answer per call, in order: a `Verdict`, or
+        for `ScoresCall` the times. The whole batch fails as one `CounterStoreUnavailableError`."""
+        if not calls:
+            return []
+
+        async def execute() -> Any:
+            pipe = self._client.pipeline(transaction=False)
+            for call in calls:
+                if isinstance(call, RateCall):
+                    interval, burst = gcra_shape(call.limit, call.period_ms)
+                    args: list[str | int] = [
+                        now_ms,
+                        interval,
+                        burst,
+                        call.cost,
+                        "1" if call.peek else "0",
+                    ]
+                    await self._rate(keys=[call.key], args=args, client=pipe)
+                elif isinstance(call, LogCall):
+                    args = [now_ms, call.window_ms, call.limit, call.mode, call.member]
+                    args += [call.block_ms, *(repr(score) for score in call.others)]
+                    await self._log(keys=[call.key], args=args, client=pipe)
+                else:
+                    pipe.zrangebyscore(
+                        call.key, f"({now_ms - call.window_ms}", "+inf", withscores=True
+                    )
+            return await pipe.execute()
+
+        results = await self._call(execute)
+        if not isinstance(results, list) or len(results) != len(calls):
+            raise CounterStoreUnavailableError("unexpected answer from the counter store")
+        out: list[Verdict | list[float]] = []
+        for call, result in zip(calls, results, strict=True):
+            if isinstance(call, ScoresCall):
+                if not isinstance(result, list):
+                    raise CounterStoreUnavailableError("unexpected answer from the counter store")
+                out.append([float(score) for member, score in result if member != b"!block"])
+            else:
+                out.append(_verdict(result))
+        return out
 
     async def close(self) -> None:
         await self._client.aclose()

@@ -18,8 +18,10 @@ from sft.data.counters import LogMode, Verdict, gcra_shape
 FALLBACK_DIVISOR = 3
 
 
-def fallback_limit(limit: int) -> int:
-    return max(1, limit // FALLBACK_DIVISOR)
+def fallback_limit(limit: int, max_cost: int = 1) -> int:
+    """A third of `limit`, but never so low that one request of `max_cost` exceeds the burst:
+    GCRA admits `limit // 2 + 1` at once (`gcra_split`), so the floor is `2 * (max_cost - 1)`."""
+    return max(1, limit // FALLBACK_DIVISOR, 2 * (max_cost - 1))
 
 
 @dataclass

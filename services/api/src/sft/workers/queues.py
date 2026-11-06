@@ -98,6 +98,11 @@ class Queues(Protocol):
 
     async def delete(self, queue: str, receipt_handle: str) -> None: ...
 
+    async def extend_visibility(self, queue: str, receipt_handle: str, seconds: int) -> None:
+        """Keep a message hidden for `seconds` more while it is being worked on: a heartbeat,
+        never a way to put a message back (ADR-0019)."""
+        ...
+
     async def close(self) -> None: ...
 
 
@@ -215,6 +220,15 @@ class SqsQueues:
     async def delete(self, queue: str, receipt_handle: str) -> None:
         url = await self._url(queue)
         await self._call(self._client.delete_message, QueueUrl=url, ReceiptHandle=receipt_handle)
+
+    async def extend_visibility(self, queue: str, receipt_handle: str, seconds: int) -> None:
+        url = await self._url(queue)
+        await self._call(
+            self._client.change_message_visibility,
+            QueueUrl=url,
+            ReceiptHandle=receipt_handle,
+            VisibilityTimeout=seconds,
+        )
 
     async def close(self) -> None:
         """Wait for calls in flight, then close the client. Call it once, at shutdown."""

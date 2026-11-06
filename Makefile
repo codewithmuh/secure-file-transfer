@@ -130,7 +130,8 @@ infra-check: ## Check infra/: conventions, fmt, validate, tflint and Trivy (same
 
 # The deploy config under deploy/ (deploy/README.md): needs helm 3, kubeconform and Docker, at the versions in ci.yml.
 .PHONY: deploy-check
-deploy-check: ## Check deploy/: helm lint, template and kubeconform per cluster, the runtime contract, the admission policies (same as CI)
+deploy-check: ## Check deploy/: helm lint, template and kubeconform per cluster, the runtime contract, the admission policies, the alert rules (same as CI)
 	deploy/check.sh
 	uv run --project $(PY) --locked pytest -p no:cacheprovider deploy/tests
 	deploy/policies.sh
+	deploy/alerts/test.sh

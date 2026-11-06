@@ -87,3 +87,17 @@ class EmailKeyring:
                 email_pseudonym(k.id, k.key, email_normalized) for k in self._verify if in_overlap
             ),
         )
+
+    @property
+    def active_key_id(self) -> str:
+        return self._active.id
+
+    def active(self, email_normalized: str) -> str:
+        """The address's pseudonym under the active key: what a new suppression entry holds."""
+        return email_pseudonym(self._active.id, self._active.key, email_normalized)
+
+    def every_version(self, email_normalized: str) -> tuple[str, ...]:
+        """The address's pseudonym under every key that may still have rows: the active key and
+        each one kept to verify. A suppression lookup checks them all (data model 2.5)."""
+        keys = (self._active, *self._verify)
+        return tuple(email_pseudonym(k.id, k.key, email_normalized) for k in keys)

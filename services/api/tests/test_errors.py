@@ -343,7 +343,9 @@ def test_an_unknown_path_is_not_found(client: TestClient) -> None:
 def test_a_method_the_path_doesnt_take_is_not_allowed(client: TestClient) -> None:
     response = client.delete(f"/v1/transfers/{ID}")
     problem(response, 405, "method_not_allowed")
-    assert response.headers["allow"] == "POST"
+    # The path takes GET (`getTransfer`, #174) and this module's test POST; Starlette names the
+    # methods of the first route the path matches.
+    assert response.headers["allow"] in ("GET", "POST")
 
 
 def test_fastapi_security_errors_are_problems(client: TestClient) -> None:

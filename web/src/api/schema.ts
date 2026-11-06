@@ -290,11 +290,16 @@ export interface paths {
          *     platform-wide cap per address delays an email instead of refusing it: the recipient's `delivery_state` stays
          *     `queued`, which never says why (`listTransferRecipients`).
          *
-         *     Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
-         *     (cancelled), `409 transfer_revoked`, `409 transfer_expired`, `422 recipient_domain_not_allowed`,
-         *     `429 rate_limited`.
+         *     The draft is checked again against the tenant's policy and suppression list as they are now: an `expires_in`
+         *     above a `max_expiry` lowered since the draft was made is refused with `422 expiry_out_of_range`, and an
+         *     address the tenant has suppressed since then with `422 recipient_undeliverable`, with a pointer to the
+         *     recipient in `errors`. The draft is unchanged either way.
          *
-         *     Requirements: FR-1, FR-5, FR-7, FR-41, FR-45.
+         *     Errors: `403 permission_denied`, `409 transfer_empty`, `409 upload_incomplete`, `409 invalid_state`
+         *     (cancelled), `409 transfer_revoked`, `409 transfer_expired`, `422 expiry_out_of_range`,
+         *     `422 recipient_domain_not_allowed`, `422 recipient_undeliverable`, `429 rate_limited`.
+         *
+         *     Requirements: FR-1, FR-3, FR-5, FR-7, FR-23, FR-41, FR-45.
          */
         post: operations["sendTransfer"];
         delete?: never;
@@ -2934,6 +2939,15 @@ export interface components {
              * @enum {string|null}
              */
             scan_engine?: "clamav" | "guardduty" | null;
+            /**
+             * @description Why a file is `unscannable` or `scan_failed`, so the member sees what to do: encrypted content or a scan
+             *     limit (`unscannable`, FR-18); an engine error on every attempt or a scan that passed its deadline
+             *     (`scan_failed`, FR-19). `large_file_scanning_unavailable`: a file over 2,000,000,000 bytes, which only
+             *     GuardDuty Malware Protection scans, and which isn't connected in the local and dev builds until M6.
+             *     Remove the file and send it in smaller parts, or wait for M6. Empty otherwise.
+             * @enum {string|null}
+             */
+            scan_detail?: "encrypted" | "limit_exceeded" | "engine_error" | "deadline_passed" | "large_file_scanning_unavailable" | null;
             /**
              * Format: date-time
              * @description For received files, when the file is deleted (FR-13).

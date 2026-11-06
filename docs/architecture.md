@@ -650,6 +650,12 @@ sequenceDiagram
 - **The message.** The API runs the same detectors on a transfer's message when the transfer is created, in process,
   because it is at most 2,000 characters of text and needs no parser (FR-50).
 
+**Until DLP-4 (M5) there is no decision.** DLP-3 (#176) records each file's inspection, reasons and findings with its
+scan, and `getFileInspection` and `File.inspection` show them, but no rule acts on them yet: when every counted file is
+shareable, the evaluation sends the transfer (#174). No `dlp_decisions` row is written, and no transfer is
+`awaiting_confirmation` or held for `dlp_blocked`. An inspection that `failed` still blocks its file, because that is a
+shareability rule (FR-16, FR-47), not a DLP decision.
+
 **The decision.** When the evaluation finds every counted file shareable (4.1), it decides under the same row lock
 (data model 3.2):
 

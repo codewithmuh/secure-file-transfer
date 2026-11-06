@@ -9,7 +9,7 @@ from prometheus_client import CollectorRegistry
 from sft.core.errors import RateLimited, ServiceUnavailable
 from sft.core.pseudonyms import EmailPseudonyms
 from sft.data.counters import CounterMetrics, CounterStore, gcra_split
-from sft.service.rate_limits import RateLimiter, RateLimitStoreUnavailable, limits
+from sft.service.rate_limits import Charge, RateLimiter, RateLimitStoreUnavailable, limits
 from sft.service.rate_limits.limits import (
     ALL,
     MAX_TTL_SECONDS,
@@ -122,6 +122,16 @@ def test_group_f_counts_uploads_apart_from_group_h_but_in_the_tenant_budget() ->
     assert limits.F_IP.rule == Rate(1200, 60)
     assert limits.UPLOAD == (limits.F_CALLER, limits.F_IP, limits.H_TENANT)
     assert limits.H_CALLER not in limits.UPLOAD
+
+
+def test_group_g_counts_recipient_emails_for_sending() -> None:
+    # Abuse and rate limits 2.2, G: 200 recipient emails an hour per member or key, 2,000 per
+    # tenant, 20 link emails a day to one address within the tenant (#174).
+    assert limits.G_CALLER_EMAILS.rule == Rate(200, 3600, max_cost=50)
+    assert limits.G_TENANT_EMAILS.rule == Rate(2000, 3600, max_cost=50)
+    assert limits.G_ADDRESS_EMAILS.rule == Quota(20, 86400)
+    assert limits.LINK_EMAILS == (limits.G_CALLER_EMAILS, limits.G_TENANT_EMAILS)
+    assert limits.ADDRESS_LINK_EMAILS == (limits.G_ADDRESS_EMAILS,)
 
 
 def test_bundles_run_narrowest_first() -> None:
@@ -337,7 +347,8 @@ async def test_fail_open_limits_count_per_pod_at_a_third(
     down: RateLimiter, clock: Clock, limit: Limit
 ) -> None:
     keys = keys_for(limit)
-    for _ in range(at_once(limit.rule, fallback_limit(limit.rule.limit))):
+    max_cost = limit.rule.max_cost if isinstance(limit.rule, Rate) else 1
+    for _ in range(at_once(limit.rule, fallback_limit(limit.rule.limit, max_cost))):
         await down.check([limit], keys)
     with pytest.raises(RateLimited):
         await down.check([limit], keys)
@@ -374,3 +385,143 @@ def test_the_per_pod_limiter_bounds_its_memory() -> None:
     assert local.scores("missing", now_ms=0, window_ms=1000) == []
     assert fallback_limit(2) == 1
     assert fallback_limit(300) == 100
+    # Never so low that the largest request is refused: 50 recipients need a burst of 50 (#129).
+    assert fallback_limit(200, max_cost=50) == 98
+
+
+@pytest.mark.parametrize("limit", limits.LINK_EMAILS, ids=lambda limit: limit.id)
+async def test_a_send_to_50_recipients_passes_during_an_outage(
+    down: RateLimiter, limit: Limit
+) -> None:
+    # #129: a third of 200 an hour has a burst of 34, below one maximal send. The per-pod limit
+    # admits one, and refuses a second straight after it.
+    keys = {KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
+    await down.check([limit], keys, cost=limits.MAX_RECIPIENTS)
+    if limit is limits.G_CALLER_EMAILS:
+        with pytest.raises(RateLimited):
+            await down.check([limit], keys, cost=limits.MAX_RECIPIENTS)
+
+
+def test_a_rate_refuses_a_max_cost_beyond_its_burst() -> None:
+    with pytest.raises(ValueError, match="max_cost"):
+        limits.Rate(10, 60, max_cost=7)
+
+
+# ---- all or nothing, batched (`check_all`, #174 review) ----
+
+
+def send_charges(addresses: list[str]) -> list[Charge]:
+    """`sendTransfer`'s charges: the caller's and tenant's emails, and each address's."""
+    keys = {KeyType.ACCOUNT: ACCOUNT, KeyType.TENANT: TENANT}
+    count = len(addresses)
+    return [
+        Charge(limits.G_CALLER_EMAILS, keys, count),
+        *(
+            Charge(
+                limits.G_ADDRESS_EMAILS,
+                {KeyType.TENANT_EMAIL: EmailPseudonyms(f"e1:{a}").within(TENANT)},
+            )
+            for a in addresses
+        ),
+        Charge(limits.G_TENANT_EMAILS, keys, count),
+    ]
+
+
+async def snapshot(store: CounterStore) -> dict[bytes, object]:
+    """Every counter key and its value, to show a refusal charged nothing."""
+    client = store._client  # read here only, to compare before and after
+    out: dict[bytes, object] = {}
+    for key in sorted(await client.keys("rl:*")):
+        kind = await client.type(key)
+        if kind == b"zset":
+            out[key] = await client.zrange(key, 0, -1, withscores=True)
+        else:
+            out[key] = await client.get(key)
+    return out
+
+
+def store_calls(metrics: CounterMetrics) -> float:
+    """Calls made to the store: the latency histogram's count."""
+    [family] = metrics.latency.collect()
+    return next(s.value for s in family.samples if s.name.endswith("_count"))
+
+
+async def test_a_tenant_cap_refusal_charges_nothing(
+    limiter: RateLimiter, counter_store: CounterStore
+) -> None:
+    keys = {KeyType.ACCOUNT: "33333333-3333-4333-8333-333333333333", KeyType.TENANT: TENANT}
+    # The tenant has 2 emails left in its burst: another member used the rest.
+    left = gcra_split(2000)[0] - 2
+    while left:
+        cost = min(50, left)
+        await limiter.check([limits.G_TENANT_EMAILS], keys, cost=cost)
+        left -= cost
+    before = await snapshot(counter_store)
+    with pytest.raises(RateLimited):
+        await limiter.check_all(send_charges([f"a{n}" for n in range(3)]))
+    assert await snapshot(counter_store) == before
+
+
+async def test_an_address_refused_mid_list_charges_nothing(
+    limiter: RateLimiter, counter_store: CounterStore
+) -> None:
+    full = Charge(
+        limits.G_ADDRESS_EMAILS, {KeyType.TENANT_EMAIL: EmailPseudonyms("e1:full").within(TENANT)}
+    )
+    for _ in range(20):
+        await limiter.check_all([full])
+    before = await snapshot(counter_store)
+    with pytest.raises(RateLimited) as refused:
+        await limiter.check_all(send_charges(["first", "full", "last"]))
+    assert refused.value.retry_after > 0
+    assert await snapshot(counter_store) == before
+    # Without the full address, the same send is charged in full: every key, once.
+    await limiter.check_all(send_charges(["first", "last"]))
+    after = await snapshot(counter_store)
+    assert len(after) == len(before) + 4  # caller, tenant and the two addresses
+
+
+async def test_a_send_is_read_and_charged_in_two_store_calls(
+    counter_store: CounterStore, metrics: CounterMetrics, clock: Clock
+) -> None:
+    limiter = RateLimiter(counter_store, metrics, clock=clock)
+    charges = send_charges([f"r{n}" for n in range(50)])
+    counted = counter_store._metrics  # the store's own, which times each call
+    start = store_calls(counted)
+    await limiter.peek_all(charges)
+    assert store_calls(counted) == start + 1  # 52 limits, one pipelined call
+    await limiter.check_all(charges)
+    assert store_calls(counted) == start + 3  # read, then charge
+    assert len(await snapshot(counter_store)) == 52
+
+
+async def test_an_older_pseudonyms_count_is_added_in_one_more_call(
+    counter_store: CounterStore, metrics: CounterMetrics, clock: Clock
+) -> None:
+    limiter = RateLimiter(counter_store, metrics, clock=clock)
+    old = EmailPseudonyms("eold:x").within(TENANT)
+    new = EmailPseudonyms("enew:x", overlap=("eold:x",)).within(TENANT)
+    for _ in range(20):
+        await limiter.check_all([Charge(limits.G_ADDRESS_EMAILS, {KeyType.TENANT_EMAIL: old})])
+    with pytest.raises(RateLimited):
+        await limiter.check_all([Charge(limits.G_ADDRESS_EMAILS, {KeyType.TENANT_EMAIL: new})])
+
+
+async def test_all_or_nothing_holds_on_the_per_pod_limits(down: RateLimiter) -> None:
+    charges = send_charges([f"r{n}" for n in range(50)])
+    await down.check_all(charges)  # a maximal send passes on the per-pod limits (#129)
+    with pytest.raises(RateLimited):
+        await down.check_all(charges)  # the caller's per-pod budget is spent
+    other = {KeyType.ACCOUNT: "99999999-9999-4999-8999-999999999999", KeyType.TENANT: TENANT}
+    # The refusal charged none of the addresses: another member can send to them now.
+    await down.check_all(
+        [
+            Charge(limits.G_CALLER_EMAILS, other, 1),
+            *send_charges(["r0"])[1:2],
+        ]
+    )
+
+
+async def test_a_fail_closed_limit_in_a_batch_refuses_during_an_outage(down: RateLimiter) -> None:
+    with pytest.raises(RateLimitStoreUnavailable):
+        await down.check_all([Charge(limits.B_START, {KeyType.IP: IP})])

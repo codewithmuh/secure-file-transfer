@@ -1,6 +1,7 @@
 """The request and response bodies of the transfer and upload operations, as the contract defines
-them (docs/api/openapi.yaml: `TransferCreate`, `Transfer`, `FileCreate`, `File`, `PartUrlRequest`,
-`PartUrlList`, `UploadedParts` and the schemas they use).
+them (docs/api/openapi.yaml: `TransferCreate`, `Transfer`, `TransferPage`, `FileCreate`, `File`,
+`FileInspection`, `PartUrlRequest`, `PartUrlList`, `UploadedParts`, `TenantPolicy`,
+`TenantPolicyUpdate` and the schemas they use).
 
 The generated-spec check compares the schemas FastAPI builds from these with the contract (API
 README 11.1), so a field here is written to produce exactly the contract's schema. Two patterns
@@ -26,10 +27,16 @@ from pydantic import (
     ConfigDict,
     Field,
     WithJsonSchema,
+    model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from sft.core.addresses import is_plain_address
-from sft.service.transfers import FileView, TransferView
+from sft.data.models import UnscannablePolicy
+from sft.data.tenants import Policy
+from sft.service.file_reads import InspectionView
+from sft.service.tenant_policy import PolicyChange
+from sft.service.transfers import FileView, SummaryView, TransferPage, TransferView
 from sft.service.uploads import PartUrl as PartUrlResult
 from sft.service.uploads import UploadedParts as UploadedPartsResult
 
@@ -60,6 +67,13 @@ HoldReason = Literal["file_blocked", "dlp_blocked", "approval_rejected"]
 InspectionState = Literal["pending", "inspected", "partial", "not_inspected", "failed", "skipped"]
 InspectionReason = Literal[
     "encrypted", "no_text", "unsupported_type", "too_large", "limit_exceeded", "parse_error"
+]
+ScanDetailName = Literal[
+    "encrypted",
+    "limit_exceeded",
+    "engine_error",
+    "deadline_passed",
+    "large_file_scanning_unavailable",
 ]
 
 _DETECTOR_PATTERN: Final = (
@@ -180,6 +194,7 @@ class File(BaseModel):
     inspection: FileInspectionSummary
     scanned_at: datetime | None = None
     scan_engine: Literal["clamav", "guardduty"] | None = None
+    scan_detail: ScanDetailName | None = None
     retention_until: datetime | None = None
     created_at: datetime
     upload: Annotated[UploadPlan | None, WithJsonSchema(_UPLOAD_PLAN_SCHEMA)] = None
@@ -197,10 +212,15 @@ class File(BaseModel):
             actual_size=view.actual_size,
             state=view.state.value,
             shareable=view.shareable,
-            # No inspection runs before the scan worker (DLP-4); until then every file is pending.
             inspection=FileInspectionSummary(
-                state="pending", reasons=[], dlp_blocked=False, detectors=[]
+                state=view.inspection_state.value,
+                reasons=[r.value for r in view.inspection_reasons],
+                dlp_blocked=False,  # received files only (FR-51), with upload requests
+                detectors=list(view.detectors),
             ),
+            scanned_at=view.scanned_at,
+            scan_engine=None if view.scan_engine is None else view.scan_engine.value,
+            scan_detail=None if view.scan_detail is None else view.scan_detail.value,
             created_at=view.created_at,
         )
         if view.state.value == "uploading":
@@ -316,4 +336,207 @@ class UploadedParts(BaseModel):
             part_size=result.part_size,
             part_count=result.part_count,
             parts=[UploadedPart(part_number=n, size=size) for n, size in result.parts],
+        )
+
+
+class TransferSummary(BaseModel):
+    id: UUID
+    state: TransferStateName
+    created_by: UUID
+    created_at: datetime
+    expires_at: datetime | None
+    sent_at: datetime | None
+    revoked_at: datetime | None
+    file_count: int = Field(ge=0, le=50)
+    recipient_count: int = Field(ge=1, le=50)
+    total_size: int = Field(ge=0)
+    dlp_outcome: Literal["none", "allow_and_record", "warn", "require_approval", "block"] | None = (
+        None
+    )
+
+    @classmethod
+    def of(cls, view: SummaryView) -> TransferSummary:
+        return cls(
+            id=view.id,
+            state=view.state.value,
+            created_by=view.created_by,
+            created_at=view.created_at,
+            expires_at=view.expires_at,
+            sent_at=view.sent_at,
+            revoked_at=view.revoked_at,
+            file_count=view.file_count,
+            recipient_count=view.recipient_count,
+            total_size=view.total_size,
+            dlp_outcome=None,  # no DLP decision before DLP-4
+        )
+
+
+class TransferPageOut(BaseModel):
+    model_config = ConfigDict(title="TransferPage")
+
+    items: list[TransferSummary]
+    next_cursor: str | None
+
+    @classmethod
+    def of(cls, page: TransferPage) -> TransferPageOut:
+        return cls(
+            items=[TransferSummary.of(item) for item in page.items], next_cursor=page.next_cursor
+        )
+
+
+# ---- DLP inspection (getFileInspection) ----
+
+
+class DlpLocation(BaseModel):
+    """Where a match is (detectors 7). None are returned before DLP-8 encrypts them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    member: Annotated[str, Field(max_length=1024)] | SkipJsonSchema[None] = None
+    page: Annotated[int, Field(ge=1)] | SkipJsonSchema[None] = None
+    sheet: Annotated[str, Field(max_length=255)] | SkipJsonSchema[None] = None
+    row: Annotated[int, Field(ge=1)] | SkipJsonSchema[None] = None
+    slide: Annotated[int, Field(ge=1)] | SkipJsonSchema[None] = None
+    line: Annotated[int, Field(ge=1)] | SkipJsonSchema[None] = None
+    paragraph: Annotated[int, Field(ge=1)] | SkipJsonSchema[None] = None
+    part: (
+        Literal[
+            "body", "header", "footer", "footnotes", "comments", "notes", "properties", "message"
+        ]
+        | SkipJsonSchema[None]
+    ) = None
+
+
+class DlpFinding(BaseModel):
+    detector: Annotated[str, Field(max_length=71, pattern=_DETECTOR_PATTERN)]
+    detector_name: str
+    count_low: int = Field(ge=0)
+    count_medium: int = Field(ge=0)
+    count_high: int = Field(ge=0)
+    details_visible: bool
+    locations: Annotated[list[DlpLocation], Field(max_length=10)] | SkipJsonSchema[None] = None
+    """Only with details (DLP-8); left out, never null, until then."""
+    previews: (
+        Annotated[list[Annotated[str, Field(max_length=64)]], Field(max_length=3)]
+        | SkipJsonSchema[None]
+    ) = None
+
+
+class FileInspection(BaseModel):
+    file_id: UUID
+    state: InspectionState
+    reasons: list[InspectionReason] = Field(max_length=6, json_schema_extra={"uniqueItems": True})
+    dlp_blocked: bool
+    engine_version: str | None
+    policy_version: int | None
+    inspected_at: datetime | None
+    findings: list[DlpFinding] = Field(max_length=70)
+
+    @classmethod
+    def of(cls, view: InspectionView) -> FileInspection:
+        return cls(
+            file_id=view.file_id,
+            state=view.state.value,
+            reasons=[r.value for r in view.reasons],
+            dlp_blocked=view.dlp_blocked,
+            engine_version=view.engine_version,
+            policy_version=view.policy_version,
+            inspected_at=view.inspected_at,
+            findings=[
+                DlpFinding(
+                    detector=f.detector,
+                    detector_name=f.detector_name,
+                    count_low=f.count_low,
+                    count_medium=f.count_medium,
+                    count_high=f.count_high,
+                    details_visible=f.details_visible,
+                )
+                for f in view.findings
+            ],
+        )
+
+
+# ---- the tenant's policy ----
+
+Hostname = Annotated[str, Field(json_schema_extra={"format": "hostname"})]
+_DOMAINS_SCHEMA: Final = {
+    "type": "array",
+    "maxItems": 500,
+    "uniqueItems": True,
+    "items": {"type": "string", "format": "hostname"},
+}
+
+
+def _duration(value: timedelta) -> str:
+    """An ISO 8601 duration such as `P30D` or `PT12H`, as the contract's examples write them."""
+    seconds = int(value.total_seconds())
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    time = "".join(f"{n}{unit}" for n, unit in ((hours, "H"), (minutes, "M"), (secs, "S")) if n)
+    return ("P" + (f"{days}D" if days else "") + (f"T{time}" if time else "")) or "PT0S"
+
+
+class TenantPolicyOut(BaseModel):
+    model_config = ConfigDict(title="TenantPolicy")
+
+    max_expiry: Annotated[str, WithJsonSchema({"type": "string", "format": "duration"})]
+    unscannable_policy: UnscannablePolicy
+    received_file_retention_days: int = Field(ge=1, le=90)
+    allowed_domains: list[Hostname] = Field(max_length=500, json_schema_extra={"uniqueItems": True})
+    blocked_domains: list[Hostname] = Field(max_length=500, json_schema_extra={"uniqueItems": True})
+    default_locale: Locale
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, policy: Policy, *, now: datetime) -> TenantPolicyOut:
+        return cls(
+            max_expiry=_duration(policy.max_expiry),
+            unscannable_policy=policy.unscannable_policy,
+            received_file_retention_days=policy.received_file_retention_days,
+            allowed_domains=[],  # FR-24, M5
+            blocked_domains=[],
+            default_locale=policy.default_locale,  # type: ignore[arg-type]
+            # A tenant made before revision 0005 has no row, so no change time: now stands in.
+            updated_at=policy.updated_at or now,
+        )
+
+
+class TenantPolicyUpdate(BaseModel):
+    """The contract's `TenantPolicyUpdate`: only the fields sent are changed."""
+
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"minProperties": 1})
+
+    max_expiry: Annotated[
+        timedelta | SkipJsonSchema[None], _optional({"type": "string", "format": "duration"})
+    ] = None
+    unscannable_policy: UnscannablePolicy | SkipJsonSchema[None] = None
+    received_file_retention_days: Annotated[
+        int | None, _optional({"type": "integer", "minimum": 1, "maximum": 90})
+    ] = Field(default=None, ge=1, le=90)
+    allowed_domains: Annotated[list[str] | None, _optional(_DOMAINS_SCHEMA)] = Field(
+        default=None, max_length=500
+    )
+    blocked_domains: Annotated[list[str] | None, _optional(_DOMAINS_SCHEMA)] = Field(
+        default=None, max_length=500
+    )
+    default_locale: Locale | SkipJsonSchema[None] = None
+
+    @model_validator(mode="after")
+    def _something_to_change(self) -> TenantPolicyUpdate:
+        if not self.model_fields_set:
+            raise ValueError("send at least one field")
+        for name in self.model_fields_set:
+            if getattr(self, name) is None:
+                raise ValueError(f"{name} can't be null")
+        return self
+
+    def change(self) -> PolicyChange:
+        return PolicyChange(
+            max_expiry=self.max_expiry,
+            unscannable_policy=self.unscannable_policy,
+            received_file_retention_days=self.received_file_retention_days,
+            default_locale=self.default_locale,
+            allowed_domains=self.allowed_domains,
+            blocked_domains=self.blocked_domains,
         )

@@ -32,7 +32,7 @@ from sft.workers.consumer import (
     Delivery,
     Outcome,
 )
-from sft.workers.queues import OutgoingMessage
+from sft.workers.queues import OutgoingMessage, QueueError
 from sft.workers.relay import Relay, RelayMetrics
 
 pytestmark = pytest.mark.anyio
@@ -354,3 +354,37 @@ async def test_shutdown_abandons_a_long_poll_at_once(
     await asyncio.sleep(0.1)
     stopping.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+async def test_a_long_message_is_kept_hidden_while_it_is_worked_on(
+    outbox_db: ScratchDatabase, scan_db: Database, metrics: ConsumerMetrics
+) -> None:
+    # The scan worker's heartbeat: a scan may outlast the queue's visibility timeout (#175).
+    queues = FakeQueues()
+    deliver(queues, a_message().body())
+    loop = ConsumerLoop(DeferringConsumer(scan_db, pause=0.25), queues, metrics)
+    loop.heartbeat_seconds = 0.1  # type: ignore[assignment]
+    assert await loop.poll_once() == [Outcome.PROCESSED]
+    assert queues.extended
+    assert {handle for handle, _ in queues.extended} == {"0"}
+    count = len(queues.extended)
+    await asyncio.sleep(0.25)
+    assert len(queues.extended) == count  # the heartbeat stops with the message
+
+
+async def test_a_failed_extension_is_only_logged(
+    outbox_db: ScratchDatabase, scan_db: Database, metrics: ConsumerMetrics, json_logs: object
+) -> None:
+    queues = FakeQueues()
+    deliver(queues, a_message().body())
+
+    class Flaky(FakeQueues):
+        async def extend_visibility(self, queue: str, receipt_handle: str, seconds: int) -> None:
+            raise QueueError("ReceiptHandleIsInvalid")
+
+    flaky = Flaky(sent=queues.sent)
+    loop = ConsumerLoop(DeferringConsumer(scan_db, pause=0.25), flaky, metrics)
+    loop.heartbeat_seconds = 0.1  # type: ignore[assignment]
+    assert await loop.poll_once() == [Outcome.PROCESSED]
+    logged = [line["msg"] for line in json_logs()]  # type: ignore[operator]
+    assert any("visibility not extended" in str(msg) for msg in logged)

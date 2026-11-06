@@ -64,8 +64,60 @@ services:
       # The buckets. Depending on the one-shot also lets `up --wait` accept its exit on a re-run.
       s3-init: { condition: service_completed_successfully }
 
-  # relay: the outbox relay (#51) goes here, from *api-image, with `depends_on: *database-ready`
-  # and DATABASE_URL as sft_relay with the same local password.
+  # ---- The scan pipeline (ADR-0019, ADR-0022; #175, #176): one worker per pool, beside clamd and the DLP inspector ----
+
+  scan-worker-small: &scan-worker # files up to 100 MB, from the scan-small queue
+    <<: [*hardening, *api-image]
+    command: ["python", "-m", "sft.workers.scan"]
+    environment: &scan-worker-env
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SCAN_POOL: small
+      # Its own login role: it reads no file name or message, and may not read findings back (data model 4.2).
+      DATABASE_URL: postgresql://sft_scan:test-only-password@postgres:5432/sft
+      VALKEY_URL: redis://sft-local:local-only-valkey-password@valkey:6379/0 # the per-tenant scan caps
+      SQS_ENDPOINT_URL: http://sqs:9324
+      SQS_QUEUE_PREFIX: sft-local-
+      S3_ENDPOINT_URL: http://s3:9090
+      S3_FILES_BUCKET: sft-local-files
+      S3_LARGE_FILES_BUCKET: sft-local-large-files
+      CLAMD_HOST: clamd
+      INSPECTOR_HOST: inspector
+      SCAN_LARGE_POOL_SIZE: "2"
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    # The default network for the stack, and the inspector's, which has no way out.
+    networks: [default, inspection]
+    ports: ["127.0.0.1:8012:8001"] # /healthz, /readyz and /metrics; 8021 is macOS's ftp-proxy socket
+    stop_grace_period: 25s # more than the 15 s drain
+    depends_on:
+      <<: *database-ready
+      s3-init: { condition: service_completed_successfully }
+      sqs: { condition: service_healthy }
+      valkey: { condition: service_healthy }
+      clamd: { condition: service_healthy }
+      inspector: { condition: service_started }
+
+  scan-worker-large: # files over 100 MB, up to 2 GB, from the scan-large queue
+    <<: *scan-worker
+    environment:
+      <<: *scan-worker-env
+      SCAN_POOL: large
+    ports: ["127.0.0.1:8013:8001"]
+
+  inspector: # the DLP inspector (ADR-0022): our image, its own entry point, no credentials
+    <<: [*hardening, *api-image]
+    command: ["python", "-m", "sft.dlp.inspector"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      INSPECTOR_SCRATCH_DIR: /scratch
+    # 4 GiB of scratch for the file it inspects, in memory locally; nothing else is writable.
+    tmpfs: [/tmp, "/scratch:size=4g,uid=10001,gid=10001,mode=0700"]
+    # Only on the inspection network, which is internal: it reaches neither the database, the counter store, nor
+    # anything outside, and only the scan workers reach it (local/smoke.py checks both).
+    networks: [inspection]
+    # It speaks only its framed protocol, one file per connection, and has no probe port (deploy/README.md).
+    healthcheck: { disable: true }
+    stop_grace_period: 35s
 
   # ---- Database jobs: one-shot, in order, on every `make up`. Each is safe to repeat. ----
 
@@ -115,8 +167,9 @@ services:
     command: ["python", "-m", "sft.workers.relay"]
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # Its own login role, which reads and marks outbox rows in system scope only (ADR-0020).
-      DATABASE_URL: ${RELAY_DATABASE_URL:-postgresql://sft_relay@postgres:5432/sft}
+      # Its own login role, which reads and marks outbox rows in system scope only (ADR-0020), with the
+      # local-only password db-passwords gives every login role, as for the API and the scan workers.
+      DATABASE_URL: postgresql://sft_relay:test-only-password@postgres:5432/sft
       # ElasticMQ stands in for SQS; its queues are sft-local-scan-small, -scan-large and -notify.
       SQS_ENDPOINT_URL: ${SQS_ENDPOINT_URL:-http://sqs:9324}
       SQS_QUEUE_PREFIX: sft-local-
@@ -126,9 +179,9 @@ services:
     # 8001 inside: /healthz, /readyz and /metrics. A worker has no other port.
     ports: ["127.0.0.1:8011:8001"]
     stop_grace_period: 25s # more than the 15 s drain
-    # It needs the database bootstrapped and migrated too; those jobs join Compose in #79.
+    # Like every workload, it starts once the database is bootstrapped, has its passwords and is migrated.
     depends_on:
-      postgres: { condition: service_healthy }
+      <<: *database-ready
       sqs: { condition: service_healthy }
 
   # ---- Local stack: AWS stand-ins, pinned by version and digest. Ports bind to 127.0.0.1 only. ----
@@ -291,6 +344,11 @@ services:
       retries: 5
       start_period: 120s
       start_interval: 2s
+
+networks:
+  default: {}
+  inspection: # the DLP inspector's: no route out (ADR-0022)
+    internal: true
 
 volumes:
   postgres-data:

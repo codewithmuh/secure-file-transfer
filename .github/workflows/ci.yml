@@ -135,10 +135,23 @@ jobs:
       TEST_SQS_ENDPOINT_URL: http://127.0.0.1:9324
       TEST_VALKEY_URL: redis://:vk-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:6379/0
       TEST_S3_ENDPOINT_URL: http://127.0.0.1:9090
+      # clamd as the local stack runs it, with its zip-bomb limits, for the scan worker's engine tests (#175).
+      TEST_CLAMD_URL: tcp://127.0.0.1:3310
+      CI_SCAN_ENGINES: "1" # fail, rather than skip, if TEST_CLAMD_URL goes missing
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Not a service container: it needs the repository's clamd.conf. It loads its signatures while the steps below
+      # run, and the tests wait for it.
+      - name: Start clamd with the local stack's configuration (compose.yaml's image)
+        working-directory: .
+        run: >-
+          docker run --detach --name clamd --user 1000:1000 --read-only --tmpfs /tmp --tmpfs /run/clamav
+          --cap-drop ALL --security-opt no-new-privileges --entrypoint /init-unprivileged
+          --env CLAMAV_NO_FRESHCLAMD=true --publish 127.0.0.1:3310:3310
+          --volume "$PWD/local/clamav/clamd.conf:/etc/clamav/clamd.conf:ro"
+          clamav/clamav:1.5.4-debian@sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
@@ -149,7 +162,9 @@ jobs:
       - run: uv run ruff check --output-format=github .
       - run: uv run mypy
       - run: uv run lint-imports # the layers of ADR-0002 (see pyproject.toml)
-      - run: uv run pytest # against the PostgreSQL, ElasticMQ, Valkey and S3Mock services; fails below 80% coverage
+      - name: Wait for clamd's signatures
+        run: timeout 300 sh -c 'until docker exec clamd clamdcheck.sh >/dev/null 2>&1; do sleep 3; done'
+      - run: uv run pytest # against the PostgreSQL, ElasticMQ, Valkey, S3Mock and clamd services; fails below 80% coverage
 
   mail:
     name: Mail adapter (SMTP to Mailpit)
@@ -450,3 +465,5 @@ jobs:
           scan-ref: ${{ runner.temp }}/rendered
           severity: CRITICAL,HIGH
           exit-code: "1"
+      - name: The alert rules pass their unit tests (promtool from the pinned Prometheus image, deploy/alerts)
+        run: deploy/alerts/test.sh

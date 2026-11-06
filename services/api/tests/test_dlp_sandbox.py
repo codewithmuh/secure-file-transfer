@@ -70,19 +70,15 @@ def inspect(
     thread.start()
 
     async def scan() -> Result:
-        reader, writer = await asyncio.open_connection(sock=worker)
-        try:
+        with worker:
             return await client.inspect(
-                reader,
-                writer,
+                worker,
                 size=len(data),
                 body=_chunks(data),
                 builtin_detectors=dlp_stub.BUILTIN,
                 tenant_detectors=tenant or [],
                 prefix_bytes=(limits or Limits()).prefix_bytes,
             )
-        finally:
-            writer.close()
 
     answer: Result | Exception
     try:
