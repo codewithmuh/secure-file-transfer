@@ -230,11 +230,11 @@ async def test_50_parallel_grants_at_limit_1_give_exactly_one(w: World) -> None:
     browser = await w.browser()
     _, session = await w.verify(browser, address)
     responses = await asyncio.gather(*(grant(browser, session, file_id) for _ in range(50)))
-    statuses = sorted(r.status_code for r in responses)
-    assert statuses == [200] + [403] * 49
-    assert {r.json()["code"] for r in responses if r.status_code == 403} == {
-        "download_limit_reached"
-    }
+    # Exactly one grant. The other 49 are refused: by the download limit (403) or, when the
+    # counter store is up, by group D's grant rate first (429). Both are right for a burst of 50.
+    assert [r.status_code for r in responses].count(200) == 1
+    refused = {(r.status_code, r.json()["code"]) for r in responses if r.status_code != 200}
+    assert refused <= {(403, "download_limit_reached"), (429, "rate_limited")}, refused
     assert count(w, recipient, file_id) == 1
     assert w.db.sql("SELECT count(*) FROM download_grants WHERE file_id = :f", f=file_id) == [(1,)]
 
