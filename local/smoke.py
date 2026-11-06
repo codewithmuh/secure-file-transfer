@@ -325,13 +325,14 @@ from sft.dlp.detect import BUILTIN_DETECTORS
 
 async def main():
     data = b"nothing sensitive here"
-    reader, writer = await asyncio.open_connection("inspector", 8070)
+    # The same calls the scan worker makes: connect, then inspect over the socket, which we close.
+    sock = await client.connect("inspector", 8070)
     async def body():
         yield data
-    answer = await client.inspect(
-        reader, writer, size=len(data), body=body(), builtin_detectors=BUILTIN_DETECTORS
-    )
-    writer.close()
+    with sock:
+        answer = await client.inspect(
+            sock, size=len(data), body=body(), builtin_detectors=BUILTIN_DETECTORS
+        )
     print(answer.state)
 
 asyncio.run(main())
