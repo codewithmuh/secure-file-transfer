@@ -762,8 +762,9 @@ What is deliberately not a secret here:
   lets the application hold several keyring versions at once.
 - **Until then (as built, #106).** The API reads its settings from environment variables only (architecture 8), so
   for now its secrets reach it through External Secrets. The cluster-bootstrap stack's `application-secrets` store,
-  which only the `sft` namespace may use, reads `csrf-hmac`, `email-hmac` and the Region's `idp-client` as its own
-  role, `sft-<env>-external-secrets-app`, which may read exactly those ARNs and nothing else. The
+  which only the `sft` namespace may use, reads `csrf-hmac`, `email-hmac`, `code-hmac` (#179), `link-hmac` (#178,
+  for the notification worker's own Secret, `notifier-secrets`, never the API's) and the Region's `idp-client` as its
+  own role, `sft-<env>-external-secrets-app`, which may read exactly those ARNs and nothing else. The
   `platform-secrets` store, for `argocd`, `monitoring` and `grafana`, reads as `sft-<env>-external-secrets-platform`,
   which may read only `sft/{env}/platform/*`. The controller's own Pod Identity role reads no secret: it may only
   assume those two roles, each of which trusts only it, and the workload boundary allows no other `sts:AssumeRole`.

@@ -39,3 +39,19 @@ async def record_processed(session: AsyncSession, *, consumer: str, message_id: 
     )
     # 1 if the row is new, 0 if it was there already.
     return result.rowcount == 1
+
+
+async def recorded_before(session: AsyncSession, *, consumer: str, message_id: str) -> bool:
+    """Whether `consumer` has recorded the message already, without recording it now.
+
+    For a consumer whose work ends outside PostgreSQL, such as an email (ADR-0013): it checks
+    first, does its work, and records the message after the send, in a transaction of its own.
+    The check records the message in a savepoint and rolls that back, because the consumers may
+    only insert into the table, never read it.
+    """
+    nested = await session.begin_nested()
+    try:
+        new = await record_processed(session, consumer=consumer, message_id=message_id)
+    finally:
+        await nested.rollback()
+    return not new

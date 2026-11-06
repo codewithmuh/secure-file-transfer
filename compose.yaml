@@ -47,13 +47,21 @@ services:
       # K_csrf: one obviously fake key, 32 bytes of "x" in base64.
       CSRF_KEYRING: '[{"id":"local","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]'
       # The email-hmac keyring (#145), per-address rate limits' pseudonyms: 32 bytes of "y".
-      EMAIL_HMAC_KEYRING: '[{"id":"local","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]'
+      EMAIL_HMAC_KEYRING: &email-keyring '[{"id":"local","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]'
       # The files buckets (#114, ADR-0012) on the S3 stand-in, with the files key's bare ID. The SDK signs part
       # URLs with fake keys; S3Mock checks no signature. Part URLs name the in-network host `s3`.
       S3_ENDPOINT_URL: http://s3:9090
       S3_FILES_BUCKET: sft-local-files
       S3_LARGE_FILES_BUCKET: sft-local-large-files
       S3_FILES_KMS_KEY_ID: 00000000-0000-4000-8000-000000000001
+      # The audit archive of both regions (#177): security-critical records go to each before a 2xx. The second
+      # bucket stands in for Osaka's, on the same S3 stand-in.
+      AUDIT_ARCHIVE_TOKYO_BUCKET: sft-local-audit-archive
+      AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL: http://s3:9090
+      AUDIT_ARCHIVE_OSAKA_BUCKET: sft-local-audit-archive-osaka
+      AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL: http://s3:9090
+      # K_code (#179), which checks verification codes: 32 bytes of "z".
+      CODE_HMAC_KEYRING: &code-keyring '[{"id":"local","state":"active","key":"enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="}]'
       AWS_ACCESS_KEY_ID: local-fake
       AWS_SECRET_ACCESS_KEY: local-fake
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
@@ -63,6 +71,35 @@ services:
       <<: *database-ready
       # The buckets. Depending on the one-shot also lets `up --wait` accept its exit on a re-run.
       s3-init: { condition: service_completed_successfully }
+
+  notifier: # the notification worker (#178, #179): link emails, codes and notices, into Mailpit
+    <<: [*hardening, *api-image]
+    command: ["python", "-m", "sft.workers.notify"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Its own login role: it reads addresses and links, never a file name or a message (revision 0012).
+      DATABASE_URL: postgresql://sft_notify:test-only-password@postgres:5432/sft
+      VALKEY_URL: redis://sft-local:local-only-valkey-password@valkey:6379/0 # the cross-tenant cap on link emails
+      SQS_ENDPOINT_URL: http://sqs:9324
+      SQS_QUEUE_PREFIX: sft-local-
+      MAIL_BACKEND: smtp
+      MAIL_FROM_ADDRESS: no-reply@mail.sft.localhost
+      SMTP_HOST: mail
+      SMTP_PORT: "1025"
+      WEB_APP_URL: ${WEB_ORIGIN:-http://localhost:3000}
+      EMAIL_HMAC_KEYRING: *email-keyring
+      CODE_HMAC_KEYRING: *code-keyring
+      # K_link, which only this worker reads: 32 bytes of "w".
+      LINK_HMAC_KEYRING: '[{"id":"local","state":"active","key":"d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c="}]'
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    ports: ["127.0.0.1:8014:8001"] # /healthz, /readyz and /metrics
+    stop_grace_period: 25s # more than the 15 s drain
+    depends_on:
+      <<: *database-ready
+      sqs: { condition: service_healthy }
+      valkey: { condition: service_healthy }
+      mail: { condition: service_healthy }
 
   # ---- The scan pipeline (ADR-0019, ADR-0022; #175, #176): one worker per pool, beside clamd and the DLP inspector ----
 

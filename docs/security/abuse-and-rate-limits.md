@@ -194,6 +194,11 @@ load balancer's web ACL unless the row says otherwise, whose `429` has a fixed `
 Only the probe mailbox's addresses are exempt from the per-address caps here and in group G, and only on the
 synthetic tenant's links (NFR-1). The recipient-page challenge is on the web app's web ACL (3.2).
 
+**As built (#179).** `resolveLink` and `createLinkSession` apply the per-IP rows; `requestVerificationCode` also the
+per-link, per-address and per-tenant code limits, after the lockout and the suppression list. A code check doesn't
+count against the code-request limits: its own attempts, and the lockout, are PostgreSQL's, and a mismatch adds to
+the IP's failed attempts. The probe mailbox's exemption comes with NFR-1's probe (M7).
+
 **B. Member sign-in:** `/v1/auth/sign-in` and `/v1/auth/callback` (defined in #23), `startInvitationSignIn`, and
 Cognito managed login. Fail closed.
 
@@ -823,6 +828,10 @@ The caps are in section 2.2, groups A and G. Three design points:
   the reason, would tell one tenant what other tenants send to that address (NFR-12).
 - **Codes:** the daily cap a leaked link can use up is per link (20), so it can't deny the address a code from every
   tenant for a day; the cross-tenant caps (5 an hour, 50 a day) stay against email bombing (9.1).
+- **As built (#178).** The notification worker reads `G.address_link_emails_all` (100 a day per address
+  pseudonym, across tenants) before it issues and sends the link, and spends a unit only after the provider took the
+  email, so failed sends, redeliveries and rejections cost the address nothing. Over it, the message is recorded with a new `recipient.link_due` message delayed until the window allows it
+  (at most SQS's 15 minutes, then again), the recipient stays `queued`, and `email_caps_hit_total` counts it.
 - **Notices are coalesced** in the notification worker: one email lists what changed since the last one.
 - **DLP emails go only to the tenant's own people,** never to a recipient or an uploader, and hold no file names,
   messages, findings or approve links (architecture 4.6). A blocked received file reaches the uploader only as the

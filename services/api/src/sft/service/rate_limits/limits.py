@@ -10,9 +10,9 @@ caller's own keys, then IP, then the invited address, then the tenant. A route n
 one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every request. Every
 number is a starting value, changed only through deploy config, for every tenant at once.
 
-This page carries the limits of the routes that exist now (groups B, F's request rates, G for
-`inviteUser` and `sendTransfer`, H and J), and group A, whose per-link and per-address keys and
-fail-closed mode the limiter is built around. Groups C, D, E, I and K join with their routes.
+This page carries the limits of the routes that exist now (groups A, B, C, F's request rates, G for
+`inviteUser` and `sendTransfer`, H and J), and group G's cross-tenant cap on link emails, which
+the notification worker applies (#178, abuse 7.2). Groups D, E, I and K join with their routes.
 Concurrent streams (leases) and byte budgets are other algorithms: they come with the download
 issues, and with the upload follow-ups for group F's per-file part-URL count and the tenant's
 daily upload volume.
@@ -177,6 +177,9 @@ B_START = _limit(Group.SIGN_IN, "start_ip", KeyType.IP, Rate(60, MINUTE))
 B_CALLBACK = _limit(Group.SIGN_IN, "callback_ip", KeyType.IP, Rate(60, MINUTE))
 B_INVITATION = _limit(Group.SIGN_IN, "invitation_ip", KeyType.IP, Rate(60, MINUTE))
 
+# ---- C. Link session reads: getLinkSession, endLinkSession, listSessionFiles. Fail open. ----
+C_SESSION = _limit(Group.LINK_SESSION, "session_requests", KeyType.LINK_SESSION, Rate(120, MINUTE))
+
 # ---- F. Uploads: declaring files, part URLs, listing parts, completing. ----
 F_CALLER = _limit(
     Group.UPLOADS, "caller_requests", (*CALLER, KeyType.LINK_SESSION), Rate(600, MINUTE)
@@ -193,6 +196,11 @@ G_TENANT_EMAILS = _limit(
     Group.EMAIL, "tenant_emails", KeyType.TENANT, Rate(2000, HOUR, max_cost=MAX_RECIPIENTS)
 )
 G_ADDRESS_EMAILS = _limit(Group.EMAIL, "address_link_emails", KeyType.TENANT_EMAIL, Quota(20, DAY))
+G_ADDRESS_ALL_TENANTS = _limit(
+    Group.EMAIL, "address_link_emails_all", KeyType.EMAIL, Quota(100, DAY)
+)
+"""100 link emails a day to one address across tenants: the notification worker holds the email
+until the window allows it, behind the neutral `queued` (abuse 7.2). Never a refusal."""
 G_INVITES = _limit(Group.EMAIL, "tenant_invites", KeyType.TENANT, Rate(100, HOUR))
 G_ADDRESS_INVITES = _limit(Group.EMAIL, "address_invites", KeyType.TENANT_EMAIL, Quota(3, DAY))
 
@@ -211,8 +219,10 @@ ALL = (
     *(A_IP, A_NOT_FOUND, A_FAILED_CODES, A_SUBJECT_GAP, A_SUBJECT_DAY),
     *(A_EMAIL_HOUR, A_EMAIL_DAY, A_TENANT),
     *(B_START, B_CALLBACK, B_INVITATION),
+    C_SESSION,
     *(F_CALLER, F_IP),
-    *(G_CALLER_EMAILS, G_TENANT_EMAILS, G_ADDRESS_EMAILS, G_INVITES, G_ADDRESS_INVITES),
+    *(G_CALLER_EMAILS, G_TENANT_EMAILS, G_ADDRESS_EMAILS, G_ADDRESS_ALL_TENANTS),
+    *(G_INVITES, G_ADDRESS_INVITES),
     *(H_CALLER, H_TENANT, H_FAILED_AUTH),
     *(J_API_KEYS, J_TENANTS),
 )
@@ -225,6 +235,14 @@ LINK_STEP = (A_IP, A_NOT_FOUND, A_FAILED_CODES)
 REQUEST_CODE = (A_SUBJECT_GAP, A_SUBJECT_DAY, A_EMAIL_HOUR, A_EMAIL_DAY, A_TENANT)
 """`requestVerificationCode`, after the token lookup and the lockout. The probe mailbox's
 addresses on the synthetic tenant's links leave out the two per-address limits (NFR-1)."""
+
+CODE_ATTEMPT = LINK_STEP
+"""`createLinkSession`: the per-IP link limits before the token lookup. Its code's own attempts
+and the recipient's lockout are PostgreSQL's (abuse design 2.2, A); the code-request limits
+count requests for codes, not attempts, so they aren't applied again here."""
+
+LINK_SESSION_READ = (C_SESSION,)
+"""`getLinkSession`, `endLinkSession`, `listSessionFiles`: per link session (group C)."""
 
 SIGN_IN_START = (B_START,)
 SIGN_IN_CALLBACK = (B_CALLBACK,)
@@ -251,6 +269,8 @@ the tenant's recipient emails, each recipient costing one, with `ADDRESS_LINK_EM
 two for every address."""
 ADDRESS_LINK_EMAILS = (G_ADDRESS_EMAILS,)
 """One address's link emails a day within the tenant (abuse 2.2, G)."""
+CROSS_TENANT_LINK_EMAILS = (G_ADDRESS_ALL_TENANTS,)
+"""One address's link emails a day across tenants, in the notification worker (abuse 7.2)."""
 INVITE_USER = (G_CALLER_EMAILS, G_ADDRESS_INVITES, G_INVITES)
 """`inviteUser`, after `TENANT_OPERATION`, once the address is known."""
 CREATE_TENANT = (J_TENANTS,)

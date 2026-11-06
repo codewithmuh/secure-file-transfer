@@ -24,6 +24,7 @@ from sft.service.email.catalog import (
     RecipientLocked,
     TransferHeld,
     TransferLink,
+    TransferReturnedToDraft,
     UploadRequest,
     VerificationCode,
 )
@@ -60,6 +61,7 @@ SAMPLES: dict[EmailType, Email] = {
         FilesArrived(tenant_name=TENANT, upload_request_id=REQUEST_ID, file_count=1),
         FilesBlockedMember(tenant_name=TENANT, upload_request_id=REQUEST_ID, file_count=1),
         TransferHeld(tenant_name=TENANT, transfer_id=TRANSFER_ID),
+        TransferReturnedToDraft(tenant_name=TENANT, transfer_id=TRANSFER_ID),
         RecipientLocked(tenant_name=TENANT, subject_kind="transfer", subject_id=TRANSFER_ID),
         DlpConfirmationNeeded(tenant_name=TENANT, transfer_id=TRANSFER_ID),
         DlpApprovalRequested(tenant_name=TENANT),

@@ -384,3 +384,27 @@ async def insert_download_counters(
     if rows:
         await session.execute(insert(DownloadCounter), rows)
     return len(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class Notice:
+    """What a notice about a transfer needs: its owner, state and expiry, never its message."""
+
+    id: UUID
+    created_by: UUID
+    state: TransferState
+    expires_at: datetime | None
+
+
+async def notice(session: AsyncSession, transfer_id: UUID) -> Notice | None:
+    """The transfer as a notice sees it, reading only the columns the notification worker may
+    read (revision 0012); None if the scope doesn't reach it."""
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(Transfer.id, Transfer.created_by, Transfer.state, Transfer.expires_at).where(
+                Transfer.id == transfer_id, in_scope(Transfer, session)
+            )
+        )
+    ).first()
+    return None if row is None else Notice(row[0], row[1], TransferState(row[2]), row[3])

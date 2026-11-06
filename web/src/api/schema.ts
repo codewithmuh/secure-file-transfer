@@ -1065,9 +1065,10 @@ export interface paths {
          *     content (FR-14). When this browser already holds a live link session for this link, `access_state` is
          *     `verified` and `link_session_id` names that session, so the web app carries on without a new code.
          *
-         *     Public. Rate limit: 60 link-page requests per IP address per minute (NFR-14).
+         *     Public. Rate limit: 60 link-page requests per IP address per minute (NFR-14). If the rate-limit counters are
+         *     unavailable, the call fails closed with `503`, like every link step (abuse-and-rate-limits 2.2 group A).
          *
-         *     Errors: `404 link_not_found`, `410 link_revoked`, `410 link_expired`.
+         *     Errors: `404 link_not_found`, `410 link_revoked`, `410 link_expired`, `503 service_unavailable`.
          *
          *     Requirements: FR-14, FR-21, NFR-14.
          */
@@ -5436,6 +5437,7 @@ export interface operations {
             410: components["responses"]["Gone"];
             422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     requestVerificationCode: {

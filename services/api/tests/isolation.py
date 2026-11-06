@@ -404,6 +404,38 @@ def seed_scans(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.
         tenant=tenant_id,
         marker=marker,
     )
+    seed_links(db, tenant_id, rows)
+
+
+def seed_links(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
+    """Links and verification (#178, #179): the recipient's link, whose token is the text of
+    `link_token`, a live code, and a live link session, whose token is the text of
+    `link_session_token`."""
+    for key in ("link_token", "code", "link_session", "link_session_token"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "UPDATE transfer_recipients SET link_token_hash = sha256(convert_to(:token, 'UTF8')), "
+        "link_key_id = 'iso', link_issued_at = now() WHERE id = :id",
+        token=str(rows["link_token"]),
+        id=rows["recipient"],
+    )
+    db.sql(
+        "INSERT INTO verification_codes (id, tenant_id, recipient_id, code_hmac, hmac_key_id, "
+        "expires_at) VALUES (:id, :tenant, :recipient, "
+        "sha256(convert_to(CAST(:id AS text), 'UTF8')), 'iso', now() + interval '5 minutes')",
+        id=rows["code"],
+        tenant=tenant_id,
+        recipient=rows["recipient"],
+    )
+    db.sql(
+        "INSERT INTO link_sessions (id, tenant_id, recipient_id, session_hash, expires_at) "
+        "VALUES (:id, :tenant, :recipient, sha256(convert_to(:token, 'UTF8')), "
+        "now() + interval '1 day')",
+        id=rows["link_session"],
+        tenant=tenant_id,
+        recipient=rows["recipient"],
+        token=str(rows["link_session_token"]),
+    )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

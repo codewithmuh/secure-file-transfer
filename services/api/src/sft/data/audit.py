@@ -22,6 +22,11 @@ flags, times and an operator's name (`OperatorName`), never free text, so a file
 email address, token or code can't reach it by accident (data model 2.5). Action names and
 target types are short lower-case codes.
 
+Security-critical events (architecture 5.2) are also written straight to the audit archive of both
+regions (`sft.service.audit_archive`). `archived_event` and `latest_critical_event` read one back,
+in the tenant's scope, as the archive record carries it (`ArchivedEvent`): IDs, enums, times and
+`details`, never the source IP or the user agent.
+
 Partition upkeep for the lifecycle job (data model 6) is here too: `create_partitions` and
 `partition_status`, as `sft_jobs` in system scope.
 """
@@ -37,9 +42,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum, IntEnum, StrEnum
 from ipaddress import IPv4Address, IPv6Address
-from typing import Final
+from typing import Any, Final
 
-from sqlalchemy import insert, text
+from sqlalchemy import Row, insert, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.logs import request_id_var, trace_id_var
@@ -61,13 +66,16 @@ __all__ = [
     "USER_AGENT_MAX",
     "Actor",
     "ActorType",
+    "ArchivedEvent",
     "Detail",
     "OperatorName",
     "Origin",
     "Outcome",
     "PartitionStatus",
     "Target",
+    "archived_event",
     "create_partitions",
+    "latest_critical_event",
     "partition_status",
     "record",
     "uuid7",
@@ -207,6 +215,110 @@ async def record(
         )
     )
     return event_id
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedEvent:
+    """A security-critical event as its archive record holds it (#177): only IDs, enums, times and
+    `details`, which holds nothing else (data model 2.5). No source IP, user agent or request ID:
+    what the failover and restore runbooks re-apply needs none of them, and the archive job's
+    copy of the row carries them (architecture 5.2)."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID | None
+    occurred_at: datetime
+    action: str
+    actor_type: str
+    actor_id: uuid.UUID | None
+    target_type: str | None
+    target_id: uuid.UUID | None
+    outcome: str
+    details: Mapping[str, object] = field(default_factory=dict)
+
+    def as_json(self) -> dict[str, object]:
+        """The record's JSON object, its keys sorted when serialised."""
+        return {
+            "id": str(self.id),
+            "tenant_id": None if self.tenant_id is None else str(self.tenant_id),
+            "occurred_at": self.occurred_at.isoformat(),
+            "action": self.action,
+            "actor_type": self.actor_type,
+            "actor_id": None if self.actor_id is None else str(self.actor_id),
+            "target_type": self.target_type,
+            "target_id": None if self.target_id is None else str(self.target_id),
+            "outcome": self.outcome,
+            "security_critical": True,
+            "details": dict(self.details),
+        }
+
+
+_ARCHIVED_COLUMNS = (
+    AuditEvent.id,
+    AuditEvent.tenant_id,
+    AuditEvent.occurred_at,
+    AuditEvent.action,
+    AuditEvent.actor_type,
+    AuditEvent.actor_id,
+    AuditEvent.target_type,
+    AuditEvent.target_id,
+    AuditEvent.outcome,
+    AuditEvent.details,
+)
+
+
+def _archived(row: Row[Any]) -> ArchivedEvent:
+    return ArchivedEvent(
+        id=row[0],
+        tenant_id=row[1],
+        occurred_at=row[2],
+        action=row[3],
+        actor_type=row[4],
+        actor_id=row[5],
+        target_type=row[6],
+        target_id=row[7],
+        outcome=row[8],
+        details=dict(row[9] or {}),
+    )
+
+
+async def archived_event(session: AsyncSession, event_id: uuid.UUID) -> ArchivedEvent | None:
+    """One security-critical event of the scope's tenant, as its archive record holds it. The
+    transaction that wrote it sees it before it commits."""
+    scope = require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(*_ARCHIVED_COLUMNS).where(
+                AuditEvent.id == event_id,
+                AuditEvent.tenant_id == scope.tenant_id,
+                AuditEvent.security_critical.is_(True),
+            )
+        )
+    ).first()
+    return None if row is None else _archived(row)
+
+
+async def latest_critical_event(
+    session: AsyncSession, *, action: str, target: Target
+) -> ArchivedEvent | None:
+    """The newest security-critical `action` event on `target` in the scope's tenant: what a
+    retry of a change already made writes to the archive if it is still missing (API README 5)."""
+    _action(action)
+    scope = require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(*_ARCHIVED_COLUMNS)
+            .where(
+                AuditEvent.tenant_id == scope.tenant_id,
+                AuditEvent.target_type == target.type,
+                AuditEvent.target_id == target.id,
+                AuditEvent.action == action,
+                AuditEvent.security_critical.is_(True),
+            )
+            .order_by(AuditEvent.occurred_at.desc(), AuditEvent.id.desc())
+            .limit(1)
+        )
+    ).first()
+    return None if row is None else _archived(row)
 
 
 async def create_partitions(

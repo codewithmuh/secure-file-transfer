@@ -182,6 +182,19 @@ The transaction that moves a transfer to `sent` sets its recipients to `queued`.
 same for its uploader, and an unlock does it for the subject it unlocks (2.4). `createTransfer` and
 `createUploadRequest` already refuse an address that is suppressed at that moment (`422 recipient_undeliverable`).
 
+**As built (#178, revision 0012).** The recipient's link and status columns are on `transfer_recipients`, with
+`link_token_hash` unique and the three link columns set together or not at all. The evaluation's `transfer.sent`
+message names the transfer; the notification worker answers it with one `recipient.link_due` message per recipient
+(IDs only), written in the transaction that records the first, so each email is one message, retried on its own, and
+an unlock or a cap deferral writes the same kind of message. For each, the worker checks the suppression list
+(`suppressed`, no email), then the cross-tenant cap (the email waits behind a delayed message, `queued`), then issues
+the link once (`recipient.link_issued`), sends, and records `sent`, `notified_at` and `email.sent` after the send. A
+link whose key has left the keyring (more than its 14 days after a rotation) is issued again; a link another attempt
+stored first is the one sent, never a token whose hash isn't stored. An email the provider refuses for good leaves the
+recipient `bounced` (`email.rejected`). The cap is read before the send and spent only after a successful one. A
+notice to several people records each email as it goes, so a redelivery sends only the unsent ones. `sft_notify`
+reads only the columns that needs, never a ciphertext column, and may write outbox messages.
+
 ### 2.3 Files, download counts and grants
 
 | Table | Key columns | Notes |
@@ -327,6 +340,17 @@ worker then derives a new token from a new `link_issued_at` (2.2) and emails it.
 (`404 link_not_found`), so whoever caused the lockout with a leaked link is cut off, and one typo after an unlock
 doesn't lock the subject again.
 
+**As built (#179, revision 0013).** `verification_codes` and `link_sessions` have the recipient key only; the
+upload-request key and the exactly-one-owner check arrive with upload requests (M5). The credential lookups are
+`lookup_link_token` (a recipient by `link_token_hash`) and `lookup_link_sessions` (up to 10 sessions by their
+hashes, each with whether it is live: not revoked, not expired, seen in the last hour). The link steps run in the
+tenant scope the token's lookup found, naming the recipient in every query; the `/session` calls run in the
+session's resource scope, which reaches its recipient's row, transfer, files, download counters, its own sessions
+and the transfer's sender (`users.reach`). A refusal because the subject is locked also writes the lockout's archive
+record if it is still missing; once the API has seen it confirmed in both regions it writes nothing more. A code made
+under a `code-hmac` key the API no longer holds can't be checked: it answers `422 code_expired` (ask for a new code,
+encryption and keys 6.5), audited as `unknown_key`, and adds nothing to `failed_attempts`.
+
 ### 2.5 Audit and plumbing
 
 | Table | Key columns | Notes |
@@ -359,6 +383,19 @@ but grants commit first and take effect at once, so their `503` means "done, rec
 writes the record if it is still missing. A grant is the other way round (2.3): its intent record comes first, so its
 `503` means nothing was counted. Their audit events carry `security_critical`, and the failover and restore runbooks
 re-apply them from the archive through `sft_recovery` (4.2).
+
+**As built (#177).** The API writes each record to the archive bucket of each region with a conditional write
+(`If-None-Match: *`), keyed by its event's ID, so a retry rewrites nothing:
+`security-critical/v1/<tenant ID or platform>/<yyyy>/<mm>/<dd>/<event ID>.json`, dated by `occurred_at` in UTC. A
+record holds the event's IDs, enums, times and `details`, never the source IP or user agent. It needs no generation,
+because an event ID never repeats after a restore, unlike a transaction ID; when the archive job arrives it writes
+under `g<generation>/` with the same tenant and date parts, and readers drop duplicates by `id`. A retry of a change
+already made reads its newest security-critical event and writes that record again; a call that doesn't make the change
+itself (an `updateUser` that keeps the role `member`) completes an earlier record only as best effort, so an archive
+outage never fails it. Each API process remembers the records it has seen confirmed in both regions and doesn't write
+them again. Dev has no Osaka, so its records
+go to Tokyo's archive alone. The every-minute archive job, its cursor and its generations aren't built yet: no
+milestone places them before M7.
 
 **Archiving without gaps.** IDs and `occurred_at` follow insert time, not commit time, so a row from a slow transaction
 can commit after a row with a later ID. A cursor on either would skip it for good. The archive job therefore works by

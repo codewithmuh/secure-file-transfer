@@ -444,3 +444,96 @@ def test_the_sweep_finds_overdue_scans_by_an_index(migrated_db: ScratchDatabase)
         "SELECT indexdef FROM pg_indexes WHERE indexname = 'files_scan_deadline_idx'"
     )
     assert "WHERE (state = 'scanning'::text)" in str(definition)
+
+
+def test_the_link_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("RECIPIENT_WRITE", "0012")
+    written: str = module.UNLOCKED_BY_KEY
+    assert written == tenant_foreign_key_sql("transfer_recipients", "unlocked_by", "users")
+    notify = "sft_notify"
+    assert list(module.RLS) == [
+        grant_sql("tenants", notify, "SELECT", columns=_columns(module.TENANT_READ)),
+        "ALTER POLICY tenant_isolation ON tenants TO sft_api, sft_operator, sft_notify",
+        grant_sql("tenant_policies", notify, "SELECT", columns=_columns(module.POLICY_READ)),
+        "ALTER POLICY tenant_isolation ON tenant_policies TO sft_operator, sft_api, sft_scan, "
+        "sft_notify",
+        grant_sql("transfers", notify, "SELECT", columns=_columns(module.TRANSFER_READ)),
+        "ALTER POLICY tenant_isolation ON transfers TO sft_api, sft_scan, sft_jobs, sft_notify",
+        grant_sql("transfer_recipients", notify, "SELECT", columns=_columns(module.RECIPIENT_READ)),
+        grant_sql(
+            "transfer_recipients", notify, "UPDATE", columns=_columns(module.RECIPIENT_WRITE)
+        ),
+        "ALTER POLICY tenant_isolation ON transfer_recipients TO sft_api, sft_scan, sft_jobs, "
+        "sft_notify",
+        grant_sql("outbox", notify, "INSERT"),
+        "ALTER POLICY tenant_isolation ON outbox TO sft_api, sft_operator, sft_scan, sft_jobs, "
+        "sft_notify",
+    ]
+    # The notification worker never reads a ciphertext column (data model 4.2).
+    for listed in (module.TRANSFER_READ, module.RECIPIENT_READ):
+        assert not {"message_ct", "display_name_ct"} & set(_columns(listed))
+
+
+def test_the_verification_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("LOOKUP_LINK_SESSIONS", "0013")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("verification_codes"),
+        tenant_foreign_key_sql(
+            "verification_codes", "recipient_id", "transfer_recipients", on_delete="CASCADE"
+        ),
+        *tenant_keys_sql("link_sessions"),
+        tenant_foreign_key_sql(
+            "link_sessions", "recipient_id", "transfer_recipients", on_delete="CASCADE"
+        ),
+    ]
+    assert list(module.RLS) == [
+        *tenant_rls_sql(
+            "verification_codes", grants={"sft_api": "SELECT, UPDATE", "sft_notify": "INSERT"}
+        ),
+        grant_sql("verification_codes", "sft_notify", "SELECT", columns=_columns(module.CODE_READ)),
+        grant_sql("verification_codes", "sft_notify", "UPDATE", columns=["superseded_at"]),
+        *tenant_rls_sql("link_sessions", grants={"sft_api": "SELECT, INSERT, UPDATE"}),
+    ]
+    assert "code_hmac" not in _columns(module.CODE_READ)
+    assert list(module.LOOKUP_LINK_TOKEN) == [
+        *lookup_read_sql("transfer_recipients", ["id", "tenant_id", "link_token_hash"]),
+        *lookup_function_sql(
+            "lookup_link_token(p_token_hash bytea)",
+            returns="TABLE (recipient_id uuid, owner_tenant_id uuid)",
+            body=module.LOOKUP_LINK_TOKEN_BODY,
+        ),
+    ]
+    assert list(module.LOOKUP_LINK_SESSIONS) == [
+        *lookup_read_sql(
+            "link_sessions",
+            [
+                "id",
+                "tenant_id",
+                "recipient_id",
+                "session_hash",
+                "expires_at",
+                "last_seen_at",
+                "revoked_at",
+            ],
+        ),
+        *lookup_function_sql(
+            "lookup_link_sessions(p_session_hashes bytea[])",
+            returns="TABLE (session_id uuid, owner_tenant_id uuid, recipient_id uuid, "
+            "live boolean)",
+            body=module.LOOKUP_LINK_SESSIONS_BODY,
+        ),
+    ]
+    assert list(module.AUDIT) == [
+        require_audit_sql("verification_codes"),
+        require_audit_sql(
+            "link_sessions", commands=("INSERT", "UPDATE"), update_of=("revoked_at",)
+        ),
+    ]
+
+
+def test_the_link_token_hash_is_unique(migrated_db: ScratchDatabase) -> None:
+    [(definition,)] = migrated_db.sql(
+        "SELECT indexdef FROM pg_indexes "
+        "WHERE indexname = 'transfer_recipients_link_token_hash_key'"
+    )
+    assert "CREATE UNIQUE INDEX" in str(definition)

@@ -7,9 +7,15 @@
 {{- $login := printf "https://%s" $c.cognitoLoginDomain }}
 {{- /*
 The API's settings (sft.core.settings.Settings): member sign-in against this region's user pool (ADR-0016,
-authn-authz 2 and 3), the region's files buckets and key (ADR-0012, #114), and the load balancer's subnets as the only
-trusted proxies (ADR-0002). The client ID and secret and the two keyrings come from the External Secrets Secret.
+authn-authz 2 and 3), the region's files buckets and key (ADR-0012, #114), the audit archive of both regions for
+security-critical records (#177; dev has no Osaka, architecture 3.3, so its records go to Tokyo's alone), and the load
+balancer's subnets as the only trusted proxies (ADR-0002). The client ID and secret and the three keyrings come from
+the External Secrets Secret.
 */}}
+{{- $archive := dict "AUDIT_ARCHIVE_TOKYO_BUCKET" (printf "sft-%s-apne1-audit-archive-%s" .Values.environment (toString $c.accountId)) }}
+{{- if ne .Values.environment "dev" }}
+{{- $_ := set $archive "AUDIT_ARCHIVE_OSAKA_BUCKET" (printf "sft-%s-apne3-audit-archive-%s" .Values.environment (toString $c.accountId)) }}
+{{- end }}
 {{- $env := merge (dict
   "WEB_ORIGIN" (printf "https://app.%s" $c.serviceDomain)
   "OIDC_ISSUER" (printf "https://cognito-idp.%s.amazonaws.com/%s" .Values.region $c.userPoolId)
@@ -20,8 +26,8 @@ trusted proxies (ADR-0002). The client ID and secret and the two keyrings come f
   "S3_FILES_BUCKET" (printf "%s-files-%s" $prefix (toString $c.accountId))
   "S3_LARGE_FILES_BUCKET" (printf "%s-large-files-%s" $prefix (toString $c.accountId))
   "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
-  "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr) $w.env }}
-{{- $secretEnv := dict "CSRF_KEYRING" "api-secrets" "EMAIL_HMAC_KEYRING" "api-secrets" "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
+  "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr) $archive $w.env }}
+{{- $secretEnv := dict "CSRF_KEYRING" "api-secrets" "EMAIL_HMAC_KEYRING" "api-secrets" "CODE_HMAC_KEYRING" "api-secrets" "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
 # The API service (architecture 2): every HTTP call, behind the load balancer, at least 3 pods across 3 AZs.
 apiVersion: apps/v1
 kind: Deployment
@@ -124,6 +130,8 @@ spec:
       remoteRef: { key: {{ printf "sft/%s/app/csrf-hmac" .Values.environment }} }
     - secretKey: EMAIL_HMAC_KEYRING
       remoteRef: { key: {{ printf "sft/%s/app/email-hmac" .Values.environment }} }
+    - secretKey: CODE_HMAC_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/code-hmac" .Values.environment }} }
     - secretKey: OIDC_CLIENT_ID
       remoteRef: { key: {{ printf "sft/%s/app/idp-client/%s" .Values.environment .Values.region }}, property: client_id }
     - secretKey: OIDC_CLIENT_SECRET

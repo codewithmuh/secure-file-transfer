@@ -9,8 +9,8 @@ Each entry point reads only the settings it needs: `Settings` for the API and `O
 for the operator API (both build on `ServerSettings`), `RelaySettings` for the outbox relay (and
 `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
 `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
-notification worker), `InspectorSettings` for the DLP inspector, `ScanSettings` for the scan
-workers.
+notification worker, whose `NotifySettings` adds it to a worker's), `InspectorSettings` for the
+DLP inspector, `ScanSettings` for the scan workers.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from sft.core.hmac_keyrings import CODE_KEY_ID, LINK_KEY_ID
 from sft.core.keyrings import CSRF_KEY_ID, EMAIL_KEY_ID, parse_keyring
 from sft.core.logs import configure_logging
 
@@ -255,6 +256,35 @@ class Settings(ServerSettings):
         "the large pool (ADR-0019's 100 MB split).",
     )
 
+    # The audit archive in both regions (#177, architecture 5.2): security-critical records are
+    # written straight to each region's bucket before the API answers 2xx (data model 2.5).
+    audit_archive_tokyo_bucket: str = Field(
+        pattern=_BUCKET,
+        description="The audit archive bucket in Tokyo, `sft-<env>-apne1-audit-archive-<account>`.",
+    )
+    audit_archive_osaka_bucket: str | None = Field(
+        default=None,
+        pattern=_BUCKET,
+        description="The audit archive bucket in Osaka. Unset only in an environment without "
+        "Osaka (dev, architecture 3.3): records then go to Tokyo's archive alone.",
+    )
+    audit_archive_tokyo_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock. In AWS the SDK finds Tokyo's S3 endpoint itself.",
+    )
+    audit_archive_osaka_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock's Osaka stand-in. In AWS the SDK finds Osaka's "
+        "endpoint; the cross-region route and IAM arrive in M4.",
+    )
+    # Verification codes (#179, data model 2.4): the API checks what the notification worker made.
+    code_hmac_keyring: SecretStr = Field(
+        description="K_code, the keyring of verification codes' HMACs (sft/{env}/app/code-hmac, "
+        "encryption and keys 6.2): like CSRF_KEYRING.",
+    )
+
     @field_validator("csrf_keyring")
     @classmethod
     def _csrf_keyring(cls, value: SecretStr) -> SecretStr:
@@ -268,6 +298,12 @@ class Settings(ServerSettings):
         parse_keyring(
             value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
         )
+        return value
+
+    @field_validator("code_hmac_keyring")
+    @classmethod
+    def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
+        parse_keyring(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
         return value
 
 
@@ -517,6 +553,48 @@ class MailSettings(_Base):
         if self.mail_backend == "ses" and not self.ses_configuration_set:
             raise ValueError("MAIL_BACKEND=ses needs SES_CONFIGURATION_SET")
         return self
+
+
+class NotifySettings(WorkerSettings, MailSettings):
+    """The notification worker's settings (#178, #179; ADR-0013, ADR-0015): a worker's, how it
+    sends email, its three keyrings and the counter store that holds the cross-tenant cap."""
+
+    valkey_url: ValkeyUrl = Field(
+        description="The counter store, for the 100 link emails a day to one address across "
+        "tenants (abuse 7.2). Unreachable, the cap counts in this pod (abuse 4.5).",
+    )
+    email_hmac_keyring: SecretStr = Field(
+        description="The email-hmac keyring (sft/{env}/app/email-hmac): the suppression list's "
+        "pseudonyms and the cap's key, like the API's.",
+    )
+    link_hmac_keyring: SecretStr = Field(
+        description="K_link (sft/{env}/app/link-hmac, data model 2.2), which only this worker "
+        "reads: it derives each link token. Keep an old key loaded at least 14 days.",
+    )
+    code_hmac_keyring: SecretStr = Field(
+        description="K_code (sft/{env}/app/code-hmac, data model 2.4): the HMAC of each new "
+        "verification code.",
+    )
+
+    @field_validator("email_hmac_keyring")
+    @classmethod
+    def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
+        parse_keyring(
+            value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
+        )
+        return value
+
+    @field_validator("link_hmac_keyring")
+    @classmethod
+    def _link_hmac_keyring(cls, value: SecretStr) -> SecretStr:
+        parse_keyring(value.get_secret_value(), name="link", key_id=LINK_KEY_ID)
+        return value
+
+    @field_validator("code_hmac_keyring")
+    @classmethod
+    def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
+        parse_keyring(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
+        return value
 
 
 class InspectorSettings(_Base):

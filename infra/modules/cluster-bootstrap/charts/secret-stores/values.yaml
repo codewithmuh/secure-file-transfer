@@ -11,7 +11,7 @@ stores:
     role: platform # sft/<env>/platform/*
     namespaces: [argocd, monitoring, grafana] # Argo CD's notifications key and the observability stack (ADR-0009)
   application-secrets:
-    role: app # the API's csrf-hmac, email-hmac and this Region's idp-client (#106)
+    role: app # the application's keyrings and this Region's idp-client (#106, #178, #179)
     namespaces: [sft]
 
 # Further objects, full (apiVersion, kind, metadata, spec): Argo CD's notifications ExternalSecret, when it is on.

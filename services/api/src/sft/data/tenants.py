@@ -201,3 +201,35 @@ async def update_policy(
     if row is None:  # pragma: no cover - INSERT … ON CONFLICT DO UPDATE always returns the row
         raise RuntimeError("the upsert returned no row")
     return _policy(row)
+
+
+@dataclass(frozen=True, slots=True)
+class Sender:
+    """What an email says of its tenant: the name the operator recorded, whether it is active,
+    and the language of its people's emails (FR-33)."""
+
+    name: str
+    active: bool
+    default_locale: str
+
+
+async def sender(session: AsyncSession) -> Sender | None:
+    """The scope's tenant as its emails name it, reading only the columns the notification worker
+    may read (revision 0012); None if the scope doesn't reach it."""
+    require_scope(session, ScopeKind.TENANT, ScopeKind.RESOURCE)
+    tenant_id = tenant_of(session)
+    row = (
+        await session.execute(
+            select(Tenant.name, Tenant.status).where(
+                Tenant.id == tenant_id, in_scope(Tenant, session)
+            )
+        )
+    ).first()
+    if row is None:
+        return None
+    locale = await session.scalar(
+        select(TenantPolicy.default_locale).where(
+            TenantPolicy.tenant_id == tenant_id, in_scope(TenantPolicy, session)
+        )
+    )
+    return Sender(str(row[0]), row[1] == ACTIVE, str(locale or DEFAULT_LOCALE))

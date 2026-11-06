@@ -296,8 +296,9 @@ class UserStatus(StrEnum):
 class User(TenantOwned, Base):
     """A member or admin of one tenant, with their role and invitation (data model 2.1, FR-22).
 
-    `sft.data.users` writes and reads it; every change commits only with its audit event. Link
-    sessions reach no user (the default `reach`).
+    `sft.data.users` writes and reads it; every change commits only with its audit event. A
+    recipient's link session reaches one user: the sender of its transfer, whose address the
+    recipient sees (`getLinkSession`).
     """
 
     __tablename__ = "users"
@@ -341,6 +342,19 @@ class User(TenantOwned, Base):
     invitation_expires_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # The sender of the recipient's transfer, and no one else.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.id.in_(
+            select(Transfer.created_by).where(
+                Transfer.id.in_(
+                    select(TransferRecipient.transfer_id).where(TransferRecipient.id == subject.id)
+                )
+            )
+        )
 
 
 class OperatorSession(Base):
@@ -660,8 +674,11 @@ class Transfer(TenantOwned, Base):
 
 
 class TransferRecipient(TenantOwned, Base):
-    """One recipient of one transfer (data model 2.2). The link and verification columns arrive
-    with the notification and verification issues of M2."""
+    """One recipient of one transfer (data model 2.2), with their link and status (revision 0012).
+
+    `link_token_hash` is the SHA-256 of the token the notification worker derives from
+    `link_issued_at` under the `link-hmac` key `link_key_id`; the three are set together or not
+    at all. `failed_attempts` and `locked_at` are the lockout of data model 2.4."""
 
     __tablename__ = "transfer_recipients"
     __table_args__ = (
@@ -672,10 +689,20 @@ class TransferRecipient(TenantOwned, Base):
             ["transfers.tenant_id", "transfers.id"],
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(["tenant_id", "unlocked_by"], ["users.tenant_id", "users.id"]),
         UniqueConstraint("tenant_id", "transfer_id", "email_normalized"),
+        Index("transfer_recipients_link_token_hash_key", "link_token_hash", unique=True),
         CheckConstraint("locale IN ('en', 'ja')", name="locale"),
         CheckConstraint(f"delivery_state IN {sql_values(DeliveryState)}", name="delivery_state"),
         CheckConstraint("email_normalized = lower(email)", name="email_normalized"),
+        CheckConstraint("octet_length(link_token_hash) = 32", name="link_token_hash"),
+        CheckConstraint(
+            "(link_issued_at IS NULL) = (link_key_id IS NULL) "
+            "AND (link_issued_at IS NULL) = (link_token_hash IS NULL)",
+            name="link",
+        ),
+        CheckConstraint("link_key_id ~ '^[A-Za-z0-9-]{1,32}$'", name="link_key_id"),
+        CheckConstraint("failed_attempts BETWEEN 0 AND 20", name="failed_attempts"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -687,6 +714,15 @@ class TransferRecipient(TenantOwned, Base):
     delivery_state: Mapped[str] = mapped_column(Text, server_default="pending")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    link_token_hash: Mapped[bytes | None] = mapped_column(LargeBinary)
+    link_key_id: Mapped[str | None] = mapped_column(Text)
+    link_issued_at: Mapped[datetime | None]
+    notified_at: Mapped[datetime | None]
+    first_verified_at: Mapped[datetime | None]
+    last_verified_at: Mapped[datetime | None]
+    failed_attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    locked_at: Mapped[datetime | None]
+    unlocked_by: Mapped[uuid.UUID | None]
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -852,6 +888,13 @@ class DownloadCounter(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches its own counters: its download count and limit.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.recipient_id == subject.id
+
 
 class SuppressionReason(StrEnum):
     HARD_BOUNCE = "hard_bounce"
@@ -916,3 +959,84 @@ class DlpFinding(TenantOwned, Base):
     detail_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
     dlp_key_version: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class VerificationCode(TenantOwned, Base):
+    """A one-time code of a recipient, by its HMAC under the `code-hmac` keyring (data model 2.4,
+    revision 0013). The notification worker creates one and supersedes the older ones; the API
+    counts each attempt with one conditional update. Only the newest live code can match."""
+
+    __tablename__ = "verification_codes"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "recipient_id"],
+            ["transfer_recipients.tenant_id", "transfer_recipients.id"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "verification_codes_recipient_id_created_at_idx",
+            "recipient_id",
+            text("created_at DESC"),
+        ),
+        Index("verification_codes_expires_at_idx", "expires_at"),
+        CheckConstraint("octet_length(code_hmac) = 32", name="code_hmac"),
+        CheckConstraint("hmac_key_id ~ '^[A-Za-z0-9-]{1,32}$'", name="hmac_key_id"),
+        CheckConstraint("attempts BETWEEN 0 AND 5", name="attempts"),
+        CheckConstraint(
+            "expires_at > created_at AND expires_at <= created_at + interval '10 minutes'",
+            name="expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID]
+    code_hmac: Mapped[bytes] = mapped_column(LargeBinary)
+    hmac_key_id: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime]
+    attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    superseded_at: Mapped[datetime | None]
+    consumed_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class LinkSession(TenantOwned, Base):
+    """A verified browser's session for one recipient (data model 2.4, authn and authz 4.3): the
+    SHA-256 of its token, 24 hours at most and 1 hour idle. Revision 0013."""
+
+    __tablename__ = "link_sessions"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("session_hash"),
+        ForeignKeyConstraint(
+            ["tenant_id", "recipient_id"],
+            ["transfer_recipients.tenant_id", "transfer_recipients.id"],
+            ondelete="CASCADE",
+        ),
+        Index("link_sessions_recipient_id_idx", "recipient_id"),
+        Index("link_sessions_expires_at_idx", "expires_at"),
+        CheckConstraint("octet_length(session_hash) = 32", name="session_hash"),
+        CheckConstraint(
+            "expires_at > created_at AND expires_at <= created_at + interval '24 hours'",
+            name="expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID]
+    session_hash: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    revoked_at: Mapped[datetime | None]
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches the sessions of its own recipient.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.recipient_id == subject.id

@@ -24,6 +24,7 @@ routes don't read, so it is `401` too, before a limit runs, as `authorize` would
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Final
 
@@ -86,8 +87,20 @@ async def get_session(request: Request) -> SessionContext:
 
 def check_csrf(request: Request, service: SignIn, token: str) -> None:
     """The checks of authn and authz 3.4 on an unsafe request of a member session."""
+    check_unsafe_request(
+        request,
+        service.config.web_origin,
+        lambda presented: service.csrf_valid(token, presented),
+    )
+
+
+def check_unsafe_request(
+    request: Request, web_origin: str, csrf_valid: Callable[[str | None], bool]
+) -> None:
+    """The checks of authn and authz 3.4 on an unsafe request of a cookie session, a member's or
+    a link session's: the origin, `Sec-Fetch-Site`, a JSON body and the session's CSRF token."""
     headers = request.headers
-    if headers.get("origin") != service.config.web_origin:
+    if headers.get("origin") != web_origin:
         raise Forbidden("csrf_failed")
     fetch_site = headers.get("sec-fetch-site")
     if fetch_site is not None and fetch_site not in _SAME_SITE:
@@ -96,7 +109,7 @@ def check_csrf(request: Request, service: SignIn, token: str) -> None:
     media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if has_body and media_type != "application/json":
         raise Forbidden("csrf_failed")
-    if not service.csrf_valid(token, headers.get(CSRF_HEADER)):
+    if not csrf_valid(headers.get(CSRF_HEADER)):
         raise Forbidden("csrf_failed")
 
 

@@ -137,6 +137,10 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `S3_FILES_KMS_KEY_ID` | none, required | The files key for SSE-KMS; S3Mock takes only the bare key ID |
 | `S3_ENDPOINT_URL` | none | Local only, for S3Mock; in AWS the SDK finds S3's endpoint |
 | `TENANT_STORAGE_QUOTA_BYTES` | `2000000000000` | Each tenant's storage quota (abuse and rate limits 6.1) |
+| `AUDIT_ARCHIVE_TOKYO_BUCKET` | none, required | The audit archive bucket in Tokyo, which every security-critical record reaches before a `2xx` (#177) |
+| `AUDIT_ARCHIVE_OSAKA_BUCKET` | none | The audit archive bucket in Osaka; unset only where there is no Osaka (dev), and records then go to Tokyo's alone |
+| `AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL`, `AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL` | none | Local only, for S3Mock; in AWS the SDK finds each region's S3 endpoint |
+| `CODE_HMAC_KEYRING` | none, required | K_code (`sft/{env}/app/code-hmac`), the shape of `CSRF_KEYRING`: the API checks verification codes' HMACs with it (#179); a secret |
 
 Whatever sends email (the notification worker) also reads `MailSettings`:
 
@@ -562,6 +566,57 @@ message_id = mailer_from_settings(settings).send(email)  # blocks: call it from 
 - **SMTP** (`sft/data/mail/smtp.py`): plain SMTP to Mailpit, tags as `X-Sft-Tag-*` headers. Its integration test runs
   against Mailpit in CI's mail job, and locally after `make up` with
   `TEST_MAIL_CATCHER_URL=http://127.0.0.1:8025 TEST_SMTP_PORT=1025 uv run pytest tests/test_mail_mailpit.py`.
+
+### The notification worker
+
+`python -m sft.workers.notify` (#178, #179) reads the notify queue and sends every email of a recipient or a member
+(`sft.service.notifications`): each recipient's link once a transfer is sent (one `recipient.link_due` message per
+recipient, written by the worker itself), the verification codes recipients ask for, the lockout notice, and the
+held and back-to-draft notices. It records each message after the send, in a transaction of its own, so a failed send
+is delivered again and a recorded success is never sent twice. A retry rebuilds the same link: the token is derived
+from the recipient's ID and `link_issued_at` with `link-hmac`, and only its SHA-256 is stored. It checks the
+suppression list first, then the cross-tenant cap (100 link emails a day to one address, abuse 7.2), which holds the
+email back with a delayed message and leaves the recipient `queued`. `member.invited` is recorded and sends nothing
+until Cognito (M4). Metrics: `emails_sent_total{type}`, `email_caps_hit_total{cap}`, `worker_messages_total`.
+
+It reads a worker's settings (as the relay's below, its role `sft_notify`), `MailSettings` above, and:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VALKEY_URL` | none, required | The counter store, for the cross-tenant cap; unreachable, the cap counts in this pod; a secret |
+| `EMAIL_HMAC_KEYRING` | none, required | As the API's: the suppression list's pseudonyms and the cap's key; a secret |
+| `LINK_HMAC_KEYRING` | none, required | K_link (`sft/{env}/app/link-hmac`), which only this worker reads; keep an old key 14 days after a rotation (data model 2.2); a secret |
+| `CODE_HMAC_KEYRING` | none, required | K_code: each new code's HMAC; a secret |
+
+Its tests (`tests/test_notify.py`) run it against PostgreSQL with every email recorded; one sends through the SMTP
+adapter to Mailpit when `TEST_MAIL_CATCHER_URL` and `TEST_SMTP_PORT` are set, and the cross-tenant cap's counts in
+Valkey (`TEST_VALKEY_URL`).
+
+## Security-critical records
+
+`sft.service.audit_archive` (#177) writes a security-critical record (a deactivation, a demotion, a lockout, an
+unlock, and the revocations and download grants to come) straight to the audit archive bucket of each region, through
+`sft.runtime.archive.S3AuditArchive`. A record is the event's IDs, enums, times and `details` (`ArchivedEvent`), at
+`security-critical/v1/<tenant>/<yyyy>/<mm>/<dd>/<event ID>.json`, written once with `If-None-Match: *`.
+
+- **Commit, then archive**: `await archive.confirm([event])` after the change commits; a failed region raises
+  `RecordNotConfirmed`, a `503` that means "done, not yet confirmed". A retry finds the change made, reads its event
+  with `audit.latest_critical_event` and confirms it again, which rewrites nothing that is there.
+- **Intent first**, for download grants (#180): `intent_first(archive, intent, commit)` writes the intent to both
+  regions (a `503` there changes nothing), runs the commit, then writes the committed record in the background until
+  both regions confirm.
+
+Failed writes are counted in `audit_archive_write_failures_total{region}`. The tests use an in-memory store
+(`tests/archive_fixtures.py`); `tests/test_audit_archive.py` runs the S3 adapter against S3Mock.
+
+## Links, codes and link sessions
+
+`sft.service.links` (#179) holds the link steps (`resolveLink`, `requestVerificationCode`, `createLinkSession`) and the
+`/session` routes. The link steps apply group A's per-IP limits before the token lookup and fail closed (`503`)
+without the counter store; a code is checked in the five steps of data model 2.4; a lockout is a security-critical
+record. A browser's link sessions live in the `__Host-sft_link` cookie (up to 10 tokens), and `X-Link-Session` picks
+one; the `/session` routes run in that session's resource scope. `sft.service.recipients` holds
+`listTransferRecipients` and `unlockRecipient`. Tests: `tests/test_links.py` (with Valkey), `tests/test_notify.py`.
 
 ## Idempotency keys
 

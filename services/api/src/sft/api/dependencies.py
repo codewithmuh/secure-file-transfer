@@ -2,7 +2,8 @@
 
 `get_database` is the process's `Database`, and `get_email_keyring` its `email-hmac` keyring, which
 per-address rate limits count under. `get_objects` is the files buckets' object store and
-`get_upload_policy` what the settings decide about uploads (#114). The rate limiter's dependency,
+`get_upload_policy` what the settings decide about uploads (#114). `get_audit_archive` writes
+security-critical records to both regions' archive (#177). The rate limiter's dependency,
 `get_rate_limiter`, lives with the limits in rate_limits.py. All need an app created with settings.
 """
 
@@ -12,6 +13,7 @@ from fastapi import Request
 
 from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
+from sft.service.audit_archive import AuditArchive
 from sft.service.objects import ObjectStore
 from sft.service.uploads import UploadPolicy
 
@@ -46,3 +48,11 @@ def get_upload_policy(request: Request) -> UploadPolicy:
     if not isinstance(policy, UploadPolicy):
         raise RuntimeError("this app was created without settings, so it has no upload policy")
     return policy
+
+
+def get_audit_archive(request: Request) -> AuditArchive:
+    """The FastAPI dependency for both regions' audit archive: `Depends(get_audit_archive)`."""
+    archive = getattr(request.app.state, "audit_archive", None)
+    if not isinstance(archive, AuditArchive):
+        raise RuntimeError("this app was created without settings, so it has no audit archive")
+    return archive

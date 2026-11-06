@@ -15,6 +15,7 @@ from joserfc import jwt
 from joserfc.jwk import RSAKey
 
 from api_settings import CSRF_KEYRING, ISSUER, WEB_ORIGIN
+from archive_fixtures import fake_archive
 from member_fixtures import EMAIL_KEYRING, RecordingLimiter
 from pg import ScratchDatabase
 from sft.api.app import create_app
@@ -188,6 +189,7 @@ async def harness(
     app = create_app()
     app.state.database = api_db
     app.state.email_keyring = EMAIL_KEYRING
+    app.state.audit_archive = fake_archive()  # deactivations and demotions (#177)
     limiter = RecordingLimiter()
     app.dependency_overrides[get_rate_limiter] = lambda: limiter
     app.state.sign_in = service = SignIn(

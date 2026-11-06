@@ -2,7 +2,8 @@
 
 Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py),
 the member routes (#112, members.py), transfers and their files (#114, #174 to #176,
-transfers.py) and the tenant policy (#174, tenant_policy.py).
+transfers.py), the tenant policy (#174, tenant_policy.py), recipients' status and unlock (#178,
+#179, recipients.py) and the link steps and link sessions (#179, links.py).
 Probes and metrics live on the internal port (sft.runtime.internal). The interactive docs and the
 OpenAPI document aren't served either: ADR-0002 keeps them off the public load balancer, and CI
 builds the document from `create_app().openapi()`.
@@ -10,11 +11,13 @@ builds the document from `create_app().openapi()`.
 With settings, the app's lifespan opens the database pool, the rate-limit counter store, the
 sign-in service (its OIDC client and state store) and the files buckets' S3 client at startup,
 without connecting, and closes them at shutdown, after uvicorn has drained the requests; it also
-loads the `email-hmac` keyring and the upload policy. A route reaches them through the
-`get_database`, `get_email_keyring`, `get_objects` and `get_upload_policy` (dependencies.py),
-`get_rate_limiter` and `sign_in_service` (caller.py) dependencies, or names its limits with
-`rate_limit` (rate_limits.py). Without settings there is none of them: that app is for generating
-the OpenAPI document and for tests of routes that don't need them.
+loads the `email-hmac` keyring and the upload policy, and opens the audit archive of both regions
+(#177) and the link steps' services: the `code-hmac` and `csrf-hmac` keyrings and their metrics
+(#179). A route reaches them through the `get_database`, `get_email_keyring`, `get_objects`,
+`get_upload_policy` and `get_audit_archive` (dependencies.py), `get_rate_limiter` and
+`sign_in_service` (caller.py) and `get_link_services` (links.py) dependencies, or names its limits
+with `rate_limit` (rate_limits.py). Without settings there is none of them: that app is for
+generating the OpenAPI document and for tests of routes that don't need them.
 
 FastAPI's own OpenTelemetry support is off: `RequestContextMiddleware` makes the one SERVER span of
 each request, outside FastAPI's error handling, from the attribute allowlist (sft.core.telemetry).
@@ -32,15 +35,20 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import auth, members, tenant_policy, transfers
+from sft.api import auth, links, members, recipients, tenant_policy, transfers
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
+from sft.core.hmac_keyrings import CodeKeyring
 from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
+from sft.runtime.archive import S3AuditArchive
 from sft.runtime.s3 import S3Objects
+from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
+from sft.service.csrf import CsrfKeyring
+from sft.service.links import LinkMetrics, LinkServices
 from sft.service.rate_limits import RateLimiter
 from sft.service.uploads import UploadPolicy
 
@@ -89,15 +97,36 @@ def _lifespan(
             storage_quota=settings.tenant_storage_quota_bytes,
             small_pool_max=settings.scan_small_pool_max_bytes,
         )
+        archive = AuditArchive(open_archive(settings), ArchiveMetrics.create(registry))
+        app.state.audit_archive = archive
+        app.state.link_services = LinkServices(
+            limiter=app.state.rate_limiter,
+            emails=app.state.email_keyring,
+            codes=CodeKeyring.from_json(settings.code_hmac_keyring.get_secret_value()),
+            csrf=CsrfKeyring.from_json(settings.csrf_keyring.get_secret_value()),
+            archive=archive,
+            metrics=LinkMetrics.create(registry),
+        )
         try:
             yield
         finally:
+            await archive.close()
             await objects.close()
             await app.state.sign_in.aclose()
             await store.close()
             await database.dispose()
 
     return lifespan
+
+
+def open_archive(settings: Settings) -> S3AuditArchive:
+    """Both regions' audit archive buckets (#177), or Tokyo's alone where there is no Osaka."""
+    buckets = {Region.TOKYO: settings.audit_archive_tokyo_bucket}
+    endpoints = {Region.TOKYO: settings.audit_archive_tokyo_endpoint_url}
+    if settings.audit_archive_osaka_bucket is not None:
+        buckets[Region.OSAKA] = settings.audit_archive_osaka_bucket
+        endpoints[Region.OSAKA] = settings.audit_archive_osaka_endpoint_url
+    return S3AuditArchive.create(buckets, endpoints)
 
 
 def create_app(
@@ -114,10 +143,13 @@ def create_app(
         telemetry=_NO_FASTAPI_TELEMETRY,
     )
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
+    app.state.web_origin = None if settings is None else settings.web_origin
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
     auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)
     members.register(app)  # members, roles and invitations (#112)
     transfers.register(app)  # transfers, file uploads and reads (#114, #174, #175, #176)
     tenant_policy.register(app)  # the tenant's policy (#174)
+    recipients.register(app)  # recipients' status and unlock (#178, #179)
+    links.register(app)  # the link steps and link sessions (#179)
     return app

@@ -429,6 +429,9 @@ sequenceDiagram
   send loses nothing.
 - Secrets never travel through the outbox or SQS: the notification worker derives each link token with the
   `link-hmac` key, stores only its hash, and emails it ([KEYS] 6.2).
+- **As built (#178).** The notification worker answers `transfer.sent` with one `recipient.link_due` message per
+  recipient, so one message is one email and each recipient's email is retried on its own; it records each message
+  after the send (ADR-0013). `python -m sft.workers.notify`, the chart's `notifier`, compose's `notifier`.
 
 ### 4.2 Verify and download (UC-1, FR-14, FR-15)
 
@@ -803,6 +806,8 @@ across tenants fails to decrypt.
    Every change but a grant writes its record right after it commits (4.4). Records within the database replication
    lag, normally seconds, can still be lost with the Tokyo region before they reach the archive (PRD NFR-15,
    [THREAT] R-05).
+   As built (#177): `sft.service.audit_archive` writes each record once per region, keyed by its event ID (data
+   model 2.5), and the deactivations, demotions, lockouts and unlocks of M1 and M2 go through it.
 4. Every API key call is audited on its own. Cognito sign-ins reach the audit log through the sign-in triggers: the
    pre-authentication trigger reports every attempt and the post-authentication trigger every success, through an SQS
    queue to the notification worker, so failed sign-ins are recorded within 60 s ([AUTH] 2.4).

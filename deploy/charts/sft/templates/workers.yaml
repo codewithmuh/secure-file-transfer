@@ -19,8 +19,36 @@ subdomain, linking only to the web app. SES_CONFIGURATION_SET comes with the SES
   "MAIL_FROM_ADDRESS" (printf "no-reply@mail.%s" .Values.cluster.serviceDomain)
   "WEB_APP_URL" (printf "https://app.%s" .Values.cluster.serviceDomain)
   "SES_REGION" .Values.region }}
-{{- $containers = include "sft.appContainer" (dict "root" $ "name" "notifier" "module" $notifier.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $notifier.env) "resources" $notifier.resources) }}
+{{- /* Its three keyrings (#178, #179): link-hmac, which only it reads, code-hmac and email-hmac (encryption 6.1). */}}
+{{- $notifierSecrets := dict "EMAIL_HMAC_KEYRING" "notifier-secrets" "LINK_HMAC_KEYRING" "notifier-secrets" "CODE_HMAC_KEYRING" "notifier-secrets" }}
+{{- $containers = include "sft.appContainer" (dict "root" $ "name" "notifier" "module" $notifier.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $notifier.env) "secretEnv" $notifierSecrets "resources" $notifier.resources) }}
 {{ include "sft.deployment" (dict "root" $ "name" "notifier" "component" "notifier" "replicas" $notifier.replicas "serviceAccount" $notifier.serviceAccount "grace" $notifier.terminationGracePeriodSeconds "containers" $containers) }}
 ---
 {{ include "sft.pdb" (dict "root" $ "name" "notifier" "component" "notifier") }}
+---
+# The notification worker's keyrings (encryption 6.1, 6.4), from Secrets Manager in this region through the application
+# store, as the API's are. One sync wave early, so the Secret exists before the worker's pods start.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: notifier-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" (dict "root" $ "component" "notifier") | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  refreshInterval: {{ .Values.secrets.refreshInterval }}
+  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.secrets.store }} }
+  target:
+    name: notifier-secrets
+    creationPolicy: Owner
+    deletionPolicy: Retain
+  data:
+    - secretKey: EMAIL_HMAC_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/email-hmac" .Values.environment }} }
+    - secretKey: LINK_HMAC_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/link-hmac" .Values.environment }} }
+    - secretKey: CODE_HMAC_KEYRING
+      remoteRef: { key: {{ printf "sft/%s/app/code-hmac" .Values.environment }} }
 {{- end }}

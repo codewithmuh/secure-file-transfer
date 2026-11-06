@@ -36,6 +36,9 @@ ENV_NAMES = (
     "S3_ENDPOINT_URL",
     "TENANT_STORAGE_QUOTA_BYTES",
     "SCAN_SMALL_POOL_MAX_BYTES",
+    "AUDIT_ARCHIVE_OSAKA_BUCKET",
+    "AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL",
+    "AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -78,6 +81,10 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.s3_endpoint_url is None
     assert s.tenant_storage_quota_bytes == 2 * 10**12
     assert s.scan_small_pool_max_bytes == 100_000_000  # ADR-0019's 100 MB split
+    # Tokyo's archive is required; Osaka's is unset only where there is no Osaka (dev, #177).
+    assert s.audit_archive_tokyo_bucket == "sft-test-audit-archive"
+    assert s.audit_archive_osaka_bucket is None
+    assert (s.audit_archive_tokyo_endpoint_url, s.audit_archive_osaka_endpoint_url) == (None, None)
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -179,6 +186,8 @@ def test_every_sign_in_and_files_bucket_setting_is_required(
             "EMAIL_HMAC_KEYRING",
             '[{"id": "a", "state": "active", "key": "%s", "activated_at": "2026-01-01T00:00:00"}]',
         ),  # no time zone
+        ("CODE_HMAC_KEYRING", '[{"id": "a_b", "state": "active", "key": "%s"}]'),  # bad key ID
+        ("CODE_HMAC_KEYRING", "[]"),
     ],
 )
 def test_a_bad_keyring_stops_the_api_and_is_never_echoed(
@@ -199,6 +208,9 @@ def test_a_bad_keyring_stops_the_api_and_is_never_echoed(
         ("S3_LARGE_FILES_BUCKET", "ab"),  # too short
         ("S3_ENDPOINT_URL", "s3mock:9090"),  # no scheme
         ("TENANT_STORAGE_QUOTA_BYTES", "0"),
+        ("AUDIT_ARCHIVE_TOKYO_BUCKET", "Not_A_Bucket"),
+        ("AUDIT_ARCHIVE_OSAKA_BUCKET", "x"),
+        ("AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL", "s3:9090"),
     ],
 )
 def test_a_bad_files_bucket_setting_stops_the_api(
@@ -299,6 +311,7 @@ def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
                 "oidc_client_secret",
                 "csrf_keyring",
                 "email_hmac_keyring",
+                "code_hmac_keyring",
             ],
         ),
         (OperatorSettings, ["database_url", "valkey_url"]),

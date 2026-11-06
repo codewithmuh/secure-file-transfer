@@ -20,14 +20,20 @@ A role change and a deactivation end every session of the user in the same trans
 authz 3.3), so the next request of a session signs in again with the new role, or not at all. Not
 here yet: a demotion or a deactivation also revokes the user's API keys (M5), in that transaction
 too. The admins' emails about role and approver changes come
-with the notification worker. Security-critical records reach the archive with the audit archive
-job.
+with the notification worker.
+
+**Security-critical records** (#177, architecture 5.2): a deactivation and a demotion commit first,
+then their record goes to the audit archive of both regions (`sft.service.audit_archive`), and the
+call answers `200` only once both hold it, `503` otherwise, with the change kept. A retry finds the
+change already made and writes the record of its latest event if it is still missing, then
+answers `200` (API README 5).
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,16 +52,19 @@ from sft.core.errors import (
     json_pointer,
 )
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import member_sessions, users
-from sft.data.audit import Origin
+from sft.data import audit, member_sessions, users
+from sft.data.audit import ArchivedEvent, Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
 from sft.data.scope import Scope
+from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
 from sft.service.idempotency import IdempotentRequest, Outcome, once
 from sft.service.permissions import authorize
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import INVITE_USER, KeyType
+
+log = logging.getLogger(__name__)
 
 MAX_PAGE: Final = users.MAX_PAGE
 
@@ -202,14 +211,14 @@ class _AdminAtStake(Exception):  # noqa: N818 - a signal, not an error
     the tenant's active admins locked first."""
 
 
-async def _change(
+async def _change[T](
     database: Database,
     caller: Caller,
     user_id: UUID,
     *,
     at_stake: Callable[[User], bool],
-    apply: Callable[[AsyncSession, User, Sequence[UUID]], Awaitable[User]],
-) -> User:
+    apply: Callable[[AsyncSession, User, Sequence[UUID]], Awaitable[T]],
+) -> T:
     """Run `apply` on the user, locked, in one transaction of the caller's tenant.
 
     `at_stake` says whether the change could take an active admin away. Only then are the tenant's
@@ -251,17 +260,36 @@ async def update_user(
     role: Role | None = None,
     sso_fallback: bool | None = None,
     dlp_approver: bool | None = None,
+    archive: AuditArchive,
     origin: Origin,
     now: datetime,
 ) -> User:
-    """`updateUser`: the role, the fallback admin flag and the DLP approver flag."""
+    """`updateUser`: the role, the fallback admin flag and the DLP approver flag. A demotion is a
+    security-critical record: `200` only once both regions' archive hold it."""
     authorize(caller, "updateUser", now=now)
     actor = caller.actor()
 
     def demotes_an_admin(user: User) -> bool:
         return role is Role.MEMBER and _active_admin(user)
 
-    async def apply(session: AsyncSession, user: User, admins: Sequence[UUID]) -> User:
+    demoted = False
+
+    async def apply(
+        session: AsyncSession, user: User, admins: Sequence[UUID]
+    ) -> tuple[User, ArchivedEvent | None]:
+        nonlocal demoted
+        was_admin = user.role == Role.ADMIN.value
+        user = await change(session, user, admins)
+        demoted = was_admin and user.role == Role.MEMBER.value
+        # A demotion's record: this call's, or an earlier call's that a retry completes (#177).
+        demotion = None
+        if role is Role.MEMBER and user.role == Role.MEMBER.value:
+            demotion = await audit.latest_critical_event(
+                session, action="user.role_changed", target=Target(users.TARGET, user.id)
+            )
+        return user, demotion
+
+    async def change(session: AsyncSession, user: User, admins: Sequence[UUID]) -> User:
         if user.status == UserStatus.DEACTIVATED:
             raise Conflict(
                 "invalid_state",
@@ -295,25 +323,52 @@ async def update_user(
             )
         return user
 
-    return await _change(database, caller, user_id, at_stake=demotes_an_admin, apply=apply)
+    user, demotion = await _change(
+        database, caller, user_id, at_stake=demotes_an_admin, apply=apply
+    )
+    if demotion is None:
+        return user
+    if demoted:
+        await archive.confirm([demotion])
+    elif await archive.write([demotion]):
+        # Not a demotion now: an earlier one's record, completed if the archive allows, but
+        # this call answers for its own change only, so an outage doesn't fail it.
+        log.warning("an earlier demotion's record is still not in both regions")
+    return user
 
 
 async def deactivate_user(
-    database: Database, caller: Caller, user_id: UUID, *, origin: Origin, now: datetime
+    database: Database,
+    caller: Caller,
+    user_id: UUID,
+    *,
+    archive: AuditArchive,
+    origin: Origin,
+    now: datetime,
 ) -> User:
-    """`deactivateUser`: the user can't sign in any more; a retry returns the same user."""
+    """`deactivateUser`: the user can't sign in any more; a retry returns the same user. A
+    security-critical record: `200` only once both regions' archive hold it, and a retry after a
+    `503` writes it if it is still missing (#177)."""
     authorize(caller, "deactivateUser", now=now)
 
-    async def apply(session: AsyncSession, user: User, admins: Sequence[UUID]) -> User:
-        if user.status == UserStatus.DEACTIVATED:
-            return user
-        if _active_admin(user) and list(admins) == [user.id]:
-            raise _last_admin()
-        # Here every key they own is revoked too (M5), in this transaction.
-        user = await users.deactivate_user(session, user.id, actor=caller.actor(), origin=origin)
-        await member_sessions.revoke_user_sessions(
-            session, user.id, reason=member_sessions.RevokedReason.DEACTIVATED
+    async def apply(
+        session: AsyncSession, user: User, admins: Sequence[UUID]
+    ) -> tuple[User, ArchivedEvent | None]:
+        if user.status != UserStatus.DEACTIVATED:
+            if _active_admin(user) and list(admins) == [user.id]:
+                raise _last_admin()
+            # Here every key they own is revoked too (M5), in this transaction.
+            user = await users.deactivate_user(
+                session, user.id, actor=caller.actor(), origin=origin
+            )
+            await member_sessions.revoke_user_sessions(
+                session, user.id, reason=member_sessions.RevokedReason.DEACTIVATED
+            )
+        event = await audit.latest_critical_event(
+            session, action="user.deactivated", target=Target(users.TARGET, user.id)
         )
-        return user
+        return user, event
 
-    return await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)
+    user, event = await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)
+    await archive.confirm([event] if event else [])
+    return user

@@ -15,10 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from isolation import Cases, Tenants
 from sft.data import (
     audit,
+    codes,
     files,
     findings,
     idempotency,
+    link_sessions,
     member_sessions,
+    recipients,
     suppressions,
     transfers,
     usage,
@@ -37,6 +40,7 @@ from sft.data.member_sessions import (
 )
 from sft.data.models import (
     ActorType,
+    DeliveryState,
     FileState,
     InspectionState,
     ProcessedMessage,
@@ -642,6 +646,125 @@ async def fail_another_tenants_overdue_scan(session: AsyncSession, tenants: Tena
         detail=ScanDetail.DEADLINE_PASSED,
         inspection_state=InspectionState.FAILED,
     )
+
+
+# ---- links, codes and link sessions (#178, #179) ----
+
+NOTIFY_TENANT = {NOTIFY: [TENANT]}
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_another_tenants_link_and_sessions(session: AsyncSession, tenants: Tenants) -> object:
+    # The credential lookups read across tenants by design, in lookup scope only: IDs and a
+    # status, never a hash; the harness checks that nothing changed.
+    return (
+        await recipients.find_by_token(session, str(tenants.theirs.rows["link_token"])),
+        await link_sessions.lookup(session, [str(tenants.theirs.rows["link_session_token"])]),
+    )
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def read_another_tenants_link_target(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await recipients.link_target(session, theirs["recipient"], lock=True),
+        await transfers.notice(session, theirs["transfer"]),
+        await transfers.recipient_ids(session, theirs["transfer"]),
+        await tenant_data.sender(session),
+    )
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def issue_another_tenants_link(session: AsyncSession, tenants: Tenants) -> object:
+    recipient_id = tenants.theirs.rows["recipient"]
+    issued = await recipients.issue_link(
+        session,
+        recipient_id,
+        key_id="iso",
+        issued_at=datetime.now(UTC),
+        hashed=hashlib.sha256(b"x").digest(),
+        replace=True,
+    )
+    await recipients.set_delivery(session, recipient_id, DeliveryState.SENT, notified=True)
+    await audit.record(session, action="recipient.link_issued", actor=Actor(ActorType.SYSTEM))
+    return issued
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def make_a_code_for_another_tenants_recipient(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    made = await codes.create(
+        session,
+        tenants.theirs.rows["recipient"],
+        code_id=uuid.uuid4(),
+        code_hmac=hashlib.sha256(b"c").digest(),
+        key_id="iso",
+    )
+    await audit.record(session, action="verification.code_created", actor=Actor(ActorType.SYSTEM))
+    return made
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]})
+async def read_another_tenants_recipient_and_counters(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await recipients.counters(session, theirs["recipient"]),
+        await link_sessions.get_live(session, theirs["link_session"]),
+        await recipients.link_view(session, theirs["recipient"]),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_statuses_and_codes(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await recipients.statuses(session, theirs["transfer"]),
+        await codes.newest(session, theirs["recipient"]),
+        await codes.why_unusable(session, theirs["code"]),
+        await link_sessions.live_for_recipient(session, theirs["recipient"]),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def check_a_code_of_another_tenants_recipient(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    locked = await recipients.lock_unlocked(session, theirs["recipient"])
+    taken = await codes.take_attempt(session, theirs["code"])
+    await codes.consume(session, theirs["code"])
+    await recipients.mark_verified(session, theirs["recipient"])
+    await audit.record(session, action="verification.attempted", actor=Actor(ActorType.SYSTEM))
+    return locked, taken, await recipients.count_failure(session, theirs["recipient"])
+
+
+@cases.add(scopes=API_TENANT)
+async def unlock_another_tenants_recipient(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    await recipients.unlock(session, theirs["recipient"], by=tenants.mine.rows["user"])
+    await audit.record(session, action="recipient.unlocked", actor=Actor(ActorType.SYSTEM))
+    return await recipients.lock_recipient(session, theirs["transfer"], theirs["recipient"])
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]})
+async def end_another_tenants_link_session(session: AsyncSession, tenants: Tenants) -> object:
+    ended = await link_sessions.revoke(session, tenants.theirs.rows["link_session"])
+    await audit.record(session, action="link_session.ended", actor=Actor(ActorType.SYSTEM))
+    return ended
+
+
+@cases.add(scopes=API_TENANT)
+async def start_a_session_for_another_tenants_recipient(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    made = await link_sessions.create(session, tenants.theirs.rows["recipient"], ends_by=None)
+    await audit.record(session, action="link_session.started", actor=Actor(ActorType.SYSTEM))
+    return made
 
 
 test_isolation = cases.test()

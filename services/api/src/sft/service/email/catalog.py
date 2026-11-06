@@ -51,6 +51,7 @@ class EmailType(enum.StrEnum):
     FILES_BLOCKED_MEMBER = "files_blocked_member"
     FILES_BLOCKED_UPLOADER = "files_blocked_uploader"
     TRANSFER_HELD = "transfer_held"
+    TRANSFER_RETURNED_TO_DRAFT = "transfer_returned_to_draft"
     RECIPIENT_LOCKED = "recipient_locked"
     DLP_CONFIRMATION_NEEDED = "dlp_confirmation_needed"
     DLP_APPROVAL_REQUESTED = "dlp_approval_requested"
@@ -390,6 +391,18 @@ class TransferHeld(Email):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TransferReturnedToDraft(Email):
+    """Data model 3.2: no counted file was left, so the transfer went back to draft and no
+    recipient was notified. Names no file: the transfer page shows what happened (#178)."""
+
+    TYPE = EmailType.TRANSFER_RETURNED_TO_DRAFT
+    transfer_id: UUID
+
+    def _context(self, links: Links, locale: Locale) -> dict[str, object]:
+        return {"transfer_url": links.transfer(self.transfer_id)}
+
+
+@dataclass(frozen=True, kw_only=True)
 class RecipientLocked(Email):
     """NFR-14, authn-authz 4.4: to the owner and every tenant admin. Names no address."""
 
@@ -505,6 +518,7 @@ EMAILS: dict[EmailType, type[Email]] = {
         FilesArrived,
         FilesBlockedMember,
         TransferHeld,
+        TransferReturnedToDraft,
         RecipientLocked,
         DlpConfirmationNeeded,
         DlpApprovalRequested,
