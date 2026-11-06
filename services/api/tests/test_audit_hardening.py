@@ -124,6 +124,24 @@ LOOKUP_COLUMNS = {
         ("member_sessions", column, "SELECT")
         for column in ("id", "tenant_id", "session_hash", "expires_at", "revoked_at")
     ),
+    # lookup_link_token (revision 0013): a recipient's link by its token hash.
+    *(
+        ("transfer_recipients", column, "SELECT")
+        for column in ("id", "tenant_id", "link_token_hash")
+    ),
+    # lookup_link_sessions (revision 0013): link sessions by their hashes, and whether each is live.
+    *(
+        ("link_sessions", column, "SELECT")
+        for column in (
+            "id",
+            "tenant_id",
+            "recipient_id",
+            "session_hash",
+            "expires_at",
+            "last_seen_at",
+            "revoked_at",
+        )
+    ),
 }
 LOOKUP_GRANTS = {(table, privilege) for table, _, privilege in LOOKUP_COLUMNS}
 
