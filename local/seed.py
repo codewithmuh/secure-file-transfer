@@ -199,9 +199,9 @@ def main() -> int:
         "sign_in": "http://localhost:8000/v1/auth/sign-in",
         "keycloak": ISSUER,
         "tenant": {"id": TENANT_ID, "name": TENANT_NAME},
-        "users": [
-            {k: u[k] for k in ("role", "email", "password", "user_id")} for u in USERS
-        ],
+        # No passwords in the output, not even these fake ones: docs/local-development.md section 3 lists them.
+        "users": [{k: u[k] for k in ("role", "email", "user_id")} for u in USERS],
+        "passwords": "docs/local-development.md, section 3",
         "added": added,
     }
     if args.json:
@@ -213,8 +213,10 @@ def main() -> int:
         f"Sign in at {WEB_APP}, or start at {details['sign_in']}, through Keycloak ({ISSUER}):"
     )
     for user in USERS:
-        print(f"  {user['role']:6}  {user['email']}  password: {user['password']}")
-    print("Every credential here is local-only and fake.")
+        print(f"  {user['role']:6}  {user['email']}")
+    print(
+        "Their local-only, fake passwords are in docs/local-development.md, section 3."
+    )
     return 0
 
 
