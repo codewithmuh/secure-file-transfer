@@ -32,6 +32,7 @@ from sft.data.database import Database
 from sft.data.models import Role
 from sft.data.roles import API
 from sft.service.caller import AuthMethod, Caller
+from sft.service.rate_limits import Charge
 from sft.service.rate_limits.limits import KeyType, KeyValue, Limit
 from sft.service.uploads import UploadPolicy
 
@@ -101,17 +102,30 @@ def session_caller(
 
 @dataclass
 class RecordingLimiter:
-    """A stand-in for `RateLimiter`: each check's limit IDs and keys; `refuse` makes it a 429."""
+    """A stand-in for `RateLimiter`: each check's limit IDs, keys and cost (`check_all` records
+    each of its charges as a check), each `peek_all`; `refuse` makes it a 429."""
 
     checks: list[tuple[tuple[str, ...], dict[KeyType, KeyValue]]] = field(default_factory=list)
+    costs: list[int] = field(default_factory=list)
+    peeks: list[list[tuple[str, int]]] = field(default_factory=list)
     refuse: bool = False
 
     async def check(
         self, limits: Sequence[Limit], keys: Mapping[KeyType, KeyValue], *, cost: int = 1
     ) -> None:
         self.checks.append((tuple(limit.id for limit in limits), dict(keys)))
+        self.costs.append(cost)
         if self.refuse:
             raise RateLimited(retry_after=30)
+
+    async def peek_all(self, charges: Sequence[Charge]) -> None:
+        self.peeks.append([(c.limit.id, c.cost) for c in charges])
+        if self.refuse:
+            raise RateLimited(retry_after=30)
+
+    async def check_all(self, charges: Sequence[Charge]) -> None:
+        for charge in charges:
+            await self.check([charge.limit], charge.keys, cost=charge.cost)
 
 
 def app_for(

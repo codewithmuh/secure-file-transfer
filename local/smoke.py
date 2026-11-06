@@ -28,6 +28,7 @@ import secrets
 import smtplib
 import socket
 import struct
+import subprocess
 import sys
 import time
 import uuid
@@ -226,10 +227,22 @@ def check_sqs() -> str:
         for queue in (name, f"{name}-dlq"):
             full = cfg["SQS_QUEUE_PREFIX"] + queue
             urls[queue] = sqs.get_queue_url(QueueName=full)["QueueUrl"]
-    url = urls["scan-small"]
-    redrive = sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["RedrivePolicy"])
+    redrive = sqs.get_queue_attributes(
+        QueueUrl=urls["scan-small"], AttributeNames=["RedrivePolicy"]
+    )
     assert "scan-small-dlq" in redrive["Attributes"]["RedrivePolicy"], redrive
 
+    # A queue of its own: the scan workers consume the work queues, so they would take its messages.
+    url = sqs.create_queue(
+        QueueName=f"{cfg['SQS_QUEUE_PREFIX']}smoke-{uuid.uuid4().hex[:8]}"
+    )["QueueUrl"]
+    try:
+        return _round_trip(sqs, url, len(urls))
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+def _round_trip(sqs, url: str, queues: int) -> str:
     body = json.dumps({"outbox_id": str(uuid.uuid4())})
     sqs.send_message(QueueUrl=url, MessageBody=body, MessageGroupId="smoke-tenant")
     sqs.send_message(QueueUrl=url, MessageBody="delayed", DelaySeconds=2)
@@ -250,7 +263,7 @@ def check_sqs() -> str:
     else:
         raise AssertionError("the delayed message never became visible")
     delay = time.monotonic() - start
-    return f"{len(urls)} queues; send and receive; delayed message after {delay:.1f}s"
+    return f"{queues} queues; send and receive; delayed message after {delay:.1f}s"
 
 
 def check_valkey() -> str:
@@ -291,6 +304,60 @@ def check_clamd() -> str:
     assert infected.endswith(b"FOUND"), infected
     signature = infected.decode().split(": ", 1)[1]
     return f"PONG; clean stream OK; EICAR detected ({signature})"
+
+
+# Run inside the inspector's container: it must reach neither the database, the counter store nor anything outside.
+INSPECTOR_PROBE = """
+import socket, sys
+for host, port in (("postgres", 5432), ("valkey", 6379), ("1.1.1.1", 443)):
+    try:
+        socket.create_connection((host, port), 3).close()
+    except OSError:
+        continue
+    sys.exit(f"reached {host}:{port}")
+"""
+
+# Run inside a scan worker's container: one small text through the inspector's protocol and sandbox.
+WORKER_PROBE = """
+import asyncio
+from sft.dlp import client
+from sft.dlp.detect import BUILTIN_DETECTORS
+
+async def main():
+    data = b"nothing sensitive here"
+    reader, writer = await asyncio.open_connection("inspector", 8070)
+    async def body():
+        yield data
+    answer = await client.inspect(
+        reader, writer, size=len(data), body=body(), builtin_detectors=BUILTIN_DETECTORS
+    )
+    writer.close()
+    print(answer.state)
+
+asyncio.run(main())
+"""
+
+
+def in_container(service: str, script: str) -> str:
+    done = subprocess.run(
+        ["docker", "compose", "exec", "-T", service, "python", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert done.returncode == 0, (
+        done.stderr.strip()[-300:] or done.stdout.strip()[-300:]
+    )
+    return done.stdout.strip()
+
+
+def check_inspector() -> str:
+    # ADR-0022: no egress at all, and no database; only the scan workers reach it.
+    in_container("inspector", INSPECTOR_PROBE)
+    state = in_container("scan-worker-small", WORKER_PROBE)
+    assert state == "inspected", state
+    return "no route to the database, the counter store or out; a scan worker's file inspected"
 
 
 def check_mail() -> str:
@@ -408,6 +475,7 @@ CHECKS: dict[str, Callable[[], str]] = {
     "sqs": check_sqs,
     "valkey": check_valkey,
     "clamd": check_clamd,
+    "inspector": check_inspector,
     "mail": check_mail,
     "oidc": check_oidc,
 }

@@ -3,6 +3,7 @@
 import ast
 import re
 from pathlib import Path
+from typing import Any
 
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
@@ -15,7 +16,11 @@ from sft.data.migrate import alembic_config, compatible_with, include_name
 from sft.data.models import (
     Base,
     FileState,
+    InspectionReason,
+    InspectionState,
     Role,
+    ScanDetail,
+    ScanEngine,
     SessionRevokedReason,
     TransferState,
     UserStatus,
@@ -318,3 +323,124 @@ def test_the_transfers_checks_list_the_states_of_the_code() -> None:
     ]
     assert f"({script.module.TRANSFER_STATES})" == sql_values(TransferState)
     assert f"({script.module.FILE_STATES})" == sql_values(FileState)
+
+
+def _module(attribute: str, revision: str) -> object:
+    [script] = [
+        s
+        for s in SCRIPTS.walk_revisions()
+        if hasattr(s.module, attribute) and s.revision == revision
+    ]
+    return script.module
+
+
+def _columns(listed: str) -> list[str]:
+    return [c.strip() for c in listed.split(",")]
+
+
+def test_the_send_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("TRANSFER_WRITE", "0009")
+    assert list(module.KEYS) == [
+        tenant_keys_sql("download_counters")[0],
+        tenant_foreign_key_sql(
+            "download_counters", "recipient_id", "transfer_recipients", on_delete="CASCADE"
+        ),
+        tenant_foreign_key_sql("download_counters", "file_id", "files", on_delete="CASCADE"),
+        *tenant_keys_sql("email_suppressions"),
+    ]
+    evaluators = ("sft_scan", "sft_jobs")
+    grants = [
+        *tenant_rls_sql(
+            "download_counters",
+            grants={"sft_api": "SELECT, INSERT", "sft_scan": "INSERT", "sft_jobs": "INSERT"},
+        ),
+        *tenant_rls_sql(
+            "email_suppressions",
+            grants={"sft_api": "SELECT", "sft_notify": "SELECT, INSERT, UPDATE"},
+        ),
+        grant_sql("tenant_policies", "sft_api", "SELECT, INSERT, UPDATE"),
+        grant_sql(
+            "tenant_policies", "sft_scan", "SELECT", columns=["tenant_id", "unscannable_policy"]
+        ),
+        "ALTER POLICY tenant_isolation ON tenant_policies TO sft_operator, sft_api, sft_scan",
+    ]
+    for table, read, write in (
+        ("transfers", module.TRANSFER_READ, module.TRANSFER_WRITE),
+        ("transfer_recipients", module.RECIPIENT_READ, module.RECIPIENT_WRITE),
+        ("files", module.FILE_READ, None),
+    ):
+        for role in evaluators:
+            grants.append(grant_sql(table, role, "SELECT", columns=_columns(read)))
+            if write is not None:
+                grants.append(grant_sql(table, role, "UPDATE", columns=_columns(write)))
+        grants.append(f"ALTER POLICY tenant_isolation ON {table} TO sft_api, sft_scan, sft_jobs")
+    assert list(module.RLS) == grants
+    assert list(module.AUDIT) == [
+        require_audit_sql("download_counters"),
+        require_audit_sql("email_suppressions"),
+    ]
+    # The evaluation's roles never read a ciphertext column or an address (data model 4.2).
+    for listed in (module.TRANSFER_READ, module.RECIPIENT_READ, module.FILE_READ):
+        assert not {"message_ct", "display_name_ct", "email", "email_normalized"} & set(
+            _columns(listed)
+        )
+
+
+def test_the_scan_revisions_keep_the_sql_the_helpers_wrote_for_them() -> None:
+    scans: Any = _module("SCAN_COLUMNS", "0010")
+    columns = _columns(scans.SCAN_COLUMNS)
+    assert list(scans.RLS) == [
+        grant_sql("files", "sft_scan", "SELECT", columns=columns),
+        grant_sql("files", "sft_scan", "UPDATE", columns=["state", *columns, "updated_at"]),
+        grant_sql("files", "sft_jobs", "SELECT", columns=columns),
+        grant_sql(
+            "files",
+            "sft_jobs",
+            "UPDATE",
+            columns=["state", "scan_detail", "scanned_at", "updated_at"],
+        ),
+        policy_sql(
+            "jobs_find",
+            "files",
+            roles=["sft_jobs"],
+            command="SELECT",
+            using="app_scope() = 'system'",
+        ),
+    ]
+    inspections: Any = _module("INSPECTION_COLUMNS", "0011")
+    inspected = _columns(inspections.INSPECTION_COLUMNS)
+    assert list(inspections.KEYS) == [
+        *tenant_keys_sql("dlp_findings"),
+        tenant_foreign_key_sql("dlp_findings", "file_id", "files", on_delete="CASCADE"),
+    ]
+    assert list(inspections.RLS) == [
+        grant_sql("files", "sft_scan", "SELECT", columns=inspected),
+        grant_sql("files", "sft_scan", "UPDATE", columns=inspected),
+        grant_sql("files", "sft_jobs", "SELECT", columns=inspected),
+        grant_sql("files", "sft_jobs", "UPDATE", columns=["inspection_state"]),
+        *tenant_rls_sql("dlp_findings", grants={"sft_api": "SELECT", "sft_scan": "INSERT"}),
+    ]
+    assert list(inspections.AUDIT) == [require_audit_sql("dlp_findings")]
+
+
+def test_the_scan_checks_list_the_values_of_the_code() -> None:
+    scans: Any = _module("SCAN_COLUMNS", "0010")
+    checks = dict(scans.CHECKS)
+    assert f"scan_engine IN {sql_values(ScanEngine)}" == checks["files_scan_engine_check"]
+    assert f"scan_detail IN {sql_values(ScanDetail)}" == checks["files_scan_detail_check"]
+    inspections: Any = _module("INSPECTION_COLUMNS", "0011")
+    checks = dict(inspections.CHECKS)
+    assert checks["files_inspection_state_check"] == (
+        f"inspection_state IN {sql_values(InspectionState)}"
+    )
+    reasons = sql_values(InspectionReason)[1:-1]
+    assert checks["files_inspection_reasons_check"] == (
+        f"inspection_reasons <@ ARRAY[{reasons}]::text[]"
+    )
+
+
+def test_the_sweep_finds_overdue_scans_by_an_index(migrated_db: ScratchDatabase) -> None:
+    [(definition,)] = migrated_db.sql(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'files_scan_deadline_idx'"
+    )
+    assert "WHERE (state = 'scanning'::text)" in str(definition)

@@ -9,6 +9,8 @@ layer's (`sft.service.uploads`).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
@@ -16,7 +18,15 @@ from sqlalchemy import Update, and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
-from sft.data.models import File, FileState
+from sft.data.models import (
+    File,
+    FileState,
+    InspectionReason,
+    InspectionState,
+    ScanDetail,
+    ScanEngine,
+    StorageClass,
+)
 from sft.data.scope import ScopeKind
 
 
@@ -197,3 +207,205 @@ async def remove_file(session: AsyncSession, file_id: UUID) -> File | None:
             removed_at=func.now(), delete_after=func.coalesce(File.delete_after, func.now())
         ),
     )
+
+
+async def cancel_files(session: AsyncSession, transfer_id: UUID) -> list[File]:
+    """A cancelled transfer's files are due for deletion (data model 6): `delete_after` on each,
+    if not set already. Returns the files that were `uploading` or `completing`, which the caller
+    rejects: cancelling wins over an upload (contract, `cancelTransfer`)."""
+    require_scope(session, ScopeKind.TENANT)
+    await session.execute(
+        update(File)
+        .where(
+            File.transfer_id == transfer_id,
+            File.delete_after.is_(None),
+            in_scope(File, session),
+        )
+        .values(delete_after=func.now())
+        .execution_options(synchronize_session=False)
+    )
+    rows = await session.scalars(
+        select(File)
+        .where(
+            File.transfer_id == transfer_id,
+            File.state.in_([FileState.UPLOADING.value, FileState.COMPLETING.value]),
+            in_scope(File, session),
+        )
+        .order_by(File.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+# ---- the evaluation, the scan worker and the scan sweep ----
+
+
+@dataclass(frozen=True, slots=True)
+class CountedFile:
+    """What the evaluation needs of one counted file (data model 3.2)."""
+
+    id: UUID
+    state: FileState
+    unscannable_allowed: bool
+    inspection_state: InspectionState
+
+
+async def counted_states(session: AsyncSession, transfer_id: UUID) -> list[CountedFile]:
+    """The transfer's counted files: not `rejected` and not removed."""
+    require_scope(session, ScopeKind.TENANT)
+    rows = await session.execute(
+        select(File.id, File.state, File.unscannable_allowed, File.inspection_state)
+        .where(
+            File.transfer_id == transfer_id,
+            File.state != FileState.REJECTED.value,
+            File.removed_at.is_(None),
+            in_scope(File, session),
+        )
+        .order_by(File.id)
+    )
+    return [
+        CountedFile(
+            r.id, FileState(r.state), r.unscannable_allowed, InspectionState(r.inspection_state)
+        )
+        for r in rows
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class ScanTarget:
+    """What the scan worker needs of a file: where its recorded version is, and its state."""
+
+    id: UUID
+    transfer_id: UUID
+    state: FileState
+    storage_class: StorageClass
+    storage_key: str
+    s3_version_id: str | None
+    actual_size: int | None
+    unscannable_allowed: bool
+    inspection_state: InspectionState
+
+
+async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(
+                File.id,
+                File.transfer_id,
+                File.state,
+                File.storage_class,
+                File.storage_key,
+                File.s3_version_id,
+                File.actual_size,
+                File.unscannable_allowed,
+                File.inspection_state,
+            ).where(File.id == file_id, in_scope(File, session))
+        )
+    ).first()
+    if row is None:
+        raise NotFoundError("file")
+    return ScanTarget(
+        id=row.id,
+        transfer_id=row.transfer_id,
+        state=FileState(row.state),
+        storage_class=StorageClass(row.storage_class),
+        storage_key=row.storage_key,
+        s3_version_id=row.s3_version_id,
+        actual_size=row.actual_size,
+        unscannable_allowed=row.unscannable_allowed,
+        inspection_state=InspectionState(row.inspection_state),
+    )
+
+
+async def record_scan(
+    session: AsyncSession,
+    file_id: UUID,
+    *,
+    state: FileState,
+    engine: ScanEngine | None,
+    detail: ScanDetail | None,
+    attempts: int,
+    unscannable_allowed: bool,
+    inspection_state: InspectionState,
+    inspection_reasons: Sequence[InspectionReason] = (),
+    inspection_engine_version: str | None = None,
+) -> bool:
+    """Record the scan's and the inspection's result together, only if the file is still
+    `scanning` (data model 3.1, 3.5); False if it wasn't, and nothing changed."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        update(File)
+        .where(
+            File.id == file_id,
+            File.state == FileState.SCANNING.value,
+            in_scope(File, session),
+        )
+        .values(
+            state=state.value,
+            scan_engine=None if engine is None else engine.value,
+            scan_detail=None if detail is None else detail.value,
+            scan_attempts=attempts,
+            scanned_at=func.now(),
+            unscannable_allowed=unscannable_allowed,
+            inspection_state=inspection_state.value,
+            inspection_reasons=[r.value for r in inspection_reasons],
+            inspection_engine_version=inspection_engine_version,
+        )
+        .returning(File.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
+
+
+@dataclass(frozen=True, slots=True)
+class Overdue:
+    tenant_id: UUID
+    file_id: UUID
+
+
+async def overdue_scans(session: AsyncSession, *, limit: int) -> list[Overdue]:
+    """Files still `scanning` past their deadline, across tenants: the scan sweep's find step, in
+    system scope (data model 3.1, 4.2)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.execute(
+        select(File.tenant_id, File.id)
+        .where(
+            File.state == FileState.SCANNING.value,
+            File.scan_deadline < func.now(),
+            in_scope(File, session),
+        )
+        .order_by(File.scan_deadline)
+        .limit(limit)
+    )
+    return [Overdue(r.tenant_id, r.id) for r in rows]
+
+
+async def fail_overdue_scan(
+    session: AsyncSession,
+    file_id: UUID,
+    *,
+    detail: ScanDetail,
+    inspection_state: InspectionState,
+) -> UUID | None:
+    """`scan_failed` for a file still `scanning` past its deadline, in its tenant's scope; its
+    transfer's ID, or None if a result came first and nothing changed."""
+    require_scope(session, ScopeKind.TENANT)
+    transfer_id: UUID | None = await session.scalar(
+        update(File)
+        .where(
+            File.id == file_id,
+            File.state == FileState.SCANNING.value,
+            File.scan_deadline < func.now(),
+            in_scope(File, session),
+        )
+        .values(
+            state=FileState.SCAN_FAILED.value,
+            scan_detail=detail.value,
+            scanned_at=func.now(),
+            inspection_state=inspection_state.value,
+        )
+        .returning(File.transfer_id)
+        .execution_options(synchronize_session=False)
+    )
+    return transfer_id

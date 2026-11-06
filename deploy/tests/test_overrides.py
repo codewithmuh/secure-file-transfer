@@ -41,7 +41,16 @@ OVERRIDES = {
         "VALKEY_URL",
         "NO_PROXY",
     ],
-    "scanWorker": ["SQS_QUEUE_PREFIX", "SCAN_POOL", "VALKEY_URL", "DATABASE_URL"],
+    "scanWorker": [
+        "SQS_QUEUE_PREFIX",
+        "SCAN_POOL",
+        "VALKEY_URL",
+        "DATABASE_URL",
+        "S3_FILES_BUCKET",
+        "CLAMD_HOST",
+        "INSPECTOR_HOST",
+        "SCAN_LARGE_POOL_SIZE",
+    ],
     "operatorApi": [
         "OPERATOR_AWS_ACCOUNT_ID",
         "OPERATOR_ROLE_NAME",

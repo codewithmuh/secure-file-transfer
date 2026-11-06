@@ -12,6 +12,10 @@
   `Retry-After: 5`; every other limit counts in this pod at a third of its value.
 - **Addresses.** A per-address limit given `EmailPseudonyms` counts under the active pseudonym and
   adds the entries of each older one still in the 25-hour overlap (encryption and keys 6.5).
+- **All or nothing** (`check_all`, `peek_all`). A request charged against many limits at once, as
+  `sendTransfer` charges each recipient's address, first reads every limit in one pipelined call
+  and charges only if all of them admit it, in a second. A refusal charges nothing. Two requests
+  racing between the two calls can still leave one partly charged; both answers stay right.
 """
 
 from __future__ import annotations
@@ -21,14 +25,19 @@ import math
 import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 
 from sft.core.errors import RateLimited, ServiceUnavailable
 from sft.core.pseudonyms import EmailPseudonyms
 from sft.data.counters import (
+    Call,
     CounterMetrics,
     CounterStore,
     CounterStoreUnavailableError,
+    LogCall,
     LogMode,
+    RateCall,
+    ScoresCall,
     Verdict,
 )
 from sft.service.rate_limits.limits import (
@@ -51,6 +60,25 @@ class RateLimitStoreUnavailable(ServiceUnavailable):
 
     def __init__(self) -> None:
         super().__init__(retry_after=STORE_UNAVAILABLE_RETRY_AFTER)
+
+
+@dataclass(frozen=True)
+class Charge:
+    """One limit, the keys it counts under and what this request costs it (`check_all`)."""
+
+    limit: Limit
+    keys: Mapping[KeyType, KeyValue]
+    cost: int = 1
+
+
+@dataclass(frozen=True)
+class _Planned:
+    charge: Charge
+    key_type: KeyType
+    key: str
+    older: tuple[str, ...]
+    limit_value: int
+    local_value: int
 
 
 class RateLimiter:
@@ -96,6 +124,173 @@ class RateLimiter:
             wait_ms = max(verdict.wait_ms for _, _, verdict in refused)
             log.info("rate limited", extra={"limits": [limit.id for limit, _, _ in refused]})
             raise RateLimited(retry_after=max(1, math.ceil(wait_ms / 1000)))
+
+    async def peek_all(self, charges: Sequence[Charge]) -> None:
+        """Raise as `check_all` would, and charge nothing: one pipelined call."""
+        await self._all(charges, charge=False)
+
+    async def check_all(self, charges: Sequence[Charge]) -> None:
+        """Charge every one of `charges`, or none (module docstring): one pipelined call to read
+        them all, and one more to charge if every limit admits the request."""
+        await self._all(charges, charge=True)
+
+    def _plan(self, charge: Charge) -> _Planned:
+        if charge.cost < 1:
+            raise ValueError("cost is at least 1")
+        limit = charge.limit
+        key_type = limit.key_type(charge.keys)
+        value = charge.keys[key_type]
+        active, older = (
+            (value.active, value.overlap) if isinstance(value, EmailPseudonyms) else (value, ())
+        )
+        rule = limit.rule
+        if isinstance(rule, Rate):
+            if older:
+                raise ValueError(f"limit {limit.id}: only quotas add an older pseudonym's count")
+            local = fallback_limit(rule.limit, rule.max_cost)
+        else:
+            if charge.cost != 1:
+                raise ValueError(f"limit {limit.id}: a quota counts one event at a time")
+            if limit.counts_failures:
+                raise ValueError(f"limit {limit.id} counts failures, not requests")
+            local = fallback_limit(rule.limit)
+        return _Planned(
+            charge,
+            key_type,
+            limit.store_key(key_type, active),
+            tuple(limit.store_key(key_type, old) for old in older),
+            rule.limit,
+            local,
+        )
+
+    async def _all(self, charges: Sequence[Charge], *, charge: bool) -> None:
+        plans = [self._plan(c) for c in charges]
+        if not plans:
+            return
+        now_ms = int(self._clock() * 1000)
+        try:
+            await self._all_in_store(plans, now_ms, charge=charge)
+        except CounterStoreUnavailableError:
+            if any(p.charge.limit.group.failure_mode is FailureMode.CLOSED for p in plans):
+                log.warning("counter store unavailable: refusing")
+                raise RateLimitStoreUnavailable() from None
+            self._all_locally(plans, now_ms, charge=charge)
+
+    def _calls(
+        self,
+        plans: Sequence[_Planned],
+        now_ms: int,
+        others: Mapping[str, list[float]],
+        *,
+        peek: bool,
+    ) -> list[Call]:
+        calls: list[Call] = []
+        for plan in plans:
+            rule = plan.charge.limit.rule
+            if isinstance(rule, Rate):
+                calls.append(
+                    RateCall(
+                        plan.key,
+                        plan.limit_value,
+                        rule.period_seconds * 1000,
+                        plan.charge.cost,
+                        peek,
+                    )
+                )
+            else:
+                calls.append(
+                    LogCall(
+                        plan.key,
+                        plan.limit_value,
+                        rule.window_seconds * 1000,
+                        "peek" if peek else "hit",
+                        f"{now_ms}-{secrets.token_hex(4)}",
+                        rule.block_seconds * 1000,
+                        tuple(s for old in plan.older for s in others.get(old, [])),
+                    )
+                )
+        return calls
+
+    async def _all_in_store(self, plans: Sequence[_Planned], now_ms: int, *, charge: bool) -> None:
+        others: dict[str, list[float]] = {}
+        older = [
+            (old, plan.charge.limit.rule)
+            for plan in plans
+            for old in plan.older
+            if isinstance(plan.charge.limit.rule, Quota)
+        ]
+        if older:
+            found = await self._store.run(
+                [ScoresCall(old, rule.window_seconds * 1000) for old, rule in older],
+                now_ms=now_ms,
+            )
+            others = {
+                old: list(times)
+                for (old, _), times in zip(older, found, strict=True)
+                if isinstance(times, list)
+            }
+        peeked = await self._store.run(self._calls(plans, now_ms, others, peek=True), now_ms=now_ms)
+        self._refuse_if_any(plans, peeked)
+        if charge:
+            charged = await self._store.run(
+                self._calls(plans, now_ms, others, peek=False), now_ms=now_ms
+            )
+            self._refuse_if_any(plans, charged)
+
+    def _all_locally(self, plans: Sequence[_Planned], now_ms: int, *, charge: bool) -> None:
+        # One pod, no await in between: the peek and the charge can't be interleaved.
+        for peek in (True, False) if charge else (True,):
+            verdicts: list[Verdict | list[float]] = []
+            for plan in plans:
+                rule = plan.charge.limit.rule
+                if isinstance(rule, Rate):
+                    verdicts.append(
+                        self._local.rate(
+                            plan.key,
+                            now_ms=now_ms,
+                            limit=plan.local_value,
+                            period_ms=rule.period_seconds * 1000,
+                            cost=plan.charge.cost,
+                            peek=peek,
+                        )
+                    )
+                else:
+                    window_ms = rule.window_seconds * 1000
+                    others = [
+                        s
+                        for old in plan.older
+                        for s in self._local.scores(old, now_ms=now_ms, window_ms=window_ms)
+                    ]
+                    verdicts.append(
+                        self._local.log(
+                            plan.key,
+                            now_ms=now_ms,
+                            limit=plan.local_value,
+                            window_ms=window_ms,
+                            mode="peek" if peek else "hit",
+                            block_ms=rule.block_seconds * 1000,
+                            others=others,
+                        )
+                    )
+            self._refuse_if_any(plans, verdicts)
+
+    def _refuse_if_any(
+        self, plans: Sequence[_Planned], verdicts: Sequence[Verdict | list[float]]
+    ) -> None:
+        refused = [
+            (plan, verdict)
+            for plan, verdict in zip(plans, verdicts, strict=True)
+            if isinstance(verdict, Verdict) and not verdict.allowed
+        ]
+        if not refused:
+            return
+        for plan, _ in refused:
+            self._metrics.rejections.labels(
+                plan.charge.limit.group.value, plan.key_type.value
+            ).inc()
+        wait_ms = max(verdict.wait_ms for _, verdict in refused)
+        log.info("rate limited", extra={"limits": sorted({p.charge.limit.id for p, _ in refused})})
+        raise RateLimited(retry_after=max(1, math.ceil(wait_ms / 1000)))
 
     async def record(self, limit: Limit, value: str) -> None:
         """Record one failure against a quota of failures, such as a `401` for an IP.
@@ -166,7 +361,7 @@ class RateLimiter:
         if isinstance(rule, Rate):
             if older:
                 raise ValueError(f"limit {limit.id}: only quotas add an older pseudonym's count")
-            limit_value = fallback_limit(rule.limit) if local else rule.limit
+            limit_value = fallback_limit(rule.limit, rule.max_cost) if local else rule.limit
             period_ms = rule.period_seconds * 1000
             if local:
                 return self._local.rate(

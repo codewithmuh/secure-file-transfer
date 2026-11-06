@@ -26,6 +26,7 @@ from sft.api.app import create_app
 from sft.data.models import Role
 from sft.data.scope import Subject
 from sft.service.caller import AuthMethod, Caller, CallerKind
+from transfer_fixtures import seed_file, seed_transfer
 
 pytestmark = pytest.mark.anyio
 
@@ -40,11 +41,13 @@ API_KEY_SCOPES = (
 
 @dataclass(frozen=True)
 class Draft:
-    """A draft of `Tenant.target` with one file whose single part is uploaded (#114)."""
+    """A draft of `Tenant.target` with one file whose single part is uploaded (#114), and a
+    second draft of theirs, `ready`, whose one file is scanning, so it can be sent (#174)."""
 
     transfer: uuid.UUID
     file: uuid.UUID
     upload: str
+    ready: uuid.UUID
 
 
 @dataclass(frozen=True)
@@ -59,13 +62,23 @@ FILE_SIZE = 10
 
 def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Draft:
     """As the superuser, like the isolation suite's seed; the part is in `objects`."""
-    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}")
+    ready, _ = seed_transfer(db, tenant.id, tenant.target)
+    seed_file(db, tenant.id, ready, state="scanning")
+    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}", ready)
     db.sql(
         "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in) "
         "VALUES (:id, :tenant, :owner, 'draft', interval '7 days')",
         id=draft.transfer,
         tenant=tenant.id,
         owner=tenant.target,
+    )
+    db.sql(
+        "INSERT INTO transfer_recipients (id, tenant_id, transfer_id, email, email_normalized, "
+        "locale) VALUES (:id, :tenant, :transfer, 'partner@example.test', "
+        "'partner@example.test', 'en')",
+        id=uuid.uuid4(),
+        tenant=tenant.id,
+        transfer=draft.transfer,
     )
     db.sql(
         "INSERT INTO files (id, tenant_id, transfer_id, display_name_ct, content_type, "
@@ -79,7 +92,7 @@ def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Dra
         upload=draft.upload,
     )
     db.sql(
-        "INSERT INTO tenant_usage (tenant_id, bytes_reserved) VALUES (:tenant, :size)",
+        "UPDATE tenant_usage SET bytes_reserved = bytes_reserved + :size WHERE tenant_id = :tenant",
         tenant=tenant.id,
         size=FILE_SIZE,
     )
@@ -189,6 +202,44 @@ def own_row(ok: int, *, scopes: tuple[str, ...] = ("transfers:write",)) -> dict[
     }
 
 
+def read_row(
+    ok: int, *, item: bool, scopes: tuple[str, ...] = ("transfers:read",)
+) -> dict[str, int]:
+    """A `transfer.read` or `file.read` operation: Own for a member, Tenant for an admin acting
+    as one and for a key with a read scope (authn and authz 6.3). An item another member owns is
+    404 to a member and to an admin signed in without a passkey, who acts as a member."""
+    return {
+        **NOT_A_TENANT_CALLER,
+        **NO_KEY_SCOPE,
+        "member": 404 if item else ok,
+        "member_self": ok,
+        "admin_passkey": ok,
+        "admin_totp": 404 if item else ok,
+        "admin_stale": ok,
+        "admin_other_tenant": 404 if item else ok,
+        **dict.fromkeys((f"api_key_{scope}" for scope in scopes), ok),
+    }
+
+
+def file_read_row(ok: int) -> dict[str, int]:
+    """`file.read` and `dlp_findings.read` on a transfer's file: a key with only
+    `upload_requests:read` gets 404, the scope of received files (contract, `getFile`)."""
+    return {**read_row(ok, item=True), "api_key_upload_requests:read": 404}
+
+
+def policy_read_row() -> dict[str, int]:
+    """`tenant_policy.read`: every member and admin, and a key with a read scope."""
+    members = ("member", "member_self", "admin_passkey", "admin_totp", "admin_stale")
+    return {
+        **NOT_A_TENANT_CALLER,
+        **NO_KEY_SCOPE,
+        **dict.fromkeys(members, 200),
+        "admin_other_tenant": 200,  # their own tenant's policy
+        "api_key_transfers:read": 200,
+        "api_key_upload_requests:read": 200,
+    }
+
+
 USER_OPERATIONS = frozenset({"inviteUser", "listUsers", "getUser", "updateUser", "deactivateUser"})
 
 EXPECTED: dict[str, dict[str, int]] = {
@@ -203,6 +254,14 @@ EXPECTED: dict[str, dict[str, int]] = {
     "listUploadedParts": own_row(200),
     "completeUpload": own_row(200),
     "deleteFile": own_row(204, scopes=("transfers:write", "upload_requests:write")),
+    "listTransfers": read_row(200, item=False),
+    "getTransfer": read_row(200, item=True),
+    "sendTransfer": own_row(200),
+    "cancelTransfer": own_row(200),
+    "getFile": file_read_row(200),
+    "getFileInspection": file_read_row(200),
+    "getTenantPolicy": policy_read_row(),
+    "updateTenantPolicy": admin_row(200, step_up=True, item=False),
 }
 
 # The session's own operations read the session cookie itself, not a caller the matrix can put in
@@ -239,6 +298,14 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
         "listUploadedParts": ("GET", f"{file}/parts", None),
         "completeUpload": ("POST", f"{file}/complete", None),
         "deleteFile": ("DELETE", file, None),
+        "listTransfers": ("GET", "/v1/transfers", None),
+        "getTransfer": ("GET", f"/v1/transfers/{world.draft.transfer}", None),
+        "sendTransfer": ("POST", f"/v1/transfers/{world.draft.ready}/send", None),
+        "cancelTransfer": ("POST", f"/v1/transfers/{world.draft.ready}/cancel", None),
+        "getFile": ("GET", file, None),
+        "getFileInspection": ("GET", f"{file}/inspection", None),
+        "getTenantPolicy": ("GET", "/v1/tenant/policy", None),
+        "updateTenantPolicy": ("PATCH", "/v1/tenant/policy", {"max_expiry": "P10D"}),
     }[operation]
 
 
@@ -248,6 +315,7 @@ STATE = """
     UNION ALL SELECT 'file', id, state || '/' || (removed_at IS NULL)
                 FROM files WHERE tenant_id = :t
     UNION ALL SELECT 'usage', tenant_id, bytes_reserved::text FROM tenant_usage WHERE tenant_id = :t
+    UNION ALL SELECT 'policy', tenant_id, max_expiry::text FROM tenant_policies WHERE tenant_id = :t
     ORDER BY 1, 2
 """
 
@@ -287,10 +355,11 @@ async def test_authorization_matrix(
         assert response.headers["content-type"] == "application/problem+json"
         after = migrated_db.sql(STATE, t=world.mine.id)
         assert after == before, "a refused call changed users, transfers or files"
-    if caller_name == "admin_totp" and operation in USER_OPERATIONS:
+    if caller_name == "admin_totp" and operation in (*USER_OPERATIONS, "updateTenantPolicy"):
         assert response.json()["code"] == "passkey_required"
     if caller_name == "admin_other_tenant":
         # Another tenant's admin never sees or changes this tenant's users or transfers.
         assert str(world.mine.target) not in response.text
         assert str(world.mine.admin) not in response.text
         assert str(world.draft.file) not in response.text
+        assert str(world.draft.ready) not in response.text

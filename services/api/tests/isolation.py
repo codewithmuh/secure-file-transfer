@@ -363,6 +363,47 @@ def seed_transfers(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, u
         "INSERT INTO tenant_usage (tenant_id, bytes_reserved) VALUES (:tenant, 20)",
         tenant=tenant_id,
     )
+    seed_scans(db, tenant_id, marker, rows)
+
+
+def seed_scans(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
+    """Sending and scanning (#174 to #176): a file past its scan deadline, its finding, a download
+    counter for the recipient, and a suppressed address whose pseudonym holds the marker."""
+    for key in ("scanning_file", "finding", "suppression"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO files (id, tenant_id, transfer_id, display_name_ct, content_type, "
+        "declared_size, actual_size, storage_class, storage_key, s3_upload_id, s3_version_id, "
+        "part_size, part_count, state, scan_deadline) VALUES (:id, :tenant, :transfer, "
+        "convert_to(:marker, 'UTF8'), 'text/plain', 10, 10, 'standard', "
+        "'tenants/' || :tenant || '/files/' || :id, :marker, :marker, 5242880, 1, 'scanning', "
+        "now() - interval '1 minute')",
+        id=rows["scanning_file"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO dlp_findings (id, tenant_id, file_id, detector, count_low, count_medium, "
+        "count_high) VALUES (:id, :tenant, :file, 'jp_my_number', 0, 0, 1)",
+        id=rows["finding"],
+        tenant=tenant_id,
+        file=rows["scanning_file"],
+    )
+    db.sql(
+        "INSERT INTO download_counters (tenant_id, recipient_id, file_id) "
+        "VALUES (:tenant, :recipient, :file)",
+        tenant=tenant_id,
+        recipient=rows["recipient"],
+        file=rows["scanning_file"],
+    )
+    db.sql(
+        "INSERT INTO email_suppressions (id, tenant_id, email_hmac, hmac_key_id, reason) "
+        "VALUES (:id, :tenant, 'eiso:' || :marker, 'iso', 'complaint')",
+        id=rows["suppression"],
+        tenant=tenant_id,
+        marker=marker,
+    )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

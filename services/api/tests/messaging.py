@@ -44,6 +44,7 @@ class FakeQueues:
     after_send: Callable[[], None] | None = None
     deleted: list[str] = field(default_factory=list)
     receives: dict[str, int] = field(default_factory=dict)
+    extended: list[tuple[str, int]] = field(default_factory=list)
     closed: bool = False
 
     async def send_batch(
@@ -87,6 +88,11 @@ class FakeQueues:
         if receipt_handle in self.fail_delete:
             raise QueueError("ServiceUnavailable")
         self.deleted.append(receipt_handle)
+
+    async def extend_visibility(self, queue: str, receipt_handle: str, seconds: int) -> None:
+        if self.outage:
+            raise QueueError(self.outage)
+        self.extended.append((receipt_handle, seconds))
 
     async def close(self) -> None:
         self.closed = True

@@ -251,18 +251,14 @@ async def _body(size: int) -> AsyncIterator[bytes]:
 
 def _client_inspect(worker: socket.socket, size: int, prefix_bytes: int) -> Result:
     async def scan() -> Result:
-        reader, writer = await asyncio.open_connection(sock=worker)
-        try:
+        with worker:
             return await client.inspect(
-                reader,
-                writer,
+                worker,
                 size=size,
                 body=_body(size),
                 builtin_detectors=dlp_stub.BUILTIN,
                 prefix_bytes=prefix_bytes,
             )
-        finally:
-            writer.close()
 
     return asyncio.run(scan())
 
@@ -299,3 +295,43 @@ def test_a_connection_that_ends_with_no_answer_is_a_protocol_error() -> None:
     with pytest.raises(ProtocolError):
         _client_inspect(worker, 32 << 20, 32 << 20)
     thread.join(timeout=10)
+
+
+@pytest.mark.parametrize("answer", [LATE, Error(type="error", code="bad_request")])
+def test_an_answer_already_waiting_when_the_send_breaks_is_read(answer: Result | Error) -> None:
+    # The race behind a rare CI failure, made certain: the inspector has answered and closed
+    # before the client sends its next byte, and the client's event loop hasn't read the answer
+    # yet. The send fails with a broken pipe; the answer is still in the socket and must be read,
+    # never taken for a connection that ended with no answer.
+    server, worker = socket.socketpair()
+    answered = threading.Event()
+
+    def serve() -> None:
+        with server:
+            header = server.recv(4, socket.MSG_WAITALL)
+            server.recv(frame_length(header, 1 << 20), socket.MSG_WAITALL)
+            server.sendall(encode_frame(answer))
+        answered.set()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+
+    async def body() -> AsyncIterator[bytes]:
+        answered.wait(10)  # blocks the loop on purpose, so nothing reads the answer meanwhile
+        yield b"x" * (1 << 20)
+
+    async def scan() -> Result:
+        return await client.inspect(
+            worker, size=1 << 20, body=body(), builtin_detectors=dlp_stub.BUILTIN
+        )
+
+    try:
+        if isinstance(answer, Result):
+            assert asyncio.run(scan()) == answer
+        else:
+            with pytest.raises(client.InspectorError) as error:
+                asyncio.run(scan())
+            assert error.value.code == "bad_request"
+    finally:
+        worker.close()
+        thread.join(timeout=10)

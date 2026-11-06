@@ -9,7 +9,8 @@ Each entry point reads only the settings it needs: `Settings` for the API and `O
 for the operator API (both build on `ServerSettings`), `RelaySettings` for the outbox relay (and
 `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
 `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
-notification worker), `InspectorSettings` for the DLP inspector.
+notification worker), `InspectorSettings` for the DLP inspector, `ScanSettings` for the scan
+workers.
 """
 
 from __future__ import annotations
@@ -246,6 +247,13 @@ class Settings(ServerSettings):
         ge=1,
         description="Each tenant's storage quota, the same for every tenant (abuse 6.1): 2 TB.",
     )
+    scan_small_pool_max_bytes: int = Field(
+        default=100_000_000,
+        ge=1,
+        le=2_000_000_000,
+        description="The largest file the small scan pool takes; larger ones, up to 2 GB, go to "
+        "the large pool (ADR-0019's 100 MB split).",
+    )
 
     @field_validator("csrf_keyring")
     @classmethod
@@ -314,6 +322,70 @@ class RelaySettings(WorkerSettings):
         le=30,
         description="The wait after a batch that wasn't full, before looking for due rows again.",
     )
+
+
+class ScanSettings(WorkerSettings):
+    """The scan worker's settings (ADR-0019, ADR-0022, #175, #176): its pool, the engines beside
+    it, the files buckets it reads, and the counter store that holds its tenants' scan leases."""
+
+    scan_pool: Literal["small", "large"] = Field(
+        description="Which pool this worker is: `small` reads the scan-small queue, files up to "
+        "100 MB; `large` reads scan-large, files up to 2 GB. Required.",
+    )
+    valkey_url: ValkeyUrl | None = Field(
+        default=None,
+        description="The counter store, for the per-tenant scan caps (ADR-0014). Unset or "
+        "unreachable, the caps are skipped and the fair queue alone applies (ADR-0019).",
+    )
+    s3_files_bucket: str = Field(
+        pattern=_BUCKET, description="The files bucket for files up to 2 GB."
+    )
+    s3_large_files_bucket: str = Field(
+        pattern=_BUCKET, description="The files bucket for files over 2 GB, for their tags."
+    )
+    s3_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock. In AWS the SDK finds S3's endpoint itself.",
+    )
+    clamd_host: str = Field(
+        default="clamd",
+        min_length=1,
+        description="clamd beside this worker: the node-local `clamd` Service in EKS.",
+    )
+    clamd_port: int = Field(default=3310, ge=1, le=65535)
+    clamd_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+        description="How long to wait for clamd's connection. The scan itself has a timeout "
+        "that grows with the file's size (sft.service.scan_timing).",
+    )
+    inspector_host: str = Field(
+        default="dlp-inspector",
+        min_length=1,
+        description="The DLP inspector beside this worker: the node-local `dlp-inspector` Service.",
+    )
+    inspector_port: int = Field(default=8070, ge=1, le=65535)
+    scan_small_tenant_cap: int = Field(
+        default=4,
+        ge=1,
+        le=100,
+        description="Small-file scans one tenant may run at once (ADR-0019).",
+    )
+    scan_large_pool_size: int = Field(
+        default=2,
+        ge=1,
+        le=100,
+        description="The large pool's workers: one tenant runs at most one fewer at once, and "
+        "at least one (ADR-0019).",
+    )
+
+    @property
+    def tenant_cap(self) -> int:
+        if self.scan_pool == "small":
+            return self.scan_small_tenant_cap
+        return max(1, self.scan_large_pool_size - 1)
 
 
 class OperatorSettings(ServerSettings):

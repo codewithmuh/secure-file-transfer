@@ -22,7 +22,14 @@ a re-publish after a failover does the work once. The message ID is the outbox r
 once it is processed or skipped, and leaves a message that failed for SQS to deliver again after its
 visibility timeout; after 5 receives the redrive policy moves it to the dead-letter queue, which
 alerts. `handle` sees `receive_count`, so its last attempt can record a terminal state such as
-`scan_failed` first.
+`scan_failed` first. With `heartbeat_seconds`, the loop keeps the message in hand hidden while it
+works, extending its visibility every `heartbeat_seconds` to twice that: a scan can outlast the
+queue's visibility timeout without a second worker taking the same file. A failed extension is
+only logged: the message may then come back as a duplicate, which the record makes harmless.
+
+A consumer whose work can't run inside one transaction overrides `process` (the scan worker: its
+scan runs between two short transactions, data model 2.5) and records the message itself, with
+`record_processed`, in the transaction that commits the work.
 
 A handler whose effect is outside PostgreSQL, such as an email, can't share the transaction; the
 notification worker records the message after the send instead (ADR-0013, data model 2.2).
@@ -132,12 +139,14 @@ class ConsumerLoop:
         *,
         max_messages: int = 10,
         wait_seconds: int = LONG_POLL_SECONDS,
+        heartbeat_seconds: int | None = None,
     ) -> None:
         self.consumer = consumer
         self.queues = queues
         self.metrics = metrics
         self.max_messages = max_messages
         self.wait_seconds = wait_seconds
+        self.heartbeat_seconds = heartbeat_seconds
 
     async def receive(self) -> list[ReceivedMessage]:
         return await self.queues.receive(
@@ -153,6 +162,11 @@ class ConsumerLoop:
         return [await self._one(item) for item in received]
 
     async def _one(self, item: ReceivedMessage) -> Outcome:
+        heartbeat = (
+            None
+            if self.heartbeat_seconds is None
+            else asyncio.create_task(self._heartbeat(item, self.heartbeat_seconds))
+        )
         try:
             outcome = await self._process(item)
         except Exception:
@@ -160,8 +174,26 @@ class ConsumerLoop:
             # again and, after 5 receives, the redrive policy moves it to the dead-letter queue.
             log.exception("message failed; SQS delivers it again", extra=self._extra())
             outcome = Outcome.FAILED
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
         self.metrics.messages.labels(self.consumer.name, outcome).inc()
         return outcome
+
+    async def _heartbeat(self, item: ReceivedMessage, seconds: int) -> None:
+        while True:
+            await asyncio.sleep(seconds)
+            try:
+                await self.queues.extend_visibility(
+                    self.consumer.queue, item.receipt_handle, 2 * seconds
+                )
+            except QueueError as exc:
+                log.warning(
+                    "visibility not extended; the message may come back as a duplicate",
+                    extra={**self._extra(), "code": exc.code},
+                )
 
     def _extra(self) -> dict[str, object]:
         return {"consumer": self.consumer.name}

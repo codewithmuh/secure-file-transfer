@@ -46,9 +46,14 @@ weekly. The configuration files are in [`local/`](../local/).
 | `clamd` | The clamd pods ([ADR-0019](adr/0019-malware-scanning-clamav-guardduty.md)) | `clamav/clamav:1.5.4-debian` | 3310 | The signatures built into the pinned image |
 | `oidc` | The Cognito user pool and its app client ([ADR-0016](adr/0016-member-sign-in-cognito.md)) | `quay.io/keycloak/keycloak:26.8.1` | 8180 | Realm `sft`, confidential client `sft-api-local` and a test member, re-imported on every start |
 
-The stack also runs the API (`:8000`). `s3-init` is a one-shot container that seeds the S3 stand-in on every
-`make up` and exits; repeating it is safe. So are the three database jobs of section 3, which run before the API
-starts.
+The stack also runs the API (`:8000`) and the scan pipeline of ADR-0019 and ADR-0022 (#175, #176): a scan worker per
+pool, `scan-worker-small` (`:8012`, files up to 100 MB) and `scan-worker-large` (`:8013`, over 100 MB up to 2 GB),
+each port serving only `/healthz`, `/readyz` and `/metrics`, and `inspector`, the DLP inspector, from the API image.
+The inspector is only on the `inspection` network, which is internal: it can open no connection out and reach neither
+the database nor the counter store, and only the scan workers reach it (`make smoke` checks both). It runs non-root on
+a read-only root file system, with 4 GiB of scratch in memory. `s3-init` is a one-shot container that seeds the S3
+stand-in on every `make up` and exits; repeating it is safe. So are the three database jobs of section 3, which run
+before the API starts.
 
 ## 3. Local credentials
 
@@ -118,6 +123,10 @@ role with the same password.
   (Terraform, M3 and M4).
 - **No lifecycle rules, replication to Osaka or GuardDuty Malware Protection.** Large-file scans can't be tested
   locally; tests put recorded GuardDuty events on `sft-local-guardduty-results` themselves.
+- **Files over 2,000,000,000 bytes are never scanned, locally and in dev, until M6.** Only GuardDuty scans them, and
+  nothing records its result before M6. So completion records such a file `scan_failed` at once, with
+  `scan_detail = large_file_scanning_unavailable`; `getFile` shows that, and sending its transfer holds it. It doesn't
+  page `ScanFailed`. Send files of up to 2 GB to test a journey end to end.
 - Versioning, object tags, `GetObjectAttributes`, multipart uploads with `ListParts` and pre-signed part URLs behave as
   the design uses them, and objects survive restarts in the `s3-data` volume.
 
@@ -181,7 +190,10 @@ role with the same password.
 - **Scratch in memory.** INSTREAM writes to a tmpfs, not to 4 GiB of disk, so scanning a file near 2 GB locally needs
   that much free memory in Docker.
 - The size limits and the alerts for exceeded limits and encrypted content follow ADR-0019 and abuse and rate limits
-  6.4; nesting, file-count and ratio limits keep ClamAV's defaults until the scan worker sets and tests them.
+  6.4. The zip-bomb limits are set and tested (#175, `services/api/tests/test_scan_engines.py`): archives nested more
+  than 10 deep, more than 10,000 files in one scan and a scan over 5 minutes are limit alerts, so `unscannable`.
+  ClamAV has no compression-ratio setting; a ratio bomb stops at `MaxFileSize` or `MaxScanSize` instead. The chart's
+  clamd uses the same values.
 
 ## 5. Hardening
 

@@ -13,7 +13,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Tenants
-from sft.data import audit, files, idempotency, member_sessions, transfers, usage
+from sft.data import (
+    audit,
+    files,
+    findings,
+    idempotency,
+    member_sessions,
+    suppressions,
+    transfers,
+    usage,
+)
+from sft.data import tenants as tenant_data
 from sft.data.access import in_scope
 from sft.data.audit import Actor
 from sft.data.identities import find_connection, find_identity
@@ -25,7 +35,17 @@ from sft.data.member_sessions import (
     revoke_tenant_sessions,
     revoke_user_sessions,
 )
-from sft.data.models import ActorType, ProcessedMessage, Role
+from sft.data.models import (
+    ActorType,
+    FileState,
+    InspectionState,
+    ProcessedMessage,
+    Role,
+    ScanDetail,
+    ScanEngine,
+    SuppressionReason,
+    TransferState,
+)
 from sft.data.operator_sessions import (
     create_operator_session,
     find_operator_session,
@@ -473,6 +493,155 @@ async def release_storage_leaves_others_alone(session: AsyncSession, tenants: Te
 @cases.add(scopes=API_TENANT)
 async def reserved_bytes_are_the_scopes_own(session: AsyncSession, tenants: Tenants) -> object:
     return await usage.reserved_bytes(session)
+
+
+# ---- sending, the evaluation and the tenant's policy (#174) ----
+# The evaluation runs as the API, the scan worker and the lifecycle jobs (data model 3.2).
+
+EVALUATORS = {API: [TENANT], SCAN: [TENANT], JOBS: [TENANT]}
+
+
+@cases.add(scopes=API_TENANT)
+async def list_another_tenants_transfers(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.list_transfers(
+        session,
+        created_by=None,
+        states=[TransferState.EXPIRED, TransferState.DRAFT],
+        limit=100,
+        now=datetime.now(UTC),
+    )
+
+
+@cases.add(scopes=EVALUATORS)
+async def lock_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.lock_for_evaluation(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=EVALUATORS)
+async def send_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.change_state(
+        session,
+        tenants.theirs.rows["transfer"],
+        from_states=(TransferState.DRAFT,),
+        to=TransferState.CANCELLED,
+    )
+
+
+@cases.add(scopes=EVALUATORS)
+async def list_another_tenants_recipient_ids(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.recipient_ids(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=EVALUATORS)
+async def queue_another_tenants_recipients(session: AsyncSession, tenants: Tenants) -> object:
+    return await transfers.queue_recipients(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=EVALUATORS)
+async def count_downloads_for_another_tenant(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return await transfers.insert_download_counters(
+        session,
+        recipient_ids=[theirs["recipient"]],
+        file_ids=[theirs["file"]],
+        download_limit=1,
+    )
+
+
+@cases.add(scopes=EVALUATORS)
+async def another_tenants_counted_files(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.counted_states(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes=API_TENANT)
+async def cancel_another_tenants_files(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.cancel_files(session, tenants.theirs.rows["transfer"])
+
+
+@cases.add(scopes={API: [TENANT], SCAN: [TENANT]})
+async def read_the_scopes_own_policy(session: AsyncSession, tenants: Tenants) -> object:
+    if session.info.get("role") == SCAN:
+        return await tenant_data.unscannable_policy(session)
+    return await tenant_data.get_policy(session)
+
+
+@cases.add(scopes=API_TENANT)
+async def change_the_scopes_own_policy(session: AsyncSession, tenants: Tenants) -> object:
+    policy = await tenant_data.update_policy(session, received_file_retention_days=7)
+    await audit.record(session, action="tenant_policy.updated", actor=ADMIN)
+    return policy
+
+
+@cases.add(scopes=API_TENANT)
+async def look_up_another_tenants_suppression(session: AsyncSession, tenants: Tenants) -> object:
+    return await suppressions.suppressed(session, [f"eiso:{tenants.theirs.marker}"])
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def suppress_for_no_other_tenant(session: AsyncSession, tenants: Tenants) -> object:
+    # Its pseudonym's entry is theirs; the scope's tenant gets an entry of its own.
+    entry = await suppressions.add_suppression(
+        session,
+        pseudonym=f"eiso:{tenants.theirs.marker}",
+        key_id="iso",
+        reason=SuppressionReason.HARD_BOUNCE,
+    )
+    await audit.record(session, action="email_suppression.added", actor=Actor(ActorType.SYSTEM))
+    return entry
+
+
+# ---- scans and inspections (#175, #176) ----
+
+
+@cases.add(scopes={SCAN: [TENANT], JOBS: [TENANT]})
+async def read_another_tenants_scan_target(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.scan_target(session, tenants.theirs.rows["scanning_file"])
+
+
+@cases.add(scopes={SCAN: [TENANT]})
+async def record_another_tenants_scan(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.record_scan(
+        session,
+        tenants.theirs.rows["scanning_file"],
+        state=FileState.CLEAN,
+        engine=ScanEngine.CLAMAV,
+        detail=None,
+        attempts=1,
+        unscannable_allowed=False,
+        inspection_state=InspectionState.INSPECTED,
+    )
+
+
+@cases.add(scopes={SCAN: [TENANT]})
+async def add_findings_to_another_tenants_file(session: AsyncSession, tenants: Tenants) -> object:
+    found = [findings.Counts("jp_my_number", 0, 0, 1)]
+    return await findings.insert_findings(session, tenants.theirs.rows["scanning_file"], found)
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_findings(session: AsyncSession, tenants: Tenants) -> object:
+    file_id = tenants.theirs.rows["scanning_file"]
+    return (
+        await findings.file_findings(session, file_id),
+        await findings.detectors_by_file(session, [file_id]),
+    )
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_overdue_scans(session: AsyncSession, tenants: Tenants) -> object:
+    # The sweep's find step reads across tenants in system scope, by design; in tenant scope the
+    # policy refuses it before any row.
+    return await files.overdue_scans(session, limit=10)
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def fail_another_tenants_overdue_scan(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.fail_overdue_scan(
+        session,
+        tenants.theirs.rows["scanning_file"],
+        detail=ScanDetail.DEADLINE_PASSED,
+        inspection_state=InspectionState.FAILED,
+    )
 
 
 test_isolation = cases.test()

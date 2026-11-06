@@ -499,6 +499,15 @@ stateDiagram-v2
   for a file of a transfer, runs the evaluation (3.2), all in one transaction, with no S3 call. The deletion job then
   aborts the multipart upload by `s3_upload_id` if it still exists and removes any object in both regions: only
   lifecycle jobs delete objects.
+- **As built (#175).** The deadline is an hour for the queue (the fair queues and the per-tenant caps defer scans),
+  then 5 attempts, each the slower of clamd's timeout (30 s plus 0.2 s per MB) and the inspector's (15 minutes of wall
+  clock plus the time to receive the bytes), and the visibility timeout between two attempts
+  (`sft.service.scan_timing`). The scan sweep (`sft.workers.scan_sweep`, scheduled with the lifecycle jobs) records
+  `scan_failed` with `scan_detail = deadline_passed`, the inspection `failed`. A file over 2 GB, which nothing scans
+  until GuardDuty is connected (M6), doesn't wait for it: completion records it `scan_failed` with
+  `large_file_scanning_unavailable`, the inspection `skipped`, and runs the evaluation. `scan_detail` also says why a
+  file is `unscannable` (`encrypted`, `limit_exceeded`) or failed every attempt (`engine_error`), and the contract's
+  `File` shows it.
 - **A scan has a deadline.** When a file enters `scanning`, `scan_deadline` is set from its size: long enough for every
   attempt's timeout, the inspection's limits included, and the backoff between them. If a worker dies without recording
   a result (for example out of memory on a zip bomb, with the message dead-lettered), reconciliation moves the file to
@@ -563,6 +572,11 @@ counts the transfer's files that are not `rejected` and have no `removed_at`. On
 | Any counted file is blocked | `held` with `hold_reason = file_blocked`, with an outbox message to the member, unless it is held already. |
 | Any counted file is still `uploading`, `completing` or `scanning` | `submitted`: no change for a submitted transfer, and a held one goes back. A later scan result or rejection runs the evaluation again. |
 | Every counted file is shareable | The DLP decision (architecture 4.6): a new `dlp_decisions` row with its matched rules, and its audit event. In monitor mode, or when no rule matched or every matched rule only allows and records, `sent` (below). A warning or a required approval gives `awaiting_confirmation`, with an outbox message to the member. A block gives `held` with `hold_reason = dlp_blocked`. |
+
+**As built before DLP-4 (#174).** The last row of the table has no DLP decision yet: a transfer whose counted files
+are all shareable is sent, findings or not, and no `dlp_decisions` row is written (architecture 4.6). The evaluation
+lives in `sft.service.evaluation`; the API runs it as its caller, the scan worker and the scan sweep as named system
+actors whose roles read only the columns it needs, never a ciphertext column or an address (revision 0009).
 
 **Moving to `sent`**, from the evaluation, a confirmation or an approval: download counters are created, the
 recipients' `delivery_state` becomes `queued`, each recipient domain is recorded in `dlp_known_domains`, and an outbox

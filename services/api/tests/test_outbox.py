@@ -23,6 +23,9 @@ from sft.data.outbox import (
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
     TOPICS,
+    TRANSFER_HELD,
+    TRANSFER_RETURNED_TO_DRAFT,
+    TRANSFER_SENT,
     InvalidMessageError,
     OutboxMessage,
     Queue,
@@ -55,16 +58,21 @@ def test_a_registry_refuses_a_topic_twice() -> None:
 
 
 def test_the_service_names_each_topic_it_sends() -> None:
-    # Each feature adds its topics, with the queue that carries them: invitations (#112) and
-    # scans (#114), each scan to the queue of its size's engine (ADR-0019).
+    # Each feature adds its topics, with the queue that carries them: invitations (#112), scans
+    # (#114, #175), each to the pool of its size (ADR-0019), and the evaluation's notices (#174).
     assert TOPICS == {
         "member.invited": MEMBER_INVITED,
         "file.scan": FILE_SCAN,
         "file.scan_large": FILE_SCAN_LARGE,
+        "transfer.sent": TRANSFER_SENT,
+        "transfer.held": TRANSFER_HELD,
+        "transfer.returned_to_draft": TRANSFER_RETURNED_TO_DRAFT,
     }
     assert MEMBER_INVITED.queue is Queue.NOTIFY
     assert FILE_SCAN.queue is Queue.SCAN_SMALL
     assert FILE_SCAN_LARGE.queue is Queue.SCAN_LARGE
+    for topic in (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT):
+        assert topic.queue is Queue.NOTIFY
 
 
 def test_only_the_scan_queues_are_fair() -> None:

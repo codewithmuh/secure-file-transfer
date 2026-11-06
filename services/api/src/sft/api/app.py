@@ -1,7 +1,8 @@
 """The public API app: the routes of the API contract, docs/api/openapi.yaml.
 
 Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py),
-the member routes (#112, members.py), and draft transfers and file uploads (#114, transfers.py).
+the member routes (#112, members.py), transfers and their files (#114, #174 to #176,
+transfers.py) and the tenant policy (#174, tenant_policy.py).
 Probes and metrics live on the internal port (sft.runtime.internal). The interactive docs and the
 OpenAPI document aren't served either: ADR-0002 keeps them off the public load balancer, and CI
 builds the document from `create_app().openapi()`.
@@ -31,7 +32,7 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import auth, members, transfers
+from sft.api import auth, members, tenant_policy, transfers
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
@@ -84,7 +85,10 @@ def _lifespan(
             endpoint_url=settings.s3_endpoint_url,
         )
         app.state.objects = objects
-        app.state.upload_policy = UploadPolicy(storage_quota=settings.tenant_storage_quota_bytes)
+        app.state.upload_policy = UploadPolicy(
+            storage_quota=settings.tenant_storage_quota_bytes,
+            small_pool_max=settings.scan_small_pool_max_bytes,
+        )
         try:
             yield
         finally:
@@ -114,5 +118,6 @@ def create_app(
     install_rate_limits(app)
     auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)
     members.register(app)  # members, roles and invitations (#112)
-    transfers.register(app)  # draft transfers and file uploads (#114)
+    transfers.register(app)  # transfers, file uploads and reads (#114, #174, #175, #176)
+    tenant_policy.register(app)  # the tenant's policy (#174)
     return app

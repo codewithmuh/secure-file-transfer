@@ -1,7 +1,11 @@
 """Catalog checks for the audit trail after `upgrade head`, so every later table meets them too."""
 
+import re
+from pathlib import Path
+
 from alembic.script import ScriptDirectory
 
+import sft
 from pg import ScratchDatabase
 from sft.data.audit_required import NOT_AUDITED, TRIGGER, require_audit_sql
 from sft.data.migrate import alembic_config
@@ -156,3 +160,26 @@ def test_0002_keeps_the_sql_the_helpers_wrote_for_it() -> None:
     ]
     trigger = require_audit_sql("tenants", commands=("INSERT", "UPDATE"), update_of=("status",))
     assert trigger == revision.TENANTS_AUDIT_REQUIRED
+
+
+# The audit actions sending and scanning add (#174 to #176), each with the audited tables whose
+# changes its event covers in the same transaction (FR-27, NFR-15).
+SEND_AND_SCAN_ACTIONS = {
+    "transfer.submitted": ("transfers",),
+    "transfer.sent": ("transfers", "transfer_recipients", "download_counters"),
+    "transfer.held": ("transfers",),
+    "transfer.returned_to_draft": ("transfers",),
+    "transfer.cancelled": ("transfers", "files"),
+    "tenant_policy.updated": ("tenant_policies",),
+    "file.scanned": ("files", "dlp_findings"),
+}
+
+
+def test_the_send_and_scan_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in SEND_AND_SCAN_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"

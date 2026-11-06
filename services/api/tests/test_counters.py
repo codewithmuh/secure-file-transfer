@@ -358,3 +358,17 @@ async def test_an_unexpected_answer_is_an_outage(counter_store: CounterStore) ->
     counter_store._client.zrangebyscore = odd  # type: ignore[method-assign, assignment]
     with pytest.raises(CounterStoreUnavailableError, match="unexpected"):
         await counter_store.scores("k", now_ms=T0, window_ms=1)
+
+
+async def test_leases_are_capped_renewed_and_expire(counter_store: CounterStore) -> None:
+    # The scan worker's per-tenant caps (ADR-0019, #175).
+    key = "scan:scan-small:tenant"
+    for n in range(4):
+        assert await counter_store.acquire_lease(key, f"s{n}", now_ms=0, ttl_ms=1000, cap=4)
+    assert not await counter_store.acquire_lease(key, "s4", now_ms=10, ttl_ms=1000, cap=4)
+    # A scan that holds a lease renews it, even at the cap.
+    assert await counter_store.acquire_lease(key, "s0", now_ms=20, ttl_ms=5000, cap=4)
+    await counter_store.release_lease(key, "s1")
+    assert await counter_store.acquire_lease(key, "s4", now_ms=30, ttl_ms=1000, cap=4)
+    # A worker that died leaves its lease to expire.
+    assert await counter_store.acquire_lease(key, "s5", now_ms=1500, ttl_ms=1000, cap=4)

@@ -64,6 +64,11 @@ class Base(DeclarativeBase):
     type_annotation_map = {datetime: DateTime(timezone=True)}  # noqa: RUF012
 
 
+def sql_values(values: type[StrEnum]) -> str:
+    """An enum's values as an SQL list, `('a', 'b')`, for a CHECK."""
+    return "(" + ", ".join(f"'{member.value}'" for member in values) + ")"
+
+
 class Tenant(TenantOwned, Base):
     """A customer company (data model 2.1). Every tenant-owned row refers to one.
 
@@ -93,18 +98,40 @@ class Tenant(TenantOwned, Base):
         return true()
 
 
+class UnscannablePolicy(StrEnum):
+    """What the tenant does with files the scanner can't inspect (FR-18)."""
+
+    BLOCK = "block"
+    ALLOW_WITH_WARNING = "allow_with_warning"
+
+
 class TenantPolicy(TenantOwned, Base):
     """A tenant's policy, one row per tenant, made with the tenant (data model 2.1, FR-33).
 
-    Revision 0005 brings `default_locale`; the expiry, domain and scanning columns arrive with the
-    policy features (FR-23, FR-24), each with its default, in their own migrations.
+    Revision 0005 brings `default_locale`, revision 0009 the transfer and scanning fields of FR-23
+    with their defaults: the longest expiry, what happens to unscannable files and how long
+    received files are kept. The domain rules (FR-24) arrive with their feature (M5).
     """
 
     __tablename__ = "tenant_policies"
-    __table_args__ = (CheckConstraint("default_locale IN ('en', 'ja')", name="default_locale"),)
+    __table_args__ = (
+        CheckConstraint("default_locale IN ('en', 'ja')", name="default_locale"),
+        CheckConstraint(
+            "max_expiry BETWEEN interval '1 hour' AND interval '30 days'", name="max_expiry"
+        ),
+        CheckConstraint(
+            f"unscannable_policy IN {sql_values(UnscannablePolicy)}", name="unscannable_policy"
+        ),
+        CheckConstraint(
+            "received_file_retention_days BETWEEN 1 AND 90", name="received_file_retention_days"
+        ),
+    )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
     default_locale: Mapped[str] = mapped_column(Text)
+    max_expiry: Mapped[timedelta] = mapped_column(Interval, server_default=text("'30 days'"))
+    unscannable_policy: Mapped[str] = mapped_column(Text, server_default="block")
+    received_file_retention_days: Mapped[int] = mapped_column(server_default=text("30"))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -153,11 +180,6 @@ class Outcome(StrEnum):
 
     SUCCESS = "success"
     FAILURE = "failure"
-
-
-def sql_values(values: type[StrEnum]) -> str:
-    """An enum's values as an SQL list, `('a', 'b')`, for a CHECK."""
-    return "(" + ", ".join(f"'{member.value}'" for member in values) + ")"
 
 
 class AuditEvent(Base):
@@ -530,6 +552,46 @@ class StorageClass(StrEnum):
     LARGE = "large"
 
 
+class ScanEngine(StrEnum):
+    """Which engine scanned a file (ADR-0019)."""
+
+    CLAMAV = "clamav"
+    GUARDDUTY = "guardduty"
+
+
+class ScanDetail(StrEnum):
+    """Why a file is `unscannable` or `scan_failed`, shown to the member (revision 0010)."""
+
+    ENCRYPTED = "encrypted"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    ENGINE_ERROR = "engine_error"
+    DEADLINE_PASSED = "deadline_passed"
+    LARGE_FILE_SCANNING_UNAVAILABLE = "large_file_scanning_unavailable"
+    """A file over 2 GB, which only GuardDuty scans (M6): recorded at completion until then."""
+
+
+class InspectionState(StrEnum):
+    """A file's DLP inspection (data model 3.5). Revision 0011's CHECK lists the same values."""
+
+    PENDING = "pending"
+    INSPECTED = "inspected"
+    PARTIAL = "partial"
+    NOT_INSPECTED = "not_inspected"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class InspectionReason(StrEnum):
+    """Why content wasn't inspected (FR-47, detectors 1)."""
+
+    ENCRYPTED = "encrypted"
+    NO_TEXT = "no_text"
+    UNSUPPORTED_TYPE = "unsupported_type"
+    TOO_LARGE = "too_large"
+    LIMIT_EXCEEDED = "limit_exceeded"
+    PARSE_ERROR = "parse_error"
+
+
 class DeliveryState(StrEnum):
     """Where a recipient's latest link email stands (data model 2.2)."""
 
@@ -676,6 +738,25 @@ class File(TenantOwned, Base):
             name="delete_after",
         ),
         CheckConstraint("octet_length(display_name_ct) > 0", name="display_name_ct"),
+        CheckConstraint(f"scan_engine IN {sql_values(ScanEngine)}", name="scan_engine"),
+        CheckConstraint(f"scan_detail IN {sql_values(ScanDetail)}", name="scan_detail"),
+        CheckConstraint("scan_attempts >= 0", name="scan_attempts"),
+        CheckConstraint(
+            "NOT unscannable_allowed OR state IN ('unscannable', 'deleted')",
+            name="unscannable_allowed",
+        ),
+        CheckConstraint(
+            f"inspection_state IN {sql_values(InspectionState)}", name="inspection_state"
+        ),
+        CheckConstraint(
+            f"inspection_reasons <@ ARRAY[{sql_values(InspectionReason)[1:-1]}]::text[]",
+            name="inspection_reasons",
+        ),
+        Index(
+            "files_scan_deadline_idx",
+            "scan_deadline",
+            postgresql_where=text("state = 'scanning'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -698,6 +779,17 @@ class File(TenantOwned, Base):
     removed_at: Mapped[datetime | None]
     scan_deadline: Mapped[datetime | None]
     delete_after: Mapped[datetime | None]
+    scan_attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    scan_engine: Mapped[str | None] = mapped_column(Text)
+    scan_detail: Mapped[str | None] = mapped_column(Text)
+    scanned_at: Mapped[datetime | None]
+    unscannable_allowed: Mapped[bool] = mapped_column(server_default=false())
+    inspection_state: Mapped[str] = mapped_column(Text, server_default="pending")
+    inspection_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]")
+    )
+    inspection_engine_version: Mapped[str | None] = mapped_column(Text)
+    inspection_policy_version: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
@@ -727,3 +819,100 @@ class TenantUsage(TenantOwned, Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     bytes_reserved: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class DownloadCounter(TenantOwned, Base):
+    """How often one recipient downloaded one file (data model 2.3). The rows of a transfer are
+    made in the transaction that moves it to `sent`, with its limit copied (revision 0009)."""
+
+    __tablename__ = "download_counters"
+    __table_args__ = (
+        PrimaryKeyConstraint("recipient_id", "file_id"),
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        ForeignKeyConstraint(
+            ["tenant_id", "recipient_id"],
+            ["transfer_recipients.tenant_id", "transfer_recipients.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "file_id"], ["files.tenant_id", "files.id"], ondelete="CASCADE"
+        ),
+        Index("download_counters_tenant_id_file_id_idx", "tenant_id", "file_id"),
+        CheckConstraint("download_limit BETWEEN 1 AND 100", name="download_limit"),
+        CheckConstraint("count >= 0", name="count"),
+    )
+
+    tenant_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID]
+    file_id: Mapped[uuid.UUID]
+    download_limit: Mapped[int | None]
+    count: Mapped[int] = mapped_column(server_default=text("0"))
+    first_downloaded_at: Mapped[datetime | None]
+    last_downloaded_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class SuppressionReason(StrEnum):
+    HARD_BOUNCE = "hard_bounce"
+    COMPLAINT = "complaint"
+
+
+class EmailSuppression(TenantOwned, Base):
+    """An address this tenant doesn't email (data model 2.5, abuse 7.4), by its pseudonym under
+    the `email-hmac` keyring, never the address (revision 0009)."""
+
+    __tablename__ = "email_suppressions"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "email_hmac"),
+        CheckConstraint(f"reason IN {sql_values(SuppressionReason)}", name="reason"),
+        CheckConstraint("bounce_count >= 1", name="bounce_count"),
+        CheckConstraint("email_hmac LIKE 'e' || hmac_key_id || ':%'", name="email_hmac"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    email_hmac: Mapped[str] = mapped_column(Text)
+    hmac_key_id: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    bounce_count: Mapped[int] = mapped_column(server_default=text("1"))
+    expires_at: Mapped[datetime | None]
+    ses_released_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class DlpFinding(TenantOwned, Base):
+    """What one detector found in one file: counts at each confidence, never a value (data model
+    2.7, FR-53). Written by the scan worker, which may not read `detail_ct` back (revision 0011).
+    A transfer's message gets `transfer_id` with FR-50; until then `file_id` is always set."""
+
+    __tablename__ = "dlp_findings"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "file_id"], ["files.tenant_id", "files.id"], ondelete="CASCADE"
+        ),
+        UniqueConstraint("tenant_id", "file_id", "detector"),
+        CheckConstraint("char_length(detector) BETWEEN 1 AND 72", name="detector"),
+        CheckConstraint(
+            "count_low >= 0 AND count_medium >= 0 AND count_high >= 0 "
+            "AND count_low + count_medium + count_high > 0",
+            name="counts",
+        ),
+        CheckConstraint("detail_ct IS NULL OR octet_length(detail_ct) > 0", name="detail_ct"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    file_id: Mapped[uuid.UUID]
+    detector: Mapped[str] = mapped_column(Text)
+    count_low: Mapped[int]
+    count_medium: Mapped[int]
+    count_high: Mapped[int]
+    detail_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
+    dlp_key_version: Mapped[int | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())

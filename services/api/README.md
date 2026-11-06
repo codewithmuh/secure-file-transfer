@@ -16,7 +16,8 @@ src/sft/
     app.py            the public app (the API routes)
     dependencies.py   get_database, get_objects and the other dependencies for what the lifespan opens
     members.py        the member routes: invite, list, read, change and deactivate users (FR-22)
-    transfers.py      the draft transfer and upload routes; transfer_schemas.py holds their bodies (#114)
+    transfers.py      the transfer and file routes; transfer_schemas.py holds their bodies (#114, #174 to #176)
+    tenant_policy.py  the tenant policy routes (#174)
     caller.py         get_caller, the request's Caller (a placeholder until #113's sessions)
     errors.py         every error as an RFC 9457 problem; problem_responses() for a route's errors
     observability.py  request and trace IDs, the request span, request metrics, one log line per request
@@ -26,6 +27,9 @@ src/sft/
     __main__.py       python -m sft.api
   workers/      beside api: asyncio workers that use the service layer without HTTP
     relay.py          the outbox relay: python -m sft.workers.relay
+    scan.py           the scan worker, one per pool: python -m sft.workers.scan (#175, #176)
+    clamd.py          clamd's INSTREAM, and its answers mapped to results (ADR-0019)
+    scan_sweep.py     the scan sweep: scan_failed past the deadline (scheduled with the lifecycle jobs)
     consumer.py       Consumer, the idempotent consumer base class, and ConsumerLoop
     queues.py         SQS behind a thin adapter (boto3 in a thread pool)
     process.py        WorkerProcess: probes, SIGTERM and the drain for every worker
@@ -36,7 +40,10 @@ src/sft/
     caller.py         Caller: who is calling and how they signed in; its audit actor and rate-limit keys
     permissions.py    the permission registry (authn and authz 6.3) and authorize()
     members.py        the member rules: the last active admin, invitations, role and approver changes
-    transfers.py      draft transfers and their views; uploads.py: declare, part URLs, complete, remove
+    transfers.py      transfers and their views; uploads.py: declare, part URLs, complete, remove
+    sending.py        sendTransfer and cancelTransfer; evaluation.py the locked evaluation (data model 3.2)
+    scans.py          recording a scan and an inspection; the sweep; scan_timing.py routing and deadlines
+    file_reads.py     getFile and getFileInspection; tenant_policy.py the tenant's policy (FR-23)
     objects.py        ObjectStore, the object storage the service sees; fields.py seals names and messages
     email/            every email, rendered in English and Japanese as text and HTML (Email below)
     rate_limits/      the limits as data, the limiter and its per-pod fallback
@@ -47,6 +54,7 @@ src/sft/
     tenants.py        data-access functions for tenants (one module per table or aggregate)
     users.py          data-access functions for users and their invitations
     transfers.py      transfers and recipients; files.py the files' state changes; usage.py the quota
+    findings.py       DLP findings, counts only; suppressions.py the tenant's suppression list
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
@@ -571,7 +579,8 @@ as `sft_jobs`; the jobs worker that schedules it comes later.
 ## Transfers and uploads
 
 `src/sft/api/transfers.py` serves `createTransfer`, `addTransferFile`, `requestUploadPartUrls`, `listUploadedParts`,
-`completeUpload` and `deleteFile` (#114). The routes only translate; `sft.service.transfers` and
+`completeUpload` and `deleteFile` (#114), and `listTransfers`, `getTransfer`, `sendTransfer`, `cancelTransfer`,
+`getFile` and `getFileInspection` (#174 to #176, below). The routes only translate; `sft.service.transfers` and
 `sft.service.uploads` check the caller with `authorize` and then the state, and `sft.runtime.s3` is the S3 adapter
 behind `sft.service.objects.ObjectStore`.
 
@@ -593,6 +602,31 @@ behind `sft.service.objects.ObjectStore`.
   landed meanwhile, a size mismatch or a vanished upload rejects the file and releases its reservation; missing parts
   send it back to `uploading`. Otherwise it moves to `scanning` and the scan message goes to the outbox in the same
   transaction. A retry is safe at every point.
+
+## Sending and scanning
+
+- **Sending** (`sft.service.sending`, #174) locks the draft, checks its files, the tenant's `max_expiry` and suppression
+  list as they are now and group G's email caps, submits it, and runs the evaluation (`sft.service.evaluation`, data
+  model 3.2) in the same transaction. Every scan result, removal and rejection runs the same evaluation under the
+  transfer's row lock. No DLP rule gates sending before DLP-4.
+- **The scan worker** (`python -m sft.workers.scan`, `SCAN_POOL=small|large`, #175, #176) reads the version recorded at
+  completion once and tees it to clamd and the DLP inspector; records the scan, the inspection and the findings in one
+  transaction; then tags the object and runs the evaluation. A failed attempt is retried by SQS; the 5th records what
+  it has. Files go to the small pool up to 100 MB, the large one up to 2 GB; files over 2 GB wait for GuardDuty (M6),
+  so completion records them `scan_failed` (`large_file_scanning_unavailable`) at once. The read follows clamd; an
+  inspector that falls 64 MiB behind for 30 s is dropped for the attempt. Group G's caps on a send are read before
+  the row lock and charged all or nothing, in batched counter calls (`RateLimiter.check_all`).
+- **Tests.** `tests/test_send.py`, `tests/test_scan_worker.py` and the others run with stand-ins for clamd and the
+  inspector on real sockets (`tests/scan_fixtures.py`). `tests/test_scan_engines.py` runs the worker against the real
+  clamd, as the local stack configures it, with `TEST_CLAMD_URL` (skipped without it; CI's Python job runs clamd), and
+  against the real inspector and detectors in their sandbox on Linux only:
+
+```bash
+docker run --detach --rm --name sft-test-clamd --user 1000:1000 --entrypoint /init-unprivileged \
+  --env CLAMAV_NO_FRESHCLAMD=true --publish 127.0.0.1:3310:3310 \
+  --volume "$PWD/../../local/clamav/clamd.conf:/etc/clamav/clamd.conf:ro" clamav/clamav:1.5.4-debian
+TEST_CLAMD_URL=tcp://127.0.0.1:3310 TEST_DATABASE_URL=… uv run pytest tests/test_scan_engines.py
+```
 
 ### Tests against S3Mock
 

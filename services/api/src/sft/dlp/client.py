@@ -10,12 +10,18 @@ The inspector may answer before it has the whole file: a result first, instead o
 when the child stopped at a limit before deciding, or an error. It then closes the connection,
 and the bytes still being sent get a reset or a broken pipe. That isn't an error of its own: the
 client stops sending and reads the answer the inspector sent before it closed.
+
+**The client works on the socket itself** (`loop.sock_sendall`, `loop.sock_recv`), not on an
+asyncio stream. A stream's transport closes its socket as soon as a write fails, so an answer the
+kernel had already received, but the event loop hadn't read yet, was lost with it, and a file
+whose inspector answered early failed its attempt now and then. The socket stays open until the
+caller closes it, so the answer is always read (tests/test_dlp_protocol.py).
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import socket
 from collections.abc import AsyncIterator, Sequence
 from typing import Final
 
@@ -38,6 +44,7 @@ from sft.dlp.protocol import (
 )
 
 PREFIX_BYTES: Final = DEFAULT_LIMITS.prefix_bytes
+_RECV: Final = 64 * 1024
 
 
 class InspectorError(Exception):
@@ -48,9 +55,30 @@ class InspectorError(Exception):
         self.code = code
 
 
+async def connect(host: str, port: int) -> socket.socket:
+    """A non-blocking TCP socket connected to the inspector; the caller closes it."""
+    loop = asyncio.get_running_loop()
+    failure: OSError = OSError(f"no address for {host}")
+    for family, kind, proto, _, address in await loop.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    ):
+        sock = socket.socket(family, kind, proto)
+        sock.setblocking(False)
+        try:
+            await loop.sock_connect(sock, address)
+        except OSError as exc:
+            sock.close()
+            failure = exc
+            continue
+        except BaseException:
+            sock.close()
+            raise
+        return sock
+    raise failure
+
+
 async def inspect(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    sock: socket.socket,
     *,
     size: int,
     body: AsyncIterator[bytes],
@@ -58,7 +86,8 @@ async def inspect(
     tenant_detectors: Sequence[TenantDetectorSpec] = (),
     prefix_bytes: int = PREFIX_BYTES,
 ) -> Result:
-    """Inspect one file of `size` bytes, read from `body`, over one connection.
+    """Inspect one file of `size` bytes, read from `body`, over one connected socket, which the
+    caller closes.
 
     Files over 2,000,000,000 bytes are never sent: the worker records them as `too_large`.
     """
@@ -66,53 +95,66 @@ async def inspect(
         type="inspect", version=PROTOCOL_VERSION, size=size, tenant_detectors=list(tenant_detectors)
     )
     custom = request.custom_detector_ids()
-    writer.write(encode_frame(request))
+    connection = _Connection(sock)
+    await connection.send(encode_frame(request))
     source = _Exactly(body, size)
-    await _send(source, writer, min(prefix_bytes, size))
-    decision = await _answer(reader, builtin_detectors, custom)
+    await source.send(connection, min(prefix_bytes, size))
+    decision = await _answer(connection, builtin_detectors, custom)
     if isinstance(decision, Result):  # answered before deciding: the child stopped at a limit
         return decision
     if not isinstance(decision, Decision):  # pragma: no cover - `_answer` raises for an error
         raise MalformedAnswerError("expected a decision")
     if decision.read_rest:
-        await _send(source, writer, size - min(prefix_bytes, size))
-    final = await _answer(reader, builtin_detectors, custom)
+        await source.send(connection, size - min(prefix_bytes, size))
+    final = await _answer(connection, builtin_detectors, custom)
     if not isinstance(final, Result):
         raise MalformedAnswerError("expected a result")
     return final
 
 
-async def _send(source: _Exactly, writer: asyncio.StreamWriter, count: int) -> None:
-    """Send `count` bytes of the body; stop quietly if the inspector has answered and closed."""
-    with contextlib.suppress(ConnectionResetError, BrokenPipeError):
-        await source.send(writer, count)
+class _Connection:
+    """The socket, and what has been read from it but not used yet."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        sock.setblocking(False)
+        self._sock = sock
+        self._loop = asyncio.get_running_loop()
+        self._held = bytearray()
+        self.broken = False
+        """A send failed: the inspector has answered and closed. Nothing more is sent."""
+
+    async def send(self, data: bytes) -> None:
+        """Send `data`, or stop quietly if the inspector has closed; its answer stays readable."""
+        if self.broken:
+            return
+        try:
+            await self._loop.sock_sendall(self._sock, data)
+        except (ConnectionResetError, BrokenPipeError):
+            self.broken = True
+
+    async def read(self, count: int) -> bytes:
+        while len(self._held) < count:
+            try:
+                chunk = await self._loop.sock_recv(self._sock, max(_RECV, count - len(self._held)))
+            except ConnectionResetError:
+                chunk = b""  # what arrived before the reset was read first
+            if not chunk:
+                raise ProtocolError("the inspector closed the connection")
+            self._held += chunk
+        data = bytes(self._held[:count])
+        del self._held[:count]
+        return data
 
 
 async def _answer(
-    reader: asyncio.StreamReader, builtin: frozenset[str], custom: frozenset[str]
+    connection: _Connection, builtin: frozenset[str], custom: frozenset[str]
 ) -> Answer:
-    header = await _read(reader, 4)
-    payload = await _read(reader, frame_length(header, MAX_ANSWER_FRAME))
+    header = await connection.read(4)
+    payload = await connection.read(frame_length(header, MAX_ANSWER_FRAME))
     answer = parse_answer(payload, builtin_detectors=builtin, custom_detectors=custom)
     if isinstance(answer, Error):
         raise InspectorError(answer.code)
     return answer
-
-
-async def _read(reader: asyncio.StreamReader, count: int) -> bytes:
-    try:
-        return await reader.readexactly(count)
-    except asyncio.IncompleteReadError:
-        raise ProtocolError("the inspector closed the connection") from None
-    except (ConnectionResetError, BrokenPipeError):
-        # The connection broke while we were still sending. asyncio reads as data arrives, so
-        # what the inspector sent before it closed is in the reader's buffer: read it from there.
-        held: bytearray = getattr(reader, "_buffer", bytearray())
-        if len(held) < count:
-            raise ProtocolError("the inspector closed the connection") from None
-        data = bytes(held[:count])
-        del held[:count]
-        return data
 
 
 class _Exactly:
@@ -123,8 +165,8 @@ class _Exactly:
         self._left = size
         self._held = b""
 
-    async def send(self, writer: asyncio.StreamWriter, count: int) -> None:
-        while count > 0:
+    async def send(self, connection: _Connection, count: int) -> None:
+        while count > 0 and not connection.broken:
             if not self._held:
                 try:
                     self._held = await anext(self._body)
@@ -134,6 +176,5 @@ class _Exactly:
                     raise ProtocolError("the body is longer than its size")
                 self._left -= len(self._held)
             piece, self._held = self._held[:count], self._held[count:]
-            writer.write(piece)
+            await connection.send(piece)
             count -= len(piece)
-            await writer.drain()
