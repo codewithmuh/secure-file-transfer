@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.0](https://github.com/codewithmuh/secure-file-transfer/compare/v0.1.0...v0.2.0) (2026-11-06)
+
+
+### Features
+
+* bank and branch code matching for Japanese bank accounts, without a bundled list ([#146](https://github.com/codewithmuh/secure-file-transfer/issues/146)) ([71ed5bd](https://github.com/codewithmuh/secure-file-transfer/commit/71ed5bd3e38942d711320298cd5d872f21535042))
+* cluster bootstrap with Argo CD, Kyverno and controllers ([#104](https://github.com/codewithmuh/secure-file-transfer/issues/104)) ([c3c9587](https://github.com/codewithmuh/secure-file-transfer/commit/c3c9587acd61dee0948d7ae4fe473602bdf6504d))
+* cluster layer with EKS, Karpenter and Pod Identity ([#103](https://github.com/codewithmuh/secure-file-transfer/issues/103)) ([c3c9587](https://github.com/codewithmuh/secure-file-transfer/commit/c3c9587acd61dee0948d7ae4fe473602bdf6504d))
+* DLP inspection in the scan pass (DLP-3) ([#176](https://github.com/codewithmuh/secure-file-transfer/issues/176)) ([40a1dd7](https://github.com/codewithmuh/secure-file-transfer/commit/40a1dd79e33e8a1b2ed71cb50ee0c12b7d7960e5))
+* DLP text extraction and the inspector sandbox ([#99](https://github.com/codewithmuh/secure-file-transfer/issues/99)) ([71ed5bd](https://github.com/codewithmuh/secure-file-transfer/commit/71ed5bd3e38942d711320298cd5d872f21535042))
+* download grants, resumable streams and revocation ([#180](https://github.com/codewithmuh/secure-file-transfer/issues/180)) ([75a2880](https://github.com/codewithmuh/secure-file-transfer/commit/75a288052a0d43a253cf2a0e72f4d33457a09430))
+* draft transfers and file uploads with part URLs ([#114](https://github.com/codewithmuh/secure-file-transfer/issues/114)) ([71ed5bd](https://github.com/codewithmuh/secure-file-transfer/commit/71ed5bd3e38942d711320298cd5d872f21535042))
+* edge stacks and the shared account ([#105](https://github.com/codewithmuh/secure-file-transfer/issues/105)) ([5b2652c](https://github.com/codewithmuh/secure-file-transfer/commit/5b2652ce553e5760d8a442a1644b9c48f39ed448))
+* Helm chart and Argo CD applications for every cluster ([#106](https://github.com/codewithmuh/secure-file-transfer/issues/106)) ([5b2652c](https://github.com/codewithmuh/secure-file-transfer/commit/5b2652ce553e5760d8a442a1644b9c48f39ed448))
+* Idempotency-Key replay for creating operations ([#144](https://github.com/codewithmuh/secure-file-transfer/issues/144)) ([b7be205](https://github.com/codewithmuh/secure-file-transfer/commit/b7be2059613886b4e41e7ce615fb7964ccd5ebdc))
+* lifecycle jobs: expiry, deletion and reconciliation ([#181](https://github.com/codewithmuh/secure-file-transfer/issues/181)) ([75a2880](https://github.com/codewithmuh/secure-file-transfer/commit/75a288052a0d43a253cf2a0e72f4d33457a09430))
+* member sign-in, sessions and CSRF ([#113](https://github.com/codewithmuh/secure-file-transfer/issues/113)) ([b7be205](https://github.com/codewithmuh/secure-file-transfer/commit/b7be2059613886b4e41e7ce615fb7964ccd5ebdc))
+* notification worker for link emails and recipient status ([#178](https://github.com/codewithmuh/secure-file-transfer/issues/178)) ([e78e46e](https://github.com/codewithmuh/secure-file-transfer/commit/e78e46e76975df74552d66e14d52d5357d15cb6c))
+* operator API to create a tenant and its first admin ([#111](https://github.com/codewithmuh/secure-file-transfer/issues/111)) ([b7be205](https://github.com/codewithmuh/secure-file-transfer/commit/b7be2059613886b4e41e7ce615fb7964ccd5ebdc))
+* per-address invitation cap with the email-hmac keyring ([#145](https://github.com/codewithmuh/secure-file-transfer/issues/145)) ([b7be205](https://github.com/codewithmuh/secure-file-transfer/commit/b7be2059613886b4e41e7ce615fb7964ccd5ebdc))
+* recipient verification codes and link sessions ([#179](https://github.com/codewithmuh/secure-file-transfer/issues/179)) ([e78e46e](https://github.com/codewithmuh/secure-file-transfer/commit/e78e46e76975df74552d66e14d52d5357d15cb6c))
+* scan worker with ClamAV ([#175](https://github.com/codewithmuh/secure-file-transfer/issues/175)) ([40a1dd7](https://github.com/codewithmuh/secure-file-transfer/commit/40a1dd79e33e8a1b2ed71cb50ee0c12b7d7960e5))
+* scan-time budget for tenant DLP patterns ([#147](https://github.com/codewithmuh/secure-file-transfer/issues/147)) ([71ed5bd](https://github.com/codewithmuh/secure-file-transfer/commit/71ed5bd3e38942d711320298cd5d872f21535042))
+* security-critical records in both audit archives ([#177](https://github.com/codewithmuh/secure-file-transfer/issues/177)) ([e78e46e](https://github.com/codewithmuh/secure-file-transfer/commit/e78e46e76975df74552d66e14d52d5357d15cb6c))
+* send and cancel transfers, with the tenant's expiry policy ([#174](https://github.com/codewithmuh/secure-file-transfer/issues/174)) ([40a1dd7](https://github.com/codewithmuh/secure-file-transfer/commit/40a1dd79e33e8a1b2ed71cb50ee0c12b7d7960e5))
+* storage and keys: S3 buckets, replication and KMS ([#102](https://github.com/codewithmuh/secure-file-transfer/issues/102)) ([c3c9587](https://github.com/codewithmuh/secure-file-transfer/commit/c3c9587acd61dee0948d7ae4fe473602bdf6504d))
+* zod 4 and React Router 7 in the web app ([#138](https://github.com/codewithmuh/secure-file-transfer/issues/138)) ([fb4255f](https://github.com/codewithmuh/secure-file-transfer/commit/fb4255f1b061d963132d44b90fefd0eeb9764653))
+
+
+### Bug Fixes
+
+* code-review findings on members and roles ([#148](https://github.com/codewithmuh/secure-file-transfer/issues/148)) ([#151](https://github.com/codewithmuh/secure-file-transfer/issues/151)) ([83fb53f](https://github.com/codewithmuh/secure-file-transfer/commit/83fb53ffe45b7515eeac69e9a3fd55e63a7b18b6))
+* code-review findings on the data layer ([#150](https://github.com/codewithmuh/secure-file-transfer/issues/150)) ([#153](https://github.com/codewithmuh/secure-file-transfer/issues/153)) ([bfd05da](https://github.com/codewithmuh/secure-file-transfer/commit/bfd05da6bceb06f664677325ad7327c3fbaaec81))
+* code-review findings on the DLP detectors ([#149](https://github.com/codewithmuh/secure-file-transfer/issues/149)) ([#152](https://github.com/codewithmuh/secure-file-transfer/issues/152)) ([4c68627](https://github.com/codewithmuh/secure-file-transfer/commit/4c686275abbcfc2f6dfb273b7d272d62ab8df96a))
+* make smoke's inspector check uses the current DLP client ([#190](https://github.com/codewithmuh/secure-file-transfer/issues/190)) ([#191](https://github.com/codewithmuh/secure-file-transfer/issues/191)) ([f2c66e6](https://github.com/codewithmuh/secure-file-transfer/commit/f2c66e6b63f81aeb67421945d393633f58b85d66))
+* the DLP client no longer loses an answer the inspector sent before closing ([40a1dd7](https://github.com/codewithmuh/secure-file-transfer/commit/40a1dd79e33e8a1b2ed71cb50ee0c12b7d7960e5))
+* the local relay waits for the database jobs and signs in with its password ([40a1dd7](https://github.com/codewithmuh/secure-file-transfer/commit/40a1dd79e33e8a1b2ed71cb50ee0c12b7d7960e5))
+* unblock main CI: stale uv.lock and a Trivy false positive ([#154](https://github.com/codewithmuh/secure-file-transfer/issues/154)) ([#155](https://github.com/codewithmuh/secure-file-transfer/issues/155)) ([6a427fc](https://github.com/codewithmuh/secure-file-transfer/commit/6a427fc4382a04126d2307dffb6a6b0b5397f97d))
+
 ## 0.1.0 (2026-11-05)
 
 
