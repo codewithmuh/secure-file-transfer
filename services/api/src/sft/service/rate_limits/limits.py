@@ -10,12 +10,12 @@ caller's own keys, then IP, then the invited address, then the tenant. A route n
 one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every request. Every
 number is a starting value, changed only through deploy config, for every tenant at once.
 
-This page carries the limits of the routes that exist now (groups A, B, C, F's request rates, G for
-`inviteUser` and `sendTransfer`, H and J), and group G's cross-tenant cap on link emails, which
-the notification worker applies (#178, abuse 7.2). Groups D, E, I and K join with their routes.
-Concurrent streams (leases) and byte budgets are other algorithms: they come with the download
-issues, and with the upload follow-ups for group F's per-file part-URL count and the tenant's
-daily upload volume.
+This page carries the limits of the routes that exist now (groups A, B, C, D's request rates, F's
+request rates, G for `inviteUser` and `sendTransfer`, H and J), and group G's cross-tenant cap on
+link emails, which the notification worker applies (#178, abuse 7.2). Groups I and K join with
+their routes. Group D's byte caps and group E's concurrent streams are budgets and leases, not
+rates: `sft.service.rate_limits.downloads` (#180). Group F's per-file part-URL count and the
+tenant's daily upload volume come with the upload follow-ups.
 """
 
 from __future__ import annotations
@@ -120,12 +120,25 @@ class Quota:
 
 
 @dataclass(frozen=True)
+class Budget:
+    """At most `limit` units in each fixed window of `window_seconds`, aligned to the Unix epoch
+    (a UTC day for `DAY`), each request spending its cost, such as a grant's megabytes.
+
+    Charged only with `RateLimiter.check_all`, which spends every budget of the batch or none:
+    if any limit refuses, the budgets it charged are refunded in the same call.
+    """
+
+    limit: int
+    window_seconds: int
+
+
+@dataclass(frozen=True)
 class Limit:
     group: Group
     name: str
     keys: tuple[KeyType, ...]
     """The key it counts per; with several, the first the caller has (a member or an API key)."""
-    rule: Rate | Quota
+    rule: Rate | Quota | Budget
 
     @property
     def id(self) -> str:
@@ -180,6 +193,13 @@ B_INVITATION = _limit(Group.SIGN_IN, "invitation_ip", KeyType.IP, Rate(60, MINUT
 # ---- C. Link session reads: getLinkSession, endLinkSession, listSessionFiles. Fail open. ----
 C_SESSION = _limit(Group.LINK_SESSION, "session_requests", KeyType.LINK_SESSION, Rate(120, MINUTE))
 
+# ---- D. Download grants: createSessionDownload. Fail open; the count is PostgreSQL's. ----
+# The byte caps (25 GB a recipient, 500 GB a tenant, a day) and group E's concurrent streams are
+# budgets and leases, not rates: `sft.service.rate_limits.downloads`.
+D_SUBJECT = _limit(Group.DOWNLOAD_GRANTS, "subject_grants", KeyType.SUBJECT, Rate(100, HOUR))
+D_IP = _limit(Group.DOWNLOAD_GRANTS, "ip_grants", KeyType.IP, Rate(300, HOUR))
+D_TENANT = _limit(Group.DOWNLOAD_GRANTS, "tenant_grants", KeyType.TENANT, Rate(2000, HOUR))
+
 # ---- F. Uploads: declaring files, part URLs, listing parts, completing. ----
 F_CALLER = _limit(
     Group.UPLOADS, "caller_requests", (*CALLER, KeyType.LINK_SESSION), Rate(600, MINUTE)
@@ -220,6 +240,7 @@ ALL = (
     *(A_EMAIL_HOUR, A_EMAIL_DAY, A_TENANT),
     *(B_START, B_CALLBACK, B_INVITATION),
     C_SESSION,
+    *(D_SUBJECT, D_IP, D_TENANT),
     *(F_CALLER, F_IP),
     *(G_CALLER_EMAILS, G_TENANT_EMAILS, G_ADDRESS_EMAILS, G_ADDRESS_ALL_TENANTS),
     *(G_INVITES, G_ADDRESS_INVITES),
@@ -243,6 +264,11 @@ count requests for codes, not attempts, so they aren't applied again here."""
 
 LINK_SESSION_READ = (C_SESSION,)
 """`getLinkSession`, `endLinkSession`, `listSessionFiles`: per link session (group C)."""
+
+GRANT_REQUEST = (D_SUBJECT, D_IP)
+"""`createSessionDownload`, resumes included: per recipient, then per IP (abuse 2.2, D). A grant
+that counts a download, not a resume, is also charged the tenant's 2,000 an hour (`D_TENANT`)
+with the byte caps, all or none (`sft.service.rate_limits.downloads.grant_charges`)."""
 
 SIGN_IN_START = (B_START,)
 SIGN_IN_CALLBACK = (B_CALLBACK,)

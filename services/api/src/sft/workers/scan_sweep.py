@@ -14,6 +14,7 @@ each file in `scan_results_total`, the scan worker's metric, so the alert sees b
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from sft.data.database import Database
@@ -23,11 +24,22 @@ from sft.workers.scan import ScanMetrics
 log = logging.getLogger(__name__)
 
 
-async def sweep(database: Database, metrics: ScanMetrics, *, batch: int = SWEEP_BATCH) -> int:
-    """Fail every overdue scan, a batch at a time; how many files it failed."""
+def _wall_clock() -> datetime:
+    return datetime.now(UTC)
+
+
+async def sweep(
+    database: Database,
+    metrics: ScanMetrics,
+    *,
+    batch: int = SWEEP_BATCH,
+    now: Callable[[], datetime] = _wall_clock,
+) -> int:
+    """Fail every overdue scan, a batch at a time; how many files it failed. `now` is the jobs'
+    clock (`sft.core.clock`), for the evaluation it runs."""
     total = 0
     while True:
-        swept = await fail_overdue_scans(database, now=datetime.now(UTC), limit=batch)
+        swept = await fail_overdue_scans(database, now=now(), limit=batch)
         for item in swept:
             metrics.results.labels("scan_failed", item.detail.value).inc()
             log.warning(

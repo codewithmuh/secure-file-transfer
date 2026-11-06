@@ -10,7 +10,8 @@ for the operator API (both build on `ServerSettings`), `RelaySettings` for the o
 `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
 `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
 notification worker, whose `NotifySettings` adds it to a worker's), `InspectorSettings` for the
-DLP inspector, `ScanSettings` for the scan workers.
+DLP inspector, `ScanSettings` for the scan workers and `JobSettings` for the lifecycle jobs.
+`ClockSettings` (`ENVIRONMENT` and the clock's test hook) is part of the API's and the jobs'.
 """
 
 from __future__ import annotations
@@ -158,12 +159,46 @@ class ServerSettings(_Traced):
         return self
 
 
+Environment = Literal["local", "test", "dev", "staging", "prod"]
+_HOOK_ENVIRONMENTS = ("local", "test")
+
+
+class ClockSettings(_Base):
+    """Which environment this is, and the test hook on the clock (#182, `sft.core.clock`).
+
+    `ENVIRONMENT` is #129's: local for the compose stack, test for the test suite, and the
+    environment's name in AWS. Unset, it is `prod`, the strictest: a pod spec that forgets it never
+    gets a test hook. `CLOCK_OFFSET_SECONDS` moves what the API and the lifecycle jobs read as
+    "now"; the process refuses to start with it set anywhere but local or test.
+    """
+
+    environment: Environment = Field(
+        default="prod",
+        description="local (the compose stack), test (the test suite), or dev, staging or prod. "
+        "Unset is prod.",
+    )
+    clock_offset_seconds: int = Field(
+        default=0,
+        ge=-366 * 86400,
+        le=366 * 86400,
+        description="A test hook: seconds added to now. Only ENVIRONMENT=local or test may set it.",
+    )
+
+    @model_validator(mode="after")
+    def _clock_hook_only_in_tests(self) -> Self:
+        if self.clock_offset_seconds and self.environment not in _HOOK_ENVIRONMENTS:
+            raise ValueError(
+                "CLOCK_OFFSET_SECONDS is a test hook: only ENVIRONMENT=local or test may set it"
+            )
+        return self
+
+
 # An origin (scheme, host and port, no path) and an http(s) URL, for the sign-in settings.
 _ORIGIN = r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?$"
 _HTTP_URL = r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?(/[^\s?#]*)?(\?[^\s#]*)?$"
 
 
-class Settings(ServerSettings):
+class Settings(ServerSettings, ClockSettings):
     """The public API's settings: the server's, member sign-in's (ADR-0016; authentication and
     authorization 2.4 and 3) and the files buckets' (#114). Locally Keycloak stands in for the
     Cognito user pool and S3Mock for S3 (docs/local-development.md)."""
@@ -283,6 +318,22 @@ class Settings(ServerSettings):
     code_hmac_keyring: SecretStr = Field(
         description="K_code, the keyring of verification codes' HMACs (sft/{env}/app/code-hmac, "
         "encryption and keys 6.2): like CSRF_KEYRING.",
+    )
+
+    # Downloads (#180, abuse and rate limits 5): the stream's re-check and the pod's stream cap.
+    download_recheck_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=30,
+        description="How often a running download re-checks its grant, session, transfer and "
+        "file, records the bytes it sent and renews its lease (abuse 5.4). 30 s meets NFR-6's 60.",
+    )
+    download_streams_per_pod: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="Streams one API pod serves at once; the next gets 503, Retry-After: 10 "
+        "(abuse 5.7).",
     )
 
     @field_validator("csrf_keyring")
@@ -422,6 +473,72 @@ class ScanSettings(WorkerSettings):
         if self.scan_pool == "small":
             return self.scan_small_tenant_cap
         return max(1, self.scan_large_pool_size - 1)
+
+
+class JobSettings(ClockSettings):
+    """The lifecycle jobs' settings (#181; architecture 4.5, data model 6): their database role,
+    the files buckets they delete from, both regions' audit archive (reconciliation rewrites a
+    grant's committed record), and where they push their metrics. Each job is a one-shot command."""
+
+    app_version: str = Field(default="0.0.0", description="Set by the image build.")
+    database_url: PostgresUrl = Field(
+        description="The `sft_jobs` login role, never the migration role or the master user.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    s3_files_bucket: str = Field(pattern=_BUCKET, description="The files bucket, up to 2 GB.")
+    s3_large_files_bucket: str = Field(
+        pattern=_BUCKET, description="The files bucket for files over 2 GB."
+    )
+    s3_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock. In AWS the SDK finds S3's endpoint itself.",
+    )
+    s3_replica_region: str | None = Field(
+        default=None,
+        pattern=r"^[a-z]{2}(-[a-z]+)+-\d$",
+        description="The region of the files buckets' replicas, Osaka's in staging and prod. "
+        "Unset where there are none: dev and the local stack (architecture 3.3).",
+    )
+    s3_replica_files_bucket: str | None = Field(default=None, pattern=_BUCKET)
+    s3_replica_large_files_bucket: str | None = Field(default=None, pattern=_BUCKET)
+    audit_archive_tokyo_bucket: str = Field(
+        pattern=_BUCKET, description="The audit archive bucket in Tokyo, as the API's."
+    )
+    audit_archive_osaka_bucket: str | None = Field(
+        default=None, pattern=_BUCKET, description="The audit archive bucket in Osaka."
+    )
+    audit_archive_tokyo_endpoint_url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
+    )
+    audit_archive_osaka_endpoint_url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
+    )
+    scan_small_pool_max_bytes: int = Field(
+        default=100_000_000,
+        ge=1,
+        le=2_000_000_000,
+        description="ADR-0019's split between the scan pools, as the API's setting of the same "
+        "name: reconciliation routes a completion it finishes by it. Keep the two equal.",
+    )
+    metrics_pushgateway_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Where a run pushes its metrics, a one-shot job having no port to scrape. "
+        "Unset: the run logs them only (the local stack; M7 adds the gateway).",
+    )
+
+    @model_validator(mode="after")
+    def _replicas_together(self) -> Self:
+        named = (self.s3_replica_files_bucket, self.s3_replica_large_files_bucket)
+        if (self.s3_replica_region is None) != all(b is None for b in named) or (
+            self.s3_replica_region is not None and None in named
+        ):
+            raise ValueError(
+                "set S3_REPLICA_REGION, S3_REPLICA_FILES_BUCKET and S3_REPLICA_LARGE_FILES_BUCKET "
+                "together, or none of them"
+            )
+        return self
 
 
 class OperatorSettings(ServerSettings):

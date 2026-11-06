@@ -12,10 +12,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from isolation import Cases, Tenants
+from isolation import Cases, Seeded, Tenants
 from sft.data import (
     audit,
     codes,
+    downloads,
     files,
     findings,
     idempotency,
@@ -66,7 +67,7 @@ from sft.data.outbox import (
 )
 from sft.data.processed import record_processed
 from sft.data.roles import API, ARCHIVE, JOBS, NOTIFY, OPERATOR, RELAY, SCAN
-from sft.data.scope import ScopeKind
+from sft.data.scope import ScopeKind, Subject
 from sft.data.tenants import (
     directory_tenant,
     get_tenant,
@@ -765,6 +766,128 @@ async def start_a_session_for_another_tenants_recipient(
     made = await link_sessions.create(session, tenants.theirs.rows["recipient"], ends_by=None)
     await audit.record(session, action="link_session.started", actor=Actor(ActorType.SYSTEM))
     return made
+
+
+# ---- download grants and revocation (#180) ----
+
+GRANT_USERS = {API: [TENANT, RESOURCE]}
+
+
+def mine_as_recipient(mine: Seeded) -> Subject:
+    return Subject.recipient(mine.rows["recipient"])
+
+
+@cases.add(scopes=GRANT_USERS, subject=mine_as_recipient)
+async def read_another_tenants_grant_and_counter(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await downloads.get_grant(session, theirs["download_grant"]),
+        await downloads.counter(session, theirs["recipient"], theirs["scanning_file"]),
+    )
+
+
+@cases.add(scopes=GRANT_USERS, subject=mine_as_recipient)
+async def count_and_grant_another_tenants_download(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    counted = await downloads.count_download(session, theirs["recipient"], theirs["scanning_file"])
+    made = await downloads.insert_grant(
+        session,
+        grant_id=uuid.uuid4(),
+        file_id=theirs["scanning_file"],
+        s3_version_id="x",
+        recipient_id=theirs["recipient"],
+        link_session_id=theirs["link_session"],
+        size=10,
+        ends_by=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await audit.record(session, action="download.granted", actor=Actor(ActorType.SYSTEM))
+    return counted, made
+
+
+@cases.add(scopes=GRANT_USERS, subject=mine_as_recipient)
+async def stream_another_tenants_grant(session: AsyncSession, tenants: Tenants) -> object:
+    grant_id = tenants.theirs.rows["download_grant"]
+    stream = uuid.uuid4()
+    admitted = await downloads.admit(session, grant_id, stream)
+    held = await downloads.record_progress(session, grant_id, stream, 5)
+    await downloads.mark_archived(session, grant_id)
+    return admitted, held
+
+
+@cases.add(scopes=API_TENANT)
+async def revoke_another_tenants_sessions_by_transfer(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    return await link_sessions.revoke_for_transfer(session, tenants.theirs.rows["transfer"])
+
+
+# ---- the lifecycle jobs (#181) ----
+
+FAR = datetime.now(UTC) + timedelta(days=36500)
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_due_lifecycle_work(session: AsyncSession, tenants: Tenants) -> object:
+    # The jobs' find steps read across tenants in system scope, by design; in tenant scope the
+    # data layer refuses them before any row.
+    return (
+        await transfers.due_for_expiry(session, now=FAR, limit=10),
+        await transfers.stale_drafts(session, before=FAR, limit=10),
+        await files.due_for_deletion(session, now=FAR, limit=10),
+        await files.abandoned_uploads(session, before=FAR, limit=10),
+        await files.stuck_completions(session, before=FAR, limit=10),
+        await files.overdue_deletions(session, before=FAR),
+        await files.oldest_due_deletion(session, now=FAR),
+        await downloads.unarchived(session, created_before=FAR, limit=10),
+    )
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_storage_and_expired_rows(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    key = f"tenants/{theirs.tenant_id}/files/{theirs.rows['file']}"
+    return (
+        await files.known_keys(session, [key]),
+        await files.open_upload_ids(session, [theirs.marker]),
+        await codes.tenants_with_expired(session, before=FAR, limit=10),
+        await link_sessions.tenants_with_expired(session, before=FAR, limit=10),
+        await downloads.tenants_with_expired(session, before=FAR, limit=10),
+    )
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def act_on_another_tenants_files(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    now = datetime.now(UTC)
+    found = (
+        await files.mark_deleted(session, theirs["scanning_file"], now=FAR),
+        await files.due_now(session, theirs["transfer"], now=now),
+        await files.reject_open(session, theirs["file"], now=now),
+        await files.resume_open(session, theirs["completing_file"]),
+        await files.mark_scanning(
+            session,
+            theirs["completing_file"],
+            actual_size=10,
+            s3_version_id="x",
+            scan_deadline=now,
+        ),
+        await transfers.idle_since(session, theirs["transfer"], before=FAR),
+    )
+    await audit.record(session, action="file.deleted", actor=Actor(ActorType.SYSTEM))
+    return found, await files.job_file(session, theirs["file"])
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def delete_another_tenants_expired_rows(session: AsyncSession, tenants: Tenants) -> object:
+    deleted = (
+        await codes.delete_expired(session, before=FAR, limit=10),
+        await downloads.delete_expired(session, before=FAR, limit=10),
+        await link_sessions.delete_expired(session, before=FAR, limit=10),
+    )
+    await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
+    return deleted
 
 
 test_isolation = cases.test()

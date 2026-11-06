@@ -17,12 +17,12 @@ Every change commits only with an audit event (`audit_required`); the caller wri
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Final
 from uuid import UUID
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.data.access import in_scope, require_scope, tenant_of
@@ -147,3 +147,40 @@ async def consume(session: AsyncSession, code_id: UUID) -> None:
         .values(consumed_at=func.now())
         .execution_options(synchronize_session=False)
     )
+
+
+# ---- the daily cleanup (sft_jobs, data model 6) ----
+
+
+async def tenants_with_expired(
+    session: AsyncSession, *, before: datetime, limit: int
+) -> list[UUID]:
+    """Tenants with codes past their expiry, across tenants, in system scope."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.scalars(
+        select(VerificationCode.tenant_id)
+        .where(VerificationCode.expires_at <= before, in_scope(VerificationCode, session))
+        .group_by(VerificationCode.tenant_id)
+        .limit(limit)
+    )
+    return list(rows)
+
+
+async def delete_expired(session: AsyncSession, *, before: datetime, limit: int) -> int:
+    """Delete up to `limit` of the scope's tenant's codes past their expiry: unusable from then
+    (data model 6). The caller writes the audit event the table's trigger asks for."""
+    require_scope(session, ScopeKind.TENANT)
+    found = (
+        select(VerificationCode.id)
+        .where(VerificationCode.expires_at <= before, in_scope(VerificationCode, session))
+        .limit(limit)
+    )
+    result = await session.execute(
+        delete(VerificationCode)
+        .where(
+            VerificationCode.id.in_(found.scalar_subquery()), in_scope(VerificationCode, session)
+        )
+        .returning(VerificationCode.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())

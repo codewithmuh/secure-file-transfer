@@ -23,12 +23,12 @@ from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID
 
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import ColumnElement, delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
 from sft.data.access import in_scope, require_scope, tenant_of
-from sft.data.models import LinkSession
+from sft.data.models import DownloadGrant, LinkSession, TransferRecipient
 from sft.data.scope import ScopeKind
 
 LIFETIME: Final = timedelta(hours=24)
@@ -179,6 +179,87 @@ async def live_for_recipient(session: AsyncSession, recipient_id: UUID) -> list[
     return list(rows)
 
 
+async def revoke_for_transfer(session: AsyncSession, transfer_id: UUID) -> int:
+    """End every open session of the transfer's recipients, in the revocation's transaction (data
+    model 2.4); how many were open. The revocation's audit event covers them."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        update(LinkSession)
+        .where(
+            LinkSession.recipient_id.in_(
+                select(TransferRecipient.id).where(
+                    TransferRecipient.transfer_id == transfer_id,
+                    in_scope(TransferRecipient, session),
+                )
+            ),
+            LinkSession.revoked_at.is_(None),
+            in_scope(LinkSession, session),
+        )
+        .values(revoked_at=func.now())
+        .returning(LinkSession.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
+# ---- the daily cleanup (sft_jobs, data model 6) ----
+
+
+def _no_unarchived_grant() -> ColumnElement[bool]:
+    """A session whose grants' committed records are all confirmed: deleting it cascades to its
+    grants, so one with a grant still waiting stays for reconciliation (NFR-15, #181 review)."""
+    # The grant's ID only: the jobs' role reads named columns of grants (revision 0015).
+    return ~(
+        select(DownloadGrant.id)
+        .where(
+            DownloadGrant.link_session_id == LinkSession.id,
+            DownloadGrant.archived_at.is_(None),
+        )
+        .exists()
+    )
+
+
+async def tenants_with_expired(
+    session: AsyncSession, *, before: datetime, limit: int
+) -> list[UUID]:
+    """Tenants with sessions past their expiry, across tenants, in system scope."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.scalars(
+        select(LinkSession.tenant_id)
+        .where(
+            LinkSession.expires_at <= before,
+            _no_unarchived_grant(),
+            in_scope(LinkSession, session),
+        )
+        .group_by(LinkSession.tenant_id)
+        .limit(limit)
+    )
+    return list(rows)
+
+
+async def delete_expired(session: AsyncSession, *, before: datetime, limit: int) -> int:
+    """Delete up to `limit` of the scope's tenant's sessions past their expiry; their grants go
+    with them (data model 6), so a session with a grant still waiting for its committed record
+    stays."""
+    require_scope(session, ScopeKind.TENANT)
+    found = (
+        select(LinkSession.id)
+        .where(
+            LinkSession.expires_at <= before,
+            _no_unarchived_grant(),
+            in_scope(LinkSession, session),
+        )
+        .limit(limit)
+    )
+    result = await session.execute(
+        delete(LinkSession)
+        .where(LinkSession.id.in_(found.scalar_subquery()), in_scope(LinkSession, session))
+        .returning(LinkSession.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
 __all__ = [
     "IDLE_TIMEOUT",
     "LIFETIME",
@@ -186,10 +267,13 @@ __all__ = [
     "FoundLinkSession",
     "LiveLinkSession",
     "create",
+    "delete_expired",
     "get_live",
     "live_for_recipient",
     "lookup",
     "new_token",
     "revoke",
+    "revoke_for_transfer",
+    "tenants_with_expired",
     "token_hash",
 ]

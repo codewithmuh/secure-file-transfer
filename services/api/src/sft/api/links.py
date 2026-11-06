@@ -23,14 +23,13 @@ CSRF check of `endLinkSession` and the problem answers. The rules are `sft.servi
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 
 from sft.api.caller import check_unsafe_request, origin_of
-from sft.api.dependencies import get_database
+from sft.api.dependencies import get_database, now_of
 from sft.api.errors import problem_responses
 from sft.api.link_schemas import (
     LinkResolution,
@@ -79,12 +78,12 @@ def get_link_services(request: Request) -> LinkServices:
 ServicesDep = Annotated[LinkServices, Depends(get_link_services)]
 
 
-def _now() -> datetime:
-    return datetime.now(UTC)
-
-
-def _cookie(request: Request) -> list[str]:
+def link_cookie(request: Request) -> list[str]:
+    """The session tokens of this browser's `__Host-sft_link` cookie."""
     return links.cookie_tokens(request.cookies.get(LINK_COOKIE))
+
+
+_cookie = link_cookie
 
 
 def _set_cookie(response: Response, tokens: tuple[str, ...] | list[str]) -> None:
@@ -111,7 +110,7 @@ async def get_link_session(request: Request, database: DatabaseDep) -> LinkCalle
         raise Unauthenticated("authentication_required") from None
     if request.headers.get("authorization") is not None:
         raise Unauthenticated("credentials_invalid")
-    link = await links.session_caller(database, _cookie(request), session_id, now=_now())
+    link = await links.session_caller(database, _cookie(request), session_id, now=now_of(request))
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         services = get_link_services(request)
         origin = request.app.state.web_origin
@@ -158,7 +157,7 @@ async def resolve_link(
         body.token,
         cookie=_cookie(request),
         ip=client_ip(request),
-        now=_now(),
+        now=now_of(request),
     )
     response.headers.update(NO_STORE)
     return LinkResolution.of(resolution)
@@ -187,7 +186,7 @@ async def request_verification_code(
         body.token,
         ip=client_ip(request),
         origin=origin_of(request),
-        now=_now(),
+        now=now_of(request),
     )
     response.headers.update(NO_STORE)
     return VerificationCodeRequested(
@@ -221,7 +220,7 @@ async def create_link_session(
         cookie=_cookie(request),
         ip=client_ip(request),
         origin=origin_of(request),
-        now=_now(),
+        now=now_of(request),
     )
     _set_cookie(response, created.cookie)
     response.headers.update(NO_STORE)

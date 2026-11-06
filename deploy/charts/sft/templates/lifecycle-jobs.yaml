@@ -1,12 +1,18 @@
 {{- if eq .Values.part "application" }}
 {{- /*
-The lifecycle jobs (architecture 4.5, 5.2): expiry, deletion in both regions, daily reconciliation, the audit archive
-and audit partition upkeep. Each is a CronJob; a run never overlaps the one before it, and a missed run waits for the
-next. Suspended in the pilot light, where the database is a read-only replica.
+The lifecycle jobs (architecture 4.5, 5.2; #181): expiry, deletion in both regions, reconciliation, the daily storage
+audit and cleanup, the audit archive and audit partition upkeep. A lifecycle job's settings (sft.core.settings.JobSettings)
+come from sft.lifecycleJobEnv: its environment, and with `s3` the files buckets of this region and of Osaka's replicas
+outside dev (architecture 3.3), with `archive` both regions' audit archive. Each is a CronJob; a run never overlaps the
+one before it, and a missed run waits for the next. Suspended in the pilot light, where the database is a read-only
+replica.
 */}}
 {{- range $name := keys .Values.lifecycleJobs | sortAlpha }}
 {{- $job := index $.Values.lifecycleJobs $name }}
 {{- $env := printf "- name: DATABASE_URL\n  value: %s" (include "sft.databaseUrl" (dict "root" $ "role" $job.databaseRole) | quote) }}
+{{- $c := $.Values.cluster }}
+{{- $account := toString $c.accountId }}
+{{- $env = include "sft.lifecycleJobEnv" (dict "root" $ "job" $job "env" $env "account" $account) }}
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -34,3 +40,29 @@ spec:
         {{- include "sft.jobPod" (dict "root" $ "component" $name "module" $job.module "serviceAccount" $job.serviceAccount "env" $env "resources" $.Values.lifecycleJobResources) | nindent 8 }}
 {{- end }}
 {{- end }}
+
+{{- define "sft.lifecycleJobEnv" -}}
+{{- $root := .root }}{{ $job := .job }}{{ $account := .account }}
+{{- $env := .env }}
+{{- if $job.lifecycle }}
+{{- $env = printf "%s\n- name: ENVIRONMENT\n  value: %s" $env ($root.Values.environment | quote) }}
+{{- $env = printf "%s\n- name: SCAN_SMALL_POOL_MAX_BYTES\n  value: %s" $env (toString $root.Values.scanSmallPoolMaxBytes | quote) }}
+{{- $prefix := include "sft.namePrefix" $root }}
+{{- $files := dict "S3_FILES_BUCKET" (printf "%s-files-%s" $prefix $account) "S3_LARGE_FILES_BUCKET" (printf "%s-large-files-%s" $prefix $account) "AUDIT_ARCHIVE_TOKYO_BUCKET" (printf "sft-%s-apne1-audit-archive-%s" $root.Values.environment $account) }}
+{{- if and $job.s3 (ne $root.Values.environment "dev") }}
+{{- /* The other region's copies: Osaka's replicas from Tokyo, Tokyo's from Osaka after a failover. */}}
+{{- $other := ternary "ap-northeast-3" "ap-northeast-1" (eq $root.Values.region "ap-northeast-1") }}
+{{- $otherShort := ternary "apne3" "apne1" (eq $root.Values.region "ap-northeast-1") }}
+{{- $_ := set $files "S3_REPLICA_REGION" $other }}
+{{- $_ := set $files "S3_REPLICA_FILES_BUCKET" (printf "sft-%s-%s-files-%s" $root.Values.environment $otherShort $account) }}
+{{- $_ := set $files "S3_REPLICA_LARGE_FILES_BUCKET" (printf "sft-%s-%s-large-files-%s" $root.Values.environment $otherShort $account) }}
+{{- end }}
+{{- if and $job.archive (ne $root.Values.environment "dev") }}
+{{- $_ := set $files "AUDIT_ARCHIVE_OSAKA_BUCKET" (printf "sft-%s-apne3-audit-archive-%s" $root.Values.environment $account) }}
+{{- end }}
+{{- range $name := keys $files | sortAlpha }}
+{{- $env = printf "%s\n- name: %s\n  value: %s" $env $name (index $files $name | quote) }}
+{{- end }}
+{{- end }}
+{{- $env }}
+{{- end -}}

@@ -22,6 +22,9 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 | `make setup` | Checks the prerequisites, installs the API's dependencies and the git hooks |
 | `make up` | Builds the API, starts the stack, runs the database jobs (section 3), then starts the API and waits until every service is healthy (under a minute once images are pulled) |
 | `make smoke` | One real round trip to each stack service, from the host ([`local/smoke.py`](../local/smoke.py)), and a check that `sft_api` reads no tenant's rows without a scope |
+| `make seed` | Writes a tenant, an admin and a member who sign in through Keycloak, and prints how (section 7). Idempotent |
+| `make jobs JOB=<job>` | Runs one lifecycle job once: `expiry`, `deletion`, `reconciliation`, `storage-audit` or `cleanup` (section 7) |
+| `make e2e` | The M2 journey test against the running, seeded stack (section 7) |
 | `make test` | The API's tests. While the stack runs, the database tests use its server as `sft`, unless `TEST_DATABASE_URL` is set; they make and drop their own databases and leave `sft` alone |
 | `make down` | Stops and removes the containers; the database and S3 objects stay |
 | `make reset` | Stops everything and deletes the local data; the next `make up` starts empty and seeds again |
@@ -69,7 +72,8 @@ over all of them.
 | SSE-KMS key IDs | Files `00000000-0000-4000-8000-000000000001`, audit `00000000-0000-4000-8000-000000000002` |
 | Valkey | `sft-local` / `local-only-valkey-password` |
 | OIDC client | `sft-api-local` / `local-only-oidc-client-secret`, callback `http://localhost:8000/v1/auth/callback` |
-| Test member | `dev.member@example.com` / `local-only-member-password`. User ID (`cognito:username`) `22222222-2222-4222-8222-222222222222`, tenant (`custom:tenant_id`) `11111111-1111-4111-8111-111111111111`, subject (`sub`) `33333333-3333-4333-8333-333333333333`. Seed data for M1 uses these IDs. |
+| Test member | `dev.member@example.com` / `local-only-member-password`. User ID (`cognito:username`) `22222222-2222-4222-8222-222222222222`, tenant (`custom:tenant_id`) `11111111-1111-4111-8111-111111111111`, subject (`sub`) `33333333-3333-4333-8333-333333333333`. `make seed` writes this user and its identity (section 7). |
+| Test admin | `dev.admin@example.com` / `local-only-admin-password`. User ID `44444444-4444-4444-8444-444444444444`, the same tenant, subject `55555555-5555-4555-8555-555555555555`. `make seed` writes it too. |
 | Keycloak admin console | `admin` / `local-only-admin` at <http://localhost:8180/admin> |
 | Mail catcher | No sign-in; it accepts any SMTP credentials. Web UI at <http://localhost:8025> |
 
@@ -186,8 +190,9 @@ role with the same password.
   clients must send them too, as `local/smoke.py` does. The API's own cookies (`__Host-sft_session`, and
   `__Host-sft_link` for recipients' link sessions, #179) are `Secure` and `__Host-` locally too: browsers treat
   `http://localhost` as a secure context and keep them, so nothing about them differs from AWS.
-- **Nothing persists.** The realm is re-imported from [`local/keycloak/sft-realm.json`](../local/keycloak/sft-realm.json)
-  on every start, so change that file, not the admin console.
+- **Nothing persists.** The realm is imported from [`local/keycloak/sft-realm.json`](../local/keycloak/sft-realm.json)
+  when the container is created, so change that file, not the admin console, and run `make down && make up` to pick a
+  change up: `make up` alone keeps a running container and its realm.
 
 ### ClamAV
 
@@ -229,3 +234,52 @@ expiry, signature checks and CORS.
 | ClamAV | **The official ClamAV image**, GPL-2.0, run unmodified as its own service (ADR-0019) | The Debian tags are multi-arch; the Alpine tags are amd64 only | — |
 | Cognito | **Keycloak 26.8.1**: Apache-2.0, a CNCF project, released monthly | The only candidate with real users and passwords, an enforced confidential client with PKCE S256, `prompt=login`, token revocation and per-user claims that mimic Cognito's. It costs about 700 MB of memory and 20 s to start. | **Dex 2.46** (Apache-2.0) is small, but its static users have only an email, a name, groups and an ID, so it can't issue `custom:tenant_id` or `token_use`; claim mapping with CEL is still a 2026 enhancement proposal. **mock-oauth2-server 6.1** (MIT) is light, but its login page takes any username with no password and lets the caller add claims, so there is no seeded member to sign in as. |
 | PostgreSQL | **The official PostgreSQL 17 image** | The major version Aurora runs (ADR-0011); the Debian variant uses glibc collations, like most servers | — |
+
+## 7. Seed, lifecycle jobs and the M2 journey
+
+**The seed** (#182). `make seed` runs [`local/seed.py`](../local/seed.py) against the stack's database, as `sft`. It
+writes the `local-keycloak` connection in `idp_connections` (the pool's row, with no tenant), the tenant
+`Local Example Co` with its policy, and the test admin and member of section 3, each with a `user_identities` row
+bound to its Keycloak subject, so both sign in through Keycloak as members do through Cognito. Every row has a fixed
+ID and is written with `ON CONFLICT DO NOTHING`: run it twice and nothing changes. `--suppress ADDRESS` adds a
+suppression for that address in the tenant (#174), to show `422 recipient_undeliverable`. It refuses any database but
+the local stack's (the loopback address, the `sft` database, the stack's roles and schema), and it prints the sign-in
+details:
+
+```bash
+make up && make seed
+# then sign in at http://localhost:3000 (the web app, M3), or start at http://localhost:8000/v1/auth/sign-in
+```
+
+**The lifecycle jobs** (#181) are one-shot commands, as the CronJobs that run them in AWS (M4): `make jobs JOB=expiry`
+runs `python -m sft.workers.jobs expiry` in the `jobs` service, which `make up` never starts (compose profile `jobs`).
+`expiry` records expired transfers and cancels drafts idle for 7 days; `deletion` deletes every version of each due
+file, and any unfinished upload of it, in the local buckets; `reconciliation` rejects uploads with no part for 24
+hours, finishes completions left for 15 minutes, runs the scan sweep and rewrites missing grant records;
+`storage-audit` deletes orphan objects and stale uploads over 24 hours old and reports what is left; `cleanup` deletes
+expired codes, link sessions and grants. Each logs its report as one JSON line. The local buckets have no Osaka
+replicas, so "every copy" means every object version in `sft-local-files` and `sft-local-large-files`; the Osaka copies
+are checked when the journey runs against AWS in M4.
+
+**The clock's test hook** (#182). `CLOCK_OFFSET_SECONDS` moves what the API and the jobs read as "now"
+(`sft.core.clock`). The settings refuse it unless `ENVIRONMENT` is `local` or `test`, so it can't be set in dev,
+staging or prod. The API keeps it at 0; the journey moves only the jobs:
+`CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry` runs expiry two hours from now.
+
+**The M2 journey** (#182, [`services/api/tests/test_journey.py`](../services/api/tests/test_journey.py)) is one test
+of M2's exit criterion, step by step, against the running stack: the seeded member signs in through Keycloak, sends a
+transfer of two files to two recipients (one file with a synthetic My Number, one upload interrupted and resumed),
+ClamAV scans and the inspector inspects both, Mailpit holds a link email per recipient, a recipient verifies with the
+code from Mailpit and downloads a file in two ranges, the member revokes the transfer, and a second transfer expires
+under the clock's hook and its files leave the buckets. It ends by checking the audit log has an event for each step
+and no token, code, address, file name or My Number. A failure names its step.
+
+```bash
+make up && make seed && make e2e
+```
+
+It talks to the service only through the public API, Mailpit's API, S3's API, the job commands and the clock's hook,
+so in M4 it runs against dev with the seed and the clock replaced there. Two local shortcuts are named in the test:
+part URLs name the in-network `s3:9090`, which it sends to `127.0.0.1:9090`, and it reads the audit log from the
+database until an audit search operation exists. It is skipped unless `SFT_E2E=1` (`make e2e` sets it), so `make test`
+never starts it. CI's Local stack job runs `make seed` and `make e2e` after the smoke checks, on every pull request.

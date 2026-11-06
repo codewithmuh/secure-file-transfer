@@ -116,8 +116,10 @@ async def record(
     inspection: InspectionResult,
     *,
     attempts: int,
+    sha256: bytes | None = None,
 ) -> bool:
-    """Record the result if the file is still `scanning` (module docstring); False if it wasn't."""
+    """Record the result if the file is still `scanning` (module docstring); False if it wasn't.
+    `sha256` is the digest of the version the worker read in full, if it did (#180)."""
     if scan.state in (FileState.INFECTED, FileState.SCAN_FAILED):
         inspection = SKIPPED
     allowed = False
@@ -135,6 +137,7 @@ async def record(
         inspection_state=inspection.state,
         inspection_reasons=inspection.reasons,
         inspection_engine_version=inspection.engine_version,
+        sha256=sha256,
     )
     if not changed:
         return False

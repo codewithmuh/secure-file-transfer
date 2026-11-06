@@ -10,6 +10,7 @@ from api_settings import API_ENV
 from sft.core import settings as settings_module
 from sft.core.settings import (
     BootstrapSettings,
+    JobSettings,
     MigrationSettings,
     OperatorSettings,
     Settings,
@@ -39,6 +40,10 @@ ENV_NAMES = (
     "AUDIT_ARCHIVE_OSAKA_BUCKET",
     "AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL",
     "AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL",
+    "ENVIRONMENT",
+    "CLOCK_OFFSET_SECONDS",
+    "DOWNLOAD_RECHECK_SECONDS",
+    "DOWNLOAD_STREAMS_PER_POD",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -85,6 +90,9 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.audit_archive_tokyo_bucket == "sft-test-audit-archive"
     assert s.audit_archive_osaka_bucket is None
     assert (s.audit_archive_tokyo_endpoint_url, s.audit_archive_osaka_endpoint_url) == (None, None)
+    # Unset is the strictest environment, so a pod spec that forgets it gets no test hook (#182).
+    assert (s.environment, s.clock_offset_seconds) == ("prod", 0)
+    assert (s.download_recheck_seconds, s.download_streams_per_pod) == (30.0, 100)
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -293,8 +301,55 @@ def secret_fields_with_defaults(model: type[BaseModel]) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("environment", ["local", "test"])
+def test_the_clock_hook_runs_in_local_and_test(
+    clean_env: pytest.MonkeyPatch, environment: str
+) -> None:
+    clean_env.setenv("ENVIRONMENT", environment)
+    clean_env.setenv("CLOCK_OFFSET_SECONDS", "90000")
+    assert Settings().clock_offset_seconds == 90000
+
+
+@pytest.mark.parametrize("environment", ["dev", "staging", "prod", None])
+def test_the_clock_hook_is_refused_anywhere_else(
+    clean_env: pytest.MonkeyPatch, environment: str | None
+) -> None:
+    if environment is not None:
+        clean_env.setenv("ENVIRONMENT", environment)
+    clean_env.setenv("CLOCK_OFFSET_SECONDS", "90000")
+    with pytest.raises(ValidationError, match="only ENVIRONMENT=local or test"):
+        Settings()
+    with pytest.raises(ValidationError, match="only ENVIRONMENT=local or test"):
+        JobSettings(
+            database_url="postgresql://sft_jobs@127.0.0.1/sft",
+            s3_files_bucket="sft-test-files",
+            s3_large_files_bucket="sft-test-large-files",
+            audit_archive_tokyo_bucket="sft-test-audit-archive",
+        )
+    clean_env.setenv("CLOCK_OFFSET_SECONDS", "0")
+    Settings()  # no offset: every environment runs
+
+
+def test_job_settings_name_the_replica_buckets_together() -> None:
+    base = {
+        "database_url": "postgresql://sft_jobs@127.0.0.1/sft",
+        "s3_files_bucket": "sft-test-files",
+        "s3_large_files_bucket": "sft-test-large-files",
+        "audit_archive_tokyo_bucket": "sft-test-audit-archive",
+    }
+    JobSettings(**base)  # type: ignore[arg-type]
+    JobSettings(  # type: ignore[arg-type]
+        **base,
+        s3_replica_region="ap-northeast-3",
+        s3_replica_files_bucket="sft-test-files-osaka",
+        s3_replica_large_files_bucket="sft-test-large-files-osaka",
+    )
+    with pytest.raises(ValidationError, match="together"):
+        JobSettings(**base, s3_replica_region="ap-northeast-3")  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
-    "model", [Settings, OperatorSettings, MigrationSettings, BootstrapSettings]
+    "model", [Settings, OperatorSettings, MigrationSettings, BootstrapSettings, JobSettings]
 )
 def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
     assert secret_fields_with_defaults(model) == []
@@ -317,6 +372,7 @@ def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
         (OperatorSettings, ["database_url", "valkey_url"]),
         (MigrationSettings, ["migration_database_url"]),
         (BootstrapSettings, ["bootstrap_database_url"]),
+        (JobSettings, ["database_url"]),
     ],
 )
 def test_secret_settings_are_secret_strings(model: type[BaseSettings], secrets: list[str]) -> None:

@@ -642,6 +642,20 @@ class Transfer(TenantOwned, Base):
         CheckConstraint(
             "(message_ct IS NULL) OR (octet_length(message_ct) > 0)", name="message_ct"
         ),
+        # The lifecycle jobs' finds (data model 5, revision 0015).
+        Index(
+            "transfers_expires_at_idx",
+            "expires_at",
+            postgresql_where=text(
+                "state IN ('submitted', 'awaiting_confirmation', 'pending_approval', 'sent', "
+                "'held')"
+            ),
+        ),
+        Index(
+            "transfers_last_activity_at_idx",
+            "last_activity_at",
+            postgresql_where=text("state = 'draft'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -793,6 +807,20 @@ class File(TenantOwned, Base):
             "scan_deadline",
             postgresql_where=text("state = 'scanning'"),
         ),
+        CheckConstraint("octet_length(sha256) = 32", name="sha256"),
+        CheckConstraint("state <> 'deleted' OR deleted_at IS NOT NULL", name="deleted"),
+        # The lifecycle jobs' finds (data model 5, revision 0015).
+        Index(
+            "files_delete_after_idx", "delete_after", postgresql_where=text("deleted_at IS NULL")
+        ),
+        Index(
+            "files_last_part_at_idx", "last_part_at", postgresql_where=text("state = 'uploading'")
+        ),
+        Index(
+            "files_completion_started_at_idx",
+            "completion_started_at",
+            postgresql_where=text("state = 'completing'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -828,6 +856,10 @@ class File(TenantOwned, Base):
     inspection_policy_version: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    sha256: Mapped[bytes | None] = mapped_column(LargeBinary)
+    """The SHA-256 of the scanned version, which the scan worker reads in full (revision 0014)."""
+    deleted_at: Mapped[datetime | None]
+    """When the deletion job removed every object version (revision 0015)."""
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -1037,6 +1069,73 @@ class LinkSession(TenantOwned, Base):
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
         # A recipient's link session reaches the sessions of its own recipient.
+        if subject.kind is not SubjectKind.RECIPIENT:
+            return false()
+        return cls.recipient_id == subject.id
+
+
+class DownloadGrant(TenantOwned, Base):
+    """One counted download of one file by one link session (data model 2.3, abuse 5.4; revision
+    0014): a byte, request and time budget, and the lease of its one active stream. The member's
+    pair (`user_id`, `member_session_id`) arrives with received files (M5)."""
+
+    __tablename__ = "download_grants"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "file_id"], ["files.tenant_id", "files.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "recipient_id"],
+            ["transfer_recipients.tenant_id", "transfer_recipients.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "link_session_id"],
+            ["link_sessions.tenant_id", "link_sessions.id"],
+            ondelete="CASCADE",
+        ),
+        Index("download_grants_file_id_idx", "file_id"),
+        Index("download_grants_recipient_id_idx", "recipient_id"),
+        Index("download_grants_link_session_id_idx", "link_session_id"),
+        Index("download_grants_expires_at_idx", "expires_at"),
+        Index(
+            "download_grants_unarchived_idx",
+            "created_at",
+            postgresql_where=text("archived_at IS NULL"),
+        ),
+        CheckConstraint("byte_budget >= 1", name="byte_budget"),
+        CheckConstraint("bytes_served >= 0", name="bytes_served"),
+        CheckConstraint("request_count BETWEEN 0 AND 20", name="request_count"),
+        CheckConstraint(
+            "expires_at > created_at AND expires_at <= created_at + interval '24 hours'",
+            name="expires_at",
+        ),
+        CheckConstraint(
+            "(active_stream_id IS NULL) = (active_stream_until IS NULL)", name="active_stream"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    file_id: Mapped[uuid.UUID]
+    s3_version_id: Mapped[str] = mapped_column(Text)
+    recipient_id: Mapped[uuid.UUID]
+    link_session_id: Mapped[uuid.UUID]
+    byte_budget: Mapped[int] = mapped_column(BigInteger)
+    bytes_served: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    request_count: Mapped[int] = mapped_column(server_default=text("0"))
+    expires_at: Mapped[datetime]
+    active_stream_id: Mapped[uuid.UUID | None]
+    active_stream_until: Mapped[datetime | None]
+    archived_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A recipient's link session reaches its own recipient's grants; which of them the session
+        # may use is the service's rule (the grant's session).
         if subject.kind is not SubjectKind.RECIPIENT:
             return false()
         return cls.recipient_id == subject.id

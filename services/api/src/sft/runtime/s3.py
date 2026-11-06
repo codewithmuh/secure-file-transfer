@@ -18,6 +18,10 @@ so a part URL carries no checksum header the browser would have to repeat.
 It lives in `sft.runtime` because both entry points need it: the API for uploads
 (`sft.service.objects.ObjectStore`), and the scan worker, which reads the recorded version of a
 file once and tags it with its result (`ScannedObjects`, ADR-0019).
+
+`S3Cleaner` is the lifecycle jobs' (`sft.service.objects.StorageCleaner`, #181): it lists and
+deletes object versions and aborts unfinished uploads, in Tokyo's buckets and in the replicas'
+region where there is one (architecture 4.5). The jobs' role is the only one that may delete.
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ from sft.service.objects import (
     ObjectAttributes,
     ObjectStoreError,
     StoredPart,
+    StoredUpload,
+    StoredVersion,
 )
 
 if TYPE_CHECKING:
@@ -267,3 +273,166 @@ class S3Objects:
         """Wait for calls in flight, then close the client. Call it once, at shutdown."""
         await asyncio.to_thread(self._executor.shutdown, wait=True)
         self._client.close()
+
+
+_PREFIX: Final = "tenants/"
+
+
+class S3Cleaner:
+    """`StorageCleaner` through boto3: the files bucket pair of each region that holds a copy."""
+
+    def __init__(
+        self,
+        clients: Mapping[str, S3Client],
+        buckets: Mapping[str, Mapping[StorageClass, str]],
+        *,
+        threads: int = 4,
+    ) -> None:
+        if set(clients) != set(buckets) or not clients:
+            raise ValueError("name a client and a bucket pair for each region")
+        self._clients = dict(clients)
+        self._buckets = {region: dict(pair) for region, pair in buckets.items()}
+        self._executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="s3-jobs")
+
+    @classmethod
+    def create(
+        cls,
+        buckets: Mapping[str, Mapping[StorageClass, str]],
+        endpoint_url: str | None = None,
+    ) -> S3Cleaner:
+        clients = {}
+        for region in buckets:
+            config = Config(
+                region_name=region,
+                signature_version="s3v4",
+                connect_timeout=2,
+                read_timeout=30,
+                retries={"mode": "standard", "max_attempts": 3},
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+                s3={"addressing_style": "path" if endpoint_url else "virtual"},
+            )
+            clients[region] = boto3.session.Session().client(
+                "s3", endpoint_url=endpoint_url, config=config
+            )
+        return cls(clients, buckets)
+
+    @property
+    def regions(self) -> tuple[str, ...]:
+        return tuple(self._clients)
+
+    async def _call[T](self, fn: Callable[..., T], /, **kwargs: object) -> T:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(self._executor, functools.partial(fn, **kwargs))
+        except (ClientError, BotoCoreError) as exc:
+            raise _error(exc) from exc
+
+    def _bucket(self, region: str, storage_class: StorageClass) -> str:
+        return self._buckets[region][StorageClass(storage_class)]
+
+    async def _version_pages(
+        self, region: str, storage_class: StorageClass, prefix: str
+    ) -> AsyncIterator[list[StoredVersion]]:
+        client = self._clients[region]
+        markers: dict[str, object] = {}
+        while True:
+            response: Any = await self._call(
+                client.list_object_versions,
+                Bucket=self._bucket(region, storage_class),
+                Prefix=prefix,
+                **markers,
+            )
+            yield [
+                StoredVersion(region, item["Key"], item["VersionId"], item["LastModified"])
+                for item in [*response.get("Versions", []), *response.get("DeleteMarkers", [])]
+            ]
+            if not response.get("IsTruncated"):
+                return
+            markers = {
+                "KeyMarker": response.get("NextKeyMarker"),
+                "VersionIdMarker": response.get("NextVersionIdMarker"),
+            }
+
+    async def versions(self, storage_class: StorageClass, key: str) -> list[StoredVersion]:
+        found = []
+        for region in self._clients:
+            async for page in self._version_pages(region, storage_class, key):
+                # The prefix matches longer keys too.
+                found += [version for version in page if version.key == key]
+        return found
+
+    async def uploads(self, storage_class: StorageClass, key: str) -> list[StoredUpload]:
+        found = []
+        for region in self._clients:
+            async for page in self._upload_pages(region, storage_class, key):
+                # The prefix matches longer keys too.
+                found += [upload for upload in page if upload.key == key]
+        return found
+
+    async def delete_versions(
+        self, storage_class: StorageClass, versions: Sequence[StoredVersion]
+    ) -> None:
+        for version in versions:
+            await self._call(
+                self._clients[version.region].delete_object,
+                Bucket=self._bucket(version.region, storage_class),
+                Key=version.key,
+                VersionId=version.version_id,
+            )
+
+    async def abort_upload(
+        self, storage_class: StorageClass, region: str, key: str, upload_id: str
+    ) -> bool:
+        try:
+            await self._call(
+                self._clients[region].abort_multipart_upload,
+                Bucket=self._bucket(region, storage_class),
+                Key=key,
+                UploadId=upload_id,
+            )
+        except ObjectStoreError as exc:
+            if exc.code in _MISSING:
+                return False
+            raise
+        return True
+
+    async def version_pages(
+        self, storage_class: StorageClass
+    ) -> AsyncIterator[list[StoredVersion]]:
+        for region in self._clients:
+            async for page in self._version_pages(region, storage_class, _PREFIX):
+                yield page
+
+    async def _upload_pages(
+        self, region: str, storage_class: StorageClass, prefix: str
+    ) -> AsyncIterator[list[StoredUpload]]:
+        client = self._clients[region]
+        markers: dict[str, object] = {}
+        while True:
+            response: Any = await self._call(
+                client.list_multipart_uploads,
+                Bucket=self._bucket(region, storage_class),
+                Prefix=prefix,
+                **markers,
+            )
+            yield [
+                StoredUpload(region, item["Key"], item["UploadId"], item["Initiated"])
+                for item in response.get("Uploads", [])
+            ]
+            if not response.get("IsTruncated"):
+                return
+            markers = {
+                "KeyMarker": response.get("NextKeyMarker"),
+                "UploadIdMarker": response.get("NextUploadIdMarker"),
+            }
+
+    async def upload_pages(self, storage_class: StorageClass) -> AsyncIterator[list[StoredUpload]]:
+        for region in self._clients:
+            async for page in self._upload_pages(region, storage_class, _PREFIX):
+                yield page
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._executor.shutdown, wait=True)
+        for client in self._clients.values():
+            client.close()

@@ -232,6 +232,37 @@ data "aws_iam_policy_document" "files" {
     }
   }
 
+  # Reconciliation finishes an upload left `completing` (#181, data model 3.1): CompleteMultipartUpload on an SSE-KMS
+  # object needs the key through S3. The jobs role has no s3:GetObject, so it can't read a file this way.
+  statement {
+    sid       = "JobsCompleteStuckUploadsThroughS3"
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.account_root]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.role_arns["jobs"]]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = [local.via["s3"]]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:s3:arn"
+      values   = [local.bucket_arns["files"], local.bucket_arns["large_files"]]
+    }
+  }
+
   # Files up to 2 GB only: larger ones are scanned by GuardDuty (ADR-0019).
   statement {
     sid       = "ScanWorkerReadsSmallFilesThroughS3"
@@ -548,7 +579,8 @@ data "aws_iam_policy_document" "audit" {
   source_policy_documents = [data.aws_iam_policy_document.common.json]
 
   # Writers only generate data keys. The archive job writes batches in Tokyo; the API and the operator API write
-  # security-critical records to both Regions (architecture 5.2).
+  # security-critical records to both Regions (architecture 5.2), and the lifecycle jobs rewrite a download grant's
+  # committed record there (#181).
   statement {
     sid       = "WritersPutArchiveObjectsThroughS3"
     actions   = ["kms:GenerateDataKey"]
@@ -564,7 +596,7 @@ data "aws_iam_policy_document" "audit" {
       variable = "aws:PrincipalArn"
       values = concat(
         local.primary ? [local.role_arns["archive"]] : [],
-        [local.role_arns["api"], local.role_arns["operator"]],
+        [local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]],
       )
     }
 

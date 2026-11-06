@@ -7,8 +7,9 @@ client's PUT to a part URL. tests/test_s3_s3mock.py runs the real adapter agains
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 
 from sft.data.models import StorageClass
@@ -76,6 +77,44 @@ class FakeObjects:
     ) -> None:
         self.aborted.append(upload_id)
         self.uploads.pop(upload_id, None)
+
+    async def close(self) -> None:
+        return None
+
+
+@dataclass
+class FakeContent:
+    """An in-memory `FileContent` for the download tests (#180): each version's bytes by key, sent
+    in `chunk`-byte pieces with an optional `delay` before each, so a test can watch a stream's
+    re-checks. tests/test_s3_s3mock.py runs the real reader against S3Mock."""
+
+    objects: dict[tuple[str, str], bytes] = field(default_factory=dict)
+    chunk: int = 64 * 1024
+    delay: float = 0.0
+    failing: bool = False
+    fail_on_close: bool = False
+    """Closing a read part-way raises, as an HTTP client can when its peer went away."""
+    reads: list[tuple[str, str, int, int]] = field(default_factory=list)
+
+    def put(self, key: str, version_id: str, data: bytes) -> None:
+        self.objects[(key, version_id)] = data
+
+    async def read(
+        self, storage_class: StorageClass, key: str, version_id: str, *, start: int, end: int
+    ) -> AsyncIterator[bytes]:
+        self.reads.append((key, version_id, start, end))
+        if self.failing:
+            raise ObjectStoreError("ServiceUnavailable")
+        data = self.objects[(key, version_id)][start : end + 1]
+        try:
+            for offset in range(0, len(data), self.chunk):
+                if self.delay:
+                    await asyncio.sleep(self.delay)
+                yield data[offset : offset + self.chunk]
+        except GeneratorExit:
+            if self.fail_on_close:
+                raise ObjectStoreError("ReadError") from None
+            raise
 
     async def close(self) -> None:
         return None

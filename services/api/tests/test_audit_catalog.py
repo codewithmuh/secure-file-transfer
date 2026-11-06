@@ -183,3 +183,28 @@ def test_the_send_and_scan_actions_are_catalogued(migrated_db: ScratchDatabase) 
         assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
         for table in tables:
             assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions downloads and the lifecycle jobs add (#180, #181), with the audited tables
+# whose changes each covers in its transaction.
+DOWNLOAD_AND_LIFECYCLE_ACTIONS = {
+    "download.granted": ("download_grants", "download_counters"),
+    "download.resumed": (),
+    "download.refused": (),
+    "download.completed": (),
+    "download.stopped": (),
+    "transfer.revoked": ("transfers", "link_sessions", "files"),
+    "transfer.expired": ("transfers", "files"),
+    "file.deleted": ("files",),
+    "retention.rows_deleted": ("verification_codes",),
+}
+
+
+def test_the_download_and_lifecycle_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in DOWNLOAD_AND_LIFECYCLE_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source or f'ACTION: Final = "{action}"' in source, action
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"

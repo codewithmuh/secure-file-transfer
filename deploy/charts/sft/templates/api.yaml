@@ -26,7 +26,9 @@ the External Secrets Secret.
   "S3_FILES_BUCKET" (printf "%s-files-%s" $prefix (toString $c.accountId))
   "S3_LARGE_FILES_BUCKET" (printf "%s-large-files-%s" $prefix (toString $c.accountId))
   "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
-  "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr) $archive $w.env }}
+  "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr
+  "ENVIRONMENT" .Values.environment
+  "SCAN_SMALL_POOL_MAX_BYTES" (toString .Values.scanSmallPoolMaxBytes)) $archive $w.env }}
 {{- $secretEnv := dict "CSRF_KEYRING" "api-secrets" "EMAIL_HMAC_KEYRING" "api-secrets" "CODE_HMAC_KEYRING" "api-secrets" "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
 # The API service (architecture 2): every HTTP call, behind the load balancer, at least 3 pods across 3 AZs.
 apiVersion: apps/v1

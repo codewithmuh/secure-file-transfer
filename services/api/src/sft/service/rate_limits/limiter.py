@@ -15,7 +15,9 @@
 - **All or nothing** (`check_all`, `peek_all`). A request charged against many limits at once, as
   `sendTransfer` charges each recipient's address, first reads every limit in one pipelined call
   and charges only if all of them admit it, in a second. A refusal charges nothing. Two requests
-  racing between the two calls can still leave one partly charged; both answers stay right.
+  racing between the two calls can still leave one partly charged; both answers stay right. For
+  budgets (`Budget`, a download's bytes, #180) the race is closed too: when the second call finds
+  a refusal, the budgets it charged are refunded at once, so a loser's budgets are unchanged.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from dataclasses import dataclass
 from sft.core.errors import RateLimited, ServiceUnavailable
 from sft.core.pseudonyms import EmailPseudonyms
 from sft.data.counters import (
+    BudgetCall,
     Call,
     CounterMetrics,
     CounterStore,
@@ -41,6 +44,7 @@ from sft.data.counters import (
     Verdict,
 )
 from sft.service.rate_limits.limits import (
+    Budget,
     FailureMode,
     KeyType,
     KeyValue,
@@ -79,6 +83,8 @@ class _Planned:
     older: tuple[str, ...]
     limit_value: int
     local_value: int
+    window_end_ms: int = 0
+    """For a budget: when its window ends, which a refusal waits for."""
 
 
 class RateLimiter:
@@ -134,7 +140,7 @@ class RateLimiter:
         them all, and one more to charge if every limit admits the request."""
         await self._all(charges, charge=True)
 
-    def _plan(self, charge: Charge) -> _Planned:
+    def _plan(self, charge: Charge, now_ms: int) -> _Planned:
         if charge.cost < 1:
             raise ValueError("cost is at least 1")
         limit = charge.limit
@@ -144,6 +150,20 @@ class RateLimiter:
             (value.active, value.overlap) if isinstance(value, EmailPseudonyms) else (value, ())
         )
         rule = limit.rule
+        if isinstance(rule, Budget):
+            if older:
+                raise ValueError(f"limit {limit.id}: only quotas add an older pseudonym's count")
+            window_ms = rule.window_seconds * 1000
+            window = now_ms // window_ms
+            return _Planned(
+                charge,
+                key_type,
+                f"{limit.store_key(key_type, active)}:w{window}",
+                (),
+                rule.limit,
+                fallback_limit(rule.limit),
+                (window + 1) * window_ms,
+            )
         if isinstance(rule, Rate):
             if older:
                 raise ValueError(f"limit {limit.id}: only quotas add an older pseudonym's count")
@@ -164,10 +184,10 @@ class RateLimiter:
         )
 
     async def _all(self, charges: Sequence[Charge], *, charge: bool) -> None:
-        plans = [self._plan(c) for c in charges]
+        now_ms = int(self._clock() * 1000)
+        plans = [self._plan(c, now_ms) for c in charges]
         if not plans:
             return
-        now_ms = int(self._clock() * 1000)
         try:
             await self._all_in_store(plans, now_ms, charge=charge)
         except CounterStoreUnavailableError:
@@ -183,11 +203,23 @@ class RateLimiter:
         others: Mapping[str, list[float]],
         *,
         peek: bool,
+        sign: int = 1,
     ) -> list[Call]:
         calls: list[Call] = []
         for plan in plans:
             rule = plan.charge.limit.rule
-            if isinstance(rule, Rate):
+            if isinstance(rule, Budget):
+                calls.append(
+                    BudgetCall(
+                        plan.key,
+                        plan.limit_value,
+                        plan.window_end_ms - now_ms + 3_600_000,
+                        sign * plan.charge.cost,
+                        peek,
+                        max(1, plan.window_end_ms - now_ms),
+                    )
+                )
+            elif isinstance(rule, Rate):
                 calls.append(
                     RateCall(
                         plan.key,
@@ -235,6 +267,18 @@ class RateLimiter:
             charged = await self._store.run(
                 self._calls(plans, now_ms, others, peek=False), now_ms=now_ms
             )
+            refunds = [
+                plan
+                for plan, verdict in zip(plans, charged, strict=True)
+                if isinstance(plan.charge.limit.rule, Budget)
+                and isinstance(verdict, Verdict)
+                and verdict.allowed
+            ]
+            if refunds and any(isinstance(v, Verdict) and not v.allowed for v in charged):
+                # Another request took what this one peeked: give back the budgets it spent.
+                await self._store.run(
+                    self._calls(refunds, now_ms, others, peek=False, sign=-1), now_ms=now_ms
+                )
             self._refuse_if_any(plans, charged)
 
     def _all_locally(self, plans: Sequence[_Planned], now_ms: int, *, charge: bool) -> None:
@@ -243,7 +287,19 @@ class RateLimiter:
             verdicts: list[Verdict | list[float]] = []
             for plan in plans:
                 rule = plan.charge.limit.rule
-                if isinstance(rule, Rate):
+                if isinstance(rule, Budget):
+                    verdicts.append(
+                        self._local.budget(
+                            plan.key,
+                            now_ms=now_ms,
+                            limit=plan.local_value,
+                            cost=plan.charge.cost,
+                            ttl_ms=plan.window_end_ms - now_ms + 3_600_000,
+                            wait_ms=max(1, plan.window_end_ms - now_ms),
+                            peek=peek,
+                        )
+                    )
+                elif isinstance(rule, Rate):
                     verdicts.append(
                         self._local.rate(
                             plan.key,
@@ -358,6 +414,8 @@ class RateLimiter:
         )
         key = limit.store_key(key_type, active)
         rule = limit.rule
+        if isinstance(rule, Budget):
+            raise ValueError(f"limit {limit.id}: a budget is charged with check_all")
         if isinstance(rule, Rate):
             if older:
                 raise ValueError(f"limit {limit.id}: only quotas add an older pseudonym's count")

@@ -1,8 +1,8 @@
 """The transfer and file operations of the contract: `createTransfer`, `listTransfers`,
-`getTransfer`, `sendTransfer` and `cancelTransfer` (#114, #174); `addTransferFile`,
-`requestUploadPartUrls`, `listUploadedParts`, `completeUpload`, `getFile` and `deleteFile` (#114,
-#175); and `getFileInspection` (#176). Architecture 4.1; docs/api/openapi.yaml, tags "Transfers",
-"Files" and "Data loss prevention".
+`getTransfer`, `sendTransfer` and `cancelTransfer` (#114, #174), `revokeTransfer` (#180);
+`addTransferFile`, `requestUploadPartUrls`, `listUploadedParts`, `completeUpload`, `getFile` and
+`deleteFile` (#114, #175); and `getFileInspection` (#176). Architecture 4.1, 4.4;
+docs/api/openapi.yaml, tags "Transfers", "Files" and "Data loss prevention".
 
 Routes only parse the request and shape the response. The service layer (`sft.service.transfers`,
 `sft.service.uploads`) checks the caller with `authorize` and applies the state rules. Its refusals
@@ -13,16 +13,17 @@ The caller is a member session or an API key (`get_tenant_caller`, #113). The ob
 upload policy come from the app's lifespan (`sft.api.dependencies`).
 
 Rate limits (abuse and rate limits 2.2): the transfer operations, `getFile` and `deleteFile` are
-group H (`TENANT_OPERATION`). `sendTransfer` also applies group G's email caps in the service, once
-the send passes its checks (`sft.service.sending`). The four upload operations are group F
-(`UPLOAD`): the caller's and the IP's upload budgets, and the tenant's group H budget, which counts
-groups D to K too. `getFileInspection` is group K, which has no limit of its own for a response
-without finding details (all of them, until DLP-8), so it counts against the caller's and the
-tenant's group H budgets.
+group H (`TENANT_OPERATION`). `revokeTransfer` is a safety action: the caller's own budget only,
+never the tenant's (`SAFETY_ACTION`), so a runaway automation can't stop an admin revoking.
+`sendTransfer` also applies group G's email caps in the service, once the send passes its checks
+(`sft.service.sending`). The four upload operations are group F (`UPLOAD`): the caller's and the
+IP's upload budgets, and the tenant's group H budget, which counts groups D to K too.
+`getFileInspection` is group K, which has no limit of its own for a response without finding details
+(all of them, until DLP-8), so it counts against the caller's and the tenant's group H budgets.
 
-`createTransfer` and `addTransferFile` take `Idempotency-Key` (`sft.api.idempotency`, API README
-5): a retry with the same key and body gets the first `201`, its `Location` and the resource as it
-is now, and creates nothing again.
+`createTransfer` and `addTransferFile` take `Idempotency-Key` (`sft.api.idempotency`, API README 5):
+a retry with the same key and body gets the first `201`, its `Location` and the resource as it is
+now, and creates nothing again.
 """
 
 from __future__ import annotations
@@ -34,7 +35,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 
 from sft.api.caller import get_tenant_caller, origin_of
-from sft.api.dependencies import get_database, get_email_keyring, get_objects, get_upload_policy
+from sft.api.dependencies import (
+    get_audit_archive,
+    get_database,
+    get_email_keyring,
+    get_objects,
+    get_upload_policy,
+    now_of,
+)
 from sft.api.errors import problem_responses
 from sft.api.idempotency import IdempotencyDep
 from sft.api.rate_limits import get_rate_limiter, rate_limit
@@ -54,11 +62,12 @@ from sft.api.transfer_schemas import (
 from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
 from sft.data.models import TransferState
-from sft.service import file_reads, sending, transfers, uploads
+from sft.service import file_reads, revocation, sending, transfers, uploads
+from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
 from sft.service.objects import ObjectStore
 from sft.service.rate_limits import RateLimiter
-from sft.service.rate_limits.limits import TENANT_OPERATION, UPLOAD
+from sft.service.rate_limits.limits import SAFETY_ACTION, TENANT_OPERATION, UPLOAD
 
 PREFIX: Final = "/v1"
 
@@ -70,6 +79,8 @@ EmailKeyringDep = Annotated[EmailKeyring, Depends(get_email_keyring)]
 LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 UPLOAD_LIMITS: Final = rate_limit(UPLOAD, caller=get_tenant_caller)
+SAFETY_LIMITS: Final = rate_limit(SAFETY_ACTION, caller=get_tenant_caller)
+ArchiveDep = Annotated[AuditArchive, Depends(get_audit_archive)]
 
 
 def _now() -> datetime:
@@ -351,6 +362,30 @@ async def cancel_transfer(
     """Cancel a transfer that wasn't sent; its files are deleted on schedule (FR-5, FR-21)."""
     view = await sending.cancel_transfer(
         database, caller, transfer_id, origin=origin_of(request), now=_now()
+    )
+    return Transfer.of(view)
+
+
+@router.post(
+    "/transfers/{transfer_id}/revoke",
+    operation_id="revokeTransfer",
+    response_model=Transfer,
+    response_model_exclude_unset=True,
+    summary="Revoke a transfer",
+    tags=["Transfers"],
+    dependencies=[SAFETY_LIMITS],
+    responses=problem_responses(401, 403, 404, 409, 429, 503),
+)
+async def revoke_transfer(
+    transfer_id: UUID,
+    request: Request,
+    caller: CallerDep,
+    database: DatabaseDep,
+    archive: ArchiveDep,
+) -> Transfer:
+    """Stop sharing at once; `200` once the record is in both regions' archive (FR-20, NFR-10)."""
+    view = await revocation.revoke_transfer(
+        database, archive, caller, transfer_id, origin=origin_of(request), now=now_of(request)
     )
     return Transfer.of(view)
 
