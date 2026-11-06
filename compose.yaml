@@ -110,13 +110,31 @@ services:
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       INSPECTOR_SCRATCH_DIR: /scratch
+      # Listen on the container's interface, as the pod does: the default 127.0.0.1 would be unreachable from the
+      # scan workers. The inspection network is internal, so nothing else can reach it.
+      BIND_HOST: 0.0.0.0
     # 4 GiB of scratch for the file it inspects, in memory locally; nothing else is writable.
     tmpfs: [/tmp, "/scratch:size=4g,uid=10001,gid=10001,mode=0700"]
     # Only on the inspection network, which is internal: it reaches neither the database, the counter store, nor
     # anything outside, and only the scan workers reach it (local/smoke.py checks both).
     networks: [inspection]
-    # It speaks only its framed protocol, one file per connection, and has no probe port (deploy/README.md).
-    healthcheck: { disable: true }
+    # It speaks only its framed protocol, one file per connection, and has no probe port (deploy/README.md). A TCP
+    # connect would be logged as a malformed request, so the check reads the kernel's socket table instead: healthy
+    # once something listens on 8070 (hex 1F86, state 0A), without ever connecting. `make up --wait` needs a check.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, sys
+          tables = [t for t in ("/proc/net/tcp", "/proc/net/tcp6") if os.path.exists(t)]
+          rows = [line.split() for t in tables for line in open(t).readlines()[1:]]
+          sys.exit(0 if any(r[1].endswith(":1F86") and r[3] == "0A" for r in rows) else 1)
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
     stop_grace_period: 35s
 
   # ---- Database jobs: one-shot, in order, on every `make up`. Each is safe to repeat. ----
