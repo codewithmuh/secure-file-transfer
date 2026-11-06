@@ -200,12 +200,15 @@ operatorApi: # namespace sft-operator, port-forward only, never on a load balanc
 # ---- Scheduled jobs (architecture 4.5, 5.2). Times are UTC. Each run is a fresh pod that exits; a run never overlaps
 # the one before it. ----
 
+# The lifecycle jobs (#181, sft.service.lifecycle) read JobSettings: `s3` gives a job the files buckets of this region
+# and of Osaka's replicas (staging and prod), `archive` both regions' audit archive, `lifecycle` ENVIRONMENT.
 lifecycleJobs:
-  expiry: # records expiry of transfers and upload requests past expires_at
+  expiry: # records expiry of transfers past expires_at, and cancels drafts idle for 7 days
     schedule: "*/5 * * * *"
     module: sft.workers.expiry
     serviceAccount: jobs
     databaseRole: sft_jobs
+    lifecycle: true
     s3: false
     activeDeadlineSeconds: 240
   deletion: # deletes every version of due files in both regions; the only workload that deletes objects
@@ -213,15 +216,34 @@ lifecycleJobs:
     module: sft.workers.deletion
     serviceAccount: jobs
     databaseRole: sft_jobs
+    lifecycle: true
     s3: true
     activeDeadlineSeconds: 1800
-  reconciliation: # daily: compares the buckets with the metadata, deletes orphans, aborts stale multipart uploads
-    schedule: "17 3 * * *"
+  reconciliation: # stale uploads, stuck completions, the scan sweep, grants whose committed record is missing
+    schedule: "*/5 * * * *"
     module: sft.workers.reconciliation
     serviceAccount: jobs
     databaseRole: sft_jobs
+    lifecycle: true
+    s3: true
+    archive: true
+    activeDeadlineSeconds: 240
+  storage-audit: # daily: compares the buckets with the metadata, deletes orphans, aborts stale multipart uploads
+    schedule: "17 3 * * *"
+    module: sft.workers.storage_audit
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    lifecycle: true
     s3: true
     activeDeadlineSeconds: 7200
+  cleanup: # daily: deletes expired verification codes, link sessions and download grants
+    schedule: "29 3 * * *"
+    module: sft.workers.cleanup
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    lifecycle: true
+    s3: false
+    activeDeadlineSeconds: 900
   audit-archive: # copies new audit rows to the Object Lock bucket at least every minute (NFR-15)
     schedule: "* * * * *"
     module: sft.workers.audit_archive
@@ -236,6 +258,10 @@ lifecycleJobs:
     databaseRole: sft_jobs
     s3: false
     activeDeadlineSeconds: 900
+
+# ADR-0019's split between the scan pools, in bytes: the API routes a completed file by it, and so does
+# reconciliation when it finishes a completion (#181). One value, so the two never differ.
+scanSmallPoolMaxBytes: "100000000"
 
 lifecycleJobResources: # capacity 4.1
   requests: { cpu: 500m, memory: 1Gi }

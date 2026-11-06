@@ -9,6 +9,7 @@ the compose clamd; tests/test_scan_inspector.py against the real inspector, in L
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -155,6 +156,10 @@ async def test_a_clean_file_is_clean_and_tagged_after_the_commit(rig: Rig) -> No
     assert rig.clamd.received == [DATA]
     assert rig.inspector.received == [DATA]
     assert rig.objects.reads == [(rig.key(file_id), "v1")]  # one read, both engines
+    # The digest of that one read, the downloads' strong ETag (#180).
+    assert rig.db.sql("SELECT sha256 FROM files WHERE id = :id", id=file_id) == [
+        (hashlib.sha256(DATA).digest(),)
+    ]
     assert actions(rig.db, file_id) == ["file.scanned"]
     # The last file of a submitted transfer sends it.
     assert transfer_row(rig.db, transfer_id)["state"] == "sent"

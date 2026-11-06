@@ -91,6 +91,19 @@ class LocalCounters:
             self._put(key, entry, now_ms)
         return Verdict(True, 0)
 
+    def budget(
+        self, key: str, *, now_ms: int, limit: int, cost: int, ttl_ms: int, wait_ms: int, peek: bool
+    ) -> Verdict:
+        """The store's `budget`: spend `cost` of `limit` in this window, or refuse."""
+        entry = self._live(key, now_ms) or _Entry(expires_ms=now_ms + ttl_ms)
+        used = entry.tat_us  # the window's total, in the field rates use for their time
+        if cost > 0 and used + cost > limit:
+            return Verdict(False, wait_ms)
+        if not peek:
+            entry.tat_us = used + cost
+            self._put(key, entry, now_ms)
+        return Verdict(True, 0)
+
     def scores(self, key: str, *, now_ms: int, window_ms: int) -> list[float]:
         entry = self._live(key, now_ms)
         return [s for s in entry.scores if s > now_ms - window_ms] if entry else []

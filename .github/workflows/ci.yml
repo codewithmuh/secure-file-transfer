@@ -59,9 +59,11 @@ jobs:
         run: .github/scripts/check-ruleset.sh
 
   local-stack:
+    # Also the M2 journey (#182): one test of the whole journey on this stack, every pull request, so it is
+    # required through this job's existing check (no ruleset change). The name stays: the ruleset names it.
     name: Local stack (up, smoke checks)
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,11 +72,18 @@ jobs:
         with:
           version: "0.13.7"
           enable-cache: true
-          cache-dependency-glob: local/smoke.py
+          cache-dependency-glob: |
+            local/smoke.py
+            local/seed.py
+            services/api/uv.lock
       - name: Start the API and the local stack, wait until every service is healthy
         run: make up
       - name: Smoke checks (one round trip per service)
         run: make smoke
+      - name: Seed the local stack (a tenant, an admin and a member, #182)
+        run: make seed
+      - name: The M2 journey, steps 1 to 9 (#182)
+        run: make e2e
       - name: Show container logs
         if: failure()
         run: docker compose logs --no-color

@@ -124,6 +124,8 @@ class FileView:
     inspection_reasons: tuple[InspectionReason, ...] = ()
     detectors: tuple[str, ...] = ()
     """The detectors that matched in the file (`File.inspection`), counts in `getFileInspection`."""
+    sha256: str | None = None
+    """The scanned version's SHA-256, in hex, once the scan worker has read it (#180)."""
 
     @property
     def shareable(self) -> bool:
@@ -261,6 +263,7 @@ def file_view(tenant_id: UUID, file: File, detectors: Sequence[str] = ()) -> Fil
         inspection_state=InspectionState(file.inspection_state),
         inspection_reasons=tuple(InspectionReason(r) for r in file.inspection_reasons),
         detectors=tuple(detectors),
+        sha256=None if file.sha256 is None else file.sha256.hex(),
     )
 
 

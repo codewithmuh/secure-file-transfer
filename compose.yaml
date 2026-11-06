@@ -64,6 +64,9 @@ services:
       CODE_HMAC_KEYRING: &code-keyring '[{"id":"local","state":"active","key":"enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="}]'
       AWS_ACCESS_KEY_ID: local-fake
       AWS_SECRET_ACCESS_KEY: local-fake
+      # The local stack (#182): the only environment, with test, where the clock's test hook may be
+      # set. It stays 0 here; the journey test moves the lifecycle jobs' clock, never the API's.
+      ENVIRONMENT: local
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
@@ -173,6 +176,41 @@ services:
       retries: 12
       start_period: 5s
     stop_grace_period: 35s
+
+  # ---- The lifecycle jobs (#181): one-shot commands, never started by `make up` ----
+  # `make jobs JOB=expiry|deletion|reconciliation|storage-audit|cleanup` runs one, as M4's CronJobs
+  # will (architecture 4.5). CLOCK_OFFSET_SECONDS is the clock's test hook (#182), refused outside
+  # ENVIRONMENT=local or test; the journey test sets it to move a transfer past its expiry.
+  jobs:
+    <<: [*hardening, *api-image]
+    profiles: [jobs]
+    restart: "no"
+    entrypoint: ["python", "-m", "sft.workers.jobs"]
+    command: ["reconciliation"]
+    healthcheck: { disable: true } # the image's check is the API's probe port
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: local
+      CLOCK_OFFSET_SECONDS: ${CLOCK_OFFSET_SECONDS:-0}
+      # ADR-0019's split between the scan pools, as the API's own default: reconciliation routes a
+      # completion it finishes by it (#181). Change both together.
+      SCAN_SMALL_POOL_MAX_BYTES: "100000000"
+      # Its own login role: it finds work across tenants read only, and acts in each tenant's
+      # scope; the only role that deletes objects and expired rows (revision 0015).
+      DATABASE_URL: postgresql://sft_jobs:test-only-password@postgres:5432/sft
+      S3_ENDPOINT_URL: http://s3:9090
+      S3_FILES_BUCKET: sft-local-files
+      S3_LARGE_FILES_BUCKET: sft-local-large-files
+      # Reconciliation rewrites a download grant's committed record in both archives (#180).
+      AUDIT_ARCHIVE_TOKYO_BUCKET: sft-local-audit-archive
+      AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL: http://s3:9090
+      AUDIT_ARCHIVE_OSAKA_BUCKET: sft-local-audit-archive-osaka
+      AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL: http://s3:9090
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    depends_on:
+      <<: *database-ready
+      s3-init: { condition: service_completed_successfully }
 
   # ---- Database jobs: one-shot, in order, on every `make up`. Each is safe to repeat. ----
 

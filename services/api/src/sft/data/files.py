@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy import Update, and_, func, insert, select, update
@@ -155,28 +156,6 @@ async def resume_uploading(session: AsyncSession, file_id: UUID) -> File | None:
         session,
         statement.values(
             state=FileState.UPLOADING.value, completion_started_at=None, last_part_at=func.now()
-        ),
-    )
-
-
-async def mark_scanning(
-    session: AsyncSession,
-    file_id: UUID,
-    *,
-    actual_size: int,
-    s3_version_id: str,
-    scan_deadline: datetime,
-) -> File | None:
-    """Phase 3: `completing` to `scanning`, with the size and version recorded at completion. The
-    scan worker scans that version, and downloads serve only it (data model 2.3)."""
-    statement = _transition(session, file_id, FileState.COMPLETING).where(File.removed_at.is_(None))
-    return await _returning(
-        session,
-        statement.values(
-            state=FileState.SCANNING.value,
-            actual_size=actual_size,
-            s3_version_id=s3_version_id,
-            scan_deadline=scan_deadline,
         ),
     )
 
@@ -330,9 +309,11 @@ async def record_scan(
     inspection_state: InspectionState,
     inspection_reasons: Sequence[InspectionReason] = (),
     inspection_engine_version: str | None = None,
+    sha256: bytes | None = None,
 ) -> bool:
     """Record the scan's and the inspection's result together, only if the file is still
-    `scanning` (data model 3.1, 3.5); False if it wasn't, and nothing changed."""
+    `scanning` (data model 3.1, 3.5); False if it wasn't, and nothing changed. `sha256` is the
+    digest of the version the worker read in full, the downloads' `ETag` (#180)."""
     require_scope(session, ScopeKind.TENANT)
     result = await session.execute(
         update(File)
@@ -351,6 +332,7 @@ async def record_scan(
             inspection_state=inspection_state.value,
             inspection_reasons=[r.value for r in inspection_reasons],
             inspection_engine_version=inspection_engine_version,
+            **({} if sha256 is None else {"sha256": sha256}),
         )
         .returning(File.id)
         .execution_options(synchronize_session=False)
@@ -409,3 +391,266 @@ async def fail_overdue_scan(
         .execution_options(synchronize_session=False)
     )
     return transfer_id
+
+
+# ---- the lifecycle jobs (sft_jobs, data model 6; #181) ----
+#
+# The jobs' role reads neither `display_name_ct` nor the inspection's findings, so these name their
+# columns and return IDs and plain values, never a whole row.
+
+NOT_YET_DELETABLE: Final = (FileState.COMPLETING.value, FileState.SCANNING.value)
+"""Deletion waits for these to settle (data model 3.1)."""
+OPEN_UPLOAD: Final = (FileState.UPLOADING.value, FileState.COMPLETING.value)
+
+
+@dataclass(frozen=True, slots=True)
+class Due:
+    tenant_id: UUID
+    file_id: UUID
+
+
+async def due_for_deletion(session: AsyncSession, *, now: datetime, limit: int) -> list[Due]:
+    """Files whose deletion trigger has passed and that aren't deleted, `completing` or
+    `scanning`, across tenants: the deletion job's find step, in system scope (data model 6)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.execute(
+        select(File.tenant_id, File.id)
+        .where(
+            File.deleted_at.is_(None),
+            File.delete_after <= now,
+            File.state.not_in(NOT_YET_DELETABLE),
+            in_scope(File, session),
+        )
+        .order_by(File.delete_after)
+        .limit(limit)
+    )
+    return [Due(r.tenant_id, r.id) for r in rows]
+
+
+async def _due(session: AsyncSession, condition: Any, order: Any, limit: int) -> list[Due]:
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.execute(
+        select(File.tenant_id, File.id)
+        .where(condition, in_scope(File, session))
+        .order_by(order)
+        .limit(limit)
+    )
+    return [Due(r.tenant_id, r.id) for r in rows]
+
+
+async def abandoned_uploads(session: AsyncSession, *, before: datetime, limit: int) -> list[Due]:
+    """Files still `uploading` with no new part since `before` (24 hours), across tenants."""
+    condition = and_(File.state == FileState.UPLOADING.value, File.last_part_at < before)
+    return await _due(session, condition, File.last_part_at, limit)
+
+
+async def stuck_completions(session: AsyncSession, *, before: datetime, limit: int) -> list[Due]:
+    """Files left `completing` since `before` (15 minutes), across tenants (data model 3.1)."""
+    condition = and_(File.state == FileState.COMPLETING.value, File.completion_started_at < before)
+    return await _due(session, condition, File.completion_started_at, limit)
+
+
+async def overdue_deletions(session: AsyncSession, *, before: datetime) -> int:
+    """Files still not deleted a long time after their trigger, across tenants: the daily
+    report's leftovers (NFR-8)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    count = await session.scalar(
+        select(func.count())
+        .select_from(File)
+        .where(File.deleted_at.is_(None), File.delete_after < before, in_scope(File, session))
+    )
+    return int(count or 0)
+
+
+async def oldest_due_deletion(session: AsyncSession, *, now: datetime) -> datetime | None:
+    """The oldest trigger among files due for deletion and not deleted, across tenants: NFR-8's
+    lag."""
+    require_scope(session, ScopeKind.SYSTEM)
+    oldest: datetime | None = await session.scalar(
+        select(func.min(File.delete_after)).where(
+            File.deleted_at.is_(None), File.delete_after <= now, in_scope(File, session)
+        )
+    )
+    return oldest
+
+
+async def known_keys(session: AsyncSession, keys: Sequence[str]) -> dict[str, bool]:
+    """Which object keys a file row names, across tenants, each with whether its file is deleted:
+    reconciliation's comparison of storage with metadata (data model 6)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    if not keys:
+        return {}
+    rows = await session.execute(
+        select(File.storage_key, File.deleted_at.is_not(None)).where(
+            File.storage_key.in_(list(keys)), in_scope(File, session)
+        )
+    )
+    return {r[0]: bool(r[1]) for r in rows}
+
+
+async def open_upload_ids(session: AsyncSession, upload_ids: Sequence[str]) -> set[str]:
+    """Which multipart uploads belong to a file still `uploading` or `completing`, across
+    tenants: those reconciliation never aborts."""
+    require_scope(session, ScopeKind.SYSTEM)
+    if not upload_ids:
+        return set()
+    rows = await session.scalars(
+        select(File.s3_upload_id).where(
+            File.s3_upload_id.in_(list(upload_ids)),
+            File.state.in_(OPEN_UPLOAD),
+            in_scope(File, session),
+        )
+    )
+    return set(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class JobFile:
+    """What the jobs need of one file, in its tenant's scope: never its name."""
+
+    id: UUID
+    transfer_id: UUID
+    state: FileState
+    storage_class: StorageClass
+    storage_key: str
+    s3_upload_id: str
+    declared_size: int
+    part_size: int
+    part_count: int
+    removed_at: datetime | None
+    delete_after: datetime | None
+    deleted_at: datetime | None
+
+
+async def job_file(session: AsyncSession, file_id: UUID) -> JobFile:
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(
+                File.id,
+                File.transfer_id,
+                File.state,
+                File.storage_class,
+                File.storage_key,
+                File.s3_upload_id,
+                File.declared_size,
+                File.part_size,
+                File.part_count,
+                File.removed_at,
+                File.delete_after,
+                File.deleted_at,
+            ).where(File.id == file_id, in_scope(File, session))
+        )
+    ).first()
+    if row is None:
+        raise NotFoundError("file")
+    return JobFile(
+        row.id,
+        row.transfer_id,
+        FileState(row.state),
+        StorageClass(row.storage_class),
+        row.storage_key,
+        row.s3_upload_id,
+        row.declared_size,
+        row.part_size,
+        row.part_count,
+        row.removed_at,
+        row.delete_after,
+        row.deleted_at,
+    )
+
+
+async def _changed(session: AsyncSession, statement: Update) -> bool:
+    result = await session.execute(
+        statement.returning(File.id).execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
+
+
+async def mark_deleted(session: AsyncSession, file_id: UUID, *, now: datetime) -> bool:
+    """`deleted`, with `deleted_at`, once every object version is gone; False if the file is
+    deleted already, or `completing` or `scanning` again (data model 3.1)."""
+    require_scope(session, ScopeKind.TENANT)
+    return await _changed(
+        session,
+        update(File)
+        .where(
+            File.id == file_id,
+            File.deleted_at.is_(None),
+            File.delete_after <= now,
+            File.state.not_in(NOT_YET_DELETABLE),
+            in_scope(File, session),
+        )
+        .values(state=FileState.DELETED.value, deleted_at=now),
+    )
+
+
+async def due_now(session: AsyncSession, transfer_id: UUID, *, now: datetime) -> list[JobFile]:
+    """An ended transfer's files are due for deletion: `delete_after` on each that has none.
+    Returns those still `uploading` or `completing`, which the caller rejects."""
+    require_scope(session, ScopeKind.TENANT)
+    await session.execute(
+        update(File)
+        .where(
+            File.transfer_id == transfer_id,
+            File.delete_after.is_(None),
+            in_scope(File, session),
+        )
+        .values(delete_after=now)
+        .execution_options(synchronize_session=False)
+    )
+    ids = await session.scalars(
+        select(File.id)
+        .where(
+            File.transfer_id == transfer_id,
+            File.state.in_(OPEN_UPLOAD),
+            in_scope(File, session),
+        )
+        .order_by(File.id)
+    )
+    return [await job_file(session, file_id) for file_id in ids]
+
+
+async def reject_open(session: AsyncSession, file_id: UUID, *, now: datetime) -> bool:
+    """`uploading` or `completing` to `rejected`, due now (data model 3.1), for the jobs."""
+    statement = _transition(session, file_id, FileState.UPLOADING, FileState.COMPLETING)
+    return await _changed(
+        session,
+        statement.values(
+            state=FileState.REJECTED.value, delete_after=func.coalesce(File.delete_after, now)
+        ),
+    )
+
+
+async def resume_open(session: AsyncSession, file_id: UUID) -> bool:
+    """Completion's phase 3 found parts missing: back to `uploading`, for the jobs."""
+    statement = _transition(session, file_id, FileState.COMPLETING)
+    return await _changed(
+        session,
+        statement.values(
+            state=FileState.UPLOADING.value, completion_started_at=None, last_part_at=func.now()
+        ),
+    )
+
+
+async def mark_scanning(
+    session: AsyncSession,
+    file_id: UUID,
+    *,
+    actual_size: int,
+    s3_version_id: str,
+    scan_deadline: datetime,
+) -> bool:
+    """Phase 3: `completing` to `scanning`, with the size and version recorded at completion. The
+    scan worker scans that version, and downloads serve only it (data model 2.3). False if the file
+    was no longer `completing` or was removed. Names its columns, so the jobs run it too."""
+    statement = _transition(session, file_id, FileState.COMPLETING).where(File.removed_at.is_(None))
+    return await _changed(
+        session,
+        statement.values(
+            state=FileState.SCANNING.value,
+            actual_size=actual_size,
+            s3_version_id=s3_version_id,
+            scan_deadline=scan_deadline,
+        ),
+    )

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import sys
 import time
@@ -345,6 +346,8 @@ class EngineAnswers:
     clamd: ClamdResult | BaseException
     inspection: Result | BaseException
     inspection_seconds: float = 0.0
+    sha256: bytes | None = None
+    """The digest of the whole version, when the read reached its end: the downloads' `ETag`."""
 
 
 def _failure_kind(exc: BaseException) -> str:
@@ -451,6 +454,7 @@ class ScanConsumer(Consumer):
                 scan,
                 inspection,
                 attempts=delivery.receive_count,
+                sha256=answers.sha256,
             )
         if recorded:
             self._count(scan, inspection, answers)
@@ -484,10 +488,22 @@ class ScanConsumer(Consumer):
     async def _read_once(self, target: files.ScanTarget, size: int) -> EngineAnswers:
         if target.s3_version_id is None:  # pragma: no cover - a scanning file has its version
             raise RuntimeError("a scanning file has no recorded version")
-        source = self.objects.read_version(
+        read = self.objects.read_version(
             target.storage_class, target.storage_key, target.s3_version_id
         )
-        tee = _Tee(source, [_Lane(TEE_DEPTH), _Lane(INSPECTOR_BUFFER, INSPECTOR_STALL)])
+        digest = hashlib.sha256()
+        seen = 0
+
+        async def source() -> AsyncIterator[bytes]:
+            # The SHA-256 of the bytes as they pass, for downloads' strong ETag (#180): no
+            # second read of the file.
+            nonlocal seen
+            async for chunk in read:
+                digest.update(chunk)
+                seen += len(chunk)
+                yield chunk
+
+        tee = _Tee(source(), [_Lane(TEE_DEPTH), _Lane(INSPECTOR_BUFFER, INSPECTOR_STALL)])
         clamd_seconds = scan_timing.clamd_timeout(size).total_seconds() + INSPECTOR_STALL
         answers = EngineAnswers(ClamdError("not run"), ProtocolError("not run"))
 
@@ -531,6 +547,8 @@ class ScanConsumer(Consumer):
         await asyncio.gather(clamd(), tee.pump())
         with contextlib.suppress(asyncio.CancelledError):
             await inspecting
+        if seen == size:
+            answers.sha256 = digest.digest()
         return answers
 
     async def _inspect(self, body: AsyncIterator[bytes], size: int) -> Result:

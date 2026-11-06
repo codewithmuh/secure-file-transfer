@@ -113,6 +113,23 @@ reset: ## Stop everything and delete the local data (database, S3 objects)
 smoke: ## One round trip to every local stack service, and sft_api's row-level security (after make up)
 	uv run --script local/smoke.py
 
+# The local seed (#182): the local-keycloak connection, a tenant, an admin and a member who sign in
+# through the stack's Keycloak. Idempotent; refuses anything but the local stack.
+.PHONY: seed jobs e2e
+seed: ## Seed the local stack with a tenant, an admin and a member, and print how to sign in (after make up)
+	uv run --script local/seed.py
+
+# The lifecycle jobs (#181), one-shot as M4's CronJobs: JOB=expiry|deletion|reconciliation|storage-audit|cleanup.
+# --build: `make up` builds only the services it starts, so the jobs' image would otherwise be stale.
+JOB ?= reconciliation
+jobs: ## Run one lifecycle job against the local stack: make jobs JOB=deletion (after make up)
+	docker compose --profile jobs run --build --rm --no-deps jobs $(JOB)
+
+# The M2 journey test (#182) against `make up` and `make seed`: one test, steps 1 to 9 of the M2 exit
+# criterion, through the public API, Mailpit's API, S3's API, the job commands and the clock hook.
+e2e: ## The M2 end-to-end journey test against the local stack (after make up and make seed)
+	cd $(PY) && SFT_E2E=1 uv run pytest -m e2e --no-cov -p no:cacheprovider tests/test_journey.py
+
 logs: ## Follow logs of all services
 	docker compose logs --follow
 

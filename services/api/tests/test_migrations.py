@@ -537,3 +537,76 @@ def test_the_link_token_hash_is_unique(migrated_db: ScratchDatabase) -> None:
         "WHERE indexname = 'transfer_recipients_link_token_hash_key'"
     )
     assert "CREATE UNIQUE INDEX" in str(definition)
+
+
+def test_the_download_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("COUNTER_WRITE", "0014")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("download_grants"),
+        *(
+            tenant_foreign_key_sql("download_grants", column, parent, on_delete="CASCADE")
+            for column, parent in (
+                ("file_id", "files"),
+                ("recipient_id", "transfer_recipients"),
+                ("link_session_id", "link_sessions"),
+            )
+        ),
+    ]
+    assert list(module.RLS) == [
+        *tenant_rls_sql("download_grants", grants={"sft_api": "SELECT, INSERT, UPDATE"}),
+        grant_sql("download_counters", "sft_api", "UPDATE", columns=_columns(module.COUNTER_WRITE)),
+        grant_sql("files", "sft_scan", "UPDATE", columns=["sha256"]),
+    ]
+    assert list(module.AUDIT) == [require_audit_sql("download_grants", commands=("INSERT",))]
+
+
+def test_the_lifecycle_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("FILE_WRITE", "0015")
+    find = "app_scope() = 'system'"
+    isolation = "ALTER POLICY tenant_isolation ON {} TO {}"
+    assert list(module.RLS) == [
+        grant_sql("transfers", "sft_jobs", "UPDATE", columns=["ended_at"]),
+        policy_sql("jobs_find", "transfers", roles=["sft_jobs"], command="SELECT", using=find),
+        grant_sql("files", "sft_jobs", "SELECT", columns=["deleted_at"]),
+        grant_sql("files", "sft_jobs", "UPDATE", columns=_columns(module.FILE_WRITE)),
+        grant_sql("tenant_usage", "sft_jobs", "SELECT, UPDATE"),
+        isolation.format("tenant_usage", "sft_api, sft_jobs"),
+        grant_sql("verification_codes", "sft_jobs", "SELECT", columns=_columns(module.CODE_READ)),
+        grant_sql("verification_codes", "sft_jobs", "DELETE"),
+        policy_sql(
+            "jobs_find", "verification_codes", roles=["sft_jobs"], command="SELECT", using=find
+        ),
+        isolation.format("verification_codes", "sft_api, sft_notify, sft_jobs"),
+        grant_sql("link_sessions", "sft_jobs", "SELECT", columns=_columns(module.SESSION_READ)),
+        grant_sql("link_sessions", "sft_jobs", "DELETE"),
+        policy_sql("jobs_find", "link_sessions", roles=["sft_jobs"], command="SELECT", using=find),
+        isolation.format("link_sessions", "sft_api, sft_jobs"),
+        grant_sql("download_grants", "sft_jobs", "SELECT", columns=_columns(module.GRANT_READ)),
+        grant_sql("download_grants", "sft_jobs", "UPDATE", columns=["archived_at"]),
+        grant_sql("download_grants", "sft_jobs", "DELETE"),
+        policy_sql(
+            "jobs_find", "download_grants", roles=["sft_jobs"], command="SELECT", using=find
+        ),
+        isolation.format("download_grants", "sft_api, sft_jobs"),
+    ]
+    # The jobs never read a name, a message or a byte count of a grant.
+    for listed in (module.FILE_WRITE, module.GRANT_READ, module.SESSION_READ):
+        assert "display_name_ct" not in _columns(listed)
+        assert "bytes_served" not in _columns(listed)
+
+
+def test_the_jobs_find_their_work_by_indexes(migrated_db: ScratchDatabase) -> None:
+    indexes = {
+        str(name)
+        for (name,) in migrated_db.sql(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN "
+            "('transfers_expires_at_idx', 'transfers_last_activity_at_idx', "
+            "'files_last_part_at_idx', 'files_completion_started_at_idx', "
+            "'files_delete_after_idx', 'download_grants_unarchived_idx')"
+        )
+    }
+    assert len(indexes) == 6
+    [(valid,)] = migrated_db.sql(
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'files_deleted_check'"
+    )
+    assert valid is True

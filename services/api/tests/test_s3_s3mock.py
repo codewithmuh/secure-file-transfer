@@ -20,6 +20,7 @@ from member_fixtures import app_for
 from pg import ScratchDatabase
 from sft.data.database import Database
 from sft.data.models import Role, StorageClass
+from sft.runtime.content import S3Content
 from sft.runtime.s3 import S3Objects
 from sft.service.objects import ObjectStoreError
 from test_transfers import MIB, add_tenant
@@ -176,3 +177,30 @@ async def test_a_file_uploads_in_parts_through_the_api_and_reaches_scanning(
         "SELECT topic FROM outbox WHERE payload->>'file_id' = :id", id=file["id"]
     )
     assert topic == "file.scan"
+
+
+async def test_the_content_reader_streams_a_range_of_exactly_the_scanned_version(
+    endpoint: str, buckets: tuple[str, str]
+) -> None:
+    """Downloads read with an async client (#180, abuse 5.7): a signed GET of one version."""
+    client = boto3.client("s3", endpoint_url=endpoint, region_name=REGION)
+    key = f"tenants/{uuid.uuid4()}/files/{uuid.uuid4()}"
+    first = client.put_object(Bucket=buckets[0], Key=key, Body=b"0123456789")["VersionId"]
+    client.put_object(Bucket=buckets[0], Key=key, Body=b"later version")
+    client.close()
+    content = S3Content.create(
+        region=REGION,
+        files_bucket=buckets[0],
+        large_files_bucket=buckets[1],
+        endpoint_url=endpoint,
+    )
+    try:
+        read = content.read(StorageClass.STANDARD, key, first, start=2, end=5)
+        assert b"".join([chunk async for chunk in read]) == b"2345"
+        whole = content.read(StorageClass.STANDARD, key, first, start=0, end=9)
+        assert b"".join([chunk async for chunk in whole]) == b"0123456789"
+        missing = content.read(StorageClass.STANDARD, key + "x", first, start=0, end=1)
+        with pytest.raises(ObjectStoreError):
+            await anext(missing)
+    finally:
+        await content.close()

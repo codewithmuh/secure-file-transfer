@@ -49,6 +49,8 @@ class Draft:
     upload: str
     ready: uuid.UUID
     recipient: uuid.UUID
+    sent: uuid.UUID
+    """A sent transfer of theirs, which can be revoked (#180)."""
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,8 @@ def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Dra
     """As the superuser, like the isolation suite's seed; the part is in `objects`."""
     ready, _ = seed_transfer(db, tenant.id, tenant.target)
     seed_file(db, tenant.id, ready, state="scanning")
-    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}", ready, uuid.uuid4())
+    sent, _ = seed_transfer(db, tenant.id, tenant.target, state="sent")
+    draft = Draft(uuid.uuid4(), uuid.uuid4(), f"upload-{uuid.uuid4()}", ready, uuid.uuid4(), sent)
     db.sql(
         "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in) "
         "VALUES (:id, :tenant, :owner, 'draft', interval '7 days')",
@@ -257,6 +260,23 @@ def unlock_row() -> dict[str, int]:
     }
 
 
+def revoke_row() -> dict[str, int]:
+    """`transfer.revoke`: Own for a member, Tenant for an admin and a key with `transfers:write`.
+    A revocation needs no passkey (authn and authz 3.3), so a local admin signed in with TOTP acts
+    as an admin, and it takes no step-up."""
+    return {
+        **NOT_A_TENANT_CALLER,
+        **NO_KEY_SCOPE,
+        "member": 404,
+        "member_self": 200,
+        "admin_passkey": 200,
+        "admin_totp": 200,
+        "admin_stale": 200,
+        "admin_other_tenant": 404,
+        "api_key_transfers:write": 200,
+    }
+
+
 USER_OPERATIONS = frozenset({"inviteUser", "listUsers", "getUser", "updateUser", "deactivateUser"})
 
 EXPECTED: dict[str, dict[str, int]] = {
@@ -281,6 +301,7 @@ EXPECTED: dict[str, dict[str, int]] = {
     "updateTenantPolicy": admin_row(200, step_up=True, item=False),
     "listTransferRecipients": read_row(200, item=True),
     "unlockRecipient": unlock_row(),
+    "revokeTransfer": revoke_row(),
 }
 
 # The session's own operations read the session cookie itself, not a caller the matrix can put in
@@ -303,6 +324,10 @@ COVERED_BY_LINK_TESTS = frozenset(
         "listSessionFiles",
     }
 )
+# The download routes read the link cookie themselves too (#180): tests/test_downloads.py runs
+# them with no credential, a member's session cookie, a bearer token, the grant's own session,
+# another recipient's and another tenant's, and without the CSRF token.
+COVERED_BY_DOWNLOAD_TESTS = frozenset({"createSessionDownload", "getSessionDownloadContent"})
 
 # The problem code each refusal carries.
 CODES = {401: {"authentication_required", "reauthentication_required"}, 404: {"not_found"}}
@@ -345,6 +370,7 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
             f"/v1/transfers/{world.draft.transfer}/recipients/{world.draft.recipient}/unlock",
             None,
         ),
+        "revokeTransfer": ("POST", f"/v1/transfers/{world.draft.sent}/revoke", None),
     }[operation]
 
 
@@ -366,7 +392,9 @@ def test_the_matrix_covers_every_operation_the_app_serves_and_every_caller() -> 
         context.original_route.operation_id  # type: ignore[attr-defined]
         for context in iter_route_contexts(create_app().routes)
     }
-    assert served == set(EXPECTED) | COVERED_BY_SIGN_IN_TESTS | COVERED_BY_LINK_TESTS
+    assert served == (
+        set(EXPECTED) | COVERED_BY_SIGN_IN_TESTS | COVERED_BY_LINK_TESTS | COVERED_BY_DOWNLOAD_TESTS
+    )
     for operation, row in EXPECTED.items():
         assert set(row) == set(CALLERS), operation
 
@@ -404,3 +432,4 @@ async def test_authorization_matrix(
         assert str(world.mine.admin) not in response.text
         assert str(world.draft.file) not in response.text
         assert str(world.draft.ready) not in response.text
+        assert str(world.draft.sent) not in response.text

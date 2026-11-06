@@ -547,7 +547,7 @@ sequenceDiagram
     participant AR as Audit archive, Tokyo and Osaka
     participant J as Lifecycle jobs
     participant S3 as S3 files
-    A->>API: POST /v1/transfers/{id}/revocation
+    A->>API: POST /v1/transfers/{id}/revoke
     API->>DB: transfer to revoked, close its sessions, audit, commit
     Note over API,DB: the revocation stands from here, and every later call checks state
     API->>AR: write the revocation record in both regions
@@ -572,6 +572,9 @@ sequenceDiagram
 - Parts already sent with a valid part URL are never assembled into a file, because completion is server-side and
   re-checks the transfer under its row lock (4.1). The reconciliation job removes any object no file refers to (PRD
   data lifecycle table).
+- **As built (#180).** `POST /v1/transfers/{id}/revoke`, as the contract names it. In the revocation's transaction
+  every file gets `delete_after` and an upload still open is rejected, so the deletion job removes them. It counts only
+  against the caller's own request budget (abuse 2.2, H).
 
 ### 4.5 Expiry and deletion (FR-21, NFR-8)
 
@@ -594,6 +597,12 @@ sequenceDiagram
     J->>DB: compare with metadata, report leftovers, delete orphans older than 24 h
     J->>T: list unfinished multipart uploads, abort those with no new part for 24 h
 ```
+
+**As built (#181).** The jobs are one-shot commands, CronJobs in AWS (M4) and `make jobs` locally: `expiry` and
+`deletion` every 5 minutes, `reconciliation` every 5 minutes, the daily `storage-audit` (listing, orphans, the
+multipart cleanup and the report) and `cleanup` (data model 6). Deletion is in Tokyo's buckets and Osaka's replicas
+(`S3_REPLICA_*` outside dev); locally there are no replicas. A one-shot job pushes its metrics to a gateway when one is
+configured (M7) and logs them otherwise.
 
 Every step covers both files bucket pairs: listing, reconciliation and the multipart cleanup run against all four
 buckets. The lifecycle jobs are the only workload that deletes objects (3.1). Lifecycle rules on every files bucket

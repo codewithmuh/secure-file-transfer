@@ -302,7 +302,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Notification worker | — | — | — | — | — | D, own secrets | D, its queues | — |
 | Outbox relay | — | — | — | — | — | — | E D, queues | — |
 | Sign-in triggers (Cognito pre- and post-authentication) | — | — | — | — | — | — | E D, sign-in events queue | — |
-| Lifecycle jobs | — | — | — | — | D, CloudTrail log files only | — | — | — |
+| Lifecycle jobs | E D, through S3, to complete an upload left `completing` (no `s3:GetObject`) | — | — | E, both Regions (a grant's committed record) | D, CloudTrail log files only | — | — | — |
 | Archive job | — | — | — | E, Tokyo | — | — | — | — |
 | Recovery job (failover and restore runbooks) | — | — | — | D | — | — | — | — |
 | Key rotation job | — | — | — | — | — | E D, keyrings and identity provider client secrets | — | — |
@@ -325,7 +325,10 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 | Operators in normal operation | — | — | — | — | — | — | — | — |
 
 - **Deletion needs no key.** Deleting object versions and aborting multipart uploads need no KMS permission, so the
-  lifecycle jobs, which do the deleting (decision 1), can't read what they delete.
+  lifecycle jobs, which do the deleting (decision 1), can't read what they delete. Reconciliation (#181) also finishes
+  an upload left `completing` (data model 3.1), and `CompleteMultipartUpload` on an SSE-KMS object needs the files key
+  through S3; the jobs role still has no `s3:GetObject`, so the key never lets it read a file. It writes a download
+  grant's committed record to the archive when the API's background write didn't confirm (data model 2.3).
 - **Reading data events for the storage-access match.** The lifecycle jobs role runs NFR-15's daily match of
   CloudTrail S3 data events against audit records. The environment's trail writes them to the shared account's log
   archive, so the role may read only its own trail's prefix there and decrypt with the archive's key only through S3 and

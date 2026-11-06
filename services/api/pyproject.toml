@@ -112,6 +112,8 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["."]  # so the tests import tools
 addopts = "-q --cov=sft --cov=tools --cov-report=term-missing --cov-fail-under=80"
+# The M2 journey (#182) runs only against the local stack, with `make e2e`: SFT_E2E=1 turns it on.
+markers = ["e2e: the end-to-end journey against `make up` (skipped unless SFT_E2E=1)"]
 
 [tool.coverage.run]
 branch = true

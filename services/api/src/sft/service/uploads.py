@@ -40,11 +40,11 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,7 +61,7 @@ from sft.core.errors import (
 from sft.core.ids import uuid7
 from sft.data import audit, files, transfers, usage
 from sft.data.access import NotFoundError
-from sft.data.audit import Origin, Target
+from sft.data.audit import Actor, Origin, Target
 from sft.data.database import Database
 from sft.data.models import (
     File,
@@ -134,6 +134,26 @@ class RejectReason(StrEnum):
     SIZE_MISMATCH = "size_mismatch"
     REMOVED = "removed"
     UPLOAD_GONE = "upload_gone"
+    UPLOAD_ABANDONED = "upload_abandoned"
+    """No new part for 24 hours: reconciliation rejects it (data model 6, #181)."""
+
+
+class PlannedUpload(Protocol):
+    """What completion's phase 2 reads of a file: never its name, so the lifecycle jobs, whose
+    role can't read one, run it too (`sft.data.files.JobFile`)."""
+
+    @property
+    def storage_class(self) -> str: ...
+    @property
+    def storage_key(self) -> str: ...
+    @property
+    def s3_upload_id(self) -> str: ...
+    @property
+    def declared_size(self) -> int: ...
+    @property
+    def part_size(self) -> int: ...
+    @property
+    def part_count(self) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +198,7 @@ def upload_plan(size: int) -> tuple[int, int]:
     return part_size, math.ceil(size / part_size)
 
 
-def part_sizes(file: File) -> dict[int, int]:
+def part_sizes(file: PlannedUpload) -> dict[int, int]:
     """The exact size of each part of the file's plan, by number."""
     last = file.declared_size - (file.part_count - 1) * file.part_size
     return {
@@ -557,25 +577,25 @@ async def uploaded_parts(
 # ---- completeUpload ----
 
 
-class _Missing:
+class Missing:
     """Phase 2 found parts missing: nothing was assembled."""
 
 
-class _Gone:
+class Gone:
     """Phase 2 found neither the upload nor an object."""
 
 
 @dataclass(frozen=True, slots=True)
-class _Assembled:
+class Assembled:
     size: int
     version_id: str
 
 
-_Outcome = _Assembled | _Missing | _Gone | None
+Assembly = Assembled | Missing | Gone | None
 """None: a part has the wrong size, a size mismatch."""
 
 
-async def _assemble(objects: ObjectStore, file: File) -> _Outcome:
+async def assemble(objects: ObjectStore, file: PlannedUpload) -> Assembly:
     """Phase 2, with no transaction: list the parts in S3 itself, never the client's list, assemble
     exactly the plan's parts, then read the real size and version (abuse and rate limits 6.3)."""
     storage_class = StorageClass(file.storage_class)
@@ -584,7 +604,7 @@ async def _assemble(objects: ObjectStore, file: File) -> _Outcome:
         expected = part_sizes(file)
         by_number = {p.number: p for p in stored if p.number in expected}
         if set(by_number) != set(expected):
-            return _Missing()
+            return Missing()
         if any(by_number[n].size != size for n, size in expected.items()):
             return None
         await objects.complete_multipart_upload(
@@ -596,11 +616,11 @@ async def _assemble(objects: ObjectStore, file: File) -> _Outcome:
     # Either just assembled, or a retry after an earlier phase 2 assembled it.
     attributes = await objects.object_attributes(storage_class, file.storage_key)
     if attributes is None:
-        return _Gone()
+        return Gone()
     if attributes.version_id is None:
         # Downloads serve only the version scanned (ADR-0012); without versioning there is none.
         raise ObjectStoreError("VersioningOff")
-    return _Assembled(attributes.size, attributes.version_id)
+    return Assembled(attributes.size, attributes.version_id)
 
 
 async def complete_upload(
@@ -659,7 +679,7 @@ async def complete_upload(
 
     # Phase 2: S3, with no transaction open.
     try:
-        outcome = await _assemble(objects, file)
+        outcome = await assemble(objects, file)
     except ObjectStoreError:
         raise _store_unavailable() from None  # the file stays `completing`; a retry resumes
 
@@ -674,21 +694,17 @@ async def complete_upload(
             # Another call finished it first.
             return file_view(tenant_id, file)
         conflict = draft_conflict(transfer)
-        if (
-            conflict
-            or file.removed_at is not None
-            or not isinstance(outcome, _Assembled | _Missing)
-        ):
+        if conflict or file.removed_at is not None or not isinstance(outcome, Assembled | Missing):
             if conflict:
                 reason, error = RejectReason.TRANSFER_NOT_OPEN, conflict
             elif file.removed_at is not None:
                 reason, error = RejectReason.REMOVED, _rejected("The file was removed.")
-            elif isinstance(outcome, _Gone):
+            elif isinstance(outcome, Gone):
                 reason, error = RejectReason.UPLOAD_GONE, _rejected("The upload no longer exists.")
             else:
                 reason, error = RejectReason.SIZE_MISMATCH, _size_mismatch()
             await _reject_and_evaluate(session, caller, file, reason, origin, now)
-        elif isinstance(outcome, _Missing):
+        elif isinstance(outcome, Missing):
             await files.resume_uploading(session, file.id)
             await audit.record(
                 session,
@@ -705,9 +721,17 @@ async def complete_upload(
             )
             error = _size_mismatch()
         else:
-            return await _to_scanning(
-                session, caller, file, outcome, origin, tenant_id, small_pool_max=small_pool_max
+            await to_scanning(
+                session,
+                file,
+                outcome,
+                actor=caller.actor(),
+                details=audit_details(caller),
+                now=now,
+                small_pool_max=small_pool_max,
+                origin=origin,
             )
+            return file_view(tenant_id, await files.get_file(session, file.id))
     if error is None:  # pragma: no cover - every branch above sets one or returns
         raise RuntimeError("completion ended without a result")
     raise error
@@ -719,59 +743,69 @@ def _limit_reason(error: ProblemError | None) -> RejectReason:
     return RejectReason.TOTAL_TOO_LARGE
 
 
-async def _to_scanning(
+class ScanningFile(Protocol):
+    """What phase 3 needs of a completing file: never its name, so the lifecycle jobs, whose role
+    can't read one, run the same step (`sft.data.files.JobFile`)."""
+
+    @property
+    def id(self) -> UUID: ...
+    @property
+    def transfer_id(self) -> UUID: ...
+    @property
+    def storage_class(self) -> str: ...
+
+
+async def to_scanning(
     session: AsyncSession,
-    caller: Caller,
-    file: File,
-    assembled: _Assembled,
-    origin: Origin,
-    tenant_id: UUID,
+    file: ScanningFile,
+    assembled: Assembled,
     *,
+    actor: Actor,
+    details: Mapping[str, audit.Detail],
+    now: datetime,
     small_pool_max: int,
-) -> FileView:
+    origin: Origin | None = None,
+) -> None:
+    """Completion's phase 3 when the parts were assembled at the declared size, under the
+    transfer's row lock: `scanning` with the size, version and deadline, and the scan message for
+    the pool its size and `small_pool_max` pick (ADR-0019's split, `SCAN_SMALL_POOL_MAX_BYTES`).
+    A file only GuardDuty scans is `scan_failed` at once (`large_file_scanning_unavailable`) and
+    the evaluation runs. The API's `completeUpload` and reconciliation's re-run (#181) share it,
+    each as its own actor."""
     storage_class = StorageClass(file.storage_class)
-    deadline = scan_timing.scan_deadline(
-        assembled.size, datetime.now(UTC), small_pool_max=small_pool_max
-    )
-    scanning = await files.mark_scanning(
+    deadline = scan_timing.scan_deadline(assembled.size, now, small_pool_max=small_pool_max)
+    if not await files.mark_scanning(
         session,
         file.id,
         actual_size=assembled.size,
         s3_version_id=assembled.version_id,
         scan_deadline=deadline,
-    )
-    if scanning is None:  # pragma: no cover - the lock holds the state seen
+    ):  # pragma: no cover - the lock holds the state seen
         raise RuntimeError("the file changed under the transfer's row lock")
     # By the real size: the small or the large ClamAV pool, or GuardDuty's (no message, M6).
     topic = scan_timing.scan_topic(assembled.size, small_pool_max=small_pool_max)
     if topic is not None:
         await enqueue(session, topic, {"file_id": file.id})
     await transfers.touch_draft(session, file.transfer_id)
+    target = Target(FILE, file.id)
     await audit.record(
         session,
         action="file.uploaded",
-        actor=caller.actor(),
-        target=Target(FILE, file.id),
+        actor=actor,
+        target=target,
         origin=origin,
-        details=audit_details(
-            caller,
-            transfer_id=file.transfer_id,
-            actual_size=assembled.size,
-            storage_class=storage_class,
-        ),
+        details={
+            **details,
+            "transfer_id": file.transfer_id,
+            "actual_size": assembled.size,
+            "storage_class": storage_class,
+        },
     )
-    if topic is None:
-        scanning = await _no_engine_scans_it(session, caller, scanning, origin)
-    return file_view(tenant_id, scanning)
-
-
-async def _no_engine_scans_it(
-    session: AsyncSession, caller: Caller, file: File, origin: Origin
-) -> File:
-    """A file over 2,000,000,000 bytes: only GuardDuty scans it, and nothing records its result
-    before M6. Rather than wait out a deadline, it is `scan_failed` at once, with
-    `large_file_scanning_unavailable`, so the member sees why, and the evaluation runs (a draft's
-    is a no-op; a send holds the transfer). It is never shareable (FR-16)."""
+    if topic is not None:
+        return
+    # Over 2,000,000,000 bytes: only GuardDuty scans it, and nothing records its result before
+    # M6. Rather than wait out a deadline, it is `scan_failed` now, so the member sees why, and
+    # the evaluation runs (a draft's is a no-op; a send holds the transfer). Never shareable.
     recorded = await files.record_scan(
         session,
         file.id,
@@ -787,26 +821,18 @@ async def _no_engine_scans_it(
     await audit.record(
         session,
         action="file.scanned",
-        actor=caller.actor(),
-        target=Target(FILE, file.id),
+        actor=actor,
+        target=target,
         origin=origin,
-        details=audit_details(
-            caller,
-            transfer_id=file.transfer_id,
-            state=FileState.SCAN_FAILED,
-            scan_detail=ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
-            inspection_state=InspectionState.SKIPPED,
-        ),
+        details={
+            **details,
+            "transfer_id": file.transfer_id,
+            "state": FileState.SCAN_FAILED,
+            "scan_detail": ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
+            "inspection_state": InspectionState.SKIPPED,
+        },
     )
-    await evaluate(
-        session,
-        file.transfer_id,
-        actor=caller.actor(),
-        now=datetime.now(UTC),
-        origin=origin,
-        details=audit_details(caller),
-    )
-    return await files.get_file(session, file.id)
+    await evaluate(session, file.transfer_id, actor=actor, now=now, origin=origin, details=details)
 
 
 # ---- deleteFile ----

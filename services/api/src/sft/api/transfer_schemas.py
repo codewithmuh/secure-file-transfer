@@ -210,6 +210,7 @@ class File(BaseModel):
             content_type=view.content_type,
             declared_size=view.declared_size,
             actual_size=view.actual_size,
+            sha256=view.sha256,
             state=view.state.value,
             shareable=view.shareable,
             inspection=FileInspectionSummary(

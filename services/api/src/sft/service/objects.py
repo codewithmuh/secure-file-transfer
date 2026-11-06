@@ -5,14 +5,17 @@ The service never talks to boto3. `ObjectStore` is what it needs for uploads; `s
 A file is named by its storage class and key: the adapter knows which bucket pair each class
 lives in, and the service never sees a bucket name.
 
-The API's role may create, sign, list, complete and abort multipart uploads and read an object's
-attributes, never delete an object (abuse and rate limits 6.2): there is no delete here.
+The API's role may create, sign, list, complete and abort multipart uploads, read an object's
+attributes and read the scanned version of a shareable file for a download (`FileContent`,
+#180), never delete an object (abuse and rate limits 6.2): there is no delete here. Only the
+lifecycle jobs delete (`StorageCleaner`, #181; architecture 4.5).
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final, Protocol
 
 from sft.data.models import StorageClass
@@ -113,6 +116,80 @@ class ScannedObjects(Protocol):
         self, storage_class: StorageClass, key: str, version_id: str, tags: Mapping[str, str]
     ) -> None:
         """Replace the version's tags with `tags`."""
+        ...
+
+    async def close(self) -> None: ...
+
+
+class FileContent(Protocol):
+    """What a download needs of the files buckets (abuse and rate limits 5.6, 5.7): a byte range
+    of exactly the version that was scanned, streamed through an async client."""
+
+    def read(
+        self, storage_class: StorageClass, key: str, version_id: str, *, start: int, end: int
+    ) -> AsyncIterator[bytes]:
+        """Bytes `start` to `end`, both included, of that version, in chunks. Raises
+        `ObjectStoreError`. Close the iterator (`aclose`) to stop early."""
+        ...
+
+    async def close(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StoredVersion:
+    """One object version, or delete marker, in one region's bucket of a storage class."""
+
+    region: str
+    key: str
+    version_id: str
+    last_modified: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StoredUpload:
+    """One unfinished multipart upload in one region's bucket of a storage class."""
+
+    region: str
+    key: str
+    upload_id: str
+    initiated: datetime
+
+
+class StorageCleaner(Protocol):
+    """What the lifecycle jobs need of the files buckets, in every region that holds a copy:
+    Tokyo's, and Osaka's replicas where they exist (architecture 4.5, encryption and keys 8.1).
+    Only the jobs' role may delete; it can't read what it deletes."""
+
+    @property
+    def regions(self) -> tuple[str, ...]: ...
+
+    async def versions(self, storage_class: StorageClass, key: str) -> list[StoredVersion]:
+        """Every version and delete marker of `key`, in every region."""
+        ...
+
+    async def uploads(self, storage_class: StorageClass, key: str) -> list[StoredUpload]:
+        """Every unfinished multipart upload of `key`, in every region."""
+        ...
+
+    async def delete_versions(
+        self, storage_class: StorageClass, versions: Sequence[StoredVersion]
+    ) -> None:
+        """Delete exactly these versions, each in its region. Raises `ObjectStoreError`."""
+        ...
+
+    async def abort_upload(
+        self, storage_class: StorageClass, region: str, key: str, upload_id: str
+    ) -> bool:
+        """Abort an unfinished upload; False if it no longer exists."""
+        ...
+
+    def version_pages(self, storage_class: StorageClass) -> AsyncIterator[list[StoredVersion]]:
+        """Every version under `tenants/`, in every region, one listing page at a time: the
+        storage audit's listing, which holds one page in memory, never a whole bucket."""
+        ...
+
+    def upload_pages(self, storage_class: StorageClass) -> AsyncIterator[list[StoredUpload]]:
+        """Every unfinished multipart upload, in every region, one listing page at a time."""
         ...
 
     async def close(self) -> None: ...

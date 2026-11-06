@@ -410,7 +410,7 @@ def seed_scans(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.
 def seed_links(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
     """Links and verification (#178, #179): the recipient's link, whose token is the text of
     `link_token`, a live code, and a live link session, whose token is the text of
-    `link_session_token`."""
+    `link_session_token`; and that session's download grants (#180)."""
     for key in ("link_token", "code", "link_session", "link_session_token"):
         rows[key] = uuid.uuid4()
     db.sql(
@@ -436,6 +436,22 @@ def seed_links(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> Non
         recipient=rows["recipient"],
         token=str(rows["link_session_token"]),
     )
+    # Downloads (#180): a grant of the link session for the scanned file, its version the marker
+    # the file holds, and an expired one, for the daily cleanup.
+    rows["download_grant"], rows["expired_grant"] = uuid.uuid4(), uuid.uuid4()
+    for key, age in (("download_grant", "0 seconds"), ("expired_grant", "2 days")):
+        db.sql(
+            "INSERT INTO download_grants (id, tenant_id, file_id, s3_version_id, recipient_id, "
+            "link_session_id, byte_budget, created_at, expires_at) SELECT :id, :tenant, :file, "
+            "s3_version_id, :recipient, :session, 30, now() - CAST(:age AS interval), "
+            "now() - CAST(:age AS interval) + interval '1 hour' FROM files WHERE id = :file",
+            id=rows[key],
+            tenant=tenant_id,
+            file=rows["scanning_file"],
+            recipient=rows["recipient"],
+            session=rows["link_session"],
+            age=age,
+        )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

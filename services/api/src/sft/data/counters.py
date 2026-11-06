@@ -12,8 +12,11 @@ script can't reach keys in different hash slots:
   per IP). Exact over the window. A `record` can also start a block for a fixed time.
 
 - `lease`: a capped set of leases in a sorted set, each with its own expiry, for work that runs a
-  while, such as the scans a tenant has running at once (ADR-0019). A lease that isn't released,
-  because its worker died, ends at its expiry.
+  while, such as the scans a tenant has running at once (ADR-0019) or a session's download streams
+  (abuse 2.2, E). A lease that isn't released, because its worker died, ends at its expiry.
+- `budget`: a total of units per fixed window, such as the bytes granted to a recipient in a UTC
+  day (abuse 2.2, D). A request spends its cost only if the total stays within the limit; a
+  negative cost refunds (`BudgetCall`, batched in `run`).
 
 Each takes the time from the caller in milliseconds (pods keep their clocks within a millisecond
 with the Amazon Time Sync Service), so tests drive time instead of sleeping. A refused request
@@ -163,6 +166,25 @@ def gcra_shape(limit: int, period_ms: int) -> tuple[int, int]:
     return interval, burst * interval
 
 
+# KEYS[1] the window's total; ARGV cost, limit, ttl (ms), peek ("1": answer without spending).
+# Returns 1 if the cost fits (and, unless peeking, is spent), 0 if it doesn't. A negative cost, a
+# refund, always fits.
+_BUDGET = """
+local used = tonumber(redis.call('GET', KEYS[1])) or 0
+local cost = tonumber(ARGV[1])
+if used + cost > tonumber(ARGV[2]) then
+  return 0
+end
+if ARGV[4] ~= '1' then
+  redis.call('INCRBY', KEYS[1], cost)
+  if redis.call('PTTL', KEYS[1]) < 0 then
+    redis.call('PEXPIRE', KEYS[1], ARGV[3])
+  end
+end
+return 1
+"""
+
+
 class CounterStoreUnavailableError(Exception):
     """The store didn't answer in time, failed, or is resting after repeated failures."""
 
@@ -209,7 +231,20 @@ class ScoresCall:
     window_ms: int
 
 
-Call = RateCall | LogCall | ScoresCall
+@dataclass(frozen=True)
+class BudgetCall:
+    """One `budget` script call in a batch: spend `cost` (or refund, when negative) of `limit` in
+    the window `key` names. `wait_ms` is what a refusal answers: the window's end."""
+
+    key: str
+    limit: int
+    ttl_ms: int
+    cost: int
+    peek: bool
+    wait_ms: int
+
+
+Call = RateCall | LogCall | ScoresCall | BudgetCall
 
 
 @dataclass(frozen=True)
@@ -271,6 +306,7 @@ class CounterStore:
         self._rate = client.register_script(_RATE)
         self._log = client.register_script(_LOG)
         self._lease = client.register_script(_LEASE)
+        self._budget = client.register_script(_BUDGET)
         self._failures = 0
         self._resting_until = 0.0
 
@@ -355,6 +391,9 @@ class CounterStore:
                     args = [now_ms, call.window_ms, call.limit, call.mode, call.member]
                     args += [call.block_ms, *(repr(score) for score in call.others)]
                     await self._log(keys=[call.key], args=args, client=pipe)
+                elif isinstance(call, BudgetCall):
+                    args = [call.cost, call.limit, call.ttl_ms, "1" if call.peek else "0"]
+                    await self._budget(keys=[call.key], args=args, client=pipe)
                 else:
                     pipe.zrangebyscore(
                         call.key, f"({now_ms - call.window_ms}", "+inf", withscores=True
@@ -370,6 +409,9 @@ class CounterStore:
                 if not isinstance(result, list):
                     raise CounterStoreUnavailableError("unexpected answer from the counter store")
                 out.append([float(score) for member, score in result if member != b"!block"])
+            elif isinstance(call, BudgetCall):
+                fits = result == 1
+                out.append(Verdict(allowed=fits, wait_ms=0 if fits else call.wait_ms))
             else:
                 out.append(_verdict(result))
         return out

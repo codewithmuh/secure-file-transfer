@@ -17,6 +17,7 @@ import yaml
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
     InspectorSettings,
+    JobSettings,
     MigrationSettings,
     NotifySettings,
     OperatorSettings,
@@ -55,6 +56,12 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.dlp.inspector": InspectorSettings,
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,
+    # The lifecycle jobs (#181), one module per CronJob, all reading JobSettings.
+    "sft.workers.expiry": JobSettings,
+    "sft.workers.deletion": JobSettings,
+    "sft.workers.reconciliation": JobSettings,
+    "sft.workers.storage_audit": JobSettings,
+    "sft.workers.cleanup": JobSettings,
 }
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 

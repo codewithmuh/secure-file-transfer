@@ -1406,8 +1406,8 @@ export interface paths {
          *     per recipient; 300 an hour per IP address; 2,000 grants an hour and 500 GB a day per tenant (NFR-14).
          *
          *     Errors: `403 download_limit_reached`, `403 download_grant_exhausted`, `403 permission_denied` (an uploader
-         *     session), `409 file_not_shareable`, `410 link_revoked`, `410 link_expired`, `429 rate_limited`,
-         *     `503 service_unavailable`.
+         *     session), `409 file_not_shareable`, `410 link_revoked`, `410 link_expired`, `422 validation_failed` (a body
+         *     that isn't a `DownloadRequest`), `429 rate_limited`, `503 service_unavailable`.
          *
          *     Requirements: FR-4, FR-6, FR-14, FR-17, FR-18, NFR-6, NFR-15.
          */
@@ -5821,6 +5821,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
             410: components["responses"]["Gone"];
+            422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
             503: components["responses"]["ServiceUnavailable"];
         };

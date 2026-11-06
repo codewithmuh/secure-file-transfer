@@ -408,3 +408,59 @@ async def notice(session: AsyncSession, transfer_id: UUID) -> Notice | None:
         )
     ).first()
     return None if row is None else Notice(row[0], row[1], TransferState(row[2]), row[3])
+
+
+# ---- the lifecycle jobs (sft_jobs, data model 6; #181) ----
+
+
+@dataclass(frozen=True, slots=True)
+class Due:
+    tenant_id: UUID
+    transfer_id: UUID
+
+
+async def due_for_expiry(session: AsyncSession, *, now: datetime, limit: int) -> list[Due]:
+    """Transfers past `expires_at` that haven't ended, across tenants: the expiry job's find
+    step, in system scope (data model 3.2, 6)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.execute(
+        select(Transfer.tenant_id, Transfer.id)
+        .where(
+            Transfer.state.in_([s.value for s in EXPIRES_FROM]),
+            Transfer.expires_at <= now,
+            in_scope(Transfer, session),
+        )
+        .order_by(Transfer.expires_at)
+        .limit(limit)
+    )
+    return [Due(r.tenant_id, r.id) for r in rows]
+
+
+async def stale_drafts(session: AsyncSession, *, before: datetime, limit: int) -> list[Due]:
+    """Drafts without activity since `before` (7 days), across tenants (data model 2.2)."""
+    require_scope(session, ScopeKind.SYSTEM)
+    rows = await session.execute(
+        select(Transfer.tenant_id, Transfer.id)
+        .where(
+            Transfer.state == TransferState.DRAFT.value,
+            Transfer.last_activity_at < before,
+            in_scope(Transfer, session),
+        )
+        .order_by(Transfer.last_activity_at)
+        .limit(limit)
+    )
+    return [Due(r.tenant_id, r.id) for r in rows]
+
+
+async def idle_since(session: AsyncSession, transfer_id: UUID, *, before: datetime) -> bool:
+    """Whether the draft's last activity is before `before`, as the caller's row lock sees it."""
+    require_scope(session, ScopeKind.TENANT)
+    found = await session.scalar(
+        select(Transfer.id).where(
+            Transfer.id == transfer_id,
+            Transfer.state == TransferState.DRAFT.value,
+            Transfer.last_activity_at < before,
+            in_scope(Transfer, session),
+        )
+    )
+    return found is not None

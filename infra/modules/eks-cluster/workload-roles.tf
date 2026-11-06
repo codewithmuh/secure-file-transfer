@@ -351,7 +351,9 @@ locals {
     ]
 
     # The only workload that deletes objects (architecture 4.5), in both files bucket pairs in both Regions. Deleting
-    # needs no key, so it can't read what it deletes (encryption 4.3).
+    # needs no key. Reconciliation (#181) also finishes an upload left `completing` (data model 3.1), which needs the
+    # files key through S3 for CompleteMultipartUpload, and rewrites a download grant's committed record in the
+    # archive. It has no s3:GetObject, so it still can't read what it deletes (encryption 4.3).
     jobs = [
       {
         Sid      = "ListFilesBuckets"
@@ -365,7 +367,33 @@ locals {
         Action   = ["s3:AbortMultipartUpload", "s3:DeleteObject", "s3:DeleteObjectVersion"]
         Resource = concat(local.objects["files"], local.objects["large-files"])
       },
+      {
+        Sid      = "FinishStuckCompletions"
+        Effect   = "Allow"
+        Action   = ["s3:ListMultipartUploadParts", "s3:PutObject", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"]
+        Resource = concat(local.objects["files"], local.objects["large-files"])
+      },
+      {
+        Sid      = "RewriteGrantCommittedRecords"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject"]
+        Resource = local.objects["audit-archive"]
+      },
       local.database["jobs"],
+      {
+        Sid       = "FilesKeyThroughS3ToCompleteUploads"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["files"], StringEquals = { "kms:ViaService" = local.via["s3"], "kms:EncryptionContext:aws:s3:arn" = concat(local.buckets["files"], local.buckets["large-files"]) } }
+      },
+      {
+        Sid       = "AuditKeyThroughS3"
+        Effect    = "Allow"
+        Action    = ["kms:GenerateDataKey"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["audit"], StringEquals = { "kms:ViaService" = local.via["s3"], "kms:EncryptionContext:aws:s3:arn" = local.buckets["audit-archive"] } }
+      },
     ]
 
     # Copies audit rows to the Object Lock archive (architecture 5.2); the bucket's default retention applies.

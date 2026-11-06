@@ -3,7 +3,8 @@
 Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py),
 the member routes (#112, members.py), transfers and their files (#114, #174 to #176,
 transfers.py), the tenant policy (#174, tenant_policy.py), recipients' status and unlock (#178,
-#179, recipients.py) and the link steps and link sessions (#179, links.py).
+#179, recipients.py), the link steps and link sessions (#179, links.py) and downloads (#180,
+downloads.py).
 Probes and metrics live on the internal port (sft.runtime.internal). The interactive docs and the
 OpenAPI document aren't served either: ADR-0002 keeps them off the public load balancer, and CI
 builds the document from `create_app().openapi()`.
@@ -12,10 +13,13 @@ With settings, the app's lifespan opens the database pool, the rate-limit counte
 sign-in service (its OIDC client and state store) and the files buckets' S3 client at startup,
 without connecting, and closes them at shutdown, after uvicorn has drained the requests; it also
 loads the `email-hmac` keyring and the upload policy, and opens the audit archive of both regions
-(#177) and the link steps' services: the `code-hmac` and `csrf-hmac` keyrings and their metrics
-(#179). A route reaches them through the `get_database`, `get_email_keyring`, `get_objects`,
-`get_upload_policy` and `get_audit_archive` (dependencies.py), `get_rate_limiter` and
-`sign_in_service` (caller.py) and `get_link_services` (links.py) dependencies, or names its limits
+(#177), the link steps' services: the `code-hmac` and `csrf-hmac` keyrings and their metrics
+(#179), and the download services: the async content reader, the byte and stream caps and their
+metrics (#180). The app's clock (`sft.core.clock`) is the wall clock, which only a local or test
+environment may offset (#182). A route reaches them through the `get_database`,
+`get_email_keyring`, `get_objects`, `get_upload_policy`, `get_audit_archive` and `now_of`
+(dependencies.py), `get_rate_limiter` and `sign_in_service` (caller.py), `get_link_services`
+(links.py) and `get_download_services` (downloads.py) dependencies, or names its limits
 with `rate_limit` (rate_limits.py). Without settings there is none of them: that app is for
 generating the OpenAPI document and for tests of routes that don't need them.
 
@@ -35,21 +39,25 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import auth, links, members, recipients, tenant_policy, transfers
+from sft.api import auth, downloads, links, members, recipients, tenant_policy, transfers
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
+from sft.core.clock import Clock
 from sft.core.hmac_keyrings import CodeKeyring
 from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
 from sft.runtime.archive import S3AuditArchive
+from sft.runtime.content import S3Content
 from sft.runtime.s3 import S3Objects
 from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
 from sft.service.csrf import CsrfKeyring
+from sft.service.downloads import DownloadMetrics, DownloadServices
 from sft.service.links import LinkMetrics, LinkServices
 from sft.service.rate_limits import RateLimiter
+from sft.service.rate_limits.downloads import DownloadLimits
 from sft.service.uploads import UploadPolicy
 
 _NO_FASTAPI_TELEMETRY: TelemetryConfig = {
@@ -107,9 +115,28 @@ def _lifespan(
             archive=archive,
             metrics=LinkMetrics.create(registry),
         )
+        # Downloads (#180): the async reader of the scanned versions, and group D's byte caps and
+        # group E's stream caps beside the rates.
+        content = S3Content.create(
+            region=settings.aws_region,
+            files_bucket=settings.s3_files_bucket,
+            large_files_bucket=settings.s3_large_files_bucket,
+            endpoint_url=settings.s3_endpoint_url,
+            max_streams=settings.download_streams_per_pod,
+        )
+        app.state.download_services = DownloadServices(
+            limiter=app.state.rate_limiter,
+            limits=DownloadLimits(store, metrics, pod_streams=settings.download_streams_per_pod),
+            archive=archive,
+            content=content,
+            metrics=DownloadMetrics.create(registry),
+            recheck_seconds=settings.download_recheck_seconds,
+            clock=app.state.clock,
+        )
         try:
             yield
         finally:
+            await content.close()
             await archive.close()
             await objects.close()
             await app.state.sign_in.aclose()
@@ -143,6 +170,10 @@ def create_app(
         telemetry=_NO_FASTAPI_TELEMETRY,
     )
     app.state.trusted_proxies = () if settings is None else settings.trusted_proxies
+    # What the routes read as now: the wall clock, offset only in a local or test environment.
+    app.state.clock = (
+        Clock() if settings is None else Clock.offset_by(settings.clock_offset_seconds)
+    )
     app.state.web_origin = None if settings is None else settings.web_origin
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
@@ -152,4 +183,5 @@ def create_app(
     tenant_policy.register(app)  # the tenant's policy (#174)
     recipients.register(app)  # recipients' status and unlock (#178, #179)
     links.register(app)  # the link steps and link sessions (#179)
+    downloads.register(app)  # download grants and streamed content (#180)
     return app

@@ -3,14 +3,18 @@
 `get_database` is the process's `Database`, and `get_email_keyring` its `email-hmac` keyring, which
 per-address rate limits count under. `get_objects` is the files buckets' object store and
 `get_upload_policy` what the settings decide about uploads (#114). `get_audit_archive` writes
-security-critical records to both regions' archive (#177). The rate limiter's dependency,
+security-critical records to both regions' archive (#177). `now_of` is the request's "now", from
+the app's clock (#182). The rate limiter's dependency,
 `get_rate_limiter`, lives with the limits in rate_limits.py. All need an app created with settings.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from fastapi import Request
 
+from sft.core.clock import SYSTEM_CLOCK, Clock
 from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
 from sft.service.audit_archive import AuditArchive
@@ -56,3 +60,12 @@ def get_audit_archive(request: Request) -> AuditArchive:
     if not isinstance(archive, AuditArchive):
         raise RuntimeError("this app was created without settings, so it has no audit archive")
     return archive
+
+
+def now_of(request: Request) -> datetime:
+    """What this request reads as now: the app's clock, which only a local or test environment may
+    offset (`sft.core.clock`, #182)."""
+    clock = getattr(request.app.state, "clock", SYSTEM_CLOCK)
+    if not isinstance(clock, Clock):
+        raise RuntimeError("the app's clock isn't a Clock")
+    return clock.now()

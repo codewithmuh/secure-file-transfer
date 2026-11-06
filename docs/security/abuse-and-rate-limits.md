@@ -231,6 +231,15 @@ count itself is always in PostgreSQL.
 | Tenant | 500 GB of granted bytes a day, recipients and members together; 200 MB per member for tenants over 2,500 members | App | `429` |
 | Subject and file | The transfer's download limit, 1–100 (FR-4) | PostgreSQL | `403 download_limit_reached` |
 
+**As built (#180).** The request rates count per recipient, per IP and, for a new grant only, per tenant; a resume
+costs the first two. The byte caps are `Budget` limits: megabytes per UTC day in the counter store, a fixed day, not
+a sliding one, so the worst case is twice a cap across midnight. A new grant's tenant rate and byte caps are read
+before its intent record and charged, all or none, with the limiter's `check_all` as the last step of the grant's own
+transaction: a `503` or a lost race (`403 download_limit_reached`) charges nothing, a refusal there rolls the grant
+back, and when two grants race for the last bytes the loser's budgets are refunded in the same call. `Retry-After`
+runs to midnight UTC. The 200 MB per member for tenants over 2,500 members isn't built:
+no tenant has member counts that high before the per-tenant overrides of section 10.
+
 **Sizing.** At design load the service grants about 40,000 downloads and 1 TB a day (capacity 3.1), a mean of 2 GB
 per tenant. A large tenant of 1,000 members (4 % of the load) has about 1,600 downloads and 40 GB a day, 200 in its
 peak hour. Its caps are 10 times that hour and 12 times that day (25 full 20 GB transfers); above 2,500 members they
@@ -249,6 +258,12 @@ checks are always in PostgreSQL; the concurrency caps fail open to the per-pod l
 | Tenant | 200 concurrent streams | App | `429` |
 | Stream | At least 2 KB/s averaged over 2 minutes | In process | Stream closed; the browser resumes under the same grant |
 | API pod | 100 concurrent streams | In process | `503`, `Retry-After: 10` |
+
+**As built (#180).** The stream caps are leases in the counter store, 90 s each, renewed at every re-check and given up
+when the stream ends, so a pod that dies frees its places within a lease; over a cap is `429` with `Retry-After: 30`.
+The pod's cap is counted in the process (`DOWNLOAD_STREAMS_PER_POD`). The 2 KB/s floor is checked at each re-check
+over the last 2 minutes; a client that reads nothing at all is closed by the load balancer's 60-second idle timeout
+(5.7). During a counter store outage each cap counts in the pod, at a third.
 
 **F. Uploads:** `addTransferFile`, `addSessionUploadFile`, `requestUploadPartUrls`, `requestSessionUploadPartUrls`,
 `listUploadedParts`, `listSessionUploadedParts`, `completeUpload`, `completeSessionUpload`. Fail open to the per-pod
@@ -634,6 +649,7 @@ The `download_grants` table (data model): `id`, `tenant_id`, `file_id`, `s3_vers
 | Resuming | `createSessionDownload` with `resume_grant_id`, in the same session, returns the same grant, uncounted, while it has time and bytes left; otherwise `403 download_grant_exhausted`, and a call without `resume_grant_id` counts a new download | FR-6 |
 | The grant ID in the URL | Not a credential: useless without the right session | FR-14 |
 | Audit | `download.granted` at creation (fail closed); `download.completed` when the last byte of the file is sent and `download.stopped` when a revocation cuts a stream (best effort, not fail closed) | FR-7, FR-27 |
+| As built (#180) | A content request is admitted only if the grant's bytes left cover its whole span (`bytes_served + span <= byte_budget`), so a response never declares a `Content-Length` it can't send; otherwise `403 download_grant_exhausted`, and a smaller range may still fit. Bytes count as they are handed to the client. The re-check interval is a setting (`DOWNLOAD_RECHECK_SECONDS`, 30 s), so tests show "stops within two intervals" quickly. The content routes read with httpx's async client, from a `GetObject` URL boto3 signs in the pod for the scanned version and a minute (`sft.runtime.content`), which never leaves the pod. `download.stopped` also records an expiry, an ended session or a file no longer shareable. | NFR-6, 5.7 |
 
 A grant's row is a security-critical record like the download count. After a regional failover the byte count may
 be up to 5 minutes behind (NFR-10), which can only allow a few extra bytes. The one way to an extra download is the

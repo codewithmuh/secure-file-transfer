@@ -262,11 +262,12 @@ UPDATE download_grants
        active_stream_id = $2,
        active_stream_until = now() + interval '60 seconds'
  WHERE id = $1 AND expires_at > now()
-   AND request_count < 20 AND bytes_served < byte_budget
+   AND request_count < 20 AND bytes_served + $3 <= byte_budget
 RETURNING bytes_served, byte_budget;
 ```
 
-No row returned means the grant is used up or has expired. The stream sends at most the budget left. Every 30 seconds,
+No row returned means the grant is used up, has expired, or has fewer bytes left than the `$3` bytes of the range
+asked for (#180: so a response never declares more than it may send; a smaller range may still fit). Every 30 seconds,
 and once more when it ends, it re-checks the transfer, the session and the file, and records what it sent:
 
 ```sql
@@ -294,6 +295,20 @@ lists them).
 
 For received files, `retention_until` and `delete_after` are both set at upload, from the tenant policy in force then
 (FR-13). A member deleting a file earlier moves `delete_after` forward.
+
+**As built (#180, revision 0014).** `download_grants` has the recipient's pair only, `recipient_id` and
+`link_session_id`, both `NOT NULL` and cascading; the member's pair and the exactly-one check arrive with received
+files (M5). Its audit trigger watches `INSERT` only: the byte count, the stream lease and `archived_at` change without
+an action of their own. `sft_api` may update a counter's count and times. The committed record's ID is the grant's
+own, and it holds only what the row holds (the grant, its session, its file and budget), so reconciliation rewrites
+the same object from the row. The intent record has an ID of its own and names the grant in its details.
+`download.granted` is security-critical; a refused grant (`download.refused`), a resume (`download.resumed`) and a
+stream's end (`download.completed`, `download.stopped`) are audited too. `files.sha256` holds the SHA-256 the scan
+worker computes as it reads the scanned version for clamd and the inspector, so it costs no second read; it is the
+downloads' strong `ETag`, and a file scanned before it has none gets one made from its ID and recorded version.
+Step 3 re-checks, under the transfer's row lock, the transfer, the session and the file after the archive writes, and
+takes the grant's end from that read of the session, so a revocation or an ended session in between answers `410` or
+`401 session_expired` and counts nothing.
 
 ### 2.4 Verification and sessions
 
@@ -946,6 +961,20 @@ contend with the evaluation lock.
 an alert fires, because deleting the `files` row would leave its object with nothing pointing at it. The scan deadline
 and the completion retry (3.1) keep a file from staying in `scanning` or `completing`, which deletion skips, so this
 should only fire on a bug.
+
+**As built (#181, revision 0015).** Five one-shot jobs (`sft.service.lifecycle`, `python -m sft.workers.<job>`):
+`expiry` (transfers past `expires_at`, and drafts idle for 7 days), `deletion`, `reconciliation` (uploads with no part
+for 24 hours, completions left for 15 minutes, the scan sweep, grants whose committed record is missing),
+`storage-audit` (daily: orphans and stale multipart uploads over 24 hours old, and the report of leftovers) and
+`cleanup` (daily: expired codes, link sessions and grants, each batch with `retention.rows_deleted`, which the codes'
+trigger requires). The cleanup never deletes a grant whose `archived_at` is empty, nor a session holding one, since
+the cascade would take the grant: they wait for reconciliation, and `lifecycle_unarchived_grants` counts them. The
+storage audit reads one listing page at a time. Completion's phase 3 is one helper for the API and reconciliation,
+which routes by the same `SCAN_SMALL_POOL_MAX_BYTES`. `files.deleted_at` records the deletion, and a check ties it to `deleted`. Deletion aborts every
+unfinished upload it lists under the file's key, rather than the recorded upload ID alone, and lists the key again to
+confirm nothing is left before it marks the file. The reservation is released at deletion unless a rejection or removal
+released it. `sft_jobs` reads no name, message or grant byte count; the API's role still deletes nothing but its
+idempotency keys. The purge after 365 days, received files' retention and the clearing of DLP details are later issues.
 
 **Jobs work in small transactions.** Every job deletes or purges in batches of at most 1,000 rows, one transaction per
 batch, and never has a transaction open while it calls S3. The deletion job, for example, deletes the objects first
