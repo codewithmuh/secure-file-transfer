@@ -388,3 +388,24 @@ async def _update_one(
     if user is None:
         raise NotFoundError("no such user in this scope")
     return user
+
+
+async def invited_everywhere(
+    session: AsyncSession, *, after: UUID | None = None, limit: int = MAX_PAGE
+) -> Sequence[tuple[UUID, UUID]]:
+    """`(tenant ID, user ID)` of up to `limit` users still `invited`, in every tenant, after the
+    user `after`, oldest first: the notification worker's invitation backlog (#193, revision
+    0017). System scope, read only."""
+    require_scope(session, ScopeKind.SYSTEM)
+    statement = select(User.tenant_id, User.id).where(User.status == UserStatus.INVITED.value)
+    if after is not None:
+        statement = statement.where(User.id > after)
+    rows = await session.execute(statement.order_by(User.id).limit(limit))
+    return [(row[0], row[1]) for row in rows]
+
+
+async def invite_again(session: AsyncSession, user_id: UUID) -> UUID:
+    """A new `member.invited` message for a user left `invited` (#193): the notifier invites
+    them through the pool as it does any new member. In the user's tenant scope."""
+    require_scope(session, ScopeKind.TENANT)
+    return await enqueue(session, MEMBER_INVITED, {"user_id": user_id})

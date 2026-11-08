@@ -20,6 +20,14 @@ ADR-0004 are written once: deploy/tests/ checks every rendered container against
 {{- if not (regexMatch (printf "^arn:aws:kms:%s:[0-9]{12}:key/mrk-[0-9a-f]{32}$" $v.region) (required "cluster.filesKeyArn is required (from the root Application)" $v.cluster.filesKeyArn)) }}{{ fail "cluster.filesKeyArn must be the files key's ARN in this cluster's region" }}{{ end -}}
 {{- if not (regexMatch (printf "^%s_[0-9A-Za-z]+$" $v.region) (required "cluster.userPoolId is required (from the root Application, once the user pool exists)" $v.cluster.userPoolId)) }}{{ fail "cluster.userPoolId must be a user pool ID in this cluster's region" }}{{ end -}}
 {{- if not (regexMatch "^[a-z0-9.-]+$" (required "cluster.cognitoLoginDomain is required (from the root Application, once the user pool exists)" $v.cluster.cognitoLoginDomain)) }}{{ fail "cluster.cognitoLoginDomain must be a plain host name" }}{{ end -}}
+{{- if ne (required "cluster.sesConfigurationSet is required (from the root Application, once the identity layer exists)" $v.cluster.sesConfigurationSet) (printf "sft-%s" $v.environment) }}{{ fail "cluster.sesConfigurationSet must be sft-<env>" }}{{ end -}}
+{{- if eq $v.region "ap-northeast-1" -}}
+{{- if not (regexMatch "^[0-9a-z]+$" (required "cluster.appClientId is required in Tokyo, for the key rotation job (from the root Application)" $v.cluster.appClientId)) }}{{ fail "cluster.appClientId must be an app client ID" }}{{ end -}}
+{{- if ne $v.environment "dev" -}}
+{{- if not (regexMatch "^ap-northeast-3_[0-9A-Za-z]+$" (required "cluster.standbyUserPoolId is required in Tokyo outside dev (Osaka's pool, for the key rotation job)" $v.cluster.standbyUserPoolId)) }}{{ fail "cluster.standbyUserPoolId must be a user pool ID in Osaka" }}{{ end -}}
+{{- if not (regexMatch "^[0-9a-z]+$" (required "cluster.standbyAppClientId is required in Tokyo outside dev (Osaka's app client)" $v.cluster.standbyAppClientId)) }}{{ fail "cluster.standbyAppClientId must be an app client ID" }}{{ end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- if eq $v.part "operator" -}}
 {{- $_ := required "cluster.operatorRoleName is required (from the root Application)" $v.cluster.operatorRoleName -}}
@@ -122,6 +130,19 @@ sft-<env>-<user>, with no password. Call with (dict "root" $ "user" name).
 rediss://sft-{{ .root.Values.environment }}-{{ .user }}@{{ .root.Values.cluster.valkeyHost }}:6379
 {{- end -}}
 
+{{/* The serverless cache's name, sft-<env>-<region-short>-valkey (infra/modules/valkey): what Valkey's IAM tokens sign. */}}
+{{- define "sft.valkeyCache" -}}
+{{ include "sft.namePrefix" . }}-valkey
+{{- end -}}
+
+{{/*
+A keyring setting that names its secret in this region's Secrets Manager (encryption 6.4, #184): the process reads it
+at start and every 5 minutes, as its own role, so no keyring is in a Kubernetes Secret or the pod spec.
+*/}}
+{{- define "sft.keyringRef" -}}
+secretsmanager:sft/{{ .root.Values.environment }}/app/{{ .name }}
+{{- end -}}
+
 {{/* Settings every application container gets. Environment variables only (architecture 8). */}}
 {{- define "sft.commonEnv" -}}
 - name: LOG_LEVEL
@@ -199,45 +220,56 @@ readinessProbe:
 {{- end -}}
 
 {{/*
-A container of our image running `python -m <module>`, with the internal port and its probes. Optional: publicPort,
-databaseRole, valkeyUser, proxyListener, env, secretEnv, preStop, volumeMounts; ports (YAML) and noProbes for an
-entry point without the internal listener (the DLP inspector).
+A container of our image running `python -m <module>`, with the internal port and its probes. Optional: publicPort
+(served with TLS), databaseRole and valkeyUser (each signed in with IAM tokens), proxyListener, env, secretEnv, preStop,
+volumeMounts; ports (YAML) for an entry point with a port of its own beside the internal one (the DLP inspector); job
+for a run-to-completion entry point with no listener, so no internal port and no probes (the invitation backlog).
 */}}
 {{- define "sft.appContainer" -}}
 - name: {{ .name }}
   image: {{ include "sft.appImage" .root }}
   imagePullPolicy: IfNotPresent
   command: [python, -m, {{ .module }}]
+  {{- if not .job }}
   ports:
     {{- with .publicPort }}
     - { name: http, containerPort: {{ . }}, protocol: TCP }
     {{- end }}
-    {{- if .ports }}
-    {{- .ports | nindent 4 }}
-    {{- else }}
-    - { name: internal, containerPort: 8001, protocol: TCP }
+    {{- with .ports }}
+    {{- . | nindent 4 }}
     {{- end }}
+    - { name: internal, containerPort: 8001, protocol: TCP }
+  {{- end }}
   env:
     {{- include "sft.commonEnv" .root | nindent 4 }}
+    {{- with .publicPort }}
+    # TLS on the public port, with the certificate the pod makes at start (encryption 2.2, #184).
+    - name: PUBLIC_TLS
+      value: "generated"
+    {{- end }}
     {{- with .databaseRole }}
     - name: DATABASE_URL
       value: {{ include "sft.databaseUrl" (dict "root" $.root "role" .) | quote }}
+    - name: DATABASE_IAM_AUTH # an IAM token per connection, as the login role (encryption 6.3)
+      value: "true"
     {{- end }}
     {{- with .valkeyUser }}
     - name: VALKEY_URL
       value: {{ include "sft.valkeyUrl" (dict "root" $.root "user" .) | quote }}
+    - name: VALKEY_IAM_CACHE # an IAM token per connection, as the workload's user (ADR-0014)
+      value: {{ include "sft.valkeyCache" $.root | quote }}
     {{- end }}
     {{- with .proxyListener }}
     {{- include "sft.proxyEnv" (dict "root" $.root "listener" .) | nindent 4 }}
     {{- end }}
     {{- with .env }}
-    {{- $reserved := concat (list "LOG_LEVEL" "AWS_REGION" "BIND_HOST" "DATABASE_URL" "VALKEY_URL" "HTTPS_PROXY" "NO_PROXY") (keys (default (dict) $.secretEnv)) }}
+    {{- $reserved := concat (list "LOG_LEVEL" "AWS_REGION" "BIND_HOST" "PUBLIC_TLS" "DATABASE_URL" "DATABASE_IAM_AUTH" "VALKEY_URL" "VALKEY_IAM_CACHE" "HTTPS_PROXY" "NO_PROXY") (keys (default (dict) $.secretEnv)) }}
     {{- include "sft.extraEnv" (dict "env" . "reserved" $reserved) | trim | nindent 4 }}
     {{- end }}
     {{- with .secretEnv }}
     {{- include "sft.secretEnv" . | trim | nindent 4 }}
     {{- end }}
-  {{- if not .noProbes }}
+  {{- if not .job }}
   {{- include "sft.appProbes" . | nindent 2 }}
   {{- end }}
   {{- if .preStop }}
@@ -350,6 +382,8 @@ spec:
           value: {{ .root.Values.logLevel | quote }}
         - name: AWS_REGION
           value: {{ .root.Values.region | quote }}
+        - name: DATABASE_IAM_AUTH # every job connects as its login role with an IAM token (encryption 6.3)
+          value: "true"
         {{- .env | nindent 8 }}
       resources:
         {{- toYaml .resources | nindent 8 }}

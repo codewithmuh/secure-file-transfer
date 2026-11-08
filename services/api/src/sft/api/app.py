@@ -16,7 +16,9 @@ loads the `email-hmac` keyring and the upload policy, and opens the audit archiv
 (#177), the link steps' services: the `code-hmac` and `csrf-hmac` keyrings and their metrics
 (#179), and the download services: the async content reader, the byte and stream caps and their
 metrics (#180). The app's clock (`sft.core.clock`) is the wall clock, which only a local or test
-environment may offset (#182). A route reaches them through the `get_database`,
+environment may offset (#182). In AWS (#184) the keyrings come from Secrets Manager, read at startup
+and every 5 minutes after (`sft.runtime.secrets`), and the database and Valkey connections sign in
+with IAM tokens (`sft.data.iam_auth`). A route reaches them through the `get_database`,
 `get_email_keyring`, `get_objects`, `get_upload_policy`, `get_audit_archive` and `now_of`
 (dependencies.py), `get_rate_limiter` and `sign_in_service` (caller.py), `get_link_services`
 (links.py) and `get_download_services` (downloads.py) dependencies, or names its limits
@@ -32,6 +34,8 @@ carry exception messages (ADR-0009, T-49).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
@@ -47,11 +51,12 @@ from sft.core.clock import Clock
 from sft.core.hmac_keyrings import CodeKeyring
 from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
-from sft.data.counters import CounterMetrics, CounterStore
+from sft.data.counters import CounterMetrics, CounterStore, ValkeyIam
 from sft.data.database import Database
 from sft.runtime.archive import S3AuditArchive
 from sft.runtime.content import S3Content
 from sft.runtime.s3 import S3Objects
+from sft.runtime.secrets import Keyrings
 from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
 from sft.service.csrf import CsrfKeyring
 from sft.service.downloads import DownloadMetrics, DownloadServices
@@ -80,18 +85,33 @@ def _lifespan(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # No connection yet: /readyz never depends on the database, so an outage can't take
         # every pod out of the load balancer at once.
+        # The keyrings first: one that names its secret is read now, and a missing or malformed
+        # one stops the startup (encryption and keys 6.5). Then refreshed every 5 minutes.
+        keyrings = Keyrings.create(region=settings.aws_region, registry=registry)
+        email_keyring = await keyrings.load(
+            settings.email_hmac_keyring, EmailKeyring.from_json, name="email"
+        )
+        code_keyring = await keyrings.load(
+            settings.code_hmac_keyring, CodeKeyring.from_json, name="code"
+        )
+        csrf_keyring = await keyrings.load(
+            settings.csrf_keyring, CsrfKeyring.from_json, name="CSRF"
+        )
         database = Database.connect(
-            settings.database_url.get_secret_value(), pool_size=settings.database_pool_size
+            settings.database_url.get_secret_value(),
+            pool_size=settings.database_pool_size,
+            iam_region=settings.aws_region if settings.database_iam_auth else None,
         )
         app.state.database = database
         # The same for the counters: an outage applies each limit's failure mode instead.
         metrics = CounterMetrics.create(registry)
-        store = CounterStore.connect(settings.valkey_url.get_secret_value(), metrics)
-        app.state.rate_limiter = RateLimiter(store, metrics)
-        app.state.sign_in = auth.open_sign_in(settings, database)
-        app.state.email_keyring = EmailKeyring.from_json(
-            settings.email_hmac_keyring.get_secret_value()
+        valkey_iam = ValkeyIam.of(settings.valkey_iam_cache, settings.aws_region)
+        store = CounterStore.connect(
+            settings.valkey_url.get_secret_value(), metrics, iam=valkey_iam
         )
+        app.state.rate_limiter = RateLimiter(store, metrics)
+        app.state.sign_in = auth.open_sign_in(settings, database, csrf_keyring, iam=valkey_iam)
+        app.state.email_keyring = email_keyring
         # The files buckets (#114). Creating the client opens no connection either.
         objects = S3Objects.create(
             region=settings.aws_region,
@@ -111,8 +131,8 @@ def _lifespan(
         app.state.link_services = LinkServices(
             limiter=app.state.rate_limiter,
             emails=app.state.email_keyring,
-            codes=CodeKeyring.from_json(settings.code_hmac_keyring.get_secret_value()),
-            csrf=CsrfKeyring.from_json(settings.csrf_keyring.get_secret_value()),
+            codes=code_keyring,
+            csrf=csrf_keyring,
             archive=archive,
             metrics=LinkMetrics.create(registry),
         )
@@ -134,9 +154,14 @@ def _lifespan(
             recheck_seconds=settings.download_recheck_seconds,
             clock=app.state.clock,
         )
+        app.state.keyrings = keyrings
+        refresh = asyncio.create_task(keyrings.run())
         try:
             yield
         finally:
+            refresh.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresh
             await content.close()
             await archive.close()
             await objects.close()

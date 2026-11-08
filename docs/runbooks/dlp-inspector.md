@@ -29,6 +29,10 @@ kubectl -n sft logs deploy/dlp-inspector-small --since=30m | tail -50
 kubectl -n sft get pods -l app.kubernetes.io/component=dlp-inspector -o wide
 ```
 
+The inspector's probes are on its own port, 8001, plain HTTP (#184): liveness `/healthz` says the process runs,
+readiness `/readyz` that it listens on 8070. A probe never reaches the framed protocol, so probes add no
+`bad_request`. A pod that restarts often with failed liveness is a crashed or wedged parent, not a slow file.
+
 - `malformed` means the inspector answered outside its schema (an unknown detector, too many previews): an image
   mismatch between the worker and the inspector, or an exploited parser (threat model T-92). Treat a burst as a
   security event.

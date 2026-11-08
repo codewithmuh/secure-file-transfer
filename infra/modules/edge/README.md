@@ -39,10 +39,10 @@ Terraform owns the load balancer, its listener and its target group (IP targets,
 behind (NFR-19), and no output has to reach the cluster-bootstrap stack, which is applied before this one. The
 controller manages no security group rules: this stack's rule on `main_nodes` admits the load balancer.
 
-**Deploy blocker.** The target group speaks HTTPS to the pods by design (encryption 2.1: each pod serves TLS on 8000
-with a certificate it makes at start). The API serves plain HTTP today, so its targets can't pass traffic until the
-API serves TLS there; [#184](https://github.com/codewithmuh/secure-file-transfer/issues/184) tracks it. The health check, plain HTTP on 8001, would still pass, so
-the targets would look healthy while every request fails. The target health check is `GET /readyz` on the internal port, 8001, which no listener routes.
+The target group speaks HTTPS to the pods (encryption 2.2): each API pod serves TLS 1.2 or later on 8000 with a
+certificate it makes at start (`PUBLIC_TLS=generated`, [#184](https://github.com/codewithmuh/secure-file-transfer/issues/184)); the load balancer doesn't validate it. The target
+health check is `GET /readyz` over plain HTTP on the internal port, 8001, which no listener routes.
+`deploy/tests/test_rendered.py` checks the chart against this target group.
 
 The listener answers `GET /edge-health` itself with `sft-edge-ok` and no target. The Region's Route 53 HTTPS
 health check matches that string on `api-<region-short>.<env-domain>`: it shows whether the Region's edge answers,

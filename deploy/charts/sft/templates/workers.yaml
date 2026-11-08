@@ -12,43 +12,71 @@
 {{- $notifier := .Values.notifier }}
 {{- /*
 How it sends email (sft.core.settings.MailSettings, ADR-0015): SES in this region, from the environment's sending
-subdomain, linking only to the web app. SES_CONFIGURATION_SET comes with the SES identity's issue, in notifier.env.
+subdomain, with the region's configuration set, whose events come back on the ses-events queue (#185), linking only
+to the web app. And the user pool's admin side (#193): Cognito's admin API on this region's pool, whose ID is also
+the pool's provider name, as the API's OIDC_PROVIDER_NAME.
 */}}
 {{- $mail := dict
   "MAIL_BACKEND" "ses"
   "MAIL_FROM_ADDRESS" (printf "no-reply@mail.%s" .Values.cluster.serviceDomain)
   "WEB_APP_URL" (printf "https://app.%s" .Values.cluster.serviceDomain)
-  "SES_REGION" .Values.region }}
-{{- /* Its three keyrings (#178, #179): link-hmac, which only it reads, code-hmac and email-hmac (encryption 6.1). */}}
-{{- $notifierSecrets := dict "EMAIL_HMAC_KEYRING" "notifier-secrets" "LINK_HMAC_KEYRING" "notifier-secrets" "CODE_HMAC_KEYRING" "notifier-secrets" }}
-{{- $containers = include "sft.appContainer" (dict "root" $ "name" "notifier" "module" $notifier.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $notifier.env) "secretEnv" $notifierSecrets "resources" $notifier.resources) }}
+  "SES_REGION" .Values.region
+  "SES_CONFIGURATION_SET" .Values.cluster.sesConfigurationSet
+  "USER_POOL_BACKEND" "cognito"
+  "USER_POOL_PROVIDER_NAME" .Values.cluster.userPoolId
+  "COGNITO_USER_POOL_ID" .Values.cluster.userPoolId }}
+{{- /*
+Its three keyrings (#178, #179): link-hmac, which only it reads, code-hmac and email-hmac (encryption 6.1). Each names
+its secret, which the worker reads itself at start and every 5 minutes, as its own role (encryption 6.4, #184).
+*/}}
+{{- $keyrings := dict
+  "EMAIL_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "email-hmac"))
+  "LINK_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "link-hmac"))
+  "CODE_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "code-hmac")) }}
+{{- $containers = include "sft.appContainer" (dict "root" $ "name" "notifier" "module" $notifier.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $keyrings $notifier.env) "resources" $notifier.resources) }}
 {{ include "sft.deployment" (dict "root" $ "name" "notifier" "component" "notifier" "replicas" $notifier.replicas "serviceAccount" $notifier.serviceAccount "grace" $notifier.terminationGracePeriodSeconds "containers" $containers) }}
 ---
 {{ include "sft.pdb" (dict "root" $ "name" "notifier" "component" "notifier") }}
 ---
-# The notification worker's keyrings (encryption 6.1, 6.4), from Secrets Manager in this region through the application
-# store, as the API's are. One sync wave early, so the Secret exists before the worker's pods start.
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
+{{- /*
+The invitation backlog (#193): the notification worker's settings and identity, `python -m sft.workers.invite_backlog`,
+run by hand once (kubectl create job --from=cronjob/invite-backlog). Always suspended, so the schedule never fires. It
+reads no keyring, but its settings are the worker's, so they name the same secrets.
+*/}}
+{{- $backlog := .Values.inviteBacklog }}
+{{- $backlogCtx := dict "root" $ "component" "invite-backlog" "serviceAccount" $notifier.serviceAccount }}
+apiVersion: batch/v1
+kind: CronJob
 metadata:
-  name: notifier-secrets
+  name: invite-backlog
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "sft.labels" (dict "root" $ "component" "notifier") | nindent 4 }}
-  annotations:
-    argocd.argoproj.io/sync-wave: "-1"
+    {{- include "sft.labels" $backlogCtx | nindent 4 }}
 spec:
-  refreshInterval: {{ .Values.secrets.refreshInterval }}
-  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.secrets.store }} }
-  target:
-    name: notifier-secrets
-    creationPolicy: Owner
-    deletionPolicy: Retain
-  data:
-    - secretKey: EMAIL_HMAC_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/email-hmac" .Values.environment }} }
-    - secretKey: LINK_HMAC_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/link-hmac" .Values.environment }} }
-    - secretKey: CODE_HMAC_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/code-hmac" .Values.environment }} }
+  schedule: "0 0 1 1 *"
+  timeZone: Etc/UTC
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $backlogCtx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # running it again is safe: a member invited through the pool is skipped
+      activeDeadlineSeconds: {{ $backlog.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sft.labels" $backlogCtx | nindent 12 }}
+        spec:
+          {{- include "sft.podCommon" $backlogCtx | nindent 10 }}
+          restartPolicy: Never
+          securityContext:
+            {{- include "sft.podSecurityContext" 10001 | nindent 12 }}
+          containers:
+            {{- include "sft.appContainer" (dict "root" $ "name" "invite-backlog" "module" $backlog.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $keyrings $notifier.env) "resources" $notifier.resources "job" true) | nindent 12 }}
+          volumes:
+            {{- include "sft.tmpVolume" . | nindent 12 }}
 {{- end }}

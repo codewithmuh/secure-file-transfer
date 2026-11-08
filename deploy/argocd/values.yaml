@@ -11,6 +11,10 @@ cluster:
   filesKeyArn: "" # the files key in this region
   userPoolId: "" # this region's user pool; empty until it exists
   cognitoLoginDomain: "" # its managed login domain; empty until it exists
+  sesConfigurationSet: "" # this region's SES configuration set, sft-<env>; empty until it exists
+  appClientId: "" # this region's app client, whose secret the key rotation job rotates (Tokyo)
+  standbyUserPoolId: "" # Osaka's user pool, for the key rotation job in Tokyo (staging, prod)
+  standbyAppClientId: "" # its app client
 
 repoURL: https://github.com/codewithmuh/secure-file-transfer.git
 # Argo CD syncs only reviewed main (ADR-0005, T-72).

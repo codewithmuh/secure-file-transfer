@@ -634,3 +634,15 @@ def test_the_jobs_find_their_work_by_indexes(migrated_db: ScratchDatabase) -> No
         "SELECT convalidated FROM pg_constraint WHERE conname = 'files_deleted_check'"
     )
     assert valid is True
+
+
+def test_the_invitation_backlog_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("FIND", "0017")
+    assert list(module.RLS) == [
+        policy_sql(
+            "notify_find", "users", roles=["sft_notify"], command="SELECT", using=module.FIND
+        )
+    ]
+    # Read only: the worker writes nothing in the system scope.
+    assert "INSERT" not in module.RLS[0]
+    assert "UPDATE" not in module.RLS[0]

@@ -21,7 +21,11 @@
         "valkeyHost": { "type": "string" },
         "filesKeyArn": { "type": "string" },
         "userPoolId": { "type": "string" },
-        "cognitoLoginDomain": { "type": "string" }
+        "cognitoLoginDomain": { "type": "string" },
+        "sesConfigurationSet": { "type": "string" },
+        "appClientId": { "type": "string" },
+        "standbyUserPoolId": { "type": "string" },
+        "standbyAppClientId": { "type": "string" }
       }
     },
     "secrets": {

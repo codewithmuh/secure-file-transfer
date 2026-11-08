@@ -33,7 +33,12 @@ for values in "$root"/deploy/environments/*/*/values.yaml; do
     --set "cluster.filesKeyArn=arn:aws:kms:$region:$fake_account:key/mrk-00000000000000000000000000000000"
     --set "cluster.userPoolId=${region}_Example0"
     --set "cluster.cognitoLoginDomain=sft-$env-example.auth.$region.amazoncognito.com"
+    --set "cluster.sesConfigurationSet=sft-$env"
+    --set "cluster.appClientId=example0client0id"
   )
+  if [[ $region == ap-northeast-1 && $env != dev ]]; then
+    cluster+=(--set "cluster.standbyUserPoolId=ap-northeast-3_Example0" --set "cluster.standbyAppClientId=example0standby0id")
+  fi
   echo "== helm lint: $env $region"
   helm lint --strict --quiet "$root/deploy/argocd" "${cluster[@]}"
   for part in application operator; do

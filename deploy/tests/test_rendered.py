@@ -6,11 +6,13 @@ the repository root: `uv run --project services/api --locked pytest deploy/tests
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -18,6 +20,7 @@ from pydantic_settings import BaseSettings
 from sft.core.settings import (
     InspectorSettings,
     JobSettings,
+    KeyRotationSettings,
     MigrationSettings,
     NotifySettings,
     OperatorSettings,
@@ -44,9 +47,10 @@ INTERNAL_PORT = 8001
 # Workloads that hold no AWS identity and never touch the database (ADR-0019, ADR-0022).
 NO_IDENTITY = {"clamd", "dlp-inspector", "signature-mirror"}
 # Only these reach the internet, through their own egress proxy listener (ADR-0021).
-PROXIED = {"api": 3128, "notifier": 3129}
-# The DLP inspector speaks its own framed protocol, one file per connection, and has no internal listener (ADR-0022).
-NO_INTERNAL_PORT = {"dlp-inspector"}
+PROXIED = {"api": 3128, "notifier": 3129, "invite-backlog": 3129, "key-rotation": 3133}
+# The DLP inspector speaks its own framed protocol, one file per connection, on a port of its own (ADR-0022); its
+# probes are on the internal port like everyone's (#184).
+OWN_PORT = {"dlp-inspector": "inspector"}
 # The entry points that exist today and the settings each reads at startup (sft.core.settings).
 SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.api": Settings,
@@ -56,6 +60,8 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.dlp.inspector": InspectorSettings,
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,
+    "sft.workers.invite_backlog": NotifySettings,  # the notification worker's one-off pass (#193)
+    "sft.workers.key_rotation": KeyRotationSettings,
     # The lifecycle jobs (#181), one module per CronJob, all reading JobSettings.
     "sft.workers.expiry": JobSettings,
     "sft.workers.deletion": JobSettings,
@@ -210,22 +216,20 @@ def test_every_server_follows_the_runtime_contract(
         spec = pod_spec(obj)
         for container in spec["containers"]:
             where = (env, region, obj["metadata"]["name"], container["name"])
-            if container.get("ports") and component(obj) not in NO_INTERNAL_PORT:
+            if container.get("ports"):
                 assert "livenessProbe" in container and "readinessProbe" in container, (
                     where
                 )
             if not runs_our_module(container):
                 continue
             seen.add(component(obj))
-            if component(obj) in NO_INTERNAL_PORT:
-                ports = {p["name"]: p["containerPort"] for p in container["ports"]}
-                assert set(ports) == {"inspector"}, where
-                assert env_of(container)["INSPECTOR_PORT"] == str(ports["inspector"])
-                assert env_of(container)["BIND_HOST"] == "0.0.0.0", where
-                continue
             ports = {p["name"]: p["containerPort"] for p in container["ports"]}
             assert ports["internal"] == INTERNAL_PORT, where
-            assert set(ports) <= {"http", "internal"}, where
+            if component(obj) in OWN_PORT:
+                assert set(ports) == {OWN_PORT[component(obj)], "internal"}, where
+                assert env_of(container)["INSPECTOR_PORT"] == str(ports["inspector"])
+            else:
+                assert set(ports) <= {"http", "internal"}, where
             assert container["livenessProbe"]["httpGet"] == {
                 "path": "/healthz",
                 "port": "internal",
@@ -432,7 +436,9 @@ def test_pilot_light(rendered: dict[tuple[str, str, str], list[Manifest]]) -> No
                 region,
                 obj["metadata"]["name"],
             )
-        if obj["kind"] == "CronJob":
+        if obj["kind"] == "CronJob" and obj["metadata"]["name"] == "invite-backlog":
+            assert obj["spec"]["suspend"] is True  # run by hand, once (#193)
+        elif obj["kind"] == "CronJob":
             assert obj["spec"]["suspend"] is osaka
             assert obj["spec"]["concurrencyPolicy"] == "Forbid"
     for env, region in CLUSTERS:
@@ -574,7 +580,7 @@ def test_every_entry_point_gets_its_required_settings(
                 and name not in {"HTTPS_PROXY", "NO_PROXY", "AWS_REGION"}
             }
             assert not unknown, (env, region, obj["metadata"]["name"], sorted(unknown))
-            # Secrets only from the External Secrets Secret, never a value (encryption 6.4).
+            # Secrets only from the External Secrets Secret or named in Secrets Manager, never a value (encryption 6.4).
             for name, field in fields.items():
                 if field.annotation is not None and "SecretStr" in str(
                     field.annotation
@@ -582,15 +588,22 @@ def test_every_entry_point_gets_its_required_settings(
                     value = settings.get(name.upper(), "")
                     if name.upper().endswith(("DATABASE_URL", "VALKEY_URL")):
                         continue  # IAM authentication: the URL holds a user, never a password
+                    if name.upper().endswith("_KEYRING"):
+                        # The process reads the keyring itself, every 5 minutes (#184).
+                        assert value.startswith(f"secretsmanager:sft/{env}/app/"), (
+                            module,
+                            name,
+                        )
+                        continue
                     assert value.startswith("secret:") or not value, (module, name)
     assert seen == set(SETTINGS)
 
 
-def test_api_and_notifier_secrets_come_from_external_secrets(
+def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_secrets(
     rendered: dict[tuple[str, str, str], list[Manifest]],
 ) -> None:
-    """The API's and the notification worker's keyrings, and the API's client secret, come from Secrets Manager through
-    the application store (encryption 6.4)."""
+    """The API and the notification worker read their keyrings from Secrets Manager themselves, every 5 minutes, so a
+    rotation needs no restart (encryption 6.4, #184); only the API's user pool client comes through External Secrets."""
     for env, region in CLUSTERS:
         objects = rendered[(env, region, "application")]
         externals = {
@@ -598,37 +611,104 @@ def test_api_and_notifier_secrets_come_from_external_secrets(
             for o in objects
             if o["kind"] == "ExternalSecret"
         }
-        assert set(externals) == {"api-secrets", "notifier-secrets"}
-        for name, spec in externals.items():
-            assert spec["secretStoreRef"] == {
-                "kind": "ClusterSecretStore",
-                "name": "application-secrets",
-            }
-            assert spec["target"]["name"] == name
-        keys = {
-            d["secretKey"]: d["remoteRef"] for d in externals["api-secrets"]["data"]
+        assert set(externals) == {"api-secrets"}
+        spec = externals["api-secrets"]
+        assert spec["secretStoreRef"] == {
+            "kind": "ClusterSecretStore",
+            "name": "application-secrets",
         }
-        assert keys["CSRF_KEYRING"] == {"key": f"sft/{env}/app/csrf-hmac"}
-        assert keys["EMAIL_HMAC_KEYRING"] == {"key": f"sft/{env}/app/email-hmac"}
-        assert keys["CODE_HMAC_KEYRING"] == {"key": f"sft/{env}/app/code-hmac"}
+        keys = {d["secretKey"]: d["remoteRef"] for d in spec["data"]}
         # Each region's API reads only its own user pool's client (encryption 6.1).
-        assert keys["OIDC_CLIENT_SECRET"]["key"] == f"sft/{env}/app/idp-client/{region}"
-        # The API never gets K_link: only the notification worker derives links (data model 2.2).
-        assert "LINK_HMAC_KEYRING" not in keys
-        notifier = {
-            d["secretKey"]: d["remoteRef"]
-            for d in externals["notifier-secrets"]["data"]
+        assert keys == {
+            "OIDC_CLIENT_ID": {
+                "key": f"sft/{env}/app/idp-client/{region}",
+                "property": "client_id",
+            },
+            "OIDC_CLIENT_SECRET": {
+                "key": f"sft/{env}/app/idp-client/{region}",
+                "property": "client_secret",
+            },
         }
-        assert notifier == {
-            "EMAIL_HMAC_KEYRING": {"key": f"sft/{env}/app/email-hmac"},
-            "LINK_HMAC_KEYRING": {"key": f"sft/{env}/app/link-hmac"},
-            "CODE_HMAC_KEYRING": {"key": f"sft/{env}/app/code-hmac"},
+        containers = {
+            component(o): pod_spec(o)["containers"][0]
+            for o in objects
+            if o["kind"] == "Deployment" and component(o) in {"api", "notifier"}
+        }
+        api, notifier = env_of(containers["api"]), env_of(containers["notifier"])
+        ref = f"secretsmanager:sft/{env}/app"
+        assert {k: v for k, v in api.items() if k.endswith("_KEYRING")} == {
+            "CSRF_KEYRING": f"{ref}/csrf-hmac",
+            "EMAIL_HMAC_KEYRING": f"{ref}/email-hmac",
+            "CODE_HMAC_KEYRING": f"{ref}/code-hmac",
+        }  # never K_link: only the notification worker derives links (data model 2.2)
+        assert {k: v for k, v in notifier.items() if k.endswith("_KEYRING")} == {
+            "EMAIL_HMAC_KEYRING": f"{ref}/email-hmac",
+            "LINK_HMAC_KEYRING": f"{ref}/link-hmac",
+            "CODE_HMAC_KEYRING": f"{ref}/code-hmac",
         }
         assert not [
             o
             for o in rendered[(env, region, "operator")]
             if o["kind"] == "ExternalSecret"
         ]
+    # Each reader's own role may read exactly its keyrings (infra/modules/eks-cluster, encryption 6.4).
+    roles = (ROOT / "infra/modules/eks-cluster/workload-roles.tf").read_text()
+    assert (
+        'local.app_secrets["code-hmac"], local.app_secrets["email-hmac"], local.app_secrets["csrf-hmac"]'
+        in roles
+    )
+    assert (
+        'local.app_secrets["code-hmac"], local.app_secrets["email-hmac"], local.app_secrets["link-hmac"]'
+        in roles
+    )
+
+
+def test_tls_to_the_pods_and_iam_tokens_match_the_edge_and_the_data_layer(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """The edge sends HTTPS to 8000 and checks health over HTTP on 8001 (encryption 2.2); the API and the operator API
+    serve TLS on 8000 and plain probes on 8001. Every database and Valkey user signs in with IAM tokens (#184)."""
+    edge = (ROOT / "infra/modules/edge/load-balancer.tf").read_text()
+    group = edge[edge.index('resource "aws_lb_target_group" "api"') :]
+    group = group[: group.index("\n}\n")]
+    assert re.search(r'^  protocol\s+= "HTTPS"$', group, re.MULTILINE), group
+    assert re.search(r'^    protocol\s+= "HTTP"$', group, re.MULTILINE), group
+    assert 'path                = "/readyz"' in group
+    variables = (ROOT / "infra/modules/edge/variables.tf").read_text()
+    for name, port in (("api_public_port", 8000), ("api_internal_port", INTERNAL_PORT)):
+        block = variables[variables.index(f'variable "{name}"') :]
+        assert f"default     = {port}" in block[: block.index("\n}\n")], name
+    valkey = (ROOT / "infra/modules/valkey/main.tf").read_text()
+    assert 'name = "${var.name_prefix}-valkey"' in valkey
+    served = set()
+    for env, region, _, obj in pods(rendered):
+        for container in pod_spec(obj)["containers"]:
+            if not runs_our_module(container):
+                continue
+            where = (env, region, obj["metadata"]["name"])
+            settings = env_of(container)
+            ports = {p["name"] for p in container.get("ports", [])}
+            if "http" in ports:
+                served.add(component(obj))
+                assert settings["PUBLIC_TLS"] == "generated", where
+                assert container["readinessProbe"]["httpGet"] == {
+                    "path": "/readyz",
+                    "port": "internal",
+                }
+                # No scheme: the probe is plain HTTP.
+                assert "scheme" not in container["readinessProbe"]["httpGet"]
+            else:
+                assert "PUBLIC_TLS" not in settings, where
+            if "DATABASE_URL" in settings or "MIGRATION_DATABASE_URL" in settings:
+                assert settings["DATABASE_IAM_AUTH"] == "true", where
+                url = settings.get("DATABASE_URL") or settings["MIGRATION_DATABASE_URL"]
+                assert "sslmode=verify-full" in url, where
+                assert urlsplit(url).password is None, where
+            if "VALKEY_URL" in settings:
+                cache = f"sft-{env}-{REGION_SHORT[region]}-valkey"
+                assert settings["VALKEY_IAM_CACHE"] == cache, where
+                assert settings["VALKEY_URL"].startswith(f"rediss://sft-{env}-"), where
+    assert served == {"api", "operator-api"}
 
 
 def test_platform_wiring_matches_terraform(
@@ -671,3 +751,88 @@ def test_platform_wiring_matches_terraform(
     for env, region in CLUSTERS:
         root = infra / "environments" / env / region / "cluster-bootstrap/main.tf"
         assert f'"{chart["clamav"]["digest"]}"' in root.read_text(), (env, region)
+
+
+def test_the_key_rotation_job_runs_in_tokyo_with_a_token_for_the_reload_only(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """Tokyo only (encryption 6.4); its Role patches only the API's Deployment and ExternalSecret, by name, since the
+    workloads read the keyrings themselves (#184); nobody else has a token; it rotates Osaka's app client too outside
+    dev (#185)."""
+    for env, region in CLUSTERS:
+        objects = rendered[(env, region, "application")]
+        jobs = [
+            o
+            for o in objects
+            if o["kind"] == "CronJob" and o["metadata"]["name"] == "key-rotation"
+        ]
+        roles = [
+            o
+            for o in objects
+            if o["kind"] in {"Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"}
+        ]
+        if region == OSAKA:
+            assert not jobs and not roles
+            continue
+        [job] = jobs
+        assert sorted(o["kind"] for o in roles) == ["Role", "RoleBinding"]
+        [role] = [o for o in roles if o["kind"] == "Role"]
+        assert role["rules"] == [
+            {
+                "apiGroups": ["external-secrets.io"],
+                "resources": ["externalsecrets"],
+                "resourceNames": ["api-secrets"],
+                "verbs": ["get", "patch"],
+            },
+            {
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "resourceNames": ["api"],
+                "verbs": ["patch"],
+            },
+        ]
+        spec = pod_spec(job)
+        assert spec["serviceAccountName"] == "key-rotation"
+        [projected] = [v["projected"] for v in spec["volumes"] if "projected" in v]
+        assert (
+            projected["sources"][0]["serviceAccountToken"]["expirationSeconds"] == 600
+        )
+        clients = json.loads(env_of(spec["containers"][0])["IDP_CLIENTS"])
+        assert [c["region"] for c in clients] == (
+            ["ap-northeast-1"] if env == "dev" else ["ap-northeast-1", OSAKA]
+        )
+    for objects in rendered.values():
+        for obj in objects:
+            if obj["kind"] in POD_KINDS and component(obj) != "key-rotation":
+                assert not any(
+                    "projected" in v for v in pod_spec(obj).get("volumes", [])
+                )
+
+
+def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cognito(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """SES_CONFIGURATION_SET from the identity layer (#185), the pool's admin side on this region's pool (#193)."""
+    for env, region in CLUSTERS:
+        for obj in rendered[(env, region, "application")]:
+            if obj["kind"] in POD_KINDS and component(obj) in {
+                "notifier",
+                "invite-backlog",
+            }:
+                container = pod_spec(obj)["containers"][0]
+                settings = env_of(container)
+                if component(obj) == "invite-backlog":
+                    # A run-to-completion pass with no listener: no port and no probes (#193).
+                    assert not {
+                        "ports",
+                        "startupProbe",
+                        "livenessProbe",
+                        "readinessProbe",
+                    } & set(container)
+                assert settings["SES_CONFIGURATION_SET"] == f"sft-{env}"
+                assert settings["USER_POOL_BACKEND"] == "cognito"
+                assert (
+                    settings["COGNITO_USER_POOL_ID"]
+                    == settings["USER_POOL_PROVIDER_NAME"]
+                    == f"{region}_Example0"
+                )

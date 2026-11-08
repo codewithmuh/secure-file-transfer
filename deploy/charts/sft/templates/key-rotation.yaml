@@ -1,0 +1,117 @@
+{{- if and (eq .Values.part "application") (eq .Values.region "ap-northeast-1") }}
+{{- /*
+The key rotation job (encryption 6.4, 6.5; #185), in Tokyo only: the only writer of the sft/<env>/app/* secrets, with
+its own role (sft-<env>-key-rotation). Each run takes the steps that are due (sft.service.key_rotation). The API and
+the notification worker read the keyrings themselves every 5 minutes, so a keyring step needs nothing more (#184). The
+API's user pool client still reaches it through the ExternalSecret `api-secrets`, read at start, so after a new client
+secret the job has External Secrets sync it and restarts the API. For that alone it has a Kubernetes token: projected,
+10 minutes, and a Role that may only read and annotate that ExternalSecret and patch that Deployment, by name. No other
+pod in the chart has a token. Cognito, and in staging and prod Osaka's Secrets Manager, go through its proxy listener.
+*/}}
+{{- $job := .Values.keyRotation }}
+{{- $c := .Values.cluster }}
+{{- $clients := list (dict "region" .Values.region "user_pool_id" $c.userPoolId "client_id" $c.appClientId) }}
+{{- if ne .Values.environment "dev" }}
+{{- $clients = append $clients (dict "region" "ap-northeast-3" "user_pool_id" $c.standbyUserPoolId "client_id" $c.standbyAppClientId) }}
+{{- end }}
+{{- $ctx := dict "root" $ "component" "key-rotation" "serviceAccount" $job.serviceAccount }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: key-rotation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ .Values.pilotLight }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # the next hourly run is the retry; every step reads the stored state first
+      activeDeadlineSeconds: {{ $job.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sft.labels" $ctx | nindent 12 }}
+        spec:
+          {{- include "sft.podCommon" $ctx | nindent 10 }}
+          restartPolicy: Never
+          securityContext:
+            {{- include "sft.podSecurityContext" 10001 | nindent 12 }}
+          containers:
+            - name: key-rotation
+              image: {{ include "sft.appImage" . }}
+              imagePullPolicy: IfNotPresent
+              command: [python, -m, {{ $job.module }}]
+              env:
+                - name: LOG_LEVEL
+                  value: {{ .Values.logLevel | quote }}
+                - name: AWS_REGION
+                  value: {{ .Values.region | quote }}
+                - name: ENVIRONMENT
+                  value: {{ .Values.environment | quote }}
+                - name: IDP_CLIENTS
+                  value: {{ toJson $clients | quote }}
+                - name: EXTERNAL_SECRETS
+                  value: {{ join "," $job.externalSecrets | quote }}
+                - name: RESTART_DEPLOYMENTS
+                  value: {{ join "," $job.deployments | quote }}
+                - name: KUBERNETES_NAMESPACE
+                  value: {{ .Release.Namespace | quote }}
+                {{- include "sft.proxyEnv" (dict "root" $ "listener" "keyRotation") | nindent 16 }}
+              resources:
+                {{- toYaml $job.resources | nindent 16 }}
+              securityContext:
+                {{- include "sft.containerSecurityContext" . | nindent 16 }}
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+                - { name: kubernetes, mountPath: /var/run/secrets/tokens/kubernetes, readOnly: true }
+          volumes:
+            {{- include "sft.tmpVolume" . | nindent 12 }}
+            - name: kubernetes
+              projected:
+                sources:
+                  - serviceAccountToken: { path: token, expirationSeconds: 600 }
+                  - configMap: { name: kube-root-ca.crt, items: [{ key: ca.crt, path: ca.crt }] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: key-rotation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+rules:
+  - apiGroups: [external-secrets.io]
+    resources: [externalsecrets]
+    resourceNames: {{ toJson $job.externalSecrets }}
+    verbs: [get, patch]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: {{ toJson $job.deployments }}
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: key-rotation
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: key-rotation
+subjects:
+  - kind: ServiceAccount
+    name: {{ $job.serviceAccount }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -67,8 +67,9 @@ SCOPES_BY_ROLE: Final[Mapping[str, frozenset[ScopeKind]]] = {
     # The tenant comes from the outbox message, which only our own workloads send.
     roles.SCAN: frozenset({_TENANT}),
     # And platform for the one event with no tenant to name: an invited address that signs in
-    # for another tenant (authn and authz 2.5, #197).
-    roles.NOTIFY: frozenset({_TENANT, _PLATFORM}),
+    # for another tenant (authn and authz 2.5, #197); system to find the members left `invited`
+    # before the user pool existed, read only (#193, revision 0017).
+    roles.NOTIFY: frozenset({_TENANT, _PLATFORM, _SYSTEM}),
     roles.RELAY: frozenset({_SYSTEM}),
     # Find across, act within: one read in system scope, then each item in its tenant's scope.
     roles.JOBS: frozenset({_SYSTEM, _TENANT}),

@@ -341,7 +341,9 @@ async def run_relay(settings: RelaySettings, *, handle_signals: bool = True) -> 
     """The relay process: its pool, its SQS client, its probes, until a signal."""
     process = WorkerProcess(settings)
     database = Database.connect(
-        settings.database_url.get_secret_value(), pool_size=settings.database_pool_size
+        settings.database_url.get_secret_value(),
+        pool_size=settings.database_pool_size,
+        iam_region=settings.aws_region if settings.database_iam_auth else None,
     )
     queues = SqsQueues.create(
         region=settings.aws_region,

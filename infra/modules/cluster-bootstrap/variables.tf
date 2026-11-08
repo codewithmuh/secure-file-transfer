@@ -147,6 +147,42 @@ variable "cognito_user_pool_id" {
   }
 }
 
+variable "ses_configuration_set" {
+  description = "This Region's SES configuration set, sft-<env> (modules/ses): the notification worker's SES_CONFIGURATION_SET. Null until the identity layer exists."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ses_configuration_set == null ? true : can(regex("^sft-(dev|staging|prod)$", var.ses_configuration_set))
+    error_message = "ses_configuration_set must be sft-<env>."
+  }
+}
+
+variable "cognito_app_client_id" {
+  description = "This Region's app client (modules/user-pool), whose secret the key rotation job rotates in Tokyo. Null until the identity layer exists."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.cognito_app_client_id == null ? true : can(regex("^[0-9a-z]{1,128}$", var.cognito_app_client_id))
+    error_message = "cognito_app_client_id must be an app client ID."
+  }
+}
+
+variable "standby_user_pool" {
+  description = "Osaka's user pool and app client, for the key rotation job in Tokyo (staging and prod, encryption 6.4). Null in dev, in Osaka, and until Osaka's identity layer exists."
+  type = object({
+    user_pool_id = string
+    client_id    = string
+  })
+  default = null
+
+  validation {
+    condition     = var.standby_user_pool == null ? true : can(regex("^ap-northeast-3_[0-9A-Za-z]+$", var.standby_user_pool.user_pool_id))
+    error_message = "standby_user_pool.user_pool_id must be a user pool ID in Osaka."
+  }
+}
+
 variable "argocd_url" {
   description = "Argo CD's URL as people reach it: through the Systems Manager tunnel to localhost (ADR-0021). Sign-in redirects use it."
   type        = string

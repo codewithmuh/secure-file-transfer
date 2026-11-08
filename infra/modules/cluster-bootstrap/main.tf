@@ -45,6 +45,7 @@ locals {
     signature-mirror = 3130
     argocd           = 3131
     platform         = 3132
+    key-rotation     = 3133
   }
   proxy_url = { for name, port in local.proxy_ports : name => "http://${local.proxy_host}:${port}" }
 

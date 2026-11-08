@@ -153,3 +153,16 @@ async def delete_identities(
         {"tenant": tenant_of(session), "user": user_id, "connections": list(connection_ids)},
     )
     return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
+async def has_identity(session: AsyncSession, *, user_id: UUID, connection_id: UUID) -> bool:
+    """Whether the user has an identity on the connection, in the scope's tenant."""
+    require_scope(session, ScopeKind.TENANT)
+    found = await session.scalar(
+        text(
+            "SELECT 1 FROM user_identities WHERE tenant_id = :tenant AND user_id = :user "
+            "AND idp_connection_id = :connection"
+        ),
+        {"tenant": tenant_of(session), "user": user_id, "connection": connection_id},
+    )
+    return found is not None

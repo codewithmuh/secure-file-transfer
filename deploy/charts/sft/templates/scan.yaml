@@ -53,16 +53,16 @@ fewer (ADR-0019).
 ---
 {{ include "sft.pdb" (dict "root" $ "name" (printf "clamd-%s" $pool) "component" "clamd" "pool" $pool) }}
 {{- /*
-The DLP inspector: our image, its own entry point; no identity, no database, no egress (ADR-0022). It speaks only its
-framed protocol, one file per connection, and has no HTTP listener, so it has no internal port. A TCP probe would be
-a malformed request it logs and counts as an inspection error, so it has none: a crashed parent exits and is
-restarted, and a hung one fails the worker's attempt, which is retried (architecture 6).
+The DLP inspector: our image, its own entry point; no identity, no database, no egress (ADR-0022). Scan workers reach
+its framed protocol, one file per connection, on its own port. Its probes are on the internal port, plain HTTP from a
+thread (#184): a probe on the inspector's port would be a malformed request it logs and counts as an inspection error,
+and would wait behind the file being inspected. Liveness says the process runs, readiness that it listens.
 */}}
 {{- $d := $.Values.dlpInspector }}
 {{- $mounts := list (dict "name" "scratch" "mountPath" "/scratch") }}
 {{- $inspectorEnv := dict "INSPECTOR_PORT" $d.port "INSPECTOR_SCRATCH_DIR" "/scratch" }}
 {{- $inspectorPorts := printf "- { name: inspector, containerPort: %v, protocol: TCP }" $d.port }}
-{{- $containers = include "sft.appContainer" (dict "root" $ "name" "dlp-inspector" "module" $d.module "ports" $inspectorPorts "noProbes" true "env" $inspectorEnv "resources" $d.resources "volumeMounts" $mounts) }}
+{{- $containers = include "sft.appContainer" (dict "root" $ "name" "dlp-inspector" "module" $d.module "ports" $inspectorPorts "env" $inspectorEnv "resources" $d.resources "volumeMounts" $mounts) }}
 {{- $volumes = printf "- name: scratch\n  emptyDir: { sizeLimit: %s }" $d.scratch }}
 {{- $affinity = include "sft.besideWorker" (dict "component" "dlp-inspector" "pool" $pool) }}
 ---

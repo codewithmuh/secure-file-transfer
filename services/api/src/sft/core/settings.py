@@ -12,6 +12,13 @@ for the operator API (both build on `ServerSettings`), `RelaySettings` for the o
 notification worker, whose `NotifySettings` adds it to a worker's), `InspectorSettings` for the
 DLP inspector, `ScanSettings` for the scan workers and `JobSettings` for the lifecycle jobs.
 `ClockSettings` (`ENVIRONMENT` and the clock's test hook) is part of the API's and the jobs'.
+
+In AWS (#184) the database and Valkey URLs name a user and no password: with `DATABASE_IAM_AUTH`
+and `VALKEY_IAM_CACHE` the process signs an IAM token for each new connection (`sft.data.iam_auth`).
+A keyring setting may name its Secrets Manager secret, `secretsmanager:<id>`, instead of holding the
+keyring (`sft.core.keyrings`), and `PUBLIC_TLS` turns on TLS on the API's public port
+(`sft.runtime.tls`). Locally all three stay off: passwords in the URLs, keyrings in the environment,
+plain HTTP.
 """
 
 from __future__ import annotations
@@ -19,9 +26,12 @@ from __future__ import annotations
 import logging
 import re
 from typing import Annotated, Literal, Self
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import (
     AfterValidator,
+    BaseModel,
+    ConfigDict,
     Field,
     IPvAnyNetwork,
     SecretStr,
@@ -32,7 +42,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from sft.core.hmac_keyrings import CODE_KEY_ID, LINK_KEY_ID
-from sft.core.keyrings import CSRF_KEY_ID, EMAIL_KEY_ID, parse_keyring
+from sft.core.keyrings import CSRF_KEY_ID, EMAIL_KEY_ID, check_keyring_setting
 from sft.core.logs import configure_logging
 
 LogLevel = Literal["debug", "info", "warning", "error", "critical"]
@@ -66,8 +76,32 @@ def _valkey_url(value: SecretStr) -> SecretStr:
 
 
 # A Valkey URL with its credentials: locally the ACL user and its fake password; in AWS `rediss://`
-# and the workload's user, whose IAM token M4 signs per connection (ADR-0014).
+# and the workload's user, whose IAM token is signed per connection (ADR-0014, VALKEY_IAM_CACHE).
 ValkeyUrl = Annotated[SecretStr, AfterValidator(_valkey_url)]
+
+
+def _iam_database(url: SecretStr, setting: str) -> None:
+    """IAM database authentication: the URL names the login role and no password, and verifies
+    the server's certificate, which IAM authentication needs (encryption and keys 2.2, 6.3)."""
+    parts = urlsplit(url.get_secret_value())
+    if not parts.username or parts.password is not None:
+        raise ValueError(f"with DATABASE_IAM_AUTH, {setting} names its login role and no password")
+    if parse_qs(parts.query).get("sslmode") != ["verify-full"]:
+        raise ValueError(f"with DATABASE_IAM_AUTH, {setting} needs sslmode=verify-full")
+
+
+def _iam_valkey(url: SecretStr) -> None:
+    """IAM authentication to Valkey: TLS, and the workload's user with no password (ADR-0014)."""
+    parts = urlsplit(url.get_secret_value())
+    if parts.scheme not in ("rediss", "valkeys"):
+        raise ValueError("VALKEY_IAM_CACHE needs a TLS VALKEY_URL: rediss:// or valkeys://")
+    if not parts.username or parts.password:
+        raise ValueError("with VALKEY_IAM_CACHE, VALKEY_URL names its user and no password")
+
+
+_CACHE_NAME = r"^[a-z][a-z0-9-]{0,39}$"
+# A keyring setting holds the keyring, or `secretsmanager:<id>` (sft.core.keyrings).
+_KEYRING_SETTING = "a JSON list of keys with `id`, `state` and base64 `key`, or secretsmanager:<id>"
 
 
 # Pods set enableServiceLinks: false, so Service variables can't clash with these (architecture 8).
@@ -145,6 +179,28 @@ class ServerSettings(_Traced):
         "its client address taken from X-Forwarded-For (ADR-0002); empty locally.",
     )
 
+    # AWS (#184): TLS on the public port, and IAM tokens for the database and Valkey.
+    public_tls: Literal["off", "generated", "files"] = Field(
+        default="off",
+        description="TLS on PUBLIC_PORT (encryption and keys 2.2). `generated`: the process makes "
+        "an ECDSA P-256 certificate at start, which the load balancer accepts without checking. "
+        "`files`: PUBLIC_TLS_CERT_FILE and PUBLIC_TLS_KEY_FILE, such as an issuer's certificate. "
+        "`off` only locally. The internal port is always plain HTTP.",
+    )
+    public_tls_cert_file: str | None = Field(default=None, min_length=1)
+    public_tls_key_file: str | None = Field(default=None, min_length=1)
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection, as DATABASE_URL's role "
+        "(encryption and keys 6.3). Off locally, where the URL holds a password.",
+    )
+    valkey_iam_cache: str | None = Field(
+        default=None,
+        pattern=_CACHE_NAME,
+        description="The serverless cache's name, sft-<env>-<region-short>-valkey: set, each new "
+        "Valkey connection signs an IAM token for VALKEY_URL's user (ADR-0014). Unset locally.",
+    )
+
     @field_validator("trusted_proxies", mode="before")
     @classmethod
     def _split_networks(cls, value: object) -> object:
@@ -156,6 +212,23 @@ class ServerSettings(_Traced):
     def _ports_differ(self) -> Self:
         if self.public_port == self.internal_port:
             raise ValueError("PUBLIC_PORT and INTERNAL_PORT must differ")
+        return self
+
+    @model_validator(mode="after")
+    def _tls_files_with_files(self) -> Self:
+        named = (self.public_tls_cert_file, self.public_tls_key_file)
+        if self.public_tls == "files" and None in named:
+            raise ValueError("PUBLIC_TLS=files needs PUBLIC_TLS_CERT_FILE and PUBLIC_TLS_KEY_FILE")
+        if self.public_tls != "files" and named != (None, None):
+            raise ValueError("PUBLIC_TLS_CERT_FILE and PUBLIC_TLS_KEY_FILE need PUBLIC_TLS=files")
+        return self
+
+    @model_validator(mode="after")
+    def _iam_urls(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        if self.valkey_iam_cache is not None:
+            _iam_valkey(self.valkey_url)
         return self
 
 
@@ -245,7 +318,7 @@ class Settings(ServerSettings, ClockSettings):
     )
     csrf_keyring: SecretStr = Field(
         description="K_csrf, the keyring CSRF tokens are derived with (sft/{env}/app/csrf-hmac, "
-        "encryption and keys 6.5): a JSON list of keys with `id`, `state` and base64 `key`.",
+        f"encryption and keys 6.5): {_KEYRING_SETTING}, read again every 5 minutes.",
     )
     email_hmac_keyring: SecretStr = Field(
         description="The keyring of email pseudonyms (sft/{env}/app/email-hmac, encryption and "
@@ -312,7 +385,7 @@ class Settings(ServerSettings, ClockSettings):
         default=None,
         pattern=r"^https?://[^\s/]+(:\d+)?/?$",
         description="Local only, for S3Mock's Osaka stand-in. In AWS the SDK finds Osaka's "
-        "endpoint; the cross-region route and IAM arrive in M4.",
+        "endpoint, through the cross-region S3 endpoint (ADR-0021).",
     )
     # Verification codes (#179, data model 2.4): the API checks what the notification worker made.
     code_hmac_keyring: SecretStr = Field(
@@ -356,14 +429,15 @@ class Settings(ServerSettings, ClockSettings):
     @field_validator("csrf_keyring")
     @classmethod
     def _csrf_keyring(cls, value: SecretStr) -> SecretStr:
-        # Read here, so a bad keyring stops the process at startup; the message holds no key.
-        parse_keyring(value.get_secret_value(), name="CSRF", key_id=CSRF_KEY_ID)
+        # Read here, so a bad keyring stops the process at startup; the message holds no key. A
+        # secret it names is read, and checked the same way, when the process starts.
+        check_keyring_setting(value.get_secret_value(), name="CSRF", key_id=CSRF_KEY_ID)
         return value
 
     @field_validator("email_hmac_keyring")
     @classmethod
     def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        parse_keyring(
+        check_keyring_setting(
             value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
         )
         return value
@@ -371,7 +445,7 @@ class Settings(ServerSettings, ClockSettings):
     @field_validator("code_hmac_keyring")
     @classmethod
     def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        parse_keyring(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
+        check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
         return value
 
 
@@ -409,6 +483,17 @@ class WorkerSettings(_Traced):
         pattern=r"^https?://[^\s/]+(:\d+)?/?$",
         description="Local only, for ElasticMQ. In AWS the SDK finds SQS's VPC endpoint itself.",
     )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection (encryption and keys "
+        "6.3), as the API's setting of the same name. Off locally.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        return self
 
 
 class RelaySettings(WorkerSettings):
@@ -485,6 +570,20 @@ class ScanSettings(WorkerSettings):
         "at least one (ADR-0019).",
     )
 
+    valkey_iam_cache: str | None = Field(
+        default=None,
+        pattern=_CACHE_NAME,
+        description="The serverless cache's name, for IAM tokens, as the API's setting.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_valkey_url(self) -> Self:
+        if self.valkey_iam_cache is not None:
+            if self.valkey_url is None:
+                raise ValueError("VALKEY_IAM_CACHE needs VALKEY_URL")
+            _iam_valkey(self.valkey_url)
+        return self
+
     @property
     def tenant_cap(self) -> int:
         if self.scan_pool == "small":
@@ -544,6 +643,17 @@ class JobSettings(ClockSettings):
         description="Where a run pushes its metrics, a one-shot job having no port to scrape. "
         "Unset: the run logs them only (the local stack; M7 adds the gateway).",
     )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection (encryption and keys "
+        "6.3). Off locally.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        return self
 
     @model_validator(mode="after")
     def _replicas_together(self) -> Self:
@@ -602,6 +712,18 @@ class MigrationSettings(_Base):
     migration_database_url: PostgresUrl = Field(
         description="The `sft_migrate` login role, which becomes `sft_owner` to run migrations.",
     )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for the connection as `sft_migrate` (encryption and keys "
+        "6.3). Off locally.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.migration_database_url, "MIGRATION_DATABASE_URL")
+        return self
 
 
 class BootstrapSettings(_Base):
@@ -713,17 +835,17 @@ class NotifySettings(WorkerSettings, MailSettings):
     @field_validator("email_hmac_keyring")
     @classmethod
     def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        parse_keyring(
+        check_keyring_setting(
             value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
         )
         return value
 
-    # The user pool's admin side (#197; authn and authz 2.5): the worker creates an invited
-    # member's pool user and records the identity. Locally Keycloak's admin API stands in for
-    # Cognito's; without a pool (`none`, dev until #193) invitations are recorded, nothing sent.
-    user_pool_backend: Literal["none", "keycloak"] = Field(
+    # The user pool's admin side (#197, #193; authn and authz 2.5): the worker creates an invited
+    # member's pool user and records the identity. Cognito's admin API in AWS; locally Keycloak's
+    # stands in for it; without a pool (`none`) invitations are recorded, nothing sent.
+    user_pool_backend: Literal["none", "keycloak", "cognito"] = Field(
         default="none",
-        description="`keycloak` in the local stack; `none` sends no invitation (dev until #193).",
+        description="`cognito` in AWS, `keycloak` in the local stack; `none` sends no invitation.",
     )
     user_pool_provider_name: str | None = Field(
         default=None,
@@ -747,9 +869,25 @@ class NotifySettings(WorkerSettings, MailSettings):
         default=None,
         description="The client whose service account may manage the realm's users. Local only.",
     )
+    cognito_user_pool_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z]{2}(-[a-z]+)+-\d_[0-9A-Za-z]+$",
+        description="This region's user pool (`ap-northeast-1_…`), for `cognito`; the pool's "
+        "provider name is the same ID, as the API's OIDC_PROVIDER_NAME is.",
+    )
 
     @model_validator(mode="after")
     def _a_pool_names_its_parts(self) -> Self:
+        if self.user_pool_backend == "cognito":
+            missing = [
+                name
+                for name in ("user_pool_provider_name", "cognito_user_pool_id")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(f"USER_POOL_BACKEND=cognito needs {', '.join(missing).upper()}")
+            if self.user_pool_provider_name != self.cognito_user_pool_id:
+                raise ValueError("USER_POOL_PROVIDER_NAME must be COGNITO_USER_POOL_ID for cognito")
         if self.user_pool_backend == "keycloak":
             missing = [
                 name
@@ -769,14 +907,26 @@ class NotifySettings(WorkerSettings, MailSettings):
     @field_validator("link_hmac_keyring")
     @classmethod
     def _link_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        parse_keyring(value.get_secret_value(), name="link", key_id=LINK_KEY_ID)
+        check_keyring_setting(value.get_secret_value(), name="link", key_id=LINK_KEY_ID)
         return value
 
     @field_validator("code_hmac_keyring")
     @classmethod
     def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        parse_keyring(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
+        check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
         return value
+
+    valkey_iam_cache: str | None = Field(
+        default=None,
+        pattern=_CACHE_NAME,
+        description="The serverless cache's name, for IAM tokens, as the API's setting.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_valkey_url(self) -> Self:
+        if self.valkey_iam_cache is not None:
+            _iam_valkey(self.valkey_url)
+        return self
 
 
 class InspectorSettings(_Base):
@@ -801,6 +951,82 @@ class InspectorSettings(_Base):
         le=900,
         description="How long a scan worker may leave the connection idle before it is dropped.",
     )
+    internal_port: int = Field(
+        default=8001,
+        ge=1,
+        le=65535,
+        description="`/healthz` and `/readyz` for the kubelet, plain HTTP on their own port, so a "
+        "probe never reaches the framed protocol (#184).",
+    )
+
+    @model_validator(mode="after")
+    def _ports_differ(self) -> Self:
+        if self.inspector_port == self.internal_port:
+            raise ValueError("INSPECTOR_PORT and INTERNAL_PORT must differ")
+        return self
+
+
+class IdpClient(BaseModel):
+    """One user pool's app client, whose secret the key rotation job rotates (encryption 6.4)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    region: Literal["ap-northeast-1", "ap-northeast-3"]
+    user_pool_id: str = Field(pattern=r"^ap-northeast-[13]_[0-9A-Za-z]+$")
+    client_id: str = Field(pattern=r"^[0-9a-z]{1,128}$")
+
+    @model_validator(mode="after")
+    def _pool_in_its_region(self) -> Self:
+        if not self.user_pool_id.startswith(f"{self.region}_"):
+            raise ValueError("a user pool ID starts with its region")
+        return self
+
+
+class KeyRotationSettings(_Base):
+    """The key rotation job's settings (encryption and keys 6.4, 6.5; #185). It runs in Tokyo only,
+    on a schedule, and reaches Osaka's idp-client through the Osaka endpoint. It holds no secret
+    of its own: its role writes the secrets, and its Kubernetes token may only restart the
+    workloads that load them."""
+
+    environment: Literal["dev", "staging", "prod"]
+    aws_region: Literal["ap-northeast-1"] = Field(
+        default="ap-northeast-1",
+        description="Tokyo: the keyrings' primary region, which replicates them to Osaka.",
+    )
+    idp_clients: list[IdpClient] = Field(
+        default_factory=list,
+        description="JSON: each user pool's app client, Tokyo's and in staging and prod "
+        "Osaka's, as [{region, user_pool_id, client_id}].",
+    )
+    restart_deployments: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["api"],
+        description="Comma-separated: the Deployments that read the user pool client from "
+        "External Secrets at start, restarted after a new client secret. Empty: nothing is "
+        "restarted (the local stack).",
+    )
+    external_secrets: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["api-secrets"],
+        description="Comma-separated: the ExternalSecrets synced again before the restart.",
+    )
+    kubernetes_namespace: str = Field(default="sft", pattern=r"^[a-z0-9-]{1,63}$")
+    kubernetes_url: str = Field(
+        default="https://kubernetes.default.svc", pattern=r"^https://[^\s/]+(:\d+)?$"
+    )
+    kubernetes_token_path: str = Field(
+        default="/var/run/secrets/tokens/kubernetes/token",
+        description="The projected service account token, for its own audience and 10 minutes.",
+    )
+    kubernetes_ca_path: str = Field(
+        default="/var/run/secrets/tokens/kubernetes/ca.crt",
+        description="The cluster's CA bundle, projected with the token.",
+    )
+
+    @field_validator("restart_deployments", "external_secrets", mode="before")
+    @classmethod
+    def _comma_separated(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
 
 
 EXIT_BAD_SETTINGS = 2

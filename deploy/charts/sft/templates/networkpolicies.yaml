@@ -39,7 +39,12 @@ VPC on 443, which the node security groups narrow to S3's prefix list. The DLP i
   (dict "component" "dlp-inspector" "ingress" (list $pods.fromWorkerToInspector) "egress" (list))
   (dict "component" "signature-mirror" "ingress" (list $pods.fromClamd) "egress" (list $rules.dns $proxy.signatureMirror))
   (dict "component" "migrate" "ingress" (list) "egress" $base)
+  (dict "component" "invite-backlog" "ingress" (list) "egress" (concat $base (list $proxy.notifier $rules.valkey)))
 }}
+{{- if eq .Values.region "ap-northeast-1" }}
+{{- /* No database: the endpoints (Secrets Manager, and the cluster API, whose ENIs share their subnets), its listener. */}}
+{{- $policies = append $policies (dict "component" "key-rotation" "ingress" (list) "egress" (list $rules.dns $rules.endpoints $rules.podIdentity $proxy.keyRotation)) }}
+{{- end }}
 {{- range $name := keys .Values.lifecycleJobs | sortAlpha }}
 {{- $job := index $.Values.lifecycleJobs $name }}
 {{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $base $rules.s3) $base $job.s3)) }}

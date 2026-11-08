@@ -75,7 +75,11 @@ def _cleaner(settings: JobSettings) -> S3Cleaner:
 
 async def run_job(job: Job, settings: JobSettings, registry: CollectorRegistry) -> dict[str, int]:
     """Run one job against the environment the settings name; its report."""
-    database = Database.connect(settings.database_url.get_secret_value(), pool_size=2)
+    database = Database.connect(
+        settings.database_url.get_secret_value(),
+        pool_size=2,
+        iam_region=settings.aws_region if settings.database_iam_auth else None,
+    )
     metrics = JobMetrics.create(registry)
     clock = Clock.offset_by(settings.clock_offset_seconds)
     jobs = Jobs(

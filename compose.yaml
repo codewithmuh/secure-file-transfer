@@ -187,19 +187,14 @@ services:
     # Only on the inspection network, which is internal: it reaches neither the database, the counter store, nor
     # anything outside, and only the scan workers reach it (local/smoke.py checks both).
     networks: [inspection]
-    # It speaks only its framed protocol, one file per connection, and has no probe port (deploy/README.md). A TCP
-    # connect would be logged as a malformed request, so the check reads the kernel's socket table instead: healthy
-    # once something listens on 8070 (hex 1F86, state 0A), without ever connecting. `make up --wait` needs a check.
+    # Its framed protocol is on 8070, one file per connection; its probes on 8001, plain HTTP from a thread (#184,
+    # deploy/README.md), so a check never reaches the protocol. Ready once it listens. `make up --wait` needs a check.
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - |
-          import os, sys
-          tables = [t for t in ("/proc/net/tcp", "/proc/net/tcp6") if os.path.exists(t)]
-          rows = [line.split() for t in tables for line in open(t).readlines()[1:]]
-          sys.exit(0 if any(r[1].endswith(":1F86") and r[3] == "0A" for r in rows) else 1)
+        - import urllib.request; urllib.request.urlopen("http://127.0.0.1:8001/readyz", timeout=2)
       interval: 5s
       timeout: 3s
       retries: 12

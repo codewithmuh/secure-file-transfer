@@ -9,12 +9,13 @@ stops another tenant's (NFR-12). An entry suppresses while `expires_at` is empty
   entry written under an older key is still found after a rotation (encryption and keys 6.5). The
   API looks addresses up in the tenant's scope; it may only read the table.
 - **An entry is added** by the notification worker's role, which records SES's bounces and
-  complaints in M4 (ADR-0015). Until then only test fixtures and the local seed (#182) add one, in
-  the tenant's scope; no API operation does. Each addition writes its audit event in the same
-  transaction (`audit_required`).
+  complaints from the `ses-events` queue (`sft.service.ses_events`, #185; ADR-0015); test fixtures
+  and the local seed (#182) add them too. No API operation does. Each addition writes its audit
+  event in the same transaction (`audit_required`).
+- **Re-keying.** An entry found under an older key moves to the active key's pseudonym when the
+  worker next records the address, because it holds the address then (encryption and keys 6.5).
 
-Re-keying a match found under an older key, and SES's own tenant lists, arrive with the SES events
-consumer in M4.
+Releasing an address from SES's own tenant list arrives with SES tenant management (ADR-0015).
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from collections.abc import Collection
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +32,9 @@ from sft.core.ids import uuid7
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import EmailSuppression, SuppressionReason
 from sft.data.scope import ScopeKind
+
+TARGET = "email_suppression"
+"""An entry's type in audit targets."""
 
 
 async def suppressed(session: AsyncSession, pseudonyms: Collection[str]) -> set[str]:
@@ -90,3 +94,30 @@ async def add_suppression(
     if entry_id is None:  # pragma: no cover - INSERT … ON CONFLICT DO UPDATE always returns it
         raise RuntimeError("the upsert returned no row")
     return entry_id
+
+
+async def find_entry(session: AsyncSession, pseudonyms: Collection[str]) -> EmailSuppression | None:
+    """The scope's tenant's entry for an address, live or ended, under any of `pseudonyms`."""
+    require_scope(session, ScopeKind.TENANT)
+    if not pseudonyms:
+        return None
+    entry: EmailSuppression | None = await session.scalar(
+        select(EmailSuppression)
+        .where(
+            EmailSuppression.email_hmac.in_(list(pseudonyms)), in_scope(EmailSuppression, session)
+        )
+        .order_by(EmailSuppression.updated_at.desc())
+        .limit(1)
+    )
+    return entry
+
+
+async def rekey(session: AsyncSession, entry_id: UUID, *, pseudonym: str, key_id: str) -> None:
+    """Move an entry made under an older key to `pseudonym` under `key_id`, the active key's."""
+    require_scope(session, ScopeKind.TENANT)
+    await session.execute(
+        update(EmailSuppression)
+        .where(EmailSuppression.id == entry_id, in_scope(EmailSuppression, session))
+        .values(email_hmac=pseudonym, hmac_key_id=key_id, updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )

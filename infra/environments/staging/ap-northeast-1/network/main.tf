@@ -59,5 +59,9 @@ module "network" {
   availability_zone_ids = ["apne1-az1", "apne1-az2", "apne1-az4"]
   peer_region           = "ap-northeast-3"
 
+  # The key rotation job writes Osaka's idp-client and rotates Osaka's app client from Tokyo, through its proxy
+  # listener (encryption 6.4, #185).
+  dns_firewall_additional_domains = ["cognito-idp.ap-northeast-3.amazonaws.com", "secretsmanager.ap-northeast-3.amazonaws.com"]
+
   flow_log_destination_arn = var.flow_log_destination_arn
 }

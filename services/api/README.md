@@ -117,6 +117,9 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `DATABASE_URL` | none, required | The workload's own login role, `postgresql://` or `postgresql+psycopg://`; a secret |
 | `DATABASE_POOL_SIZE` | `5` | Connections per process, with no overflow (1 to 50) |
 | `VALKEY_URL` | none, required | The rate-limit counter store with its credentials, `redis://`, `rediss://`, `valkey://` or `valkeys://`; a secret |
+| `PUBLIC_TLS` | `off` | TLS on `PUBLIC_PORT` (encryption and keys 2.2, #184): `generated` (in AWS, a certificate the pod makes at start), `files` (`PUBLIC_TLS_CERT_FILE` and `PUBLIC_TLS_KEY_FILE`), or `off` (locally). The internal port is always plain HTTP |
+| `DATABASE_IAM_AUTH` | `false` | In AWS: sign an IAM token for each new connection as `DATABASE_URL`'s role, which holds no password and needs `sslmode=verify-full` (`sft.data.iam_auth`). Every entry point that connects reads it |
+| `VALKEY_IAM_CACHE` | none | In AWS: the serverless cache's name, `sft-<env>-<region-short>-valkey`; each new Valkey connection signs an IAM token as `VALKEY_URL`'s user (ADR-0014). Unset locally, where the URL holds a password |
 | `TRUSTED_PROXIES` | empty | Our load balancer's subnets, comma-separated; only their requests have the client address read from `X-Forwarded-For` (ADR-0002) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | none | The collector's OTLP/HTTP base URL, e.g. `http://<node>:4318`; spans go to `<endpoint>/v1/traces`. Unset or empty: nothing is exported |
 | `WEB_ORIGIN` | none, required | The web app's origin; CORS and the CSRF `Origin` check allow only it (authn and authz 3.4) |
@@ -128,7 +131,7 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `OIDC_LOGOUT_URL` | none, required | The pool's logout URL that `signOut` returns |
 | `OIDC_REVOCATION_URL` | from discovery | The token revocation endpoint (Cognito's isn't in its discovery document) |
 | `OIDC_PROVIDER_NAME` | none, required | The pool's `idp_connections.provider_name` (`local-keycloak` locally) |
-| `CSRF_KEYRING` | none, required | K_csrf (`sft/{env}/app/csrf-hmac`): a JSON list of `{id, state, key}`, exactly one `active`; a secret |
+| `CSRF_KEYRING` | none, required | K_csrf (`sft/{env}/app/csrf-hmac`): a JSON list of `{id, state, key}`, exactly one `active`; or, in AWS, `secretsmanager:<secret id>`, read at start and every 5 minutes (`sft.runtime.secrets`, #184). The same holds for every keyring setting; a secret |
 | `EMAIL_HMAC_KEYRING` | none, required | The `email-hmac` keyring (`sft/{env}/app/email-hmac`), the shape of `CSRF_KEYRING` with `activated_at` on the active key: per-address rate limits count under its pseudonyms, never an address; a secret |
 | `ADMIN_PASSKEY_RULE` | `false` | ADR-0016's launch switch: a local admin acts as an admin only after a passkey sign-in |
 | `AWS_REGION` | `ap-northeast-1` | The region of the files buckets |
@@ -164,6 +167,7 @@ The DLP inspector (`python -m sft.dlp.inspector`) reads `InspectorSettings`, whi
 | `INSPECTOR_PORT` | `8070` | Where scan workers connect, one file per connection |
 | `INSPECTOR_SCRATCH_DIR` | none, required | The 4 GiB scratch volume, the only writable path |
 | `INSPECTOR_IO_TIMEOUT_SECONDS` | `60` | How long a connection may stay idle before it is dropped (1 to 900) |
+| `INTERNAL_PORT` | `8001` | `/healthz` and `/readyz` only, plain HTTP from a thread, so a probe never reaches the framed protocol (#184) |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
 `BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
@@ -276,10 +280,10 @@ Created by the bootstrap job, `python -m sft.data.bootstrap`, never by a migrati
 
 **In AWS** the bootstrap job (`sft-{env}-db-bootstrap`, M4) runs as the master user with `BOOTSTRAP_IAM_AUTH=true`.
 Every login role gets `rds_iam` and no password: each pod's IAM role (`sft-{env}-api`, …) signs a 15-minute token for
-each new connection, over TLS with `sslmode=verify-full` (encryption and keys 2.2, 6.3), so `DATABASE_URL` holds a user
-name and a host, never a password. The master password lives only in Secrets Manager (`sft/{env}/db/master`), set by
-Terraform's write-only arguments; the bootstrap job reads it once and after that only break-glass does. **Locally and
-in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
+each new connection, over TLS with `sslmode=verify-full` (encryption and keys 2.2, 6.3; `DATABASE_IAM_AUTH`,
+`sft.data.iam_auth`, #184), so `DATABASE_URL` holds a user name and a host, never a password. The master password
+lives only in Secrets Manager (`sft/{env}/db/master`), set by Terraform's write-only arguments; the bootstrap job
+reads it once and after that only break-glass does. **Locally and in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
 obviously fake password yourself (`ALTER ROLE sft_api PASSWORD '…'`), as the tests do.
 
 ### Migrations
@@ -447,7 +451,7 @@ The counter store (`sft/data/counters.py`) runs GCRA for rates and a sliding log
 key, with 50 ms per call and a 10-second rest after 5 failures in a row (ADR-0014). A rate of N per period admits a
 burst of N // 2 + 1, then the rest evenly spaced, so no window of one period holds more than N. The client is
 [valkey-py](https://github.com/valkey-io/valkey-py), the Valkey project's asyncio client: pure Python, the redis-py
-API, standalone and cluster clients, and a credential provider for the IAM tokens of M4.
+API, standalone and cluster clients, and a credential provider, which signs the IAM tokens in AWS (#184).
 
 ### Tests against PostgreSQL and Valkey
 
@@ -579,8 +583,24 @@ from the recipient's ID and `link_issued_at` with `link-hmac`, and only its SHA-
 suppression list first, then the cross-tenant cap (100 link emails a day to one address, abuse 7.2), which holds the
 email back with a delayed message and leaves the recipient `queued`. `member.invited` and `member.sign_in_reset`
 (#197) create the member's user in the user pool with a temporary password, record the identity, then send the
-invitation; without a pool adapter (`USER_POOL_BACKEND=none`, dev until Cognito, #193) they are recorded and send
-nothing. Metrics: `emails_sent_total{type}`, `email_caps_hit_total{cap}`, `worker_messages_total`.
+invitation: through Cognito's admin API in AWS (`sft.runtime.cognito`, #193), Keycloak's locally. Cognito sends
+nothing itself (`MessageAction=SUPPRESS`); the invitation is the catalog's, in the tenant's language. Without a pool
+adapter (`USER_POOL_BACKEND=none`) they are recorded and send nothing. Metrics: `emails_sent_total{type}`,
+`email_caps_hit_total{cap}`, `worker_messages_total`.
+
+Beside the notify queue it reads **SES's events** from the `ses-events` queue (#185, ADR-0015,
+`sft.service.ses_events`): SNS's envelope around each event of the region's configuration set. A permanent bounce
+suppresses the address for the sending tenant for 90 days, or for good when it bounced before; a complaint suppresses
+it for good; a bounce or reject of a link email leaves its recipient `bounced`. Each change writes its audit event. The
+tenant comes from the send's `tenant_id` tag, so an event without one (Cognito's own mail) changes nothing and is
+deleted; so are deliveries, delays and transient bounces. A copy is handled once: its ID is derived from SES's message
+ID, the event type and its time. An entry found under an older `email-hmac` key moves to the active key.
+
+`python -m sft.workers.invite_backlog` (the same as `python -m sft.workers.notify invite-backlog`) is the one-off pass
+that invites, through the pool, every member left `invited` before the pool existed (#193): a new `member.invited`
+message each, skipping members who already have an identity on the pool's connection. It reads the worker's settings,
+lists the users across tenants in the system scope, read only (revision 0017), and exits 0 when done, 1 on a failure;
+running it again is safe. The chart has it as a suspended CronJob, run by hand once (deploy/README.md).
 
 It reads a worker's settings (as the relay's below, its role `sft_notify`), `MailSettings` above, and:
 
@@ -590,8 +610,9 @@ It reads a worker's settings (as the relay's below, its role `sft_notify`), `Mai
 | `EMAIL_HMAC_KEYRING` | none, required | As the API's: the suppression list's pseudonyms and the cap's key; a secret |
 | `LINK_HMAC_KEYRING` | none, required | K_link (`sft/{env}/app/link-hmac`), which only this worker reads; keep an old key 14 days after a rotation (data model 2.2); a secret |
 | `CODE_HMAC_KEYRING` | none, required | K_code: each new code's HMAC; a secret |
-| `USER_POOL_BACKEND` | `none` | The user pool's admin side (#197, authn-authz 2.5): `keycloak` in the local stack, where the worker creates an invited member's pool user with a temporary password and records the identity before the invitation; `none` records invitations and sends nothing (dev, until #193) |
-| `USER_POOL_PROVIDER_NAME` | none | With a pool: its `idp_connections.provider_name` (the API's `OIDC_PROVIDER_NAME`) |
+| `USER_POOL_BACKEND` | `none` | The user pool's admin side (#197, #193, authn-authz 2.5): `cognito` in AWS and `keycloak` in the local stack, where the worker creates an invited member's pool user with a temporary password and records the identity before the invitation; `none` records invitations and sends nothing |
+| `USER_POOL_PROVIDER_NAME` | none | With a pool: its `idp_connections.provider_name` (the API's `OIDC_PROVIDER_NAME`); for Cognito, the pool's ID |
+| `COGNITO_USER_POOL_ID` | none | With `USER_POOL_BACKEND=cognito`, required: this region's pool, `ap-northeast-1_…`, the same as `USER_POOL_PROVIDER_NAME`. The worker's role may call only the `Admin*` user calls it makes |
 | `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | none | With `USER_POOL_BACKEND=keycloak`, all required: Keycloak's in-network address, the realm, and the client whose service account may manage the realm's users; the secret is a secret. Local only |
 
 Its tests (`tests/test_notify.py`) run it against PostgreSQL with every email recorded; one sends through the SMTP
@@ -860,3 +881,30 @@ it and fail in CI, where ElasticMQ is a service container on the Python job.
 docker run --detach --name sft-test-elasticmq --publish 127.0.0.1:59324:9324 softwaremill/elasticmq-native:1.7.1
 TEST_SQS_ENDPOINT_URL=http://127.0.0.1:59324 TEST_DATABASE_URL=… uv run pytest
 ```
+
+### The key rotation job
+
+`python -m sft.workers.key_rotation` (#185; encryption and keys 6.4, 6.5) is the only writer of the
+`sft/{env}/app/*` secrets. Terraform creates them without a value, so its first run writes every first version; the
+API and the notification worker start only after that. Each hourly run (Tokyo only, `sft.service.key_rotation`) takes
+at most one step per secret: a keyring is staged once its active key is older than its period, activated 15 minutes
+after staging, and its old key retired after the overlap (6.5's table); an `email-hmac` key is never retired by the job,
+because only the database knows when no suppression row uses it, so that stays an operator's step for now. Each pool's
+app client gets a second client secret from Cognito once the stored one is a year old or isn't live; the older one is
+deleted after 15 minutes (Tokyo's) or a day (Osaka's). A keyring step needs nothing more, because the workloads read
+their keyrings every 5 minutes (`sft.runtime.secrets`, #184). After a new client secret in Tokyo, which the API reads at
+start through External Secrets, it has External Secrets sync `api-secrets`, waits until it has, then restarts the `api`
+Deployment. For that alone it has a projected Kubernetes token, whose Role names those two objects. It logs one report line naming secrets, steps and key IDs, never a value, and exits 0, 1 (the next run
+retries) or 2 (bad settings).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ENVIRONMENT` | none, required | `dev`, `staging` or `prod`: the secrets are `sft/<env>/app/*` |
+| `AWS_REGION` | `ap-northeast-1` | Tokyo only: the keyrings' primary Region |
+| `IDP_CLIENTS` | `[]` | JSON: each pool's app client, `[{region, user_pool_id, client_id}]`; Tokyo's, and Osaka's outside dev |
+| `RESTART_DEPLOYMENTS` | `api` | Comma-separated, restarted after a new client secret; empty restarts nothing |
+| `EXTERNAL_SECRETS` | `api-secrets` | Comma-separated: synced before the restart |
+| `KUBERNETES_NAMESPACE`, `KUBERNETES_URL`, `KUBERNETES_TOKEN_PATH`, `KUBERNETES_CA_PATH` | `sft`, the in-cluster API, the projected token and CA | Where the reload goes |
+
+Its tests (`tests/test_key_rotation.py`) run the rules against fakes, and the adapters against botocore's Stubber and
+an in-memory Kubernetes API.

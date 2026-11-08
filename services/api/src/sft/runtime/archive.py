@@ -14,7 +14,8 @@ Lock archive bucket. One integration test runs it against S3Mock (tests/test_aud
 - **boto3 in a thread pool**, as for the files buckets (`sft.runtime.s3`), with short timeouts and
   few retries, because the API answers only once both writes are done.
 
-In AWS the Osaka client reaches Osaka's S3 from Tokyo's VPC; that route and its IAM come in M4.
+In AWS the Osaka client reaches Osaka's S3 from Tokyo's VPC through the network layer's cross-Region
+S3 endpoint (ADR-0021); both Regions' archive admit the API's role (modules/audit-archive, #185).
 """
 
 from __future__ import annotations

@@ -19,7 +19,11 @@
         "valkeyHost": { "type": "string", "minLength": 1 },
         "filesKeyArn": { "type": "string", "pattern": "^arn:aws:kms:ap-northeast-[13]:[0-9]{12}:key/mrk-[0-9a-f]{32}$" },
         "userPoolId": { "type": "string", "pattern": "^(ap-northeast-[13]_[0-9A-Za-z]+)?$" },
-        "cognitoLoginDomain": { "type": "string" }
+        "cognitoLoginDomain": { "type": "string" },
+        "sesConfigurationSet": { "type": "string", "pattern": "^(sft-(dev|staging|prod))?$" },
+        "appClientId": { "type": "string", "pattern": "^[0-9a-z]*$" },
+        "standbyUserPoolId": { "type": "string", "pattern": "^(ap-northeast-3_[0-9A-Za-z]+)?$" },
+        "standbyAppClientId": { "type": "string", "pattern": "^[0-9a-z]*$" }
       }
     },
     "repoURL": { "const": "https://github.com/codewithmuh/secure-file-transfer.git" },

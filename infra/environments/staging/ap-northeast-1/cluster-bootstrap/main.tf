@@ -61,6 +61,27 @@ data "terraform_remote_state" "cluster" {
   }
 }
 
+# The identity layer (#185): this Region's user pool, its login domain and the SES configuration set.
+data "terraform_remote_state" "identity" {
+  backend = "s3"
+  config = {
+    bucket = module.conventions.state_bucket_name
+    key    = "environments/staging/ap-northeast-1/identity/terraform.tfstate"
+    region = module.conventions.region
+  }
+}
+
+# Osaka's identity layer, in Osaka's state bucket: its pool and app client, which the key rotation job rotates from
+# Tokyo (encryption 6.4, #185).
+data "terraform_remote_state" "identity_osaka" {
+  backend = "s3"
+  config = {
+    bucket = "sft-staging-apne3-tfstate-${var.account_id}"
+    key    = "environments/staging/ap-northeast-3/identity/terraform.tfstate"
+    region = "ap-northeast-3"
+  }
+}
+
 data "terraform_remote_state" "data" {
   backend = "s3"
   config = {
@@ -146,8 +167,14 @@ module "cluster_bootstrap" {
   # digest as deploy/charts/sft/values.yaml, which deploy/tests checks (ADR-0007).
   additional_mirror_digests = ["sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1"]
 
-  identity_center_saml = var.identity_center_saml
-  github_app           = var.github_app
-  cognito_login_domain = var.cognito_login_domain
-  cognito_user_pool_id = var.cognito_user_pool_id
+  identity_center_saml  = var.identity_center_saml
+  github_app            = var.github_app
+  cognito_login_domain  = data.terraform_remote_state.identity.outputs.cognito_login_domain
+  cognito_user_pool_id  = data.terraform_remote_state.identity.outputs.user_pool_id
+  ses_configuration_set = data.terraform_remote_state.identity.outputs.ses_configuration_set
+  cognito_app_client_id = data.terraform_remote_state.identity.outputs.app_client_id
+  standby_user_pool = {
+    user_pool_id = data.terraform_remote_state.identity_osaka.outputs.user_pool_id
+    client_id    = data.terraform_remote_state.identity_osaka.outputs.app_client_id
+  }
 }

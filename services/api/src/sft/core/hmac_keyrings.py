@@ -26,7 +26,6 @@ import hashlib
 import hmac
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import ClassVar, Final, Self
 from uuid import UUID
@@ -62,54 +61,70 @@ def epoch_micros(value: datetime) -> int:
     return (value - _EPOCH) // timedelta(microseconds=1)
 
 
-@dataclass(frozen=True, slots=True)
 class _Keyring:
+    """A loaded keyring. `reload` swaps in a new version of its secret whole
+    (`sft.runtime.secrets`), and each method reads the ring once, so it never mixes two versions."""
+
     NAME: ClassVar[str]
     KEY_ID: ClassVar[re.Pattern[str]]
 
-    active_id: str
-    keys: Mapping[str, bytes] = field(repr=False)
+    __slots__ = ("_ring",)
+
+    def __init__(self, active_id: str, keys: Mapping[str, bytes]) -> None:
+        if active_id not in keys:
+            raise KeyringError(f"the {self.NAME} keyring's active key must be one of its keys")
+        self._ring: tuple[str, Mapping[str, bytes]] = (active_id, dict(keys))
 
     @classmethod
     def from_json(cls, raw: str) -> Self:
         """Read the keyring; `KeyringError`, which never holds a key, if it is malformed."""
+        return cls(*cls._read(raw))
+
+    def reload(self, raw: str) -> None:
+        """Take a new version of the secret; a malformed one raises `KeyringError` and changes
+        nothing."""
+        self._ring = self._read(raw)
+
+    @classmethod
+    def _read(cls, raw: str) -> tuple[str, dict[str, bytes]]:
         entries = parse_keyring(raw, name=cls.NAME, key_id=cls.KEY_ID)
         [active] = [entry.id for entry in entries if entry.state == "active"]
-        return cls(active, {entry.id: entry.key for entry in entries})
+        return active, {entry.id: entry.key for entry in entries}
+
+    @property
+    def active_id(self) -> str:
+        return self._ring[0]
+
+    def knows(self, key_id: str) -> bool:
+        """Whether this keyring still holds the key a value was made with."""
+        return key_id in self._ring[1]
 
     def _mac(self, key_id: str, message: bytes) -> bytes:
-        key = self.keys.get(key_id)
+        key = self._ring[1].get(key_id)
         if key is None:
             raise UnknownKeyError(f"the {self.NAME} keyring has no key {key_id}")
         return hmac.new(key, message, hashlib.sha256).digest()
 
 
-@dataclass(frozen=True, slots=True)
 class LinkKeyring(_Keyring):
     """`K_link`, which only the notification worker loads."""
 
     NAME: ClassVar[str] = "link"
     KEY_ID: ClassVar[re.Pattern[str]] = LINK_KEY_ID
+    __slots__ = ()
 
     def token(self, key_id: str, subject_id: UUID, issued_at: datetime) -> str:
         """The link token of a recipient or upload request issued at `issued_at`, under `key_id`."""
         message = f"link/v1/{subject_id}/{epoch_micros(issued_at)}".encode()
         return base64.urlsafe_b64encode(self._mac(key_id, message)).rstrip(b"=").decode()
 
-    def knows(self, key_id: str) -> bool:
-        return key_id in self.keys
 
-
-@dataclass(frozen=True, slots=True)
 class CodeKeyring(_Keyring):
     """`K_code`: the notification worker makes codes' HMACs, the API checks them."""
 
     NAME: ClassVar[str] = "code"
     KEY_ID: ClassVar[re.Pattern[str]] = CODE_KEY_ID
-
-    def knows(self, key_id: str) -> bool:
-        """Whether this keyring still holds the key a code was made with."""
-        return key_id in self.keys
+    __slots__ = ()
 
     def code_hmac(self, key_id: str, code_id: UUID, code: str) -> bytes:
         return self._mac(key_id, f"code/v1/{code_id}/{code}".encode())

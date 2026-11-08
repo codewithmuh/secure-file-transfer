@@ -22,6 +22,8 @@ from uuid import UUID
 import valkey.asyncio as valkey
 from valkey.exceptions import ValkeyError
 
+from sft.data.counters import ValkeyIam, iam_url
+
 log = logging.getLogger(__name__)
 
 LIFETIME_SECONDS: Final = 600
@@ -75,9 +77,12 @@ class ValkeyStateStore:
         self._client = client
 
     @classmethod
-    def from_url(cls, url: str) -> ValkeyStateStore:
+    def from_url(cls, url: str, *, iam: ValkeyIam | None = None) -> ValkeyStateStore:
+        """The store at `url`; with `iam`, each connection signs in with an IAM token."""
+        address, extra = iam_url(url, iam)
         client = valkey.from_url(  # type: ignore[no-untyped-call]
-            url,
+            address,
+            **extra,
             socket_timeout=TIMEOUT_SECONDS,
             socket_connect_timeout=TIMEOUT_SECONDS,
             retry_on_timeout=False,

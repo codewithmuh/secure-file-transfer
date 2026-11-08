@@ -72,6 +72,7 @@ class Outcome(StrEnum):
     DUPLICATE = "duplicate"
     FAILED = "failed"
     INVALID = "invalid"
+    IGNORED = "ignored"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +81,9 @@ class Delivery:
 
     message: OutboxMessage
     receive_count: int = 1
+    body: str = ""
+    """The body as received, for a consumer whose queue carries more than the envelope (SES's
+    events, `sft.service.ses_events`)."""
 
 
 class Consumer(ABC):
@@ -92,6 +96,11 @@ class Consumer(ABC):
 
     def __init__(self, database: Database) -> None:
         self.database = database
+
+    def parse(self, body: str) -> OutboxMessage | None:
+        """The message in a received body, or `InvalidMessageError`. A queue that isn't the
+        outbox's (SES's events) overrides it; None is a message to delete unhandled."""
+        return OutboxMessage.from_body(body)
 
     @abstractmethod
     async def handle(self, session: AsyncSession, delivery: Delivery) -> None:
@@ -121,7 +130,8 @@ class ConsumerMetrics:
             Counter(
                 "worker_messages_total",
                 "Messages received, by consumer and outcome: processed, duplicate (skipped), "
-                "failed (delivered again) or invalid (left for the dead-letter queue).",
+                "failed (delivered again), invalid (left for the dead-letter queue) or ignored "
+                "(nothing to do: deleted).",
                 ["consumer", "outcome"],
                 registry=registry,
             )
@@ -200,7 +210,7 @@ class ConsumerLoop:
 
     async def _process(self, item: ReceivedMessage) -> Outcome:
         try:
-            message = OutboxMessage.from_body(item.body)
+            message = self.consumer.parse(item.body)
         except InvalidMessageError as exc:
             # Never deleted: after 5 receives it lands in the dead-letter queue, which alerts.
             log.error(
@@ -208,6 +218,12 @@ class ConsumerLoop:
                 extra={"consumer": self.consumer.name, "error": str(exc)},
             )
             return Outcome.INVALID
+        if message is None:
+            try:
+                await self.queues.delete(self.consumer.queue, item.receipt_handle)
+            except QueueError as exc:
+                log.warning("delete failed", extra={**self._extra(), "code": exc.code})
+            return Outcome.IGNORED
         extra = {
             "consumer": self.consumer.name,
             "outbox_id": str(message.id),
@@ -227,7 +243,9 @@ class ConsumerLoop:
             message.trace_context, f"process {queue}", attributes=attributes
         ) as span:
             try:
-                outcome = await self.consumer.process(Delivery(message, item.receive_count))
+                outcome = await self.consumer.process(
+                    Delivery(message, item.receive_count, item.body)
+                )
                 log.info(f"message {outcome}", extra=extra)
             except Exception as exc:
                 log.exception("message failed; SQS delivers it again", extra=extra)

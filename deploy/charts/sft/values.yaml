@@ -22,10 +22,18 @@ cluster:
   # user pool's stack exists; the application part refuses to render without them.
   userPoolId: ""
   cognitoLoginDomain: ""
+  # The identity layer's other outputs (#185): this region's SES configuration set, sft-<env>, which every email is
+  # sent with (ADR-0015); and, for the key rotation job in Tokyo, this region's app client and in staging and prod
+  # Osaka's pool and client, whose secrets it rotates (encryption 6.4). Empty until the layer exists.
+  sesConfigurationSet: ""
+  appClientId: ""
+  standbyUserPoolId: ""
+  standbyAppClientId: ""
 
-# Secrets come from Secrets Manager through External Secrets (encryption 6.4): the cluster-bootstrap stack's store,
-# which only the sft namespace may use, writes them into one Secret that the API reads as environment variables.
-# Nothing secret is in Git or in these values.
+# The keyrings are read from Secrets Manager by the API and the notification worker themselves, at start and every 5
+# minutes, as their own roles (encryption 6.4, #184): their settings only name the secret. The user pool client's ID
+# and secret still come through External Secrets: the cluster-bootstrap stack's store, which only the sft namespace
+# may use, writes them into the API's Secret, read as environment variables. Nothing secret is in Git or in these values.
 secrets:
   store: application-secrets
   refreshInterval: 1h
@@ -57,7 +65,8 @@ logLevel: info
 database:
   port: 5432
   name: sft
-  # IAM authentication: the URL names the workload's login role and the host, never a password (encryption 6.3).
+  # IAM authentication: the URL names the workload's login role and the host, never a password; each pod signs a token
+  # per connection (DATABASE_IAM_AUTH, encryption 6.3), which needs TLS with the server's certificate verified.
   options: sslmode=verify-full
 
 # Where pods may go (ADR-0021). The CIDRs are per cluster, from the network module's layout (infra/modules/network).
@@ -77,7 +86,7 @@ network:
     namespace: egress-proxy
     host: egress-proxy.egress-proxy.svc.cluster.local
     podLabels: { app.kubernetes.io/name: egress-proxy }
-    ports: { api: 3128, notifier: 3129, signatureMirror: 3130 }
+    ports: { api: 3128, notifier: 3129, signatureMirror: 3130, keyRotation: 3133 }
 
 # Node pools (ADR-0004, #103): main for most workloads, scan for the scan trios, which are tainted. No pod here may
 # run on, or tolerate, the system pool.
@@ -162,7 +171,8 @@ clamd: # third-party, from the clamav image; no identity, ingress only from the 
 
 dlpInspector: # our image; no identity, no egress at all, ingress only from the scan workers
   module: sft.dlp.inspector
-  # One file per connection, on the inspector's own framed protocol (sft.dlp.protocol): no HTTP, so no internal port.
+  # One file per connection, on the inspector's own framed protocol (sft.dlp.protocol). Its probes are on the internal
+  # port, 8001, plain HTTP (#184).
   port: 8070
   terminationGracePeriodSeconds: 30
   scratch: 4Gi
@@ -258,6 +268,28 @@ lifecycleJobs:
     databaseRole: sft_jobs
     s3: false
     activeDeadlineSeconds: 900
+
+# The key rotation job (encryption 6.4, 6.5; #185): Tokyo only, hourly, the only writer of the sft/<env>/app/* secrets.
+# The workloads read the keyrings themselves every 5 minutes (#184); after a new user pool client secret, which the API
+# reads at start through `api-secrets`, it has External Secrets sync that and restarts the API, with a projected
+# Kubernetes token its Role limits to those names; no other pod has a token.
+keyRotation:
+  schedule: "7 * * * *"
+  module: sft.workers.key_rotation
+  serviceAccount: key-rotation # Pod Identity: sft-<env>-key-rotation
+  activeDeadlineSeconds: 900
+  externalSecrets: [api-secrets]
+  deployments: [api]
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+
+# The invitation backlog (#193): a one-off pass that invites, through the user pool, every member left `invited` before
+# it existed. A CronJob that is always suspended, run by hand once the pool exists: kubectl create job --from=cronjob/
+# invite-backlog invite-backlog-1 (deploy/README.md). It runs as the notification worker, with its settings.
+inviteBacklog:
+  module: sft.workers.invite_backlog
+  activeDeadlineSeconds: 3600
 
 # ADR-0019's split between the scan pools, in bytes: the API routes a completed file by it, and so does
 # reconciliation when it finishes a completion (#181). One value, so the two never differ.
