@@ -350,6 +350,8 @@ class DlpDetectorOut(BaseModel):
     case_insensitive: bool | SkipJsonSchema[None] = None
     min_length: Annotated[int | None, _out(_MIN_LENGTH_SCHEMA)] = None
     created_at: datetime | SkipJsonSchema[None] = None
+    budget_exceeded_files: Annotated[int | None, _out({"type": "integer", "minimum": 0})] = None
+    budget_exceeded_last_at: datetime | None = None
 
     @classmethod
     def of(cls, view: dlp_policy.DetectorView) -> DlpDetectorOut:
@@ -365,6 +367,10 @@ class DlpDetectorOut(BaseModel):
             fields["revision"] = view.revision
         if view.created_at is not None:
             fields["created_at"] = view.created_at
+        if view.budget_stops is not None:
+            # A pattern in getDlpDetector (#164): set, the time null if none ever stopped it.
+            fields["budget_exceeded_files"] = view.budget_stops
+            fields["budget_exceeded_last_at"] = view.last_budget_stop_at
         definition = view.definition
         if isinstance(definition, Keywords):
             fields["keywords"] = list(definition.terms)
@@ -409,6 +415,7 @@ class DlpDetectorCreate(BaseModel):
             pattern=self.pattern,
             context_keywords=self.context_keywords,
             min_length=self.min_length,
+            case_insensitive=self.case_insensitive,
         )
 
 
@@ -447,6 +454,76 @@ class DlpDetectorUpdate(BaseModel):
 def sent(model: BaseModel) -> frozenset[str]:
     """The body's fields the client sent, for the pointer of a service refusal."""
     return frozenset(model.model_fields_set)
+
+
+# ---- testDlpDetectors (FR-56, #221) ----
+
+_TEST_TEXT_SCHEMA: Final = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": dlp_policy.MAX_TEST_TEXT,
+    "description": "Sample text, processed in memory and never stored or logged.",
+}
+
+
+class DlpDetectorTest(BaseModel):
+    """The contract's `DlpDetectorTest`. The text's 16,384 characters are checked by the service,
+    which answers `413 request_too_large` past them (abuse 2.2, K), not a `422`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[str, WithJsonSchema(_TEST_TEXT_SCHEMA), Field(min_length=1, repr=False)]
+    detectors: Annotated[
+        list[DetectorId] | None,
+        _optional(
+            {
+                "type": "array",
+                "maxItems": 64,
+                "uniqueItems": True,
+                "items": _DETECTOR_ID,
+                "description": "Existing detectors to run. Leave out to run only `draft`, or "
+                "every detector if there is no draft.",
+            }
+        ),
+        AfterValidator(_unique),
+    ] = Field(default=None, max_length=64)
+    draft: DlpDetectorCreate | SkipJsonSchema[None] = None
+
+    def test(self) -> dlp_policy.DetectorTest:
+        return dlp_policy.DetectorTest(
+            text=self.text,
+            detectors=self.detectors,
+            draft=None if self.draft is None else self.draft.detector(),
+        )
+
+
+class DlpDetectorTestMatch(BaseModel):
+    detector: str
+    confidence: DlpConfidence
+    line: int = Field(ge=1)
+    preview: str = Field(max_length=64)
+
+
+class DlpDetectorTestResult(BaseModel):
+    """The contract's `DlpDetectorTestResult`: the matches, masked as findings are."""
+
+    matches: list[DlpDetectorTestMatch] = Field(max_length=100)
+    truncated: bool
+
+    @classmethod
+    def of(cls, result: dlp_policy.TestResult) -> DlpDetectorTestResult:
+        return cls(
+            matches=[
+                DlpDetectorTestMatch(
+                    detector=m.detector,
+                    confidence=DlpConfidence(m.confidence),
+                    line=m.line,
+                    preview=m.preview,
+                )
+                for m in result.matches
+            ],
+            truncated=result.truncated,
+        )
 
 
 # ---- a transfer's DLP decision (#219): getTransferDlp, confirmTransfer ----

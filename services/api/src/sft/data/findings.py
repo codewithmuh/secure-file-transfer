@@ -2,25 +2,28 @@
 FR-53).
 
 The scan worker inserts findings in the transaction that records the file's scan and inspection
-result. It may read back only the counts, which the DLP decision adds up (`counts_by_file`,
-revision 0025), never `detail_ct` (revision 0011); so may the jobs. The API reads them, counts
-only, until location hints and masked previews arrive encrypted with DLP-8. No column holds a
-matched value (NFR-26). The deletion job clears a deleted file's `detail_ct` in the transaction
-that marks the file deleted (data model 6, `clear_details`), and keeps the counts.
+result; the API inserts a transfer's message findings at `createTransfer` (FR-50, #221), under
+`transfer_id` instead of `file_id`. The scan worker may read back only the counts, which the DLP
+decision adds up (`counts_by_file`, revision 0025), never `detail_ct` (revision 0011); so may
+the jobs. The API reads them, counts only, until location hints and masked previews arrive
+encrypted with DLP-8. No column holds a matched value (NFR-26). The deletion job clears a
+deleted file's `detail_ct` in the transaction that marks the file deleted (data model 6,
+`clear_details`), and keeps the counts.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
 from sft.data.access import in_scope, require_scope, tenant_of
-from sft.data.models import DlpFinding
+from sft.data.models import DlpFinding, File, FileState, Transfer
 from sft.data.scope import ScopeKind
 
 
@@ -113,7 +116,8 @@ async def detectors_by_file(
         .order_by(DlpFinding.file_id, DlpFinding.detector)
     )
     for file_id, detector in rows.tuples():
-        found.setdefault(file_id, []).append(detector)
+        if file_id is not None:  # the filter leaves only file findings
+            found.setdefault(file_id, []).append(detector)
     return found
 
 
@@ -128,3 +132,93 @@ async def clear_details(session: AsyncSession, file_id: UUID) -> None:
         .values(detail_ct=None, dlp_key_version=None)
         .execution_options(synchronize_session=False)
     )
+
+
+# ---- a transfer's message (FR-50, #221) ----
+
+
+async def insert_message_findings(
+    session: AsyncSession, transfer_id: UUID, found: Sequence[Counts]
+) -> int:
+    """One row per detector that matched in the transfer's message; nothing for an empty list.
+    Counts only: no location hint or preview is kept for a message (FR-53)."""
+    require_scope(session, ScopeKind.TENANT)
+    tenant_id = tenant_of(session)
+    rows = [
+        {
+            "id": uuid7(),
+            "tenant_id": tenant_id,
+            "transfer_id": transfer_id,
+            "detector": c.detector,
+            "count_low": c.low,
+            "count_medium": c.medium,
+            "count_high": c.high,
+        }
+        for c in found
+    ]
+    if rows:
+        await session.execute(insert(DlpFinding), rows)
+    return len(rows)
+
+
+async def message_counts(session: AsyncSession, transfer_id: UUID) -> list[Counts]:
+    """The message's findings, counts only. Names its columns: the evaluation's system roles read
+    `transfer_id` and the counts, never `detail_ct` (revision 0027)."""
+    require_scope(session, ScopeKind.TENANT)
+    rows = await session.execute(
+        select(
+            DlpFinding.detector,
+            DlpFinding.count_low,
+            DlpFinding.count_medium,
+            DlpFinding.count_high,
+        )
+        .where(DlpFinding.transfer_id == transfer_id, in_scope(DlpFinding, session))
+        .order_by(DlpFinding.detector)
+    )
+    return [Counts(r.detector, r.count_low, r.count_medium, r.count_high) for r in rows]
+
+
+async def sender_recent_counts(
+    session: AsyncSession, created_by: UUID, *, since: datetime, other_than: UUID
+) -> list[Counts]:
+    """The findings of the sender's other transfers sent since `since` (FR-49): their counted
+    files' and their messages', counts only, one entry per row. For a rule with
+    `include_sender_24h`, so splitting data over several transfers doesn't keep each under the
+    threshold."""
+    require_scope(session, ScopeKind.TENANT)
+    recent = (
+        select(Transfer.id)
+        .where(
+            Transfer.created_by == created_by,
+            Transfer.sent_at.is_not(None),
+            Transfer.sent_at >= since,
+            Transfer.id != other_than,
+            in_scope(Transfer, session),
+        )
+        .scalar_subquery()
+    )
+    counted_files = (
+        select(File.id)
+        .where(
+            File.transfer_id.in_(recent),
+            File.removed_at.is_(None),
+            File.state != FileState.REJECTED.value,
+            in_scope(File, session),
+        )
+        .scalar_subquery()
+    )
+    rows = await session.execute(
+        select(
+            DlpFinding.detector,
+            DlpFinding.count_low,
+            DlpFinding.count_medium,
+            DlpFinding.count_high,
+        ).where(
+            or_(
+                DlpFinding.file_id.in_(counted_files),
+                and_(DlpFinding.transfer_id.is_not(None), DlpFinding.transfer_id.in_(recent)),
+            ),
+            in_scope(DlpFinding, session),
+        )
+    )
+    return [Counts(r.detector, r.count_low, r.count_medium, r.count_high) for r in rows]

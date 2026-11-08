@@ -460,7 +460,8 @@ async def test_an_eicar_file_is_reported_to_both_sides_and_the_uploader_learns_n
     assert file_row(rig, file_id)["state"] == "infected"
     listed = (await session_files(up)).json()["items"]
     assert [f["state"] for f in listed] == ["infected"]
-    assert set(listed[0]) <= {"id", "display_name", "content_type", "size", "state"}
+    assert set(listed[0]) <= {"id", "display_name", "content_type", "size", "state", "blocked"}
+    assert listed[0]["blocked"] is True  # that much, and no reason (#221)
     await send_notices(rig)
     member_mail = rig.w.sent.to(owner_email(rig))
     assert [e.email_type for e in member_mail] == ["files_blocked_member"]

@@ -341,7 +341,11 @@ the files already received stay with the member. `listSessionFiles` lists the up
 `uploading` one with its name, declared size and `upload` plan, so the web app resumes it after a reload; a blocked
 file shows only its state, never a finding or a scan detail (FR-12). `completeSessionUpload` answers a `SessionFile`.
 A received file's `retention_until` counts from the moment its upload is accepted, when it reaches `scanning` (FR-13);
-the member may delete it earlier with `deleteFile`, and its contents go on the next deletion run. Notices of received
+the member may delete it earlier with `deleteFile`, and its contents go on the next deletion run. While the request is
+open, the uploader may take back a file they declared or uploaded with `deleteSessionUploadFile` (#229): it stops
+counting toward the limits, the member no longer sees it, and a retry gets `204`; a blocked file stays
+(`409 invalid_state`). An unscannable file the tenant policy allows carries `warning: unscannable` for the uploader
+too, so the web app shows it as accepted. Notices of received
 files are batched: one per request per 5 minutes, counts only (architecture 4.3).
 
 **Scanning.** Each file is scanned for malware and inspected for sensitive data in one pass (ADR-0019, ADR-0022);
@@ -412,7 +416,7 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-6 | Download files one by one; resume without using up the limit | `listSessionFiles`, `createSessionDownload` (`resume_grant_id`), `getSessionDownloadContent` (Range) |
 | FR-7 | Per-recipient status | `listTransferRecipients` (`delivery_state`, `notified_at`, verification and downloads); `getUploadRequest` for the uploader; `clearEmailSuppression` lets a tenant admin email a `suppressed` address again |
 | FR-10 | Create an upload request | `createUploadRequest`, `listUploadRequests`, `getUploadRequest` |
-| FR-11 | Uploader uploads up to 50 files, resumable | `getLinkSession`, `addSessionUploadFile`, `requestSessionUploadPartUrls`, `listSessionUploadedParts`, `completeSessionUpload` |
+| FR-11 | Uploader uploads up to 50 files, resumable | `getLinkSession`, `addSessionUploadFile`, `requestSessionUploadPartUrls`, `listSessionUploadedParts`, `completeSessionUpload`, `deleteSessionUploadFile` |
 | FR-12 | Shareable files reach the member; blocked files reported to both sides | `listUploadRequestFiles`, `getFile`, `createReceivedFileDownload`, `getReceivedFileDownloadContent`, `listSessionFiles` |
 | FR-13 | Member deletes received files early | `deleteFile` |
 | FR-14 | Verify the email address before anything is shown | `resolveLink`, `requestVerificationCode`, `createLinkSession`; content URLs work only with the grant's session |

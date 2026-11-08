@@ -67,6 +67,9 @@ NOT_AUDITED: Final[dict[str, str]] = {
     "(architecture 5.4).",
     "tenant_usage": "A storage reservation changes only with the file it is for: declaring, "
     "rejecting or removing the file is audited in the same transaction (#114, data model 2.5).",
+    "notice_windows": "A notice window is the notification worker's bookkeeping of emails about "
+    "changes audited when they were made (a DLP policy change, an approval request, a "
+    "deactivation), and every email it sends is audited as `email.sent` (#230, abuse 7.1).",
 }
 
 

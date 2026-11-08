@@ -142,7 +142,7 @@ covers a whole bucket and ClamAV can't scan them.
 | Scan worker | Streams files up to 2,000,000,000 bytes from S3 to clamd and to its DLP inspector at once, and records both results and the findings in one transaction; for larger files records GuardDuty's result from its EventBridge event, confirmed by GuardDuty's tag on the object, and marks them not inspected; sets the `scan` tag that the API's read permission requires, whichever engine scanned the file, keeping GuardDuty's own tags (FR-16 to FR-19, FR-36). Applies the tenant's DLP rules in the evaluation and to received files (4.6). Takes scan leases in the counter store for the per-tenant caps. Runs in its own node pool, whose volumes use the files key. | Queue age; two pools split at 100 MB, so large files don't delay small ones | Files stay in `scanning`, never downloadable. Retries with backoff; the last retry marks the file `scan-failed`, and the dead-letter queue raises an alert. |
 | ClamAV (clamd) | Scans the bytes a scan worker streams to it (INSTREAM), with 4 GiB of scratch for temporary extraction (ADR-0019). Its own Deployment, one pod beside each scan worker: no service account token, no AWS identity, ingress only from the scan workers and egress only to the signature mirror: one pod on the main pool whose freshclam fetches ClamAV's database through its own proxy listener and tests each one before the clamd pods take it. | With the scan workers | The worker's scan times out and is retried, as for any scan failure; a crashed pod is replaced. |
 | DLP inspector | Extracts text from the bytes a scan worker streams to it and runs the DLP detectors, with the tenant's own detectors sent along; returns findings with masked previews, never values (ADR-0022, 4.6). Its own Deployment from the application image, one pod beside each scan worker: no service account token, no AWS identity, no database, ingress only from the scan workers and no egress at all. A fresh child process per file, under seccomp and resource limits, with 4 GiB of scratch. | With the scan workers | The worker's attempt fails and is retried; the last attempt marks the inspection `failed`, which blocks the file and alerts (FR-47). A crashed pod is replaced. |
-| Notification worker | Derives each link token and creates each code, stores only the token's hash and the code's HMAC, and sends them through SES's endpoint (NFR-7). Sends the DLP notices: to a member whose transfer needs them, to approvers, and to tenant admins on a policy change (4.6). Applies the per-address caps across tenants in the counter store. Creates invited members in the user pool, through its egress proxy listener. Records SES's bounces and complaints from the `ses-events` queue in the sending tenant's suppression list (#185). Writes the sign-in triggers' events to the audit log. Outbox messages carry IDs, never secrets. Emails are fixed templates in English and Japanese, text and HTML (`sft.service.email`), sent through one adapter: SES API v2 in AWS, SMTP to Mailpit locally (`sft.data.mail`, #100). | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert, and so does a sign-in event waiting over 30 s. |
+| Notification worker | Derives each link token and creates each code, stores only the token's hash and the code's HMAC, and sends them through SES's endpoint (NFR-7). Sends the DLP notices: to a member whose transfer needs them, to approvers, and to tenant admins on a policy change (4.6). Applies the per-address caps across tenants in the counter store. Creates invited members in the user pool, through its egress proxy listener. Records SES's bounces and complaints from the `ses-events` queue in the sending tenant's suppression list (#185), and marks the recipient or the upload request whose email bounced (#228). Writes the sign-in triggers' events to the audit log. Outbox messages carry IDs, never secrets. Emails are fixed templates in English and Japanese, text and HTML (`sft.service.email`), sent through one adapter: SES API v2 in AWS, SMTP to Mailpit locally (`sft.data.mail`, #100). | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert, and so does a sign-in event waiting over 30 s. |
 | Lifecycle jobs | Expiry, deletion from both files bucket pairs in both regions, daily reconciliation, audit archiving (section 4.5, 5.2); expiry of DLP approval requests, and deletion of finding details with their file's contents (4.6). The only workload that deletes objects. | Scheduled jobs | Work waits for the next run. An alert fires on lag (NFR-8, NFR-15). |
 | Operator API | Tenant provisioning and the other operator calls (FR-34). Its own Deployment in the `sft-operator` namespace with its own IAM and database roles, on no load balancer; operators reach it only by port-forward ([AUTH] 8.2). It never returns file names, messages or contents. | Not on the request path | Operators wait; tenants are unaffected. Break-glass doesn't need it (3.4). |
 | Egress proxy | Envoy as an HTTPS `CONNECT` proxy on the `system` nodes, the only way out of the VPC that doesn't go through a VPC endpoint: one listener and allowlist per workload (3.1, ADR-0021) | 2 replicas in different AZs | If both fail, code exchanges, Cognito admin calls and Argo CD syncs stop; sends, downloads and Osaka writes use endpoints and continue (section 6). |
@@ -563,6 +563,17 @@ assembled (NFR-6). An accepted file gets `retention_until` and `delete_after` fr
 worker's pass is the same as for a transfer's file; the result, in the transaction that records it, counts towards the
 request's next notice instead of a transfer's evaluation.
 
+**As built (#229).** While the request is open, the uploader may take a file back (`deleteSessionUploadFile`), under the
+request's row lock, which a completion and the member's grant take too: the file is removed as the member's early
+delete removes it, so it stops counting toward the limits, a completion still running finds it removed and rejects it,
+and the deletion job deletes it. A shareable file still counted in the request's next notice is taken off it
+(`withdraw_arrival`): the notice counts it when it settled after the notice's window began; a file the window can't
+place stays counted, so a notice may name one file too many, never one too few. A blocked file stays for the member
+(`409`). The member's download of a received file keeps its grant in the tab's `sessionStorage` until the browser has
+the download, and sends it as `resume_grant_id` on the next click, as the recipient's page does (FR-6), so an
+interrupted start resumes under the same grant. An unscannable file the policy allows is `warning: unscannable` in
+the uploader's list too, which the uploader's page words as accepted.
+
 **One notice per request per 5 minutes** (the decision #213 left open). One `files_arrived` per file would flood a
 member who receives 50, so the notices are batched: `upload_requests` holds the files that became shareable and those
 that were blocked since the last notice, and when it is due. The scan result that finds no notice due makes one due in
@@ -749,7 +760,8 @@ and the findings' counts (never their details), and writes the decision (data mo
 
 - Step 1: domains are compared lowercase and IDNA-normalised, a subdomain of a trusted domain is trusted, and a domain
   is new when `dlp_known_domains` has no send to it in 365 days. SSO domains don't count yet: `sso_domains` arrives with
-  M6. Step 2: the message (FR-50) and the sender's 24 hours (FR-49) join with #221; a `not_inspected` rule counts files
+  M6. Step 2: the message's findings (FR-50) count as a file's, and a rule with `include_sender_24h` adds the
+  sender's transfers sent in the last 24 hours (FR-49, #221); a `not_inspected` rule counts files
   and a `new_domain` rule domains, and a rule scoped to untrusted recipients is tested only when one is (its new
   domains are theirs). The policy and its rules are read in one statement, so the version recorded names the rules
   applied. A tenant without a policy, which can't happen, fails closed: nothing is sent.
@@ -760,8 +772,7 @@ and the findings' counts (never their details), and writes the decision (data mo
 - A decision stands: an evaluation that isn't a file removal (a scan worker's retry, say) changes nothing for a transfer
   awaiting confirmation or held by a rule. A file removal from `awaiting_confirmation` sets it back to `submitted` first.
 - `getTransferDlp` and `confirmTransfer` are `sft.service.transfer_dlp`; a required approval's confirmation makes an
-  approval request (#220, below). Monitor mode, refused by the policy API until #221, already sends everything with
-  `enforced: false`.
+  approval request (#220, below). Monitor mode (FR-52, #221) sends everything with `enforced: false`.
 - Moving to `sent` records each recipient domain in `dlp_known_domains`; the daily cleanup deletes a domain 365 days
   after `last_sent_at`.
 
@@ -841,8 +852,64 @@ and the `expiry` job expires requests (`sft.service.lifecycle`); data model 3.2 
 - **Emails** come from the outbox: `dlp_approval.requested` (each eligible approver, while the request is pending),
   `dlp_approval.decided` and `dlp_approval.expired` (the sender), `dlp_approval.no_eligible_approver` (the admins), and
   `dlp_policy.changed.approvers_changed` (the admins, when `updateUser` changes a designation). The hourly digest
-  past 20 requests an hour and the 10-minute coalescing of policy notices ([ABUSE] 7.1) aren't built yet.
-- Finding details for approvers (location hints, masked previews) come with DLP-8; two-approver rules with #221.
+  past 20 requests an hour and the 10-minute coalescing of policy notices ([ABUSE] 7.1) arrived with #230 (below).
+- Finding details for approvers (location hints, masked previews) come with DLP-8. Two-approver rules (#221) wait for
+  two different approvers.
+
+**As built (#221, DLP-6): the Should requirements.**
+
+- **The message** (FR-50) is inspected by the API in process at `createTransfer`, in the transaction that creates the
+  transfer, with the detector library the inspector runs (`sft.dlp.detect.inspect_text`): every built-in detector and
+  the tenant's live, enabled keyword lists and patterns, each pattern within its scan-time budget. The API image
+  already carries the detector package and `google-re2`, so nothing new is deployed. Only plain text of at most 2,000
+  characters runs there; files are only ever read by the sandboxed inspector (ADR-0022). The findings are stored with
+  `transfer_id`, counts only, and `getTransferDlp.message_findings` shows them.
+- **Received files** (FR-51): after a received file's scan and inspection, in the same transaction, the scan worker
+  applies the tenant's rules for received files (`content` and `not_inspected` only). A block in enforce mode sets
+  `dlp_blocked` and tags the object `scan=dlp_blocked`: the member sees the file as blocked and gets no grant; both
+  sides are told through the request's next notice, the uploader without any finding, rule or reason (the uploader's
+  `SessionFile.blocked`). `allow_and_record` and monitor mode record the decision and leave the file available.
+- **Patterns** (FR-39) are accepted with the save-time checks of detectors 5; at most 20 a tenant. **#164:** the scan
+  worker counts the patterns the inspector stopped for their budget (`dlp_pattern_stops`) and writes one
+  `dlp.pattern_budget_exceeded` per file with their IDs; `getDlpDetector` shows the count and the last time.
+- **`testDlpDetectors`** (FR-56) runs the same library on up to 16,384 characters in the API process, never stored or
+  logged; the audit event names the detectors only.
+- **Two approvers** (FR-44), **the sender's 24 hours** (FR-49) and **monitor mode** (FR-52) are accepted by the policy
+  API; the decision and the approvals already acted on them.
+
+**As built (#222, DLP-7): reports.** `listDlpDecisions` and `getDlpReport` (`sft.service.dlp_reports`) read the
+decision tables in the caller's tenant scope, for an admin or a key with `audit:read`; the report covers at most 92
+days and its viewing is audited (`dlp.report_viewed`, the range only). Decisions are audit events, so the audit
+export with `actions: [dlp.decided]` exports exactly what the report counts (FR-29); the report page links to it.
+
+**As built (#230): coalesced, digested and capped DLP notices** ([ABUSE] 7.1). The notification worker keeps one
+window per tenant and kind of notice, and one per approver for the digest (`notice_windows`, data model 2.5), and
+reads and changes each under its row lock in the transaction that prepares the email
+(`sft.service.notice_windows`). The API's messages are unchanged.
+
+- **Policy changes.** A `dlp_policy.changed.<kind>` message sends nothing itself: its kind joins the tenant's window.
+  The first change with no notice due makes one due in 10 minutes, with one `dlp_policy.notice_due` message delayed
+  that long; the changes meanwhile only add their kinds. The notice lists every kind of the window, one email per
+  active admin. A change recorded while it goes out makes the next notice due, which lists the window's kinds again:
+  a notice may repeat a kind, never miss one. So an admin gets at most one policy email per tenant every 10 minutes,
+  and the first one comes at most 10 minutes after the change (the decision #230 left open: a trailing window, so
+  several changes in a row make one email rather than an immediate one followed by a second).
+- **Approval requests.** Each approver's window counts the request emails sent in the hour since it began; up to 20
+  go out one by one. Past 20, the approver gets none until the hour ends, then one digest,
+  `dlp_approval_requested` with the number of requests they could decide then (pending, not their own transfers),
+  so it is right however many were decided meanwhile. The digest's message, `dlp_approval.digest_due`, waits in
+  15-minute steps (SQS's longest delay) until the hour ends; the next request after it starts a new hour.
+  `email_caps_hit_total{cap="approver_request_emails"}` counts the held emails.
+- **No eligible approver.** At most 3 `dlp_no_eligible_approver` emails per tenant a day (a window of 24 hours from
+  the first); the rest are counted in `email_caps_hit_total{cap="tenant_no_eligible_approver"}` and the refusals stay
+  in the audit log. The count is taken when the email is prepared and recorded with the message, so a redelivery after
+  a failed send can't count twice or pass the cap.
+- **Deactivated approvers.** `deactivateUser` clears the approver designation and, for an approver, writes
+  `dlp_approval.approver_deactivated` in its transaction. With fewer than two active approvers left, every active
+  admin gets `dlp_approver_deactivated` at once, saying whether none is left or one, who can't approve their own
+  transfers; it names nobody. With two or more left, the change joins the coalesced policy notice as
+  `approvers_changed`. A rule that needs two approvals may still lack approvers with two left; a sender who meets
+  that is refused, and the admins get `dlp_no_eligible_approver`.
 
 **Recipient domain checks at send time.** `createTransfer` checks FR-24's allowed and blocked domains, and
 `sendTransfer` checks them again against the policy in force, so a domain blocked since the draft was made is refused

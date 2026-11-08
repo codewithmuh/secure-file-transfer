@@ -17,8 +17,10 @@ import { ApprovalQueuePage, ApprovalRequestPage } from '@/features/approvals';
 import { AuditLogPage } from '@/features/audit';
 import {
   DlpAdminPage,
+  DlpReportsSection,
   KeywordListEditor,
   KeywordListsSection,
+  PatternEditor,
   RuleEditor,
   RulesSection,
   SettingsSection,
@@ -26,7 +28,7 @@ import {
 
 /**
  * The routes. Every M5 page is live: upload requests and the uploader's `/u` (#212, #213), the audit log (#216), API
- * keys (#215), the DLP policy (#218) and approvals (#220).
+ * keys (#215), the DLP policy (#218), its patterns (#221) and reports (#222), and approvals (#220).
  */
 export const router = createBrowserRouter([
   { path: '/sign-in', element: <SignInPage /> },
@@ -84,6 +86,9 @@ export const router = createBrowserRouter([
           { path: 'keywords', element: <KeywordListsSection /> },
           { path: 'keywords/new', element: <KeywordListEditor /> },
           { path: 'keywords/:detectorId', element: <KeywordListEditor /> },
+          { path: 'patterns/new', element: <PatternEditor /> },
+          { path: 'patterns/:detectorId', element: <PatternEditor /> },
+          { path: 'reports', element: <DlpReportsSection /> },
         ],
       },
     ],

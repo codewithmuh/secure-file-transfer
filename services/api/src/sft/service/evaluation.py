@@ -37,7 +37,8 @@ only, never a value, a name or a domain. Then, in enforce mode:
 - `block`: `held` with `hold_reason = dlp_blocked` and the `transfer_held` notice, unless it was
   held for that already. Removing a file evaluates again and makes a new decision.
 
-In monitor mode (#221) the transfer is sent whatever the outcome. A decision is never recomputed
+In monitor mode (FR-52, #221) the transfer is sent whatever the outcome, and the decision is
+recorded with `enforced` false. A decision is never recomputed
 when the policy changes; only a change to the counted files makes a new one.
 
 **Moving to `sent`** (`send`), here or from a confirmation, in the same transaction: a download
@@ -133,8 +134,8 @@ def is_shareable(
     state: FileState, unscannable_allowed: bool, inspection_state: InspectionState
 ) -> bool:
     """Data model 3.1: `clean`, or `unscannable` with the policy's allowance recorded at scan
-    time, and an inspection that finished and didn't fail. Received files' `dlp_blocked` joins
-    with upload requests."""
+    time, and an inspection that finished and didn't fail. A received file a DLP rule blocked
+    (`dlp_blocked`, FR-51) is kept from the member besides: its tag and the downloads check it."""
     scanned_ok = state is FileState.CLEAN or (
         state is FileState.UNSCANNABLE and unscannable_allowed
     )
@@ -264,7 +265,9 @@ async def evaluate(
         await record("transfer.submitted")
         return Outcome.SUBMITTED
 
-    decided = await dlp_decision.decide(session, transfer_id, counted, now=now)
+    decided = await dlp_decision.decide(
+        session, transfer_id, counted, now=now, sender=locked.created_by
+    )
     await record("dlp.decided", _decision_details(decided))
     for match in decided.matches:
         await record(

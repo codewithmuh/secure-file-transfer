@@ -4,15 +4,19 @@ ADR-0015; abuse and rate limits 7.3, 7.4; data model 2.5).
 Each region's configuration set publishes bounce, complaint, delivery, reject and delivery-delay
 events through its SNS topic to the queue (infra/modules/ses). A queue message is SNS's envelope,
 whose `Message` is SES's event; an envelope-less body (raw delivery) is read too. Every send
-carries the tags `tenant_id` and `email_type`, and a link email `recipient_id`
-(`sft.data.mail.OutgoingEmail.all_tags`), so each event is handled in its own tenant's scope.
+carries the tags `tenant_id` and `email_type`, a recipient's link and code emails `recipient_id`,
+and an uploader's emails (the request's link, codes and the blocked-file notice) the request's
+`upload_request_id` (#228; `sft.data.mail.OutgoingEmail.all_tags`), so each event is handled in its
+own tenant's scope.
 
 - **A permanent bounce** suppresses the address for the sending tenant: for 90 days the first
   time; with no expiry when an ended entry shows it bounced before. A live entry stays as it is,
-  so a complaint is never weakened to a bounce. A link email's recipient becomes `bounced` (FR-7).
-- **A complaint** suppresses the address for the tenant until a tenant admin clears it.
-- **A reject** (SES refused the email after accepting it) leaves a link email's recipient
-  `bounced`.
+  so a complaint is never weakened to a bounce. A link email's recipient becomes `bounced` (FR-7);
+  so does an uploader's request (#228), whose page shows the member the address bounced.
+- **A complaint** suppresses the address for the tenant until a tenant admin clears it, for an
+  uploader as for a recipient. The delivery state stays as it was: the email arrived.
+- **A reject** (SES refused the email after accepting it) leaves a link email's recipient, or an
+  uploader's request, `bounced`.
 - **Everything else** (deliveries, delays, transient bounces) and any event without our tenant
   tag, such as one of Cognito's own emails (ADR-0016), changes nothing: the consumer deletes it.
 
@@ -35,7 +39,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import audit, recipients, suppressions, users
+from sft.data import audit, recipients, suppressions, upload_requests, users
 from sft.data.audit import Actor, Target
 from sft.data.models import ActorType, DeliveryState, SuppressionReason
 from sft.data.models import Outcome as AuditOutcome
@@ -72,10 +76,16 @@ class SesEvent:
     email_type: EmailType | None
     recipient_id: UUID | None
     addresses: tuple[str, ...]
+    upload_request_id: UUID | None = None
+    """The upload request an uploader's email belongs to (#228)."""
 
     def as_message(self) -> OutboxMessage:
         """The envelope the consumer framework records and scopes by (`sft.workers.consumer`)."""
-        payload = {} if self.recipient_id is None else {"recipient_id": self.recipient_id}
+        payload: dict[str, UUID] = {}
+        if self.recipient_id is not None:
+            payload["recipient_id"] = self.recipient_id
+        if self.upload_request_id is not None:
+            payload["upload_request_id"] = self.upload_request_id
         return OutboxMessage(
             id=self.id, topic=f"ses.{self.kind}", tenant_id=self.tenant_id, payload=payload
         )
@@ -143,6 +153,7 @@ def parse_event(body: str) -> SesEvent | None:
         email_type=EmailType(email_type) if email_type in set(EmailType) else None,
         recipient_id=_uuid(_tag(mail.get("tags"), "recipient_id")),
         addresses=addresses,
+        upload_request_id=_uuid(_tag(mail.get("tags"), "upload_request_id")),
     )
 
 
@@ -165,6 +176,29 @@ class SesEvents:
                 outcome=AuditOutcome.FAILURE,
                 details={"email_type": event.email_type, "event": event.kind},
             )
+        if event.upload_request_id is not None and event.kind in (
+            EventKind.BOUNCE,
+            EventKind.REJECT,
+        ):
+            await self._uploader_bounced(session, event, event.upload_request_id)
+
+    async def _uploader_bounced(
+        self, session: AsyncSession, event: SesEvent, request_id: UUID
+    ) -> None:
+        """The request's uploader address bounced (#228): `bounced`, which its page shows the
+        member, whatever the request's state, as a recipient's would be. A request the tenant
+        doesn't have (a tag of another tenant's send) changes nothing."""
+        if await upload_requests.link_target(session, request_id) is None:
+            return
+        await upload_requests.set_delivery(session, request_id, DeliveryState.BOUNCED)
+        await audit.record(
+            session,
+            action="email.bounced",
+            actor=SYSTEM,
+            target=Target(upload_requests.TARGET, request_id),
+            outcome=AuditOutcome.FAILURE,
+            details={"email_type": event.email_type, "event": event.kind},
+        )
 
     async def _suppress(self, session: AsyncSession, event: SesEvent, normalized: str) -> None:
         pseudonym, key_id = self.emails.active(normalized), self.emails.active_key_id

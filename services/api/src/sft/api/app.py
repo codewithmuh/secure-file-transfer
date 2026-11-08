@@ -50,6 +50,7 @@ from sft.api import (
     audit,
     auth,
     dlp,
+    dlp_reports,
     downloads,
     links,
     members,
@@ -239,4 +240,5 @@ def create_app(
     audit.register(app)  # audit search and export (#216)
     dlp.register(app)  # the DLP policy, rules and detectors (#218)
     approval_routes.register(app)  # DLP approval requests and decisions (#220)
+    dlp_reports.register(app)  # DLP decisions list and report (#222)
     return app

@@ -18,6 +18,9 @@ The rules of the contract's member operations live here:
 
 A change of `dlp_approver` writes `user.dlp_approver_changed` and an outbox message that emails
 every active admin `dlp_policy_changed` with `approvers_changed` (#220, FR-54), in its transaction.
+A deactivation that clears the designation writes `dlp_approval.approver_deactivated` in its
+transaction (#230): the notification worker tells the admins at once when fewer than two approvers
+are left, and otherwise adds the change to the coalesced policy notice.
 An admin may name themselves an approver: they still can't approve their own transfers (T-100).
 
 A role change and a deactivation end every session of the user in the same transaction (authn and
@@ -76,7 +79,12 @@ from sft.data import audit, identities, member_sessions, users
 from sft.data.audit import ArchivedEvent, Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
-from sft.data.outbox import DLP_POLICY_CHANGED, MEMBER_SIGN_IN_RESET, enqueue
+from sft.data.outbox import (
+    DLP_APPROVER_DEACTIVATED,
+    DLP_POLICY_CHANGED,
+    MEMBER_SIGN_IN_RESET,
+    enqueue,
+)
 from sft.data.scope import Scope
 from sft.service import api_keys
 from sft.service.audit_archive import AuditArchive
@@ -390,9 +398,12 @@ async def deactivate_user(
         if user.status != UserStatus.DEACTIVATED:
             if _active_admin(user) and list(admins) == [user.id]:
                 raise _last_admin()
+            was_approver = user.dlp_approver
             user = await users.deactivate_user(
                 session, user.id, actor=caller.actor(), origin=origin
             )
+            if was_approver:  # the admins learn of it (#230)
+                await enqueue(session, DLP_APPROVER_DEACTIVATED, {"user_id": user.id})
             await member_sessions.revoke_user_sessions(
                 session, user.id, reason=member_sessions.RevokedReason.DEACTIVATED
             )

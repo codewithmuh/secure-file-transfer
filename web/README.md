@@ -130,18 +130,19 @@ check then fails, the web app relied on something the contract no longer says.
 | `/` | Dashboard: the five newest transfers and the five newest upload requests (`listTransfers`, `listUploadRequests`) | Member |
 | `/transfers` | Transfer list, with a state filter and "load more"; an admin's "every transfer in the organization" switch (`scope=tenant`, #217) adds the owner and revoke | Member |
 | `/transfers/new` | Create, upload and send a transfer; "email me on the first download" (`notify_on_first_download`, #214) | Member |
-| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand, each recipient's delivery, verification and downloads, unlock, revoke, extend expiry (`extendTransferExpiry`, #214); a draft's upload resumes here. A DLP decision shows its matched rules, flagged recipients and findings, with confirm, request approval, remove file and cancel (#219, #220) | Member |
+| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand, each recipient's delivery, verification and downloads, unlock, revoke, extend expiry (`extendTransferExpiry`, #214); a draft's upload resumes here. A DLP decision shows its matched rules, flagged recipients and findings, the message's findings too (#221), with confirm, request approval, remove file and cancel (#219, #220) | Member |
 | `/upload-requests` | Upload requests (`listUploadRequests`, `scope=own`): state, link email and the uploader's access as badges with text, a state filter and "load more" (#212); an admin's "every request in the organization" switch (`scope=tenant`, #217) adds the owner and revoke | Member |
 | `/upload-requests/new` | Ask someone for files (`createUploadRequest`): address, language, how long it stays open, message (#212) | Member |
-| `/upload-requests/:id` | One request (`getUploadRequest`): state, expiry, link email, verified or locked, unlock (`unlockUploader`), revoke (`revokeUploadRequest`); the received files (`listUploadRequestFiles`) with findings on demand (`getFileInspection`), download (`createReceivedFileDownload`) and delete (`deleteFile`) (#212, #213) | Member (an admin sees another member's as metadata) |
-| `/approvals`, `/approvals/:id` | DLP approvals (#220): an approver's queue and every request for an admin; a request's page with approve and reject. The sender may open their own request | Approver, admin |
+| `/upload-requests/:id` | One request (`getUploadRequest`): state, expiry, link email, verified or locked, unlock (`unlockUploader`), revoke (`revokeUploadRequest`); the received files (`listUploadRequestFiles`) with findings on demand (`getFileInspection`), download (`createReceivedFileDownload`) and delete (`deleteFile`) (#212, #213); a file a DLP rule for received files blocked shows "Blocked by your data policy" and can't be downloaded (#221) | Member (an admin sees another member's as metadata) |
+| `/approvals`, `/approvals/:id` | DLP approvals (#220): an approver's queue and every request for an admin; a request's page with approve and reject, and the files' and the message's findings (#221). The sender may open their own request | Approver, admin |
 | `/t` | The recipient's link page (#198): the link's state, the code, then each file's download, in the link's language | Public (link) |
-| `/u` | The uploader's link page (#212, #213): the same link states and code step as `/t`, then the request and the uploads, in the link's language | Public (link) |
+| `/u` | The uploader's link page (#212, #213): the same link states and code step as `/t`, then the request and the uploads, in the link's language; a file the company's checks blocked reads "Not accepted", with no reason and no "Remove" (#221) | Public (link) |
 | `/admin/users` | Members and admins: invite, role, DLP approver, sign out everywhere, reset sign-in, deactivate | Admin |
 | `/admin/policy` | Tenant policy, with the allowed and blocked recipient domains (#217), and a form that clears a suppressed email address (`clearEmailSuppression`, #217) | Admin |
-| `/admin/audit` | Audit log (#216): filters in the POST body only (T-47), cursor paging, an event's details, CSV and JSON export | Admin |
+| `/admin/audit` | Audit log (#216): filters in the POST body only (T-47), cursor paging, an event's details, CSV and JSON export. A link may start it with actions and a time range only (`?action=…&from=…&to=…`, never an address), as the DLP report's export does (#222) | Admin |
 | `/admin/api-keys` | API keys (#215): list, create (the secret shown once), revoke | Admin |
-| `/admin/dlp` | DLP policy (#218): settings (mode, trusted domains, approval timeout), rules, keyword lists; every write confirmed | Admin |
+| `/admin/dlp` | DLP policy (#218, #221): settings (enforce or monitor mode, with its warning; trusted domains; approval timeout), rules (for sent or received files, the sender's last 24 hours, two approvers), keyword lists and patterns (`/admin/dlp/patterns/:id`, with their budget stops), each list and pattern with "Test on sample text" (`testDlpDetectors`); every write confirmed | Admin |
+| `/admin/dlp/reports` | DLP report (#222): a range of at most 92 days, decisions by outcome over time, matches by rule and by detector (inline SVG and CSS bars, each with a text alternative and a table view), senders, recipient domains, approvers, files not fully inspected, policy changes, and the decisions with filters and "load more"; "Export with the audit log" opens `/admin/audit` filtered to `dlp.decided` over the range | Admin |
 
 Every M5 page is routed: upload requests and the uploader (#212, #213), the audit log and API keys (#215, #216), the
 DLP policy and approvals (#218, #220). `npm run check:mocks` (part of `npm run check`) walks the imports from
@@ -178,8 +179,15 @@ operations (`sessionUploadApi`: `listSessionUploadedParts`, `requestSessionUploa
 which the API client sends with `X-Link-Session` and the session's CSRF token. A dropped connection resumes by itself
 when the browser is back online; after a reload a file still `uploading` is picked again (matched on name and size)
 and only its missing parts go. Each file's state comes from `listSessionFiles`, in the uploader's words: a blocked
-file says only "blocked by the company's policy" or "couldn't be scanned" (FR-12). The list is polled, so a revocation
-or an expiry ends the page within 15 seconds.
+file says only "blocked by the company's policy" or "couldn't be scanned" (FR-12), and an unscannable file the
+company's policy accepts reads "Accepted", with a word on why (#229). Every file but a blocked one has "Remove", which
+asks first, then takes the file back (`deleteSessionUploadFile`, #229). The list is polled, so a revocation or an
+expiry ends the page within 15 seconds.
+
+**Received files and the uploader's address** (#228, #229, `features/sender/`). On `/upload-requests/:id` the member's
+download keeps its grant in the tab's `sessionStorage` until the browser has the download and sends it as
+`resume_grant_id` on the next click (`receivedDownload.ts`), as the recipient's page does, so an interrupted start
+resumes. A `bounced` link email is explained in the uploader's words: any email of the request may have bounced.
 
 **Extend expiry and the first-download email** (#214, `features/sender/`). `/transfers/new` sends
 `notify_on_first_download`. On `/transfers/:id` the owner of a submitted, not ended transfer gets "Extend expiry": the
@@ -248,3 +256,7 @@ Members ask outsiders for files, and uploaders verify and upload on `/u` (#212, 
 expiry and choose a first-download email (#214).
 Admins manage the DLP policy, rules and keyword lists (#218); senders confirm warnings, clear blocks and request
 approval, and approvers decide requests (#219, #220); `e2e/dlp.e2e.ts` runs those flows in English and Japanese.
+Admins switch the policy to monitor mode, write rules for received files, with the sender's last 24 hours or two
+approvers, add patterns and test lists and patterns on sample text; senders and approvers see the message's findings,
+members see a received file the policy blocked and uploaders see it "not accepted" (#221); admins read the DLP report
+and export its decisions with the audit log (#222).

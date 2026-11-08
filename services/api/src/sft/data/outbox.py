@@ -212,7 +212,8 @@ DLP_POLICY_CHANGED: Final[Mapping[str, Topic]] = {
 """A tenant admin changed the DLP policy, a rule or a detector (#218), or an approver
 designation (#220): the notification worker emails `dlp_policy_changed`, naming the kind, to every
 active admin of the tenant (FR-54). A payload carries IDs only, so the kind is the topic's last
-part: one topic per kind. Payload `{}`."""
+part: one topic per kind. Payload `{}`. Since #230 the worker coalesces them: the kind waits in the
+tenant's notice window, and `dlp_policy.notice_due` sends one email for the window."""
 
 TRANSFER_AWAITING_CONFIRMATION: Final = Topic("transfer.awaiting_confirmation", Queue.NOTIFY)
 """A DLP rule warns or needs approval, so the evaluation moved a transfer to
@@ -238,6 +239,25 @@ DLP_NO_ELIGIBLE_APPROVER: Final = Topic("dlp_approval.no_eligible_approver", Que
 architecture 4.6): `dlp_no_eligible_approver` to every active admin. Payload
 `{"transfer_id": …}`."""
 
+DLP_POLICY_NOTICE_DUE: Final = Topic("dlp_policy.notice_due", Queue.NOTIFY)
+"""The tenant's coalesced DLP policy notice is due (#230, abuse 7.1): the notification worker
+emails `dlp_policy_changed`, listing every kind of change since the last one, to every active
+admin. Written delayed 10 minutes by the `dlp_policy.changed.<kind>` message that found no notice
+due (`sft.service.notice_windows`), so one email covers every change of its window. Payload `{}`."""
+
+DLP_APPROVAL_DIGEST_DUE: Final = Topic("dlp_approval.digest_due", Queue.NOTIFY)
+"""An approver's digest of approval requests is due (#230, abuse 7.1): past 20 request emails in an
+hour, the rest of the hour's requests go into one `dlp_approval_requested` email that counts every
+request the approver could still decide. Written by the `dlp_approval.requested` message that
+first held one back, delayed until the hour ends; a delay longer than SQS's 15 minutes is the
+message sent again, delayed. Payload `{"user_id": …}`."""
+
+DLP_APPROVER_DEACTIVATED: Final = Topic("dlp_approval.approver_deactivated", Queue.NOTIFY)
+"""A deactivation cleared a member's DLP approver designation (#230): with fewer than two active
+approvers left, the notification worker emails `dlp_approver_deactivated` to every active admin at
+once; otherwise the change joins the coalesced policy notice as `approvers_changed`. Written by
+`deactivateUser` in its transaction. Payload `{"user_id": …}`."""
+
 TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
@@ -262,6 +282,9 @@ TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     DLP_APPROVAL_DECIDED,
     DLP_APPROVAL_EXPIRED,
     DLP_NO_ELIGIBLE_APPROVER,
+    DLP_POLICY_NOTICE_DUE,
+    DLP_APPROVAL_DIGEST_DUE,
+    DLP_APPROVER_DEACTIVATED,
 )
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.

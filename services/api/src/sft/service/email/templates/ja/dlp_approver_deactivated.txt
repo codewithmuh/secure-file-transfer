@@ -1,0 +1,14 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{% if none_left %}{{ tenant_name }}のDLP承認者がいなくなりました{% else %}{{ tenant_name }}のDLP承認者が1人だけになりました{% endif %}{% endblock %}
+{% block body %}
+{{ tenant_name }}で情報漏えい対策（DLP）の承認者だったメンバーが無効化されたため、このメンバーは今後承認できません。
+{% if none_left %}
+承認者が1人もいないため、管理者が承認者を指定するまで、承認が必要な送信はできません。
+{% else %}
+残る承認者は1人で、その人は自分の送信を承認できません。
+{% endif %}
+誰がいつ変更したかは、監査ログで確認できます。DLPの設定で承認者を追加してください。
+
+DLPの設定を開く：
+{{ dlp_policy_url }}
+{% endblock %}

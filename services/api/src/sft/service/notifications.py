@@ -33,18 +33,27 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `transfer.awaiting_confirmation` (#219): `dlp_confirmation_needed` to the owner, while the
   transfer still waits for them. A DLP block is `transfer.held` (`transfer_held` says a file or a
   rule holds it), and neither email names a file, a rule or a finding.
-- `dlp_policy.changed.<kind>` (#218): `dlp_policy_changed`, naming that kind of change, to every
-  active admin of the tenant (FR-54). One topic per kind, since a payload carries IDs only; an
-  update of several settings at once sends one email per kind it changed. The coalescing of abuse
-  7.1 (one email per tenant every 10 minutes) isn't built yet: each change is its own notice. An
-  approver designation changed by `updateUser` is the kind `approvers_changed` (#220).
+- `dlp_policy.changed.<kind>` (#218): the kind of change, one topic per kind since a payload
+  carries IDs only, joins the tenant's coalesced notice (#230, abuse 7.1;
+  `sft.service.notice_windows`): the first change with no notice due makes one due in 10 minutes
+  with a delayed `dlp_policy.notice_due`; the rest only add their kind. An approver designation
+  changed by `updateUser` is the kind `approvers_changed` (#220).
+- `dlp_policy.notice_due` (#230): `dlp_policy_changed`, listing every kind of change of the
+  window, to every active admin (FR-54): one email per admin however many changes. A change made
+  while it goes out makes the next notice due.
 - `dlp_approval.requested` (#220): `dlp_approval_requested` to each eligible approver (active,
   with the designation, not the transfer's sender), while the request is still pending. No file
-  name, no approve link: decisions are made signed in (architecture 4.6). The hourly digest past
-  20 an hour (abuse 7.1) isn't built yet: each request is its own email.
+  name, no approve link: decisions are made signed in (architecture 4.6). Past 20 in an hour, an
+  approver's emails wait for their digest (#230, abuse 7.1).
+- `dlp_approval.digest_due` (#230): the digest, `dlp_approval_requested` with the count of
+  requests the approver could decide now, once the approver's hour has ended.
 - `dlp_approval.decided`, `dlp_approval.expired` (#220): `dlp_approval_decided` (approved or
   rejected; the comment stays in the web app) and `dlp_approval_expired` to the transfer's sender.
-- `dlp_approval.no_eligible_approver` (#220): `dlp_no_eligible_approver` to every active admin.
+- `dlp_approval.no_eligible_approver` (#220): `dlp_no_eligible_approver` to every active admin,
+  at most 3 times a day per tenant (#230); the rest are counted in `email_caps_hit_total`.
+- `dlp_approval.approver_deactivated` (#230): a deactivation cleared an approver designation.
+  With fewer than two active approvers left, `dlp_approver_deactivated` to every active admin at
+  once; otherwise the kind `approvers_changed` joins the coalesced policy notice.
 - `member.invited`: with a user pool (`sft.service.user_pool`; Keycloak locally, #197), the
   member's pool user with a temporary password, its identity, then `member_invitation` with that
   password; an address that already signs in locally for another tenant gets
@@ -152,10 +161,13 @@ from sft.data.outbox import (
     API_KEY_EXPIRING,
     API_KEY_FIRST_EXPORT,
     DLP_APPROVAL_DECIDED,
+    DLP_APPROVAL_DIGEST_DUE,
     DLP_APPROVAL_EXPIRED,
     DLP_APPROVAL_REQUESTED,
+    DLP_APPROVER_DEACTIVATED,
     DLP_NO_ELIGIBLE_APPROVER,
     DLP_POLICY_CHANGED,
+    DLP_POLICY_NOTICE_DUE,
     MAX_DELAY,
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
@@ -176,6 +188,7 @@ from sft.data.outbox import (
 )
 from sft.data.processed import record_processed, recorded_before
 from sft.data.scope import Scope, Subject
+from sft.service import notice_windows
 from sft.service.email import EmailRenderer
 from sft.service.email.catalog import (
     ApiKeyExpiring,
@@ -183,6 +196,7 @@ from sft.service.email.catalog import (
     DlpApprovalDecided,
     DlpApprovalExpired,
     DlpApprovalRequested,
+    DlpApproverDeactivated,
     DlpConfirmationNeeded,
     DlpNoEligibleApprover,
     DlpPolicyChanged,
@@ -280,6 +294,10 @@ class NotifyMetrics:
             registry=registry,
         )
         caps.labels("address_link_emails_all")
+        # #230: an approver's request emails held for their digest, and the tenant's capped
+        # "no eligible approver" notices.
+        caps.labels("approver_request_emails")
+        caps.labels("tenant_no_eligible_approver")
         return cls(emails, caps)
 
 
@@ -380,6 +398,9 @@ class Notifier:
             DLP_APPROVAL_DECIDED.name: self._approval_decided,
             DLP_APPROVAL_EXPIRED.name: self._approval_decided,
             DLP_NO_ELIGIBLE_APPROVER.name: self._no_eligible_approver,
+            DLP_POLICY_NOTICE_DUE.name: self._policy_notice_due,
+            DLP_APPROVAL_DIGEST_DUE.name: self._approval_digest,
+            DLP_APPROVER_DEACTIVATED.name: self._approver_deactivated,
         }.get(message.topic)
         if prepare is None:
             # Never deleted: after 5 receives it lands in the dead-letter queue, which alerts.
@@ -1019,19 +1040,37 @@ class Notifier:
     # ---- notices to the tenant's admins ----
 
     async def _policy_changed(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
-        """`dlp_policy_changed` to every active admin, naming the kind of change: the topic's last
-        part (#218, FR-54). Never a keyword, a threshold or a domain: the email names kinds."""
+        """The kind of change, the topic's last part (#218, FR-54), joins the tenant's coalesced
+        notice (#230): no email of its own. Never a keyword, a threshold or a domain."""
         change = PolicyChange(message.topic.rsplit(".", 1)[-1])
+        await notice_windows.note_policy_change(session, change.value, now=self.clock())
+        return _Plan()
+
+    async def _policy_notice_due(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`dlp_policy_changed` to every active admin, listing every kind of change of the window
+        in the catalog's order (#230, abuse 7.1): one email per admin for many changes."""
+        notice = await notice_windows.policy_notice(session)
         sender = await tenants.sender(session)
-        if sender is None or not sender.active:
-            return _Plan()
+        if notice is None or sender is None or not sender.active:
+            return _Plan()  # sent already; or a suspended tenant's, kept for its next change
+        now = self.clock()
+
+        async def settled(session: AsyncSession) -> None:
+            await notice_windows.settle_policy_notice(session, notice, now=now)
+
         admins = await users.list_users(
             session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
         )
-        email = DlpPolicyChanged(tenant_name=sender.name, changes=(change,))
+        if not admins:  # pragma: no cover - a tenant keeps an active admin (409 last_admin)
+            await settled(session)
+            return _Plan()
+        changes = tuple(change for change in PolicyChange if change.value in notice.changes)
+        email = DlpPolicyChanged(tenant_name=sender.name, changes=changes)
         return _Plan(
             [self._to_member(email, sender, admin.email, message.tenant_id) for admin in admins],
             Target("dlp_policy", message.tenant_id),
+            after=settled,
+            rejected=settled,
             per_email=True,
         )
 
@@ -1042,6 +1081,15 @@ class Notifier:
         sender = await tenants.sender(session)
         if sender is None or not sender.active:
             return _Plan()
+        # At most 3 a day per tenant (#230). Counted once per message: a redelivery after a
+        # failed send finds its count recorded and sends without counting again.
+        counted = f"{message.id}:counted"
+        if not await recorded_before(session, consumer=CONSUMER, message_id=counted):
+            if not await notice_windows.reserve_no_approver_email(session, now=self.clock()):
+                self.metrics.caps.labels("tenant_no_eligible_approver").inc()
+                log.info("no-eligible-approver notice held by the tenant's cap")
+                return _Plan()
+            await record_processed(session, consumer=CONSUMER, message_id=counted)
         admins = await users.list_users(
             session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
         )
@@ -1067,7 +1115,7 @@ class Notifier:
         if transfer is None:
             return _Plan()
         email = DlpApprovalRequested(tenant_name=sender.name)
-        plans = []
+        approvers: dict[UUID, str] = {}
         after: UUID | None = None
         while True:
             page = await users.list_users(
@@ -1079,11 +1127,78 @@ class Notifier:
             )
             for user in page[: users.MAX_PAGE]:
                 if user.id != transfer.created_by:  # the sender never approves (T-100)
-                    plans.append(self._to_member(email, sender, user.email, message.tenant_id))
+                    approvers[user.id] = user.email
             if len(page) <= users.MAX_PAGE:
                 break
             after = page[users.MAX_PAGE - 1].id
-        return _Plan(plans, Target("dlp_approval_request", request_id), per_email=True)
+        # Past 20 this hour, an approver's email waits for their digest (#230, abuse 7.1).
+        now = self.clock()
+        emailed, held = await notice_windows.split_approvers(session, list(approvers), now=now)
+        if held:
+            self.metrics.caps.labels("approver_request_emails").inc(len(held))
+
+        async def counted(session: AsyncSession) -> None:
+            await notice_windows.count_approver_emails(session, emailed, now=now)
+
+        return _Plan(
+            [self._to_member(email, sender, approvers[a], message.tenant_id) for a in emailed],
+            Target("dlp_approval_request", request_id),
+            after=counted,
+            per_email=True,
+        )
+
+    async def _approval_digest(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """An approver's digest (#230, abuse 7.1): `dlp_approval_requested` counting every request
+        they could decide now, once their hour has ended, if they are still an active approver."""
+        user_id = _id(message, "user_id")
+        sender = await tenants.sender(session)
+        if sender is None or not sender.active:
+            return _Plan()
+        user = await users.get_user(session, user_id)
+        if user is None:  # pragma: no cover - the message names a user of its tenant
+            return _Plan()
+        if user.status != UserStatus.ACTIVE.value or not user.dlp_approver:
+            await notice_windows.clear_digest(session, user_id)
+            return _Plan()  # they approve nothing any more
+        digest = await notice_windows.digest_due(session, user_id, now=self.clock())
+        if not digest.due:
+            return _Plan()
+
+        async def cleared(session: AsyncSession) -> None:
+            await notice_windows.clear_digest(session, user_id)
+
+        email = DlpApprovalRequested(tenant_name=sender.name, request_count=digest.request_count)
+        return _Plan(
+            [self._to_member(email, sender, user.email, message.tenant_id)],
+            Target(users.TARGET, user_id),
+            after=cleared,
+            rejected=cleared,
+        )
+
+    async def _approver_deactivated(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """A deactivation cleared an approver designation (#230): with fewer than two active
+        approvers left, `dlp_approver_deactivated` to every active admin at once, since some
+        transfers can't be approved now; otherwise `approvers_changed` joins the coalesced
+        policy notice."""
+        user_id = _id(message, "user_id")
+        sender = await tenants.sender(session)
+        if sender is None or not sender.active:
+            return _Plan()
+        left = await users.list_users(session, status=UserStatus.ACTIVE, dlp_approver=True, limit=2)
+        if len(left) >= 2:
+            await notice_windows.note_policy_change(
+                session, PolicyChange.APPROVERS_CHANGED.value, now=self.clock()
+            )
+            return _Plan()
+        admins = await users.list_users(
+            session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
+        )
+        email = DlpApproverDeactivated(tenant_name=sender.name, none_left=not left)
+        return _Plan(
+            [self._to_member(email, sender, admin.email, message.tenant_id) for admin in admins],
+            Target(users.TARGET, user_id),
+            per_email=True,
+        )
 
     async def _approval_decided(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         """`dlp_approval_decided` or `dlp_approval_expired` to the transfer's sender, by the

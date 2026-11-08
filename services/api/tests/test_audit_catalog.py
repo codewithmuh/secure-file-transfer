@@ -394,3 +394,53 @@ def test_the_dlp_approval_actions_are_catalogued(migrated_db: ScratchDatabase) -
         assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
         for table in tables:
             assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of #228 to #230, with the audited tables whose changes each covers in its
+# transaction: an uploader's bounced email marks the request and suppresses the address; the
+# uploader's removal takes a file off and off its request's notice; a deactivation clears the
+# approver designation and writes its notice message. The notice windows are `NOT_AUDITED`.
+M5_REST_ACTIONS = {
+    "email.bounced": ("upload_requests", "transfer_recipients"),
+    "email.suppressed": ("email_suppressions",),
+    "file.removed": ("files", "upload_requests"),
+    "user.deactivated": ("users",),
+    "email.sent": (),
+}
+
+
+def test_the_m5_rest_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    assert not audited["notice_windows"]
+    assert "notice_windows" in NOT_AUDITED
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in M5_REST_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of DLP-6 and DLP-7 (#221, #222), with the audited tables whose changes each
+# covers in its transaction: a received file's decision and its block (with `file.scanned`), the
+# message's findings (with `transfer.created`), a pattern's budget stops, and the reads that are
+# audited though they change nothing.
+DLP_SHOULD_ACTIONS = {
+    "dlp.decided": ("dlp_decisions", "dlp_decision_rules"),
+    "dlp.rule_matched": ("dlp_decision_rules",),
+    "file.scanned": ("files", "dlp_findings"),
+    "transfer.created": ("transfers", "dlp_findings"),
+    "dlp.pattern_budget_exceeded": ("dlp_pattern_stops",),
+    "dlp.detector_tested": (),
+    "dlp.report_viewed": (),
+}
+
+
+def test_the_dlp_should_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in DLP_SHOULD_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"

@@ -27,7 +27,8 @@ row the scope doesn't reach is `NotFoundError`.
   message, so the request is the dedup key. The scan worker (`sft_scan`) and the jobs (`sft_jobs`,
   the scan sweep and a completion over 2 GB) do this. The notification worker reads the counts
   under the row lock (`notice`) and, once its emails are out, takes off what it sent
-  (`settle_notice`); counts that arrived meanwhile make the next notice due.
+  (`settle_notice`); counts that arrived meanwhile make the next notice due. A file the uploader
+  removes before its notice went out is taken off again by the API (`withdraw_arrival`, #229).
 
 Every change here commits only with an audit event (`audit_required`); the caller writes it.
 """
@@ -587,3 +588,37 @@ async def settle_notice(
         .execution_options(synchronize_session=False)
     )
     return bool(more)
+
+
+async def withdraw_arrival(
+    session: AsyncSession, request_id: UUID, *, settled_at: datetime
+) -> bool:
+    """The uploader removed a shareable file that settled at `settled_at` (#229): take it off the
+    request's next notice, if that notice still counts it, so the member isn't told of a file that
+    is gone. The notice counts it when one is due and the file settled in its window (from
+    `notice_due_at - NOTICE_WINDOW`); a file told of already, or one the window can't place, is
+    left counted, so the notice may over-report, never miss a file. A notice left with nothing to
+    say is no longer due. True when the count went down. The caller holds the row lock and writes
+    the audit event."""
+    require_scope(session, ScopeKind.TENANT)
+    left = UploadRequest.arrived_since_notice - 1
+    changed: UUID | None = await session.scalar(
+        update(UploadRequest)
+        .where(
+            UploadRequest.id == request_id,
+            UploadRequest.arrived_since_notice > 0,
+            UploadRequest.notice_due_at.is_not(None),
+            UploadRequest.notice_due_at - NOTICE_WINDOW <= settled_at,
+            in_scope(UploadRequest, session),
+        )
+        .values(
+            arrived_since_notice=left,
+            notice_due_at=case(
+                (and_(left == 0, UploadRequest.blocked_since_notice == 0), None),
+                else_=UploadRequest.notice_due_at,
+            ),
+        )
+        .returning(UploadRequest.id)
+        .execution_options(synchronize_session=False)
+    )
+    return changed is not None

@@ -25,7 +25,7 @@ import pytest
 from prometheus_client import CollectorRegistry
 
 from member_fixtures import Tenant, client, seed_tenant, session_caller
-from notify_fixtures import Sent, drain, notifier
+from notify_fixtures import Sent, drain, elapse, notifier
 from pg import ScratchDatabase
 from sft.data.database import Database
 from sft.data.models import Role
@@ -610,6 +610,8 @@ async def test_the_approver_designation_is_audited_and_emailed_to_admins(w: Worl
     assert changed.status_code == 200, changed.text
     assert changed.json()["dlp_approver"] is True
     assert actions(w.db, w.tenant.member)[-1] == "user.dlp_approver_changed"
+    await emails(w.db, w.tenant.id)  # the change joins the coalesced notice (#230)
+    elapse(w.db, w.tenant.id, timedelta(minutes=10))
     sent = await emails(w.db, w.tenant.id)
     [notice] = sent.of_type("dlp_policy_changed")
     assert notice.to == w.address(w.tenant.admin)

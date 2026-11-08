@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery } from '@tanstack/react-query';
 import { FileIcon, Upload, X } from 'lucide-react';
@@ -13,12 +13,14 @@ import { IdempotencyKeys } from '@/lib/idempotency';
 import {
   addSessionUploadFile,
   countedFiles,
+  deleteSessionUploadFile,
   limitsOf,
   listUploadedFiles,
   resumableMatch,
   sessionUploadApi,
   uploaderFileProblem,
   uploaderFileStatus,
+  uploaderMayRemove,
   uploaderProblemText,
   uploaderStatusVariant,
   uploadsPollInterval,
@@ -53,6 +55,10 @@ const ARRIVED = new Set<SessionFile['state']>(['scanning', 'clean', 'infected', 
  * back online, or on "Try again", from the parts storage already holds. After a reload (the link opened again, the
  * session resumed), a file still `uploading` on the service is picked again, matched on its name and size, and carries
  * on where it stopped. A revoked or expired request ends the page (`410`, the gate's own page).
+ *
+ * **Taking a file back (#229).** While nothing uploads, each file but a blocked one has "Remove", which asks first,
+ * then removes it on the service (`deleteSessionUploadFile`): it stops counting toward the limits and the company
+ * never gets it. An unscannable file the company's policy accepts reads as accepted, with a word on why.
  */
 export function UploaderUploadPage({ session, actions }: { session: VerifiedSession; actions: GateActions }) {
   const { t, i18n } = useTranslation();
@@ -73,6 +79,7 @@ export function UploaderUploadPage({ session, actions }: { session: VerifiedSess
   const [fileError, setFileError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState('');
   const [ending, setEnding] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
 
   entriesNow.current = entries;
   phaseNow.current = phase;
@@ -215,6 +222,26 @@ export function UploaderUploadPage({ session, actions }: { session: VerifiedSess
     return () => window.removeEventListener('online', onOnline);
   });
 
+  /** Takes one of the uploader's files back, then forgets this tab's upload of it (#229). */
+  const takeBack = async (file: SessionFile) => {
+    setRemoving(file.id);
+    setError(null);
+    try {
+      await deleteSessionUploadFile(file.id);
+      for (const entry of entriesNow.current.filter((other) => other.fileId === file.id)) engines.current.delete(entry.key);
+      setEntries((previous) => previous.filter((entry) => entry.fileId !== file.id));
+      entriesNow.current = entriesNow.current.filter((entry) => entry.fileId !== file.id);
+      setAnnouncement(t('uploader.removed', { name: file.display_name }));
+      await refetchFiles();
+    } catch (failure) {
+      const gone = goneOf(failure);
+      if (gone) return actions.gone(gone);
+      setError(uploaderProblemText(failure, t));
+    } finally {
+      if (mounted.current) setRemoving(null);
+    }
+  };
+
   const done = async () => {
     setEnding(true);
     try {
@@ -348,10 +375,12 @@ export function UploaderUploadPage({ session, actions }: { session: VerifiedSess
                 key={file.id}
                 name={file.display_name}
                 size={file.size}
-                status={uploaderFileStatus(file.state)}
+                status={uploaderFileStatus(file.state, file.warning, file.blocked)}
                 entry={byFileId.get(file.id)}
                 resumable={file.state === 'uploading' && !byFileId.has(file.id) && phase !== 'uploading'}
                 onPick={(picked) => pickAndRun(picked)}
+                onTakeBack={uploaderMayRemove(file) && phase !== 'uploading' ? () => takeBack(file) : undefined}
+                takingBack={removing === file.id}
               />
             ))}
             {localOnly.map((entry) => (
@@ -383,7 +412,8 @@ export function UploaderUploadPage({ session, actions }: { session: VerifiedSess
 
 /**
  * One file: its name, size and state as words with a badge (never colour alone), its upload's progress while this tab
- * sends it, and, for a file left `uploading` by an earlier visit, a way to pick it again so it carries on.
+ * sends it, and, for a file left `uploading` by an earlier visit, a way to pick it again so it carries on. A file on
+ * the service that the uploader may take back has "Remove", which asks before it removes (#229).
  */
 function FileRow({
   name,
@@ -393,6 +423,8 @@ function FileRow({
   resumable = false,
   onPick,
   onRemove,
+  onTakeBack,
+  takingBack = false,
 }: {
   name: string;
   size: number;
@@ -402,10 +434,26 @@ function FileRow({
   resumable?: boolean;
   onPick?: (picked: FileList | null) => void;
   onRemove?: () => void;
+  /** Removes the file on the service, after the uploader confirmed (#229). */
+  onTakeBack?: () => Promise<void>;
+  takingBack?: boolean;
 }) {
   const { t } = useTranslation();
   const input = useRef<HTMLInputElement>(null);
+  const keep = useRef<HTMLButtonElement>(null);
+  const removeButton = useRef<HTMLButtonElement>(null);
   const [mismatch, setMismatch] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const confirmId = useId();
+
+  // Asking moves focus to the safe answer; keeping the file returns it to "Remove".
+  useEffect(() => {
+    if (confirming) keep.current?.focus();
+  }, [confirming]);
+  const cancel = () => {
+    setConfirming(false);
+    requestAnimationFrame(() => removeButton.current?.focus());
+  };
   const progress = entry?.progress;
   const sending = progress && progress.status !== 'done';
   const shown: UploaderFileStatus | 'waiting' = sending ? 'uploading' : (status ?? (progress ? 'uploading' : 'waiting'));
@@ -423,6 +471,17 @@ function FileRow({
         </div>
         <div className="flex items-center gap-2">
           <Badge variant={variant}>{t(`uploader.status.${shown}`)}</Badge>
+          {onTakeBack && !confirming && (
+            <Button
+              ref={removeButton}
+              size="sm"
+              variant="secondary"
+              aria-label={t('uploader.removeFile', { name })}
+              onClick={() => setConfirming(true)}
+            >
+              {t('uploader.remove')}
+            </Button>
+          )}
           {onRemove && (
             <button
               type="button"
@@ -464,6 +523,23 @@ function FileRow({
               event.target.value = '';
             }}
           />
+        </div>
+      )}
+      {status === 'accepted' && <p className="mt-1 text-xs text-gray-700">{t('uploader.acceptedHint')}</p>}
+      {status === 'notAccepted' && <p className="mt-1 text-xs text-gray-700">{t('uploader.notAcceptedHint')}</p>}
+      {onTakeBack && confirming && (
+        <div role="group" aria-labelledby={confirmId} className="mt-2 flex flex-wrap items-center justify-between gap-2">
+          <p id={confirmId} className="text-sm text-gray-700">
+            {t('uploader.removeConfirm', { name })}
+          </p>
+          <div className="flex gap-2">
+            <Button ref={keep} size="sm" variant="secondary" onClick={cancel} disabled={takingBack}>
+              {t('uploader.removeKeep')}
+            </Button>
+            <Button size="sm" variant="danger" loading={takingBack} onClick={() => void onTakeBack().finally(() => setConfirming(false))}>
+              {t('uploader.removeYes')}
+            </Button>
+          </div>
         </div>
       )}
       {resumable && mismatch && <p className="mt-1 text-sm text-red-700">{t('sender.resumeMismatch', { name })}</p>}

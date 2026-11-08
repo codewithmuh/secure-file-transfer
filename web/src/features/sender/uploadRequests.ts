@@ -50,11 +50,15 @@ export const DELETABLE_RECEIVED_STATES: readonly FileState[] = ['clean', 'infect
 
 /**
  * Only the member who created the request may download or delete its files; a tenant admin sees the metadata only
- * (`403 permission_denied` otherwise, UC-3). A download needs a shareable file (FR-16).
+ * (`403 permission_denied` otherwise, UC-3). A download needs a shareable file (FR-16), never one a DLP rule for
+ * received files blocked (FR-51; the API says so with `shareable: false` too).
  */
-export function receivedFileActions(file: Pick<ApiFile, 'state' | 'shareable'>, isOwner: boolean) {
+export function receivedFileActions(
+  file: Pick<ApiFile, 'state' | 'shareable'> & { inspection?: Pick<ApiFile['inspection'], 'dlp_blocked'> },
+  isOwner: boolean,
+) {
   return {
-    download: isOwner && file.shareable && file.state !== 'deleted',
+    download: isOwner && file.shareable && file.state !== 'deleted' && !file.inspection?.dlp_blocked,
     remove: isOwner && DELETABLE_RECEIVED_STATES.includes(file.state),
   };
 }

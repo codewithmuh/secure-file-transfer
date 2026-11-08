@@ -14,8 +14,10 @@ and their findings' counts (never their details).
    before the decision (`dlp_known_domains`, FR-46).
 2. **Rules.** Every live, enabled rule for sent files is tested:
    - `content`: the matches of its detectors at or above its confidence, added up over the
-     counted files (FR-48), against its threshold; the count is that sum. The message's findings
-     (FR-50) and the sender's last 24 hours (FR-49) join with #221.
+     counted files and the transfer's message (FR-48, FR-50), against its threshold; the count is
+     that sum. With `include_sender_24h` (FR-49, #221) it adds the findings of the sender's other
+     transfers that moved to `sent` in the 24 hours before the decision: their counted files' and
+     their messages'.
    - `not_inspected`: any counted file whose inspection reasons include one the rule lists; the
      count is the files.
    - `new_domain`: any new recipient domain; the count is the new domains.
@@ -25,8 +27,13 @@ and their findings' counts (never their details).
    `require_approval` < `block`), or `none`. One `dlp_decisions` row records it with the policy
    version, the mode and the numbers of untrusted recipients and new domains, never which, and
    one `dlp_decision_rules` row each matched rule, at the revision it applied.
-4. **Enforcement.** In enforce mode the outcome acts (`Decided.sends`); in monitor mode (#221,
-   refused by the policy API until then) everything is sent and `enforced` is false.
+4. **Enforcement.** In enforce mode the outcome acts (`Decided.sends`); in monitor mode (FR-52,
+   #221) everything is sent and `enforced` is false.
+
+**A received file** (FR-51, #221; `decide_received`) is decided once, by the scan worker, in the
+transaction that records its result: the live, enabled rules for received files, `content` on its
+findings and `not_inspected` on its reasons (no recipients, so no scope or new domain). The outcome
+is `block`, `allow_and_record` or `none`; in enforce mode a block keeps the file from the member.
 
 A tenant always has a policy (revision 0024, `createTenant`). One without is a fault, and the
 evaluation fails closed: nothing is sent without a decision (FR-41).
@@ -51,10 +58,14 @@ from sft.data.models import (
     DlpAction,
     DlpCondition,
     DlpConfidence,
+    DlpDirection,
     DlpMode,
     DlpOutcome,
     DlpRecipientScope,
 )
+
+SENDER_WINDOW: Final = timedelta(hours=24)
+"""How far back a rule with `include_sender_24h` adds the sender's sent transfers (FR-49)."""
 
 KNOWN_FOR: Final = timedelta(days=365)
 """A recipient domain the tenant has sent to within this is not new (FR-46); the daily cleanup
@@ -156,9 +167,15 @@ class Match:
 
 
 def match_rule(
-    rule: PolicyRule, recipients: Sequence[RecipientCheck], files: Sequence[FileEvidence]
+    rule: PolicyRule,
+    recipients: Sequence[RecipientCheck],
+    files: Sequence[FileEvidence],
+    *,
+    sender_24h: Sequence[Counts] = (),
 ) -> Match | None:
-    """The rule's match and its count, or None (module docstring, step 2)."""
+    """The rule's match and its count, or None (module docstring, step 2). `files` holds the
+    message as evidence too, with no reasons; `sender_24h` is the sender's other findings of the
+    last 24 hours, added only for a rule that asks for them."""
     in_scope = list(recipients)
     if rule.recipient_scope == DlpRecipientScope.UNTRUSTED.value:
         in_scope = [r for r in recipients if not r.trusted]
@@ -167,10 +184,12 @@ def match_rule(
     condition = DlpCondition(rule.condition)
     if condition is DlpCondition.CONTENT:
         detectors = set(rule.detectors)
+        found = [counts for file in files for counts in file.findings]
+        if rule.include_sender_24h:
+            found += sender_24h
         total = sum(
             at_or_above(counts, rule.min_confidence)
-            for file in files
-            for counts in file.findings
+            for counts in found
             if counts.detector in detectors
         )
         return Match(rule, total) if total >= rule.threshold else None
@@ -217,10 +236,16 @@ class Decided:
 
 
 async def decide(
-    session: AsyncSession, transfer_id: UUID, counted: Sequence[CountedFile], *, now: datetime
+    session: AsyncSession,
+    transfer_id: UUID,
+    counted: Sequence[CountedFile],
+    *,
+    now: datetime,
+    sender: UUID | None = None,
 ) -> Decided:
-    """Decide on the transfer's counted files, all shareable, and write the decision. The caller
-    holds the transfer's row lock, applies the outcome and writes the audit events."""
+    """Decide on the transfer's counted files, all shareable, and its message, and write the
+    decision. The caller holds the transfer's row lock, applies the outcome and writes the audit
+    events. `sender` is the transfer's `created_by`, for the rules with `include_sender_24h`."""
     policy = await dlp_decisions.decision_policy(session)
     if policy is None:
         raise MissingPolicyError("the tenant has no DLP policy: nothing is sent undecided")
@@ -233,8 +258,20 @@ async def decide(
         FileEvidence(f.id, tuple(r.value for r in f.inspection_reasons), tuple(found.get(f.id, ())))
         for f in counted
     ]
+    message = await findings.message_counts(session, transfer_id)
+    if message:
+        files.append(FileEvidence(transfer_id, (), tuple(message)))
+    sender_24h: list[Counts] = []
+    if sender is not None and any(r.include_sender_24h for r in policy.rules):
+        sender_24h = await findings.sender_recent_counts(
+            session, sender, since=now - SENDER_WINDOW, other_than=transfer_id
+        )
     matches = tuple(
-        m for m in (match_rule(rule, recipients, files) for rule in policy.rules) if m is not None
+        m
+        for m in (
+            match_rule(rule, recipients, files, sender_24h=sender_24h) for rule in policy.rules
+        )
+        if m is not None
     )
     decided = Decided(
         id=uuid7(),
@@ -261,3 +298,63 @@ async def decide(
         ],
     )
     return decided
+
+
+# ---- a received file (FR-51, #221) ----
+
+RECEIVED_OUTCOMES: Final = frozenset(
+    {DlpOutcome.NONE, DlpOutcome.ALLOW_AND_RECORD, DlpOutcome.BLOCK}
+)
+"""What a received file's decision can be: its rules only allow and record, or block."""
+
+
+async def decide_received(
+    session: AsyncSession,
+    file_id: UUID,
+    *,
+    reasons: Sequence[str],
+    found: Sequence[Counts],
+) -> Decided | None:
+    """Decide on a received file from its inspection, and write the decision; None, and nothing
+    written, for a tenant without a policy or without a live rule for received files. The caller
+    records the file's result in the same transaction, blocks the file if `blocks`, and writes the
+    audit events."""
+    policy = await dlp_decisions.decision_policy(session, DlpDirection.RECEIVED)
+    if policy is None or not policy.rules:
+        return None
+    evidence = [FileEvidence(file_id, tuple(reasons), tuple(found))]
+    matches = tuple(
+        m for m in (match_rule(rule, (), evidence) for rule in policy.rules) if m is not None
+    )
+    decided = Decided(
+        id=uuid7(),
+        outcome=outcome_of(matches),
+        mode=DlpMode(policy.mode),
+        policy_version=policy.version,
+        matches=matches,
+        untrusted_recipients=0,
+        new_domains=0,
+    )
+    await dlp_decisions.insert_decision(
+        session,
+        decision_id=decided.id,
+        transfer_id=None,
+        file_id=file_id,
+        policy_version=decided.policy_version,
+        mode=decided.mode.value,
+        outcome=decided.outcome.value,
+        enforced=decided.enforced,
+        untrusted_recipients=0,
+        new_domains=0,
+        rules=[
+            MatchedRule(m.rule.id, m.rule.revision, DlpAction(m.rule.action).value, m.count)
+            for m in matches
+        ],
+    )
+    return decided
+
+
+def blocks(decided: Decided | None) -> bool:
+    """A received file's decision keeps it from the member: a block, in enforce mode (FR-51,
+    FR-52)."""
+    return decided is not None and decided.enforced and decided.outcome is DlpOutcome.BLOCK

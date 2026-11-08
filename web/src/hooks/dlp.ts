@@ -1,14 +1,17 @@
 /**
- * The DLP hooks and calls over the typed `api` client: the tenant's policy, rules and keyword lists for admins (#218),
- * a transfer's decision and its confirmation for the sender (#219), and approval requests for approvers (#220).
- * Pages read through these, never through `api` directly.
+ * The DLP hooks and calls over the typed `api` client: the tenant's policy, rules, keyword lists and patterns for
+ * admins (#218, #221), detector tests on sample text (#221), a transfer's decision and its confirmation for the sender
+ * (#219), approval requests for approvers (#220), and the decisions list and report (#222). Pages read through these,
+ * never through `api` directly.
  */
 import { useInfiniteQuery, useQuery, type QueryClient } from '@tanstack/react-query';
 import {
   api,
   type ApprovalRequest,
   type ApprovalState,
+  type DlpDecision,
   type DlpDetector,
+  type DlpOutcome,
   type DlpPolicy,
   type DlpRule,
   type Schema,
@@ -21,6 +24,11 @@ export type DlpRuleCreate = Schema<'DlpRuleCreate'>;
 export type DlpRuleUpdate = Schema<'DlpRuleUpdate'>;
 export type DlpDetectorCreate = Schema<'DlpDetectorCreate'>;
 export type DlpDetectorUpdate = Schema<'DlpDetectorUpdate'>;
+export type DlpDetectorTest = Schema<'DlpDetectorTest'>;
+export type DlpDetectorTestResult = Schema<'DlpDetectorTestResult'>;
+export type DlpReport = Schema<'DlpReport'>;
+export type DlpDecisionPage = Schema<'DlpDecisionPage'>;
+export type { DlpDecision };
 export type ApprovalScope = 'queue' | 'own' | 'tenant';
 
 export const dlpKeys = {
@@ -29,6 +37,8 @@ export const dlpKeys = {
   rules: ['dlp', 'rules'] as const,
   detectors: ['dlp', 'detectors'] as const,
   detector: (id: string) => ['dlp', 'detectors', id] as const,
+  report: (from: string, to: string) => ['dlp', 'report', from, to] as const,
+  decisions: (filters: DlpDecisionFilters) => ['dlp', 'decisions', filters] as const,
   approvals: ['approvals'] as const,
   approvalList: (scope: ApprovalScope, state: ApprovalState | null) => ['approvals', 'list', scope, state ?? 'all'] as const,
   pendingCount: ['approvals', 'pending-count'] as const,
@@ -109,6 +119,15 @@ export async function updateDlpDetector(detectorId: string, body: DlpDetectorUpd
 
 export async function deleteDlpDetector(detectorId: string): Promise<void> {
   await api.delete('/dlp/detectors/{detector_id}', { path: { detector_id: detectorId } });
+}
+
+/**
+ * `testDlpDetectors` (FR-56): runs existing detectors, a draft keyword list or pattern, or both, on sample text of at
+ * most 16,384 characters. The text is processed in memory, never stored or logged; nothing is cached here either.
+ * `413 request_too_large` past the limit, `429 rate_limited` past 30 a minute per account.
+ */
+export async function testDlpDetectors(body: DlpDetectorTest): Promise<DlpDetectorTestResult> {
+  return (await api.post('/dlp/detector-tests', { body })).data;
 }
 
 /** After any policy, rule or detector write: every DLP view loads again, with the new policy version. */
@@ -222,4 +241,64 @@ export async function rejectTransfer(requestId: string, comment: string): Promis
 /** After an approval decision: the queue, the badge and the request load again. */
 export function invalidateApprovals(client: QueryClient): Promise<void> {
   return client.invalidateQueries({ queryKey: dlpKeys.approvals });
+}
+
+// ---- the report and the decisions list (#222; FR-55): admins ----
+
+/** A report's range as the API takes it: RFC 3339 times, `from` inclusive and `to` exclusive, at most 92 days apart. */
+export interface DlpRange {
+  from: string;
+  to: string;
+}
+
+/**
+ * The DLP report for the range (`getDlpReport`). Each response is audited (`dlp.report_viewed`), so it is fetched when
+ * the range changes, not on window focus; `null` while the range is invalid.
+ */
+export function useDlpReport(range: DlpRange | null) {
+  return useQuery({
+    queryKey: dlpKeys.report(range?.from ?? '', range?.to ?? ''),
+    queryFn: async ({ signal }) => (await api.get('/dlp/report', { query: { from: range?.from, to: range?.to }, signal })).data,
+    enabled: range !== null,
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+}
+
+/** The decisions list's filters: outcomes (any when empty), a rule, a sender, and the range. */
+export interface DlpDecisionFilters {
+  outcomes: DlpOutcome[];
+  ruleId: string | null;
+  senderId: string | null;
+  range: DlpRange;
+}
+
+/** The tenant's DLP decisions, newest first, with "load more" through the cursor (`listDlpDecisions`). */
+export function useDlpDecisions(filters: DlpDecisionFilters | null, limit = 25) {
+  return useInfiniteQuery({
+    queryKey: dlpKeys.decisions(
+      filters ?? { outcomes: [], ruleId: null, senderId: null, range: { from: '', to: '' } },
+    ),
+    initialPageParam: null as string | null,
+    queryFn: async ({ pageParam, signal }) =>
+      (
+        await api.get('/dlp/decisions', {
+          query: {
+            limit,
+            from: filters?.range.from,
+            to: filters?.range.to,
+            ...(filters && filters.outcomes.length > 0 ? { outcome: filters.outcomes } : {}),
+            ...(filters?.ruleId ? { rule_id: filters.ruleId } : {}),
+            ...(filters?.senderId ? { sender_id: filters.senderId } : {}),
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
+          signal,
+        })
+      ).data,
+    getNextPageParam: (page) => page.next_cursor ?? null,
+    enabled: filters !== null,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
 }

@@ -3,7 +3,8 @@ import type { ActorType, Schema } from '@/api';
 /**
  * The audit log's filter form (#216; FR-28, UC-4) as the contract's `AuditFilter`, and the export's file name. Email
  * addresses and IP addresses go only in a POST body, never in the page's address or a query string (T-47), so the
- * form's state lives in the page, not in the URL.
+ * form's state lives in the page, not in the URL. Only a link from another page may start it with actions and a time
+ * range (`auditLink`, `formFromSearch`; the DLP report's "export with the audit log", #222): nothing personal.
  */
 
 export type AuditFilter = Schema<'AuditFilter'>;
@@ -45,6 +46,7 @@ export const KNOWN_ACTIONS = {
     'user.dlp_approver_changed',
     'user.deactivated',
   ],
+  dlp: ['dlp.decided', 'dlp.rule_matched', 'dlp.detector_tested', 'dlp.pattern_budget_exceeded', 'dlp.report_viewed'],
   admin: [
     'tenant_policy.updated',
     'api_key.created',
@@ -143,6 +145,45 @@ export function filterBody(form: FilterForm): AuditFilter | undefined {
   if (form.targetId.trim()) filter.target_id = form.targetId.trim().toLowerCase();
   if (form.sourceIp.trim()) filter.source_ip = form.sourceIp.trim();
   return Object.keys(filter).length > 0 ? filter : undefined;
+}
+
+/** An RFC 3339 time as a `datetime-local` value in the browser's time zone, to the second; `''` if it isn't one. */
+export function isoToLocal(iso: string): string {
+  const time = Date.parse(iso);
+  if (Number.isNaN(time)) return '';
+  const date = new Date(time);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  );
+}
+
+const ACTION = /^[a-z_]+\.[a-z_]+$/;
+
+/**
+ * The audit log's address with actions and a time range filled in (`/admin/audit?action=dlp.decided&from=…&to=…`):
+ * the only fields a link carries, none of them personal (T-47).
+ */
+export function auditLink(filter: { actions: readonly string[]; from?: string; to?: string }): string {
+  const params = new URLSearchParams();
+  for (const action of filter.actions) params.append('action', action);
+  if (filter.from) params.set('from', filter.from);
+  if (filter.to) params.set('to', filter.to);
+  const query = params.toString();
+  return query ? `/admin/audit?${query}` : '/admin/audit';
+}
+
+/**
+ * The form a link starts the page with: its actions (dotted codes, at most 20) and its `from` and `to` times, nothing
+ * else, so an address never fills in an email or IP address. `null` when the link has none of them.
+ */
+export function formFromSearch(search: URLSearchParams): FilterForm | null {
+  const actions = [...new Set(search.getAll('action').filter((action) => ACTION.test(action)))].slice(0, MAX_ACTIONS);
+  const from = isoToLocal(search.get('from') ?? '');
+  const to = isoToLocal(search.get('to') ?? '');
+  if (actions.length === 0 && !from && !to) return null;
+  return { ...EMPTY_FILTER, actions, from, to };
 }
 
 export function toggleAction(actions: readonly string[], action: string): string[] {

@@ -14,8 +14,13 @@ import {
   blockedDlp,
   blockedId,
   codeRequested,
+  detectorTestResult,
+  dlpBlockedFileId,
+  dlpDecisionPage,
   dlpDetectors,
   dlpPolicy,
+  dlpPolicyMonitor,
+  dlpReport,
   dlpRules,
   draft,
   draftId,
@@ -35,6 +40,8 @@ import {
   pendingId,
   pendingRequest,
   pendingRequestId,
+  patternDetector,
+  patternPath,
   policy,
   problemOf,
   queueRequest,
@@ -42,6 +49,7 @@ import {
   receivedFiles,
   receivedFindingsFileId,
   receivedInspection,
+  receivedRuleId,
   recipientStatuses,
   rejected,
   rejectedDlp,
@@ -72,7 +80,8 @@ import {
  * the browser journey shares (support/axe.ts): any WCAG 2.0, 2.1 or 2.2 A or AA violation fails. The API is answered
  * from contract-typed fixtures (apiFixtures.ts), so the live pages are checked with real shapes and no backend is
  * needed: every page, every dialog, every link state and step of the recipient's and the uploader's pages, and the
- * sign-in callback's error state (#168, #198, #199, #212, #213, #214).
+ * sign-in callback's error state (#168, #198, #199, #212, #213, #214), and the DLP policy, its patterns, detector tests,
+ * monitor mode, received-file rules and blocks, message findings and reports (#218 to #222).
  */
 
 /** What the API answers, by path: contract-typed fixtures (apiFixtures.ts), so the live pages show real shapes. */
@@ -99,6 +108,9 @@ const answers: Record<string, unknown> = {
   '/v1/dlp/rules': dlpRules,
   '/v1/dlp/detectors': dlpDetectors,
   [`/v1/dlp/detectors/${keywordListPath}`]: keywordList,
+  [`/v1/dlp/detectors/${patternPath}`]: patternDetector,
+  '/v1/dlp/report': dlpReport,
+  '/v1/dlp/decisions': dlpDecisionPage,
   '/v1/dlp/approval-requests': approvalQueue,
   [`/v1/dlp/approval-requests/${queueRequestId}`]: queueRequest,
   [`/v1/dlp/approval-requests/${pendingRequestId}`]: pendingRequest,
@@ -168,6 +180,11 @@ const memberPages = [
   ['DLP keyword lists', '/admin/dlp/keywords'],
   ['DLP new keyword list', '/admin/dlp/keywords/new'],
   ['DLP keyword list', `/admin/dlp/keywords/${keywordListPath}`],
+  // #221, #222: patterns, a rule for received files, and the report.
+  ['DLP new pattern', '/admin/dlp/patterns/new'],
+  ['DLP pattern stopped for its budget', `/admin/dlp/patterns/${patternPath}`],
+  ['DLP rule for received files', `/admin/dlp/rules/${receivedRuleId}`],
+  ['DLP reports', '/admin/dlp/reports'],
   ['transfer awaiting confirmation, warned', `/transfers/${warnedId}`],
   ['transfer awaiting confirmation, approval required', `/transfers/${approvalNeededId}`],
   ['transfer pending approval', `/transfers/${pendingId}`],
@@ -633,6 +650,15 @@ test('upload request: a revocation not yet confirmed (503) says it stands and of
   await expectNoWcagViolations(page, 'upload request revocation unconfirmed');
 });
 
+test('upload request: the uploader\'s address bounced (#228)', async ({ page }) => {
+  await page.route(`**/v1/upload-requests/${uploadRequestId}`, (route) =>
+    route.fulfill({ status: 200, json: { ...openRequest, delivery_state: 'bounced' } }),
+  );
+  await page.goto(`/upload-requests/${uploadRequestId}`);
+  await expect(page.getByText(text().requests.deliveryExplain.bounced)).toBeVisible();
+  await expectNoWcagViolations(page, 'upload request with a bounced address');
+});
+
 test('transfer detail: the extend expiry dialog (#214)', async ({ page }) => {
   await page.route(`**/v1/transfers/${transferId}`, (route) => route.fulfill({ status: 200, json: extendableTransfer() }));
   await page.goto(`/transfers/${transferId}`);
@@ -672,6 +698,46 @@ test('uploader: the request and the files, each state in plain words', async ({ 
   await expect(page.getByText(text().uploader.status.unscannable)).toBeVisible();
   await expect(page.getByText(text().uploader.resumeHint)).toBeVisible();
   await expectNoWcagViolations(page, 'uploader files');
+});
+
+test('uploader: an accepted unscannable file, then taking a file back, by keyboard (#229)', async ({ page }) => {
+  const accepted = {
+    id: '0190c0de-0000-7000-8000-0000000000c7',
+    display_name: 'scan.tif',
+    content_type: 'image/tiff',
+    size: 3_145_728,
+    state: 'unscannable' as const,
+    warning: 'unscannable' as const,
+  };
+  const removable = uploaderFiles.items[0];
+  if (!removable) throw new Error('the fixture lists files');
+  await answerLinks(page, {
+    'POST /v1/links/resolve': { status: 200, json: uploaderResolution(language(), 'verified') },
+    'GET /v1/session': { status: 200, json: uploaderSession(language()) },
+    'GET /v1/session/files': { status: 200, json: { items: [...uploaderFiles.items, accepted] } },
+    [`DELETE /v1/session/files/${removable.id}`]: { status: 204 },
+  });
+  await page.goto(UPLOAD_LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().uploader.title })).toBeFocused();
+  await expect(page.getByText(text().uploader.status.accepted, { exact: true })).toBeVisible();
+  await expect(page.getByText(text().uploader.acceptedHint)).toBeVisible();
+  // A blocked file can't be taken back: it has no "Remove".
+  await expect(page.getByRole('button', { name: fill(text().uploader.removeFile, { name: 'setup.exe' }) })).toHaveCount(0);
+
+  const remove = page.getByRole('button', { name: fill(text().uploader.removeFile, { name: removable.display_name }) });
+  await remove.focus();
+  await page.keyboard.press('Enter');
+  const keep = page.getByRole('button', { name: text().uploader.removeKeep });
+  await expect(keep).toBeFocused();
+  await expect(page.getByRole('group', { name: fill(text().uploader.removeConfirm, { name: removable.display_name }) })).toBeVisible();
+  await expectNoWcagViolations(page, 'uploader remove confirmation');
+  await page.keyboard.press('Enter');
+  await expect(remove).toBeFocused();
+
+  await page.keyboard.press('Enter');
+  await page.getByRole('button', { name: text().uploader.removeYes }).click();
+  await expect(page.getByRole('status').filter({ hasText: fill(text().uploader.removed, { name: removable.display_name }) })).toHaveCount(1);
+  await expectNoWcagViolations(page, 'uploader file removed');
 });
 
 test('uploader: a revoked request says so', async ({ page }) => {
@@ -836,4 +902,135 @@ test('approval request: approve with a sign-in too old, and reject without a com
   await reject.getByRole('button', { name: t.reject.action }).click();
   await expect(reject.getByLabel(t.commentRequired)).toHaveAccessibleDescription(new RegExp(escapeRegExp(t.commentProblem.required)));
   await expectNoWcagViolations(page, 'reject dialog, comment missing');
+});
+
+// ---- DLP-6 and DLP-7 (#221, #222): monitor mode, rules for received files, patterns, tests, blocks and reports ----
+
+test('DLP settings: switching to monitor mode warns and names the change; a policy in monitor mode says so (#221)', async ({ page }) => {
+  await page.goto('/admin/dlp');
+  const t = text().dlpAdmin;
+  await page.getByRole('radio', { name: new RegExp(escapeRegExp(t.modes.monitor)) }).check();
+  await expect(page.getByText(t.monitorWarning)).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings, monitor chosen');
+  await page.getByRole('button', { name: text().common.save, exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: t.confirmSettings });
+  await expect(dialog.getByText(fill(t.change.mode, { from: t.modes.enforce, to: t.modes.monitor }))).toBeVisible();
+  await expect(dialog.getByRole('button', { name: t.switchToMonitor })).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings, monitor confirmation');
+
+  await page.route('**/v1/dlp/policy', (route) => route.fulfill({ status: 200, json: dlpPolicyMonitor }));
+  await page.goto('/admin/dlp');
+  await expect(page.getByText(fill(t.currentMode, { mode: t.modes.monitor }))).toBeVisible();
+  await expect(page.getByText(t.monitorWarning)).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings in monitor mode');
+});
+
+test('DLP rule form: a rule for received files, then two approvers and the 24-hour window (#221)', async ({ page }) => {
+  await page.goto('/admin/dlp/rules/new');
+  const t = text().dlpAdmin;
+  await page.getByRole('radio', { name: new RegExp(escapeRegExp(t.direction.received)) }).check();
+  await expect(page.getByRole('group', { name: t.recipients })).toHaveCount(0);
+  await expect(page.getByRole('radio', { name: new RegExp(escapeRegExp(text().dlpAction.warn)) })).toHaveCount(0);
+  await expect(page.getByText(t.include24h)).toHaveCount(0);
+  await expectNoWcagViolations(page, 'new rule for received files');
+
+  await page.getByRole('radio', { name: new RegExp(escapeRegExp(t.direction.sent)) }).check();
+  await page.getByRole('checkbox', { name: new RegExp(escapeRegExp(t.include24h)) }).check();
+  await page.getByRole('radio', { name: new RegExp(escapeRegExp(text().dlpAction.require_approval)) }).check();
+  await page.getByRole('checkbox', { name: new RegExp(escapeRegExp(t.twoApproversOption)) }).check();
+  await expect(page.getByText(fill(t.twoApproversNeed_other, { count: 2 }))).toBeVisible();
+  await expectNoWcagViolations(page, 'new rule with two approvers and 24 hours');
+});
+
+test('DLP pattern: its budget stops, a test on sample text, then a refusal on its field (#221)', async ({ page }) => {
+  await page.route('**/v1/dlp/detector-tests', (route) => route.fulfill({ status: 200, json: detectorTestResult }));
+  await page.route(`**/v1/dlp/detectors/${patternPath}`, (route) =>
+    route.request().method() === 'PATCH'
+      ? route.fulfill({
+          status: 422,
+          json: problemOf(422, 'validation_failed', { errors: [{ detail: 'The pattern matches the empty string.', pointer: '#/pattern' }] }),
+        })
+      : route.fulfill({ status: 200, json: patternDetector }),
+  );
+  await page.goto(`/admin/dlp/patterns/${patternPath}`);
+  const t = text().dlpAdmin;
+  await expect(page.getByText(t.budgetAdvice)).toBeVisible();
+
+  const sample = page.getByLabel(t.test.text);
+  await sample.fill('Invoice\nINV-000012 is due.');
+  await page.getByRole('button', { name: t.test.run, exact: true }).click();
+  await expect(page.getByRole('table', { name: t.test.resultsCaption })).toBeVisible();
+  await expect(page.getByText('INV-••••12')).toBeVisible();
+  await expectNoWcagViolations(page, 'pattern test results');
+
+  const expression = page.getByLabel(t.pattern, { exact: true });
+  await expression.fill('(INV)?');
+  await page.getByRole('button', { name: text().common.save, exact: true }).click();
+  await page.getByRole('dialog', { name: t.confirmEditPattern }).getByRole('button', { name: text().common.save }).click();
+  await expect(expression).toHaveAttribute('aria-invalid', 'true');
+  await expect(expression).toBeFocused();
+  await expectNoWcagViolations(page, 'pattern refused on its field');
+});
+
+test('DLP keyword list: a test past the rate limit says when to try again (#221)', async ({ page }) => {
+  await page.route('**/v1/dlp/detector-tests', (route) =>
+    route.fulfill({ status: 429, headers: { 'Retry-After': '20' }, json: problemOf(429, 'rate_limited') }),
+  );
+  await page.goto(`/admin/dlp/keywords/${keywordListPath}`);
+  const t = text().dlpAdmin.test;
+  await page.getByLabel(t.text).fill('Bluebird ships on Friday.');
+  await page.getByRole('button', { name: t.run, exact: true }).click();
+  await expect(page.getByText(t.rateLimited, { exact: false })).toBeVisible();
+  await expectNoWcagViolations(page, 'keyword list test, rate limited');
+});
+
+test('message findings on the transfer and on its approval request (#221)', async ({ page }) => {
+  await page.goto(`/transfers/${warnedId}`);
+  await expect(page.getByRole('heading', { name: text().dlp.message })).toBeVisible();
+  await expectNoWcagViolations(page, 'transfer with message findings');
+  await page.goto(`/approvals/${queueRequestId}`);
+  await expect(page.getByText(text().dlp.messageFindings)).toBeVisible();
+  await expectNoWcagViolations(page, 'approval request with message findings');
+});
+
+test('upload request: a file the data policy blocked can\'t be downloaded (#221)', async ({ page }) => {
+  await page.goto(`/upload-requests/${uploadRequestId}`);
+  await expect(page.getByText(text().requests.dlpBlocked)).toBeVisible();
+  await expect(page.getByRole('button', { name: fill(text().requests.downloadFile, { name: 'customers.csv' }) })).toHaveCount(0);
+  await expect(page.locator(`#blocked-${dlpBlockedFileId}`)).toBeVisible();
+  await expectNoWcagViolations(page, 'received file blocked by the data policy');
+});
+
+test('uploader: a file not accepted, with no reason and no Remove (#221)', async ({ page }) => {
+  await answerLinks(page, {
+    'POST /v1/links/resolve': { status: 200, json: uploaderResolution(language(), 'verified') },
+    'GET /v1/session': { status: 200, json: uploaderSession(language()) },
+    'GET /v1/session/files': { status: 200, json: uploaderFiles },
+  });
+  await page.goto(UPLOAD_LINK);
+  await expect(page.getByText(text().uploader.status.notAccepted, { exact: true })).toBeVisible();
+  await expect(page.getByText(text().uploader.notAcceptedHint)).toBeVisible();
+  await expect(page.getByRole('button', { name: fill(text().uploader.removeFile, { name: 'customers.csv' }) })).toHaveCount(0);
+  await expectNoWcagViolations(page, 'uploader file not accepted');
+});
+
+test('DLP reports: the charts as tables, the decisions list, and the export link (#222)', async ({ page }) => {
+  await page.goto('/admin/dlp/reports');
+  const t = text().dlpReports;
+  await expect(page.getByRole('heading', { name: t.overTime })).toBeVisible();
+  for (const button of await page.getByRole('button', { name: t.tableView }).all()) await button.click();
+  await expect(page.getByRole('table', { name: t.overTimeCaption })).toBeVisible();
+  await expect(page.getByRole('table', { name: t.decisionsCaption })).toBeVisible();
+  await expect(page.getByText(t.recordedOnly)).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP reports as tables');
+
+  await page.getByLabel(t.from, { exact: true }).fill('2020-01-01');
+  await page.getByRole('button', { name: t.apply, exact: true }).click();
+  await expect(page.getByText(fill(t.rangeProblem.tooLong, { max: 92 }))).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP reports, range too long');
+
+  await page.getByRole('link', { name: t.export }).click();
+  await expect(page).toHaveURL(/\/admin\/audit\?action=dlp\.decided&from=/);
+  await expect(page.locator('main').getByRole('heading', { level: 1, name: text().audit.title })).toBeVisible();
+  await expectNoWcagViolations(page, 'audit log filtered to DLP decisions');
 });

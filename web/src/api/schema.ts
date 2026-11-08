@@ -1257,6 +1257,51 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/session/files/{file_id}": {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description ID of the link session this call acts in (`LinkSession.id`, from `createLinkSession` or `resolveLink`). A
+                 *     browser can hold several link sessions at once under its `__Host-sft_link` cookie, one per transfer recipient
+                 *     or upload request; this header picks one, and the call sees only that session's transfer or request. The ID
+                 *     is not a credential: it works only with the cookie of the browser that verified it, so the web app may keep it
+                 *     across a page reload. A missing ID, or one this browser doesn't hold, gets `401 authentication_required`.
+                 *     Every `/session` operation takes it except `getSessionDownloadContent`, which a navigation starts.
+                 */
+                "X-Link-Session": components["parameters"]["LinkSessionId"];
+            };
+            path: {
+                /** @description ID of the file. */
+                file_id: components["parameters"]["FileId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove an uploader's file
+         * @description For an uploader: takes back a file they declared or uploaded, while the request is open. The file is removed as
+         *     the member's early delete removes it: it no longer counts toward the request's limits (50 files, 20 GB; its
+         *     declaration still counts toward the 100), its storage reservation is released, its contents are deleted on the
+         *     data lifecycle schedule, an open upload is aborted, and the member no longer sees it. A file still counted in
+         *     the member's next files-arrived notice is taken off it. Removing a file already removed changes nothing and
+         *     answers `204`, so a retry is safe. A blocked file (infected, a failed scan, unscannable and not allowed by the
+         *     tenant policy, or blocked by a DLP rule) stays for the requesting company to review: `409 invalid_state`, as
+         *     for a file already deleted. Not allowed for a recipient session.
+         *
+         *     Errors: `403 permission_denied`, `404 not_found` (not a file of this request), `409 invalid_state`,
+         *     `410 link_revoked`, `410 link_expired`, `429 rate_limited`.
+         *
+         *     Requirements: FR-11, FR-12, FR-27.
+         */
+        delete: operations["deleteSessionUploadFile"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/session/files/{file_id}/parts": {
         parameters: {
             query?: never;
@@ -1675,6 +1720,8 @@ export interface paths {
          *     next call with any of their keys gets `401`. Before deactivating an admin, the web app shows the keys they own
          *     (`listApiKeys`, by `created_by`), so automation can move to another admin's key first. Their transfers and
          *     upload requests are unchanged; an admin can revoke them. The tenant always keeps at least one active admin.
+         *     A deactivated DLP approver approves nothing any more: the designation is cleared, and the tenant's admins are
+         *     emailed, at once when fewer than two approvers are left, otherwise in the next DLP policy notice (#230).
          *
          *     A deactivation is a security-critical record (README section 5): the `200` comes only after it is in the
          *     audit archive in both regions (NFR-10). If that write fails, the deactivation has still taken effect and the
@@ -3172,7 +3219,9 @@ export interface components {
             size: number;
             state: components["schemas"]["FileState"];
             /**
-             * @description For a recipient, present when the file couldn't be scanned and the tenant policy allows it (FR-18).
+             * @description Present when the file couldn't be scanned and the tenant policy allows it (FR-18). For a recipient, a
+             *     warning before the download; for an uploader, the file was accepted as it is, so the web app words it as
+             *     accepted, not as a failure (#229).
              * @enum {string}
              */
             warning?: "unscannable";
@@ -3182,6 +3231,11 @@ export interface components {
             downloads_used?: number;
             /** @description For an uploader, present only while the file is `uploading`. */
             upload?: components["schemas"]["UploadPlan"];
+            /**
+             * @description For an uploader: the company's checks didn't accept the file (malware, a scan that failed, or the company's
+             *     data policy, FR-51). No reason is given (FR-12): the company sees why.
+             */
+            blocked?: boolean;
         };
         SessionFileList: {
             items: components["schemas"]["SessionFile"][];
@@ -3897,6 +3951,16 @@ export interface components {
             case_insensitive?: boolean;
             min_length?: number;
             created_at?: components["schemas"]["Timestamp"];
+            /**
+             * @description For a pattern, in `getDlpDetector` only: how many files stopped it for spending its scan-time budget
+             *     (detectors 5). Its matches up to then still counted; a high number means the pattern needs narrowing.
+             */
+            budget_exceeded_files?: number;
+            /**
+             * Format: date-time
+             * @description For a pattern, in `getDlpDetector` only, when a file last stopped it; `null` if none has.
+             */
+            budget_exceeded_last_at?: string | null;
         };
         /** @description `keywords` is required for a keyword list, `pattern` for a pattern (detectors 5). */
         DlpDetectorCreate: {
@@ -5654,6 +5718,43 @@ export interface operations {
             410: components["responses"]["Gone"];
             413: components["responses"]["ContentTooLarge"];
             422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    deleteSessionUploadFile: {
+        parameters: {
+            query?: never;
+            header: {
+                /**
+                 * @description ID of the link session this call acts in (`LinkSession.id`, from `createLinkSession` or `resolveLink`). A
+                 *     browser can hold several link sessions at once under its `__Host-sft_link` cookie, one per transfer recipient
+                 *     or upload request; this header picks one, and the call sees only that session's transfer or request. The ID
+                 *     is not a credential: it works only with the cookie of the browser that verified it, so the web app may keep it
+                 *     across a page reload. A missing ID, or one this browser doesn't hold, gets `401 authentication_required`.
+                 *     Every `/session` operation takes it except `getSessionDownloadContent`, which a navigation starts.
+                 */
+                "X-Link-Session": components["parameters"]["LinkSessionId"];
+            };
+            path: {
+                /** @description ID of the file. */
+                file_id: components["parameters"]["FileId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The file was removed. Its contents are deleted on the data lifecycle schedule. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            410: components["responses"]["Gone"];
             429: components["responses"]["TooManyRequests"];
         };
     };

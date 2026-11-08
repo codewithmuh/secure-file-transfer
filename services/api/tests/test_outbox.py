@@ -22,10 +22,13 @@ from sft.data.outbox import (
     API_KEY_EXPIRING,
     API_KEY_FIRST_EXPORT,
     DLP_APPROVAL_DECIDED,
+    DLP_APPROVAL_DIGEST_DUE,
     DLP_APPROVAL_EXPIRED,
     DLP_APPROVAL_REQUESTED,
+    DLP_APPROVER_DEACTIVATED,
     DLP_NO_ELIGIBLE_APPROVER,
     DLP_POLICY_CHANGED,
+    DLP_POLICY_NOTICE_DUE,
     FILE_SCAN,
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
@@ -107,6 +110,10 @@ def test_the_service_names_each_topic_it_sends() -> None:
         "dlp_approval.decided": DLP_APPROVAL_DECIDED,
         "dlp_approval.expired": DLP_APPROVAL_EXPIRED,
         "dlp_approval.no_eligible_approver": DLP_NO_ELIGIBLE_APPROVER,
+        # The coalesced policy notice, the approvers' digest and the deactivated approver (#230).
+        "dlp_policy.notice_due": DLP_POLICY_NOTICE_DUE,
+        "dlp_approval.digest_due": DLP_APPROVAL_DIGEST_DUE,
+        "dlp_approval.approver_deactivated": DLP_APPROVER_DEACTIVATED,
     } == TOPICS
     assert TRANSFER_AWAITING_CONFIRMATION.queue is Queue.NOTIFY
     for topic in (
@@ -114,6 +121,9 @@ def test_the_service_names_each_topic_it_sends() -> None:
         DLP_APPROVAL_DECIDED,
         DLP_APPROVAL_EXPIRED,
         DLP_NO_ELIGIBLE_APPROVER,
+        DLP_POLICY_NOTICE_DUE,
+        DLP_APPROVAL_DIGEST_DUE,
+        DLP_APPROVER_DEACTIVATED,
     ):
         assert topic.queue is Queue.NOTIFY
     assert MEMBER_INVITED.queue is Queue.NOTIFY

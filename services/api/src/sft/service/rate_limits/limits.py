@@ -250,6 +250,8 @@ K_POLICY_CHANGES = _limit(Group.DLP, "policy_changes", KeyType.TENANT, Quota(100
 K_CONFIRMATIONS = _limit(Group.DLP, "confirmations", CALLER, Rate(30, MINUTE))
 K_FINDING_READS = _limit(Group.DLP, "finding_reads", CALLER, Rate(600, HOUR))
 K_APPROVAL_DECISIONS = _limit(Group.DLP, "approval_decisions", CALLER, Rate(120, HOUR))
+K_DETECTOR_TESTS = _limit(Group.DLP, "detector_tests", CALLER, Rate(30, MINUTE))
+K_REPORT_READS = _limit(Group.DLP, "report_reads", KeyType.TENANT, Rate(60, MINUTE))
 
 ALL = (
     *(A_IP, A_NOT_FOUND, A_FAILED_CODES, A_SUBJECT_GAP, A_SUBJECT_DAY),
@@ -268,6 +270,8 @@ ALL = (
     K_CONFIRMATIONS,
     K_FINDING_READS,
     K_APPROVAL_DECISIONS,
+    K_DETECTOR_TESTS,
+    K_REPORT_READS,
 )
 """Every limit above, for the tests that check the whole table."""
 
@@ -354,3 +358,9 @@ APPROVAL_DECISION = (K_APPROVAL_DECISIONS,)
 """`approveTransfer` (with `TENANT_OPERATION`) and `rejectTransfer` (with `SAFETY_ACTION` only, a
 safety action): 120 approval decisions an hour per approver (abuse 2.2, K), so a compromised
 approver session can't release a backlog in seconds (#220)."""
+DLP_DETECTOR_TEST = (K_DETECTOR_TESTS,)
+"""`testDlpDetectors`, with `TENANT_OPERATION`: 30 tests a minute per account (abuse 2.2, K, #221).
+Keys are refused by the service; the API key's key is named only so the check has one."""
+DLP_REPORT_READ = (K_REPORT_READS,)
+"""`getDlpReport` and `listDlpDecisions`, with `TENANT_OPERATION`: 60 reads a minute per tenant
+(abuse 2.2, K, #222)."""

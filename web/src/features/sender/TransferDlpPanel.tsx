@@ -16,11 +16,11 @@ import { CHANGEABLE_STATES, dlpStage, filesToRemove, findingTotal, flaggedRecipi
 import { dlpActionVariant, isBuiltinDetector } from './states';
 
 /**
- * The transfer's DLP decision on its page (#219, #220; FR-41 to FR-43, FR-45, FR-46, FR-48, UC-7): the rules that
- * matched and their actions, the recipients flagged untrusted or new, and what each file's inspection found (detector
- * names and counts). The sender confirms a warning, requests approval with a justification, removes a file (the
- * transfer is checked again) or cancels. A pending request shows its expiry and the approvals so far; a rejection
- * shows the approver's comment.
+ * The transfer's DLP decision on its page (#219, #220, #221; FR-41 to FR-43, FR-45, FR-46, FR-48, FR-50, UC-7): the
+ * rules that matched and their actions, the recipients flagged untrusted or new, what each file's inspection found and
+ * what the message holds (detector names and counts). The sender confirms a warning, requests approval with a
+ * justification, removes a file (the transfer is checked again) or cancels. A pending request shows its expiry and
+ * the approvals so far; a rejection shows the approver's comment.
  */
 export function TransferDlpPanel({ transfer }: { transfer: Transfer }) {
   const { t } = useTranslation();
@@ -161,6 +161,24 @@ function DlpView({
         </ul>
       </div>
 
+      {(transfer.message || dlp.message_findings.length > 0) && (
+        <div className="mt-5">
+          <h3 id="dlp-message" className="text-sm font-semibold text-gray-900">
+            {t('dlp.message')}
+          </h3>
+          <div
+            className={
+              dlp.message_findings.length > 0 && stage === 'blocked'
+                ? 'mt-2 rounded-lg bg-red-50 p-3 ring-1 ring-red-200'
+                : 'mt-2 rounded-lg bg-gray-50 p-3'
+            }
+          >
+            <MessageFindings findings={dlp.message_findings} />
+            {dlp.message_findings.length > 0 && changeable && <p className="mt-2 text-sm text-gray-700">{t('dlp.messageFixed')}</p>}
+          </div>
+        </div>
+      )}
+
       {changeable && (
         <div className="mt-6 flex flex-wrap gap-3 border-t border-gray-100 pt-4">
           {(stage === 'confirm' || stage === 'approval') && dlp.decision && (
@@ -203,6 +221,19 @@ export function FindingLine({ finding }: { finding: DlpFinding }) {
         low: finding.count_low,
       })}
     </li>
+  );
+}
+
+/** What the transfer's message holds (FR-50): detector names and counts, as for a file. */
+export function MessageFindings({ findings }: { findings: readonly DlpFinding[] }) {
+  const { t } = useTranslation();
+  if (findings.length === 0) return <p className="text-sm text-gray-600">{t('dlp.nothingFound')}</p>;
+  return (
+    <ul className="space-y-1 text-sm text-gray-700">
+      {findings.map((finding) => (
+        <FindingLine key={finding.detector} finding={finding} />
+      ))}
+    </ul>
   );
 }
 

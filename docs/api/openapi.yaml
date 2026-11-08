@@ -1886,6 +1886,48 @@ paths:
         '429':
           $ref: '#/components/responses/TooManyRequests'
 
+  /session/files/{file_id}:
+    parameters:
+      - $ref: '#/components/parameters/FileId'
+      - $ref: '#/components/parameters/LinkSessionId'
+    delete:
+      tags: [Recipient session]
+      operationId: deleteSessionUploadFile
+      summary: Remove an uploader's file
+      description: |
+        For an uploader: takes back a file they declared or uploaded, while the request is open. The file is removed as
+        the member's early delete removes it: it no longer counts toward the request's limits (50 files, 20 GB; its
+        declaration still counts toward the 100), its storage reservation is released, its contents are deleted on the
+        data lifecycle schedule, an open upload is aborted, and the member no longer sees it. A file still counted in
+        the member's next files-arrived notice is taken off it. Removing a file already removed changes nothing and
+        answers `204`, so a retry is safe. A blocked file (infected, a failed scan, unscannable and not allowed by the
+        tenant policy, or blocked by a DLP rule) stays for the requesting company to review: `409 invalid_state`, as
+        for a file already deleted. Not allowed for a recipient session.
+
+        Errors: `403 permission_denied`, `404 not_found` (not a file of this request), `409 invalid_state`,
+        `410 link_revoked`, `410 link_expired`, `429 rate_limited`.
+
+        Requirements: FR-11, FR-12, FR-27.
+      x-permission: session.upload
+      security:
+        - linkSession: []
+          csrfToken: []
+      responses:
+        '204':
+          description: The file was removed. Its contents are deleted on the data lifecycle schedule.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
   /session/files/{file_id}/parts:
     parameters:
       - $ref: '#/components/parameters/FileId'
@@ -2492,6 +2534,8 @@ paths:
         next call with any of their keys gets `401`. Before deactivating an admin, the web app shows the keys they own
         (`listApiKeys`, by `created_by`), so automation can move to another admin's key first. Their transfers and
         upload requests are unchanged; an admin can revoke them. The tenant always keeps at least one active admin.
+        A deactivated DLP approver approves nothing any more: the designation is cleared, and the tenant's admins are
+        emailed, at once when fewer than two approvers are left, otherwise in the next DLP policy notice (#230).
 
         A deactivation is a security-critical record (README section 5): the `200` comes only after it is in the
         audit archive in both regions (NFR-10). If that write fails, the deactivation has still taken effect and the
@@ -5829,7 +5873,10 @@ components:
         warning:
           type: string
           enum: [unscannable]
-          description: For a recipient, present when the file couldn't be scanned and the tenant policy allows it (FR-18).
+          description: |
+            Present when the file couldn't be scanned and the tenant policy allows it (FR-18). For a recipient, a
+            warning before the download; for an uploader, the file was accepted as it is, so the web app words it as
+            accepted, not as a failure (#229).
         download_limit:
           type: [integer, 'null']
           minimum: 1
@@ -5842,6 +5889,11 @@ components:
         upload:
           $ref: '#/components/schemas/UploadPlan'
           description: For an uploader, present only while the file is `uploading`.
+        blocked:
+          type: boolean
+          description: |
+            For an uploader: the company's checks didn't accept the file (malware, a scan that failed, or the company's
+            data policy, FR-51). No reason is given (FR-12): the company sees why.
 
     SessionFileList:
       type: object
@@ -7246,6 +7298,16 @@ components:
           maximum: 1000
         created_at:
           $ref: '#/components/schemas/Timestamp'
+        budget_exceeded_files:
+          type: integer
+          minimum: 0
+          description: |
+            For a pattern, in `getDlpDetector` only: how many files stopped it for spending its scan-time budget
+            (detectors 5). Its matches up to then still counted; a high number means the pattern needs narrowing.
+        budget_exceeded_last_at:
+          type: [string, 'null']
+          format: date-time
+          description: For a pattern, in `getDlpDetector` only, when a file last stopped it; `null` if none has.
 
     DlpDetectorCreate:
       type: object

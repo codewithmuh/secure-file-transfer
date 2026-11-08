@@ -15,6 +15,7 @@ import {
   approvalTimeoutOptions,
   domainChanges,
   MAX_TRUSTED_DOMAINS,
+  MODES,
   settingsFormOf,
   settingsUpdate,
   type SettingsForm,
@@ -25,8 +26,9 @@ import { useWrite } from './useWrite';
 const NAMED_DOMAINS = 10;
 
 /**
- * The policy's settings (#218; FR-43, FR-45, FR-52): the mode, shown only (monitor mode arrives with #221), the
- * trusted domains, the approval timeout, and how many active approvers the tenant has.
+ * The policy's settings (#218, #221; FR-43, FR-45, FR-52): the mode (enforce, or monitor, which records every decision
+ * and holds, warns and blocks nothing, with a warning that says so), the trusted domains, the approval timeout, and
+ * how many active approvers the tenant has.
  */
 export function SettingsSection() {
   const policy = useDlpPolicy();
@@ -69,6 +71,10 @@ function SettingsEditor({ policy }: { policy: DlpPolicy }) {
 
   const lines = useMemo(() => {
     const out: string[] = [];
+    if (body?.mode) {
+      out.push(t('dlpAdmin.change.mode', { from: t(`dlpAdmin.modes.${policy.mode}`), to: t(`dlpAdmin.modes.${body.mode}`) }));
+      out.push(t(`dlpAdmin.change.modeEffect.${body.mode}`));
+    }
     const { added, removed } = domainChanges(policy.trusted_domains, form.trusted_domains);
     const named = (domains: string[]) => {
       const shown = domains.slice(0, NAMED_DOMAINS).join(t('common.listSeparator'));
@@ -119,12 +125,37 @@ function SettingsEditor({ policy }: { policy: DlpPolicy }) {
         </p>
 
         <Card>
-          <CardTitle>{t('dlpAdmin.mode')}</CardTitle>
-          <p className="mt-3 flex flex-wrap items-center gap-2 text-sm text-gray-700">
-            <Badge variant={policy.mode === 'enforce' ? 'success' : 'info'}>{t(`dlpAdmin.modes.${policy.mode}`)}</Badge>
-            <span>{t(`dlpAdmin.modeHint.${policy.mode}`)}</span>
-          </p>
-          <p className="mt-2 text-sm text-gray-600">{t('dlpAdmin.monitorLater')}</p>
+          <fieldset aria-describedby={form.mode === 'monitor' ? 'dlp-monitor-warning' : undefined}>
+            <legend className="flex flex-wrap items-center gap-2 text-lg font-semibold text-gray-900">
+              {t('dlpAdmin.mode')}
+              <Badge variant={policy.mode === 'enforce' ? 'success' : 'warning'}>
+                {t('dlpAdmin.currentMode', { mode: t(`dlpAdmin.modes.${policy.mode}`) })}
+              </Badge>
+            </legend>
+            <div className="mt-3 space-y-3">
+              {MODES.map((value) => (
+                <label key={value} className="flex items-start gap-3">
+                  <input
+                    type="radio"
+                    name="dlp-mode"
+                    value={value}
+                    checked={form.mode === value}
+                    onChange={() => setForm((previous) => ({ ...previous, mode: value }))}
+                    className="mt-1 h-4 w-4 accent-brand-600"
+                  />
+                  <span>
+                    <span className="block text-sm font-medium text-gray-900">{t(`dlpAdmin.modes.${value}`)}</span>
+                    <span className="block text-sm text-gray-600">{t(`dlpAdmin.modeHint.${value}`)}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+          {form.mode === 'monitor' && (
+            <Alert variant="warning" role="status" className="mt-4">
+              <p id="dlp-monitor-warning">{t('dlpAdmin.monitorWarning')}</p>
+            </Alert>
+          )}
         </Card>
 
         <Card>
@@ -210,7 +241,8 @@ function SettingsEditor({ policy }: { policy: DlpPolicy }) {
         open={confirming}
         title={t('dlpAdmin.confirmSettings')}
         lines={lines}
-        action={t('common.save')}
+        action={body?.mode === 'monitor' ? t('dlpAdmin.switchToMonitor') : t('common.save')}
+        danger={body?.mode === 'monitor'}
         busy={write.busy}
         error={write.error}
         onConfirm={() => void save()}

@@ -128,7 +128,7 @@ class TransferDlpView:
     recipients: tuple[RecipientFlags, ...]
     files: tuple[FileFindings, ...]
     message_findings: tuple[FindingView, ...] = ()
-    """The message's findings (FR-50): none until #221 inspects the message."""
+    """The message's findings (FR-50, #221), counts only."""
     approval_request: ApprovalSummaryView | None = None
     """The transfer's latest approval request, in whatever state (#220)."""
 
@@ -174,13 +174,14 @@ async def get_transfer_dlp(
         if transfer.dlp_decision_id is not None:
             decision = await dlp_decisions.get_decision(session, transfer.dlp_decision_id)
         recipients = await recipient_flags(session, transfer.id, decision, now)
-        counted = await _file_findings(session, tenant_id, transfer.id, language)
+        counted, message = await transfer_findings(session, tenant_id, transfer.id, language)
         return TransferDlpView(
             transfer_id=transfer.id,
             state=effective_state(TransferState(transfer.state), transfer.expires_at, now),
             decision=decision,
             recipients=recipients,
             files=counted,
+            message_findings=message,
             approval_request=approval,
         )
 
@@ -203,18 +204,20 @@ async def recipient_flags(
     )
 
 
-async def _file_findings(
+async def transfer_findings(
     session: AsyncSession, tenant_id: UUID, transfer_id: UUID, language: str
-) -> tuple[FileFindings, ...]:
-    """The counted files (not rejected, not removed), each with its findings, counts only."""
+) -> tuple[tuple[FileFindings, ...], tuple[FindingView, ...]]:
+    """The counted files (not rejected, not removed), each with its findings, and the message's
+    findings (FR-50); counts only."""
     counted = [
         f
         for f in await files.list_transfer_files(session, transfer_id)
         if f.state != FileState.REJECTED.value
     ]
     found = await findings.counts_by_file(session, [f.id for f in counted])
+    message = await findings.message_counts(session, transfer_id)
     own: set[UUID] = set()
-    for counts in (c for f in counted for c in found.get(f.id, ())):
+    for counts in [*(c for f in counted for c in found.get(f.id, ())), *message]:
         if counts.detector.startswith(dlp_policy.CUSTOM_PREFIX):
             try:
                 own.add(UUID(counts.detector.removeprefix(dlp_policy.CUSTOM_PREFIX)))
@@ -224,7 +227,7 @@ async def _file_findings(
         dlp_policy.detector_ref(i): name
         for i, name in (await dlp_policy.detector_names(session, sorted(own))).items()
     }
-    return tuple(
+    files_found = tuple(
         FileFindings(
             file_id=f.id,
             display_name=fields.open_sealed(tenant_id, f.display_name_ct),
@@ -234,6 +237,7 @@ async def _file_findings(
         )
         for f in counted
     )
+    return files_found, _finding_views(message, names, language)
 
 
 def _finding_views(

@@ -21,13 +21,14 @@ import { deleteDlpRule, invalidateDlp, updateDlpRule, useDlpDetectors, useDlpPol
 import { dlpActionVariant } from '@/features/sender/states';
 import { ConfirmChange } from './ConfirmChange';
 import { LoadError, Loading } from './DlpAdminPage';
-import { conditionText } from './ruleText';
+import { conditionText, ruleOptionNotes } from './ruleText';
 import { useWrite } from './useWrite';
 
 type Pending = { kind: 'toggle' | 'delete'; rule: DlpRule };
 
 /**
- * The tenant's rules (#218; FR-40, FR-41): each with its condition, recipients, action and whether it is on. A rule is
+ * The tenant's rules (#218, #221; FR-40, FR-41, FR-44, FR-49, FR-51): each with the files it applies to (sent or
+ * received), its condition and options, recipients, action and whether it is on. A rule is
  * turned on or off, edited or deleted from its row; the default policy's new-domain rule is edited like any other.
  */
 export function RulesSection() {
@@ -102,6 +103,7 @@ export function RulesSection() {
             <TableHead>
               <tr>
                 <TableHeader>{t('common.name')}</TableHeader>
+                <TableHeader>{t('dlpAdmin.appliesTo')}</TableHeader>
                 <TableHeader>{t('dlpAdmin.condition')}</TableHeader>
                 <TableHeader>{t('dlpAdmin.recipients')}</TableHeader>
                 <TableHeader>{t('dlpAdmin.action')}</TableHeader>
@@ -117,10 +119,19 @@ export function RulesSection() {
                   <th scope="row" className="px-4 py-3 text-left text-sm font-medium text-gray-900">
                     {rule.name}
                   </th>
-                  <TableCell className="whitespace-normal">{conditionText(rule, detectors.data?.items, t)}</TableCell>
-                  <TableCell>{t(`dlpAdmin.scope.${rule.recipient_scope}`)}</TableCell>
-                  <TableCell>
+                  <TableCell>{t(`dlpAdmin.direction.${rule.direction}`)}</TableCell>
+                  <TableCell className="whitespace-normal">
+                    {conditionText(rule, detectors.data?.items, t)}
+                    {rule.include_sender_24h && <span className="mt-0.5 block text-xs text-gray-600">{t('dlpAdmin.includes24h')}</span>}
+                  </TableCell>
+                  <TableCell>{rule.direction === 'received' ? '—' : t(`dlpAdmin.scope.${rule.recipient_scope}`)}</TableCell>
+                  <TableCell className="whitespace-normal">
                     <Badge variant={dlpActionVariant[rule.action]}>{t(`dlpAction.${rule.action}`)}</Badge>
+                    {ruleOptionNotes({ ...rule, include_sender_24h: false }, t).map((note) => (
+                      <span key={note} className="mt-0.5 block text-xs text-gray-600">
+                        {note}
+                      </span>
+                    ))}
                   </TableCell>
                   <TableCell>
                     <Badge variant={rule.enabled ? 'success' : 'default'}>{t(rule.enabled ? 'dlpAdmin.on' : 'dlpAdmin.off')}</Badge>

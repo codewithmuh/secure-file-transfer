@@ -1167,6 +1167,41 @@ def test_the_dlp_approval_revision_keeps_the_sql_the_helpers_wrote_for_it() -> N
     assert f"({module.DECISIONS})" == sql_values(ApprovalDecisionKind)
 
 
+def test_the_notice_windows_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    from sft.data.audit_required import NOT_AUDITED
+    from sft.data.models import NoticeKind
+    from sft.data.outbox import DLP_POLICY_CHANGES
+
+    module: Any = _module("NOTICES", "0028")
+    table = "notice_windows"
+    assert list(module.KEYS) == [
+        tenant_keys_sql(table)[0],
+        tenant_foreign_key_sql(table, "user_id", "users"),
+    ]
+    assert list(module.RLS) == tenant_rls_sql(
+        table, grants={"sft_notify": "SELECT, INSERT, UPDATE"}
+    )
+    assert f"({module.NOTICES})" == sql_values(NoticeKind)
+    assert ", ".join(f"'{change}'" for change in DLP_POLICY_CHANGES) == module.CHANGES
+    # Only the notification worker keeps it, and its changes need no audit event (#230).
+    assert table in NOT_AUDITED
+    assert "sft_api" not in " ".join(module.RLS)
+
+
+def test_a_notice_window_is_one_per_tenant_kind_and_approver(migrated_db: ScratchDatabase) -> None:
+    tenant = "88888888-8888-4888-8888-888888888888"
+    migrated_db.sql("INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant)
+    insert = (
+        "INSERT INTO notice_windows (id, tenant_id, notice) "
+        "VALUES (gen_random_uuid(), :t, 'dlp_policy_changed') ON CONFLICT DO NOTHING"
+    )
+    migrated_db.sql(insert, t=tenant)
+    migrated_db.sql(insert, t=tenant)
+    assert migrated_db.sql(
+        "SELECT count(*) FROM notice_windows WHERE tenant_id = :t", t=tenant
+    ) == [(1,)]
+
+
 def test_a_recipients_domain_is_set_on_insert(migrated_db: ScratchDatabase) -> None:
     # Revision 0025's trigger: the evaluation's roles read the domain, never the address.
     tenant = "55555555-5555-4555-8555-555555555555"
@@ -1196,3 +1231,23 @@ def test_a_recipients_domain_is_set_on_insert(migrated_db: ScratchDatabase) -> N
     assert migrated_db.sql(
         "SELECT domain FROM transfer_recipients WHERE transfer_id = :x", x=transfer
     ) == [("sub.partner.example",)]
+
+
+def test_the_dlp_should_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("MESSAGE_KEY", "0027")
+    stops = "dlp_pattern_stops"
+    assert list(module.KEYS) == [tenant_keys_sql(stops)[0]]
+    assert (
+        tenant_foreign_key_sql("dlp_findings", "transfer_id", "transfers", on_delete="CASCADE")
+        == module.MESSAGE_KEY
+    )
+    assert list(module.RLS) == [
+        *tenant_rls_sql(stops, grants={"sft_api": "SELECT", "sft_scan": "SELECT, INSERT, UPDATE"}),
+        grant_sql("dlp_findings", "sft_api", "INSERT"),
+        grant_sql("dlp_findings", "sft_scan", "SELECT", columns=["transfer_id"]),
+        grant_sql("dlp_findings", "sft_jobs", "SELECT", columns=["transfer_id"]),
+        grant_sql("files", "sft_scan", "SELECT, UPDATE", columns=["dlp_blocked"]),
+    ]
+    assert list(module.AUDIT) == [require_audit_sql(stops)]
+    # Nobody new reads a finding's details.
+    assert "detail_ct" not in " ".join(module.RLS)

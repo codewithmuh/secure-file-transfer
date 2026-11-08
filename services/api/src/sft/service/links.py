@@ -107,7 +107,7 @@ from sft.service import fields, uploads
 from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller, CallerKind
 from sft.service.csrf import CsrfKeyring
-from sft.service.evaluation import is_shareable
+from sft.service.evaluation import is_blocked, is_shareable
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import (
     A_FAILED_CODES,
@@ -926,24 +926,33 @@ class SessionFile:
     `uploading`."""
     part_size: int = 0
     part_count: int = 0
+    blocked: bool = False
+    """An uploader's file the company's checks blocked: infected, scan failed, unscannable and not
+    allowed, inspection failed, or a DLP rule for received files (FR-12, FR-51, #221). The
+    uploader learns that much and no reason."""
 
 
 def uploader_file(tenant_id: UUID, file: File) -> SessionFile:
     """A file as its uploader sees it (FR-12): its name, its declared size until the upload is
     accepted, its state and, while uploading, its plan, so the web app can resume it. Never a
-    finding or a scan detail."""
+    finding or a scan detail. An unscannable file the tenant policy allowed carries the
+    `unscannable` warning, so the web app words it as accepted, not as a failure (#229). A file
+    the company's checks blocked says so (`blocked`, #221), without saying which check."""
+    state = FileState(file.state)
     return SessionFile(
         id=file.id,
         display_name=fields.open_sealed(tenant_id, file.display_name_ct),
         content_type=file.content_type,
         size=file.actual_size or file.declared_size,
         state=FileState(file.state),
-        unscannable=False,
+        unscannable=file.state == FileState.UNSCANNABLE.value and file.unscannable_allowed,
         download_limit=None,
         downloads_used=0,
         uploader=True,
         part_size=file.part_size,
         part_count=file.part_count,
+        blocked=file.dlp_blocked
+        or is_blocked(state, file.unscannable_allowed, InspectionState(file.inspection_state)),
     )
 
 

@@ -1,0 +1,12 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">{{ tenant_name }}で情報漏えい対策（DLP）の承認者だったメンバーが無効化されたため、このメンバーは今後承認できません。</p>
+{% if none_left %}
+<p style="margin:0 0 16px;">承認者が1人もいないため、管理者が承認者を指定するまで、承認が必要な送信はできません。</p>
+{% else %}
+<p style="margin:0 0 16px;">残る承認者は1人で、その人は自分の送信を承認できません。</p>
+{% endif %}
+<p style="margin:0 0 16px;">誰がいつ変更したかは、監査ログで確認できます。DLPの設定で承認者を追加してください。</p>
+{{ button(dlp_policy_url, 'DLPの設定を開く', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

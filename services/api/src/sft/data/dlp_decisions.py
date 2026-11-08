@@ -61,6 +61,7 @@ class PolicyRule:
     reasons: tuple[str, ...]
     recipient_scope: str
     action: str
+    include_sender_24h: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,16 +74,18 @@ class DecisionPolicy:
     rules: tuple[PolicyRule, ...]
 
 
-async def decision_policy(session: AsyncSession) -> DecisionPolicy | None:
-    """The scope's tenant's policy and its live, enabled rules for sent files, in the order they
-    were made, read in one statement so they belong to one version. None for a tenant without a
-    policy."""
+async def decision_policy(
+    session: AsyncSession, direction: DlpDirection = DlpDirection.SENT
+) -> DecisionPolicy | None:
+    """The scope's tenant's policy and its live, enabled rules for `direction` (sent files, or
+    received files, #221), in the order they were made, read in one statement so they belong to
+    one version. None for a tenant without a policy."""
     require_scope(session, *_TENANT)
     rule_join = and_(
         DlpRule.tenant_id == DlpPolicy.tenant_id,
         DlpRule.retired_at.is_(None),
         DlpRule.enabled.is_(True),
-        DlpRule.direction == DlpDirection.SENT.value,
+        DlpRule.direction == direction.value,
         in_scope(DlpRule, session),
     )
     rows = (
@@ -100,6 +103,7 @@ async def decision_policy(session: AsyncSession) -> DecisionPolicy | None:
                 DlpRule.reasons,
                 DlpRule.recipient_scope,
                 DlpRule.action,
+                DlpRule.include_sender_24h,
             )
             .select_from(DlpPolicy)
             .outerjoin(DlpRule, rule_join)
@@ -121,6 +125,7 @@ async def decision_policy(session: AsyncSession) -> DecisionPolicy | None:
             reasons=tuple(row.reasons),
             recipient_scope=row.recipient_scope,
             action=row.action,
+            include_sender_24h=row.include_sender_24h,
         )
         for row in rows
         if row.id is not None
@@ -145,7 +150,7 @@ async def insert_decision(
     session: AsyncSession,
     *,
     decision_id: UUID,
-    transfer_id: UUID,
+    transfer_id: UUID | None,
     policy_version: int,
     mode: str,
     outcome: str,
@@ -153,8 +158,10 @@ async def insert_decision(
     untrusted_recipients: int,
     new_domains: int,
     rules: Sequence[MatchedRule],
+    file_id: UUID | None = None,
 ) -> None:
-    """A transfer's decision of the scope's tenant, and the rules it matched. Commits only with an
+    """A transfer's decision of the scope's tenant, or a received file's (`file_id`, #221), and
+    the rules it matched. Commits only with an
     audit event in the same transaction (`audit_required`). No `RETURNING`: the system roles may
     insert decisions but not read them."""
     require_scope(session, *_TENANT)
@@ -164,6 +171,7 @@ async def insert_decision(
             id=decision_id,
             tenant_id=tenant_id,
             transfer_id=transfer_id,
+            file_id=file_id,
             policy_version=policy_version,
             mode=mode,
             outcome=outcome,

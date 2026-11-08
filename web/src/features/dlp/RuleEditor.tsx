@@ -10,12 +10,16 @@ import { IdempotencyKeys, mayHaveHappened } from '@/lib/idempotency';
 import { ConfirmChange } from './ConfirmChange';
 import { LoadError, Loading } from './DlpAdminPage';
 import {
-  ACTIONS,
+  actionsFor,
   builtInDetectors,
   CONFIDENCES,
   CREATABLE_CONDITIONS,
+  DIRECTIONS,
+  effectiveRuleOptions,
   emptyRuleForm,
   keywordLists,
+  offersSender24h,
+  patterns,
   REASONS,
   RULE_NAME_MAX,
   ruleCreateBody,
@@ -23,6 +27,7 @@ import {
   ruleProblems,
   ruleUpdate,
   THRESHOLD_MAX,
+  withDirection,
   type RuleChange,
   type RuleForm,
 } from './dlpForms';
@@ -30,10 +35,12 @@ import { conditionText, detectorName } from './ruleText';
 import { useWrite } from './useWrite';
 
 /**
- * A rule's form (#218; FR-40, FR-41, FR-45), new (`/admin/dlp/rules/new`) or existing (`/admin/dlp/rules/:ruleId`).
- * A new rule has a content condition (detectors, the least confidence and a threshold) or a not-inspected one
- * (reasons); a rule keeps its condition once made. Only sent files, one approver and no 24-hour window are offered:
- * the API refuses the rest until #221.
+ * A rule's form (#218, #221; FR-40, FR-41, FR-44, FR-45, FR-49, FR-51), new (`/admin/dlp/rules/new`) or existing
+ * (`/admin/dlp/rules/:ruleId`). A new rule is for sent or received files and has a content condition (detectors,
+ * keyword lists and patterns, the least confidence and a threshold) or a not-inspected one (reasons); a rule keeps its
+ * direction and condition once made. A rule for received files only records or blocks, and has no recipients and no
+ * 24-hour window; a content rule for sent files can count the sender's last 24 hours, and a rule that requires
+ * approval can ask for two different approvers.
  */
 export function RuleEditor() {
   const { ruleId } = useParams<{ ruleId: string }>();
@@ -64,12 +71,15 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
   const keys = useRef(new IdempotencyKeys());
 
   const condition = rule?.condition ?? form.condition;
-  const problems = ruleProblems({ ...form, condition });
+  const direction = rule?.direction ?? form.direction;
+  const problems = ruleProblems({ ...form, condition, direction });
+  const options = effectiveRuleOptions({ ...form, condition, direction });
   const update = rule ? ruleUpdate(rule, form, version) : null;
   const createBody = rule ? null : ruleCreateBody(form, version);
   const nothingChanged = rule !== undefined && update !== null && update.changes.length === 0;
 
   const set = <K extends keyof RuleForm>(key: K, value: RuleForm[K]) => setForm((previous) => ({ ...previous, [key]: value }));
+  const setDirection = (value: RuleForm['direction']) => setForm((previous) => withDirection(previous, value));
   const toggle = <K extends 'detectors' | 'reasons'>(key: K, value: RuleForm[K][number]) =>
     setForm((previous) => {
       const list = previous[key] as string[];
@@ -81,9 +91,12 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
     if (!rule) {
       return [
         t('dlpAdmin.change.addRule', { name: form.name.trim() }),
+        t('dlpAdmin.change.direction', { direction: t(`dlpAdmin.direction.${form.direction}`) }),
         t('dlpAdmin.change.when', { condition: conditionText({ ...form, condition, threshold: Number(form.threshold) }, detectors, t) }),
-        t('dlpAdmin.change.recipients', { scope: t(`dlpAdmin.scope.${form.recipient_scope}`) }),
+        ...(options.include_sender_24h ? [t('dlpAdmin.change.with24h')] : []),
+        ...(form.direction === 'sent' ? [t('dlpAdmin.change.recipients', { scope: t(`dlpAdmin.scope.${form.recipient_scope}`) })] : []),
         t('dlpAdmin.change.then', { action: actionText }),
+        ...(options.approvals_required === 2 ? [t('dlpAdmin.change.twoApprovers')] : []),
         ...(form.enabled ? [] : [t('dlpAdmin.change.createdOff')]),
       ];
     }
@@ -122,10 +135,14 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
           });
         case 'action':
           return t('dlpAdmin.change.action', { from: t(`dlpAction.${rule.action}`), to: actionText });
+        case 'include_sender_24h':
+          return t(options.include_sender_24h ? 'dlpAdmin.change.with24h' : 'dlpAdmin.change.without24h');
+        case 'approvals_required':
+          return t('dlpAdmin.change.approvers', { from: rule.approvals_required, to: options.approvals_required });
       }
     };
     return [t('dlpAdmin.change.editRule', { name: rule.name }), ...(update?.changes ?? []).map(describe)];
-  }, [rule, form, condition, detectors, update, t]);
+  }, [rule, form, condition, options, detectors, update, t]);
 
   const submit = () => {
     setShown(true);
@@ -159,6 +176,8 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
   const fieldError = (field: keyof typeof problems) => (shown && problems[field] ? t(`dlpAdmin.ruleProblem.${problems[field]}`) : undefined);
   const builtIns = builtInDetectors(detectors);
   const lists = keywordLists(detectors);
+  const ownPatterns = patterns(detectors);
+  const actions = actionsFor(direction);
 
   return (
     <>
@@ -198,6 +217,37 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
               {t('dlpAdmin.ruleEnabled')}
             </label>
           </div>
+        </Card>
+
+        <Card>
+          {rule ? (
+            <>
+              <CardTitle>{t('dlpAdmin.appliesTo')}</CardTitle>
+              <p className="mt-3 text-sm text-gray-700">{t(`dlpAdmin.direction.${rule.direction}`)}</p>
+            </>
+          ) : (
+            <fieldset>
+              <legend className="text-lg font-semibold text-gray-900">{t('dlpAdmin.appliesTo')}</legend>
+              <div className="mt-3 space-y-3">
+                {DIRECTIONS.map((value) => (
+                  <label key={value} className="flex items-start gap-3">
+                    <input
+                      type="radio"
+                      name="direction"
+                      value={value}
+                      checked={form.direction === value}
+                      onChange={() => setDirection(value)}
+                      className="mt-1 h-4 w-4 accent-brand-600"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-gray-900">{t(`dlpAdmin.direction.${value}`)}</span>
+                      <span className="block text-sm text-gray-600">{t(`dlpAdmin.directionHint.${value}`)}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )}
         </Card>
 
         <Card>
@@ -245,6 +295,14 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
                 empty={t('dlpAdmin.noKeywordListsYet')}
                 describedBy={fieldError('detectors') ? 'rule-detectors-error' : undefined}
               />
+              <DetectorChoices
+                legend={t('dlpAdmin.patterns')}
+                detectors={ownPatterns}
+                selected={form.detectors}
+                onToggle={(id) => toggle('detectors', id)}
+                empty={t('dlpAdmin.noPatternsYet')}
+                describedBy={fieldError('detectors') ? 'rule-detectors-error' : undefined}
+              />
               {fieldError('detectors') && (
                 <p id="rule-detectors-error" className="text-sm text-red-600">
                   {fieldError('detectors')}
@@ -268,6 +326,20 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
                   error={fieldError('threshold')}
                 />
               </div>
+              {offersSender24h({ direction, condition }) && (
+                <label className="flex items-start gap-3">
+                  <input
+                    type="checkbox"
+                    className="mt-1 h-4 w-4 accent-brand-600"
+                    checked={form.include_sender_24h}
+                    onChange={(event) => set('include_sender_24h', event.target.checked)}
+                  />
+                  <span>
+                    <span className="block text-sm font-medium text-gray-900">{t('dlpAdmin.include24h')}</span>
+                    <span className="block text-sm text-gray-600">{t('dlpAdmin.include24hHint')}</span>
+                  </span>
+                </label>
+              )}
             </div>
           )}
 
@@ -296,32 +368,35 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
           )}
         </Card>
 
-        <Card>
-          <fieldset>
-            <legend className="text-lg font-semibold text-gray-900">{t('dlpAdmin.recipients')}</legend>
-            <div className="mt-3 space-y-3">
-              {(['any', 'untrusted'] as const).map((value) => (
-                <label key={value} className="flex items-start gap-3">
-                  <input
-                    type="radio"
-                    name="recipient_scope"
-                    value={value}
-                    checked={form.recipient_scope === value}
-                    onChange={() => set('recipient_scope', value)}
-                    className="mt-1 h-4 w-4 accent-brand-600"
-                  />
-                  <span className="text-sm text-gray-900">{t(`dlpAdmin.scopeHint.${value}`)}</span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
-        </Card>
+        {direction === 'sent' && (
+          <Card>
+            <fieldset>
+              <legend className="text-lg font-semibold text-gray-900">{t('dlpAdmin.recipients')}</legend>
+              <div className="mt-3 space-y-3">
+                {(['any', 'untrusted'] as const).map((value) => (
+                  <label key={value} className="flex items-start gap-3">
+                    <input
+                      type="radio"
+                      name="recipient_scope"
+                      value={value}
+                      checked={form.recipient_scope === value}
+                      onChange={() => set('recipient_scope', value)}
+                      className="mt-1 h-4 w-4 accent-brand-600"
+                    />
+                    <span className="text-sm text-gray-900">{t(`dlpAdmin.scopeHint.${value}`)}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          </Card>
+        )}
 
         <Card>
-          <fieldset>
+          <fieldset aria-describedby={fieldError('action') ? 'rule-action-error' : undefined}>
             <legend className="text-lg font-semibold text-gray-900">{t('dlpAdmin.action')}</legend>
+            {direction === 'received' && <p className="mt-1 text-sm text-gray-600">{t('dlpAdmin.receivedActionsHint')}</p>}
             <div className="mt-3 space-y-3">
-              {ACTIONS.map((value) => (
+              {actions.map((value) => (
                 <label key={value} className="flex items-start gap-3">
                   <input
                     type="radio"
@@ -333,16 +408,43 @@ function RuleFormView({ rule, detectors, policy }: { rule: DlpRule | undefined; 
                   />
                   <span>
                     <span className="block text-sm font-medium text-gray-900">{t(`dlpAction.${value}`)}</span>
-                    <span className="block text-sm text-gray-600">{t(`dlpAdmin.actionHint.${value}`)}</span>
+                    <span className="block text-sm text-gray-600">
+                      {t(direction === 'received' ? `dlpAdmin.receivedActionHint.${value}` : `dlpAdmin.actionHint.${value}`)}
+                    </span>
                   </span>
                 </label>
               ))}
             </div>
+            {fieldError('action') && (
+              <p id="rule-action-error" className="mt-2 text-sm text-red-600">
+                {fieldError('action')}
+              </p>
+            )}
           </fieldset>
-          {form.action === 'require_approval' && (
-            <Alert variant={policy.active_approvers < 2 ? 'warning' : 'info'} role="status" className="mt-4">
-              {t('dlpAdmin.approvalNeedsApprovers', { count: policy.active_approvers })}
-            </Alert>
+          {direction === 'sent' && form.action === 'require_approval' && (
+            <>
+              <label className="mt-4 flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  className="mt-1 h-4 w-4 accent-brand-600"
+                  checked={form.approvals_required === 2}
+                  onChange={(event) => set('approvals_required', event.target.checked ? 2 : 1)}
+                />
+                <span>
+                  <span className="block text-sm font-medium text-gray-900">{t('dlpAdmin.twoApproversOption')}</span>
+                  <span className="block text-sm text-gray-600">{t('dlpAdmin.twoApproversHint')}</span>
+                </span>
+              </label>
+              {form.approvals_required === 2 ? (
+                <Alert variant={policy.active_approvers < 3 ? 'warning' : 'info'} role="status" className="mt-4">
+                  {t('dlpAdmin.twoApproversNeed', { count: policy.active_approvers })}
+                </Alert>
+              ) : (
+                <Alert variant={policy.active_approvers < 2 ? 'warning' : 'info'} role="status" className="mt-4">
+                  {t('dlpAdmin.approvalNeedsApprovers', { count: policy.active_approvers })}
+                </Alert>
+              )}
+            </>
           )}
         </Card>
 
@@ -413,6 +515,9 @@ function DetectorChoices({
                 )}
                 {detector.kind === 'keywords' && (
                   <span className="block text-xs text-gray-600">{t('dlpAdmin.termCount', { count: detector.keywords?.length ?? 0 })}</span>
+                )}
+                {detector.kind === 'pattern' && detector.pattern && (
+                  <code className="block break-all text-xs text-gray-600">{detector.pattern}</code>
                 )}
               </span>
             </label>
