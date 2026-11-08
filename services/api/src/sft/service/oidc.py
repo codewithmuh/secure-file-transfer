@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
-from urllib.parse import urlencode
+from urllib.parse import unquote, urlencode
 
 import httpx2 as httpx
 from joserfc import jwt
@@ -100,6 +100,11 @@ class IdToken:
     auth_time: int | None
     identities: tuple[Mapping[str, Any], ...]
     """Cognito's `identities` claim, present for a federated (SSO) sign-in."""
+    email: str | None = None
+    """The address the pool, or for SSO the identity provider, sent. It never finds a user in
+    another tenant or outside the connection's proven domains (#231, `sft.service.signin`)."""
+    groups: tuple[str, ...] = ()
+    """The identity provider's groups, as the pool mapped them (`OIDC_GROUPS_CLAIM`)."""
 
 
 class OidcClient:
@@ -116,8 +121,12 @@ class OidcClient:
         revocation_url: str | None = None,
         http: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.time,
+        hint_parameter: str = "identity_provider",
+        groups_claim: str = "custom:sso_groups",
     ) -> None:
         self.issuer = issuer
+        self.hint_parameter = hint_parameter
+        self.groups_claim = groups_claim
         self.client_id = client_id
         self._secret = client_secret
         self.redirect_uri = redirect_uri
@@ -197,7 +206,8 @@ class OidcClient:
             "code_challenge": pkce.challenge,
             "code_challenge_method": "S256",
             "prompt": "login",
-            "identity_provider": identity_provider,
+            # Cognito's `identity_provider`; Keycloak, the local stand-in, reads `kc_idp_hint`.
+            self.hint_parameter: identity_provider,
         }
         separator = "&" if "?" in endpoint else "?"
         return f"{endpoint}{separator}{urlencode(query)}"
@@ -267,7 +277,7 @@ class OidcClient:
         sent = claims.get("nonce")
         if not isinstance(sent, str) or not hmac.compare_digest(sent.encode(), nonce.encode()):
             raise OidcError(OidcFailure.NONCE_MISMATCH)
-        return _id_token(claims)
+        return _id_token(claims, self.groups_claim)
 
     async def revoke(self, refresh_token: str) -> None:
         """Revoke the refresh token; best effort, since nothing keeps it (ADR-0016)."""
@@ -289,7 +299,20 @@ def _unknown_key(exc: JoseError) -> bool:
     return type(exc).__name__ in ("InvalidKeyIdError", "MissingKeyError")
 
 
-def _id_token(claims: Mapping[str, Any]) -> IdToken:
+def groups_of(value: object) -> tuple[str, ...]:
+    """The groups claim: a JSON list, or Cognito's mapped attribute, one string `[a,b]` whose
+    values are each URL-encoded (#231)."""
+    if isinstance(value, list):
+        return tuple(v for v in value if isinstance(v, str) and v)
+    if not isinstance(value, str):
+        return ()
+    text = value.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return tuple(unquote(part.strip()) for part in text.split(",") if part.strip())
+
+
+def _id_token(claims: Mapping[str, Any], groups_claim: str = "custom:sso_groups") -> IdToken:
     def strings(value: object) -> tuple[str, ...]:
         if isinstance(value, list):
             return tuple(v for v in value if isinstance(v, str))
@@ -298,6 +321,10 @@ def _id_token(claims: Mapping[str, Any]) -> IdToken:
     username = claims.get("cognito:username")
     auth_time = claims.get("auth_time")
     identities = claims.get("identities")
+    if isinstance(identities, dict):
+        # One object rather than a list: Keycloak's nested claim, the local stand-in's.
+        identities = [identities]
+    email = claims.get("email")
     return IdToken(
         subject=str(claims["sub"]),
         username=username if isinstance(username, str) else None,
@@ -308,4 +335,6 @@ def _id_token(claims: Mapping[str, Any]) -> IdToken:
         identities=tuple(i for i in identities if isinstance(i, dict))
         if isinstance(identities, list)
         else (),
+        email=email if isinstance(email, str) and email else None,
+        groups=groups_of(claims.get(groups_claim)),
     )

@@ -38,3 +38,8 @@ variable "dmarc_report_address" {
   description = "Where DMARC aggregate reports go (ADR-0015). TF_VAR_dmarc_report_address, never committed."
   type        = string
 }
+
+variable "signin_trigger_image" {
+  description = "The API image by digest, <registry>/sft/app@sha256:<digest>, that the sign-in triggers run (#238). The deploy supplies the digest it promotes (TF_VAR_signin_trigger_image)."
+  type        = string
+}

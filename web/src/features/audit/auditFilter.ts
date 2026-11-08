@@ -55,6 +55,17 @@ export const KNOWN_ACTIONS = {
     'audit.searched',
     'audit.exported',
   ],
+  sso: [
+    'tenant_sso.updated',
+    'tenant_sso.configured',
+    'sso_domain.claimed',
+    'sso_domain.verified',
+    'sso_domain.deleted',
+    'user.provisioned',
+    'user.identity_bound',
+  ],
+  // An operator's break-glass access to the tenant (authn-authz 8.3): the tenant's admins see it in their own log.
+  break_glass: ['break_glass.approved', 'break_glass.ended', 'break_glass.expired'],
 } as const satisfies Record<string, readonly string[]>;
 
 export type ActionGroup = keyof typeof KNOWN_ACTIONS;

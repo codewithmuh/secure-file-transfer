@@ -308,6 +308,20 @@ REGISTRY: Final[tuple[Permission, ...]] = (
     Permission("operator.tenant.sso.update", ("configureTenantSso",), operator=True),
     Permission("operator.tenant.admin_recovery", ("recoverTenantAdmin",), operator=True),
     Permission("operator.break_glass.record", ("recordBreakGlassGrant",), operator=True),
+    # Tenant SSO (#231): the tenant admin's settings and domains, web sessions only.
+    Permission("sso.read", ("getTenantSso",), admin=TENANT),
+    Permission(
+        "sso.update",
+        ("updateTenantSso", "claimSsoDomain", "verifySsoDomain", "deleteSsoDomain"),
+        admin=TENANT,
+    ),
+    # Break-glass in the service (#232): any operator asks, lists and ends; a second approves.
+    Permission(
+        "operator.break_glass.request",
+        ("requestBreakGlass", "listBreakGlassRequests", "endBreakGlass"),
+        operator=True,
+    ),
+    Permission("operator.break_glass.approve", ("approveBreakGlass",), operator=True),
 )
 """Table 6.3, row by row."""
 
@@ -330,9 +344,16 @@ STEP_UP: Final = frozenset(
         "updateDlpDetector",
         "deleteDlpDetector",
         "approveTransfer",
+        # #231: the SSO settings and domains decide who signs in, and how.
+        "updateTenantSso",
+        "claimSsoDomain",
+        "verifySsoDomain",
+        "deleteSsoDomain",
     }
 )
-"""The operations that need a recent sign-in (authn and authz 3.3)."""
+"""The step-up policy (authn and authz 3.3, #232): the operations that need a recent sign-in, so a
+recent MFA, and answer `401 reauthentication_required` without one. One list, read by `authorize`
+for every caller; the web app re-authenticates and retries the request (web/src/lib/stepUp.ts)."""
 
 PASSKEY_EXEMPT: Final = frozenset({"revokeTransfer", "revokeUploadRequest", "revokeApiKey"})
 """Revocations keep working in an admin's TOTP session: they can only stop sharing (3.3)."""

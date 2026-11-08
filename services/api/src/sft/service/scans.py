@@ -5,7 +5,8 @@ The scan worker (`sft.workers.scan`) and the scan sweep act as named system acto
 6.1), each named in its audit events' details (`system_actor`).
 
 **Recording** (`record`) writes, in the caller's transaction, the file's state, its scan columns,
-its inspection and one `dlp_findings` row per detector that matched, with `file.scanned`, and only
+its inspection and one `dlp_findings` row per detector that matched (its location hints and
+masked previews sealed with the tenant's DLP data key, #233), with `file.scanned`, and only
 while the file is still `scanning`: a result that arrives after another, or after the sweep, changes
 nothing. `unscannable_allowed` is read from the tenant's policy now, at scan time, and never
 changes after (data model 3.1). An infected or `scan_failed` file's inspection is `skipped` and its
@@ -15,9 +16,9 @@ findings are discarded. The audit event names detectors, counts and enums only, 
 **The sweep** (`fail_overdue_scans`) moves each file still `scanning` past its deadline to
 `scan_failed` and runs the evaluation, which holds its transfer. It finds them across tenants in
 system scope and acts on each in its own tenant's scope (data model 4.2): `scan_failed` with
-`deadline_passed`, its inspection `failed` (both engines ran out of time). Files over 2 GB never
-wait for it: completion records them `scan_failed` (`large_file_scanning_unavailable`) at once
-(`sft.service.uploads`). The lifecycle jobs (#181) schedule it.
+`deadline_passed`, its inspection `failed` (both engines ran out of time). Files over 2 GB wait
+for GuardDuty's result (#234, `sft.service.guardduty`), and the sweep is their fallback too, two
+hours after completion (`sft.service.scan_timing`). The lifecycle jobs (#181) schedule it.
 
 **Received files** (#213) follow the same pass. A result has no transfer to evaluate; instead, in
 the transaction that records it, a file that would be shareable gets the DLP decision of the
@@ -64,7 +65,7 @@ from sft.data.models import (
 )
 from sft.data.outbox import UPLOAD_REQUEST_FILES_SETTLED, enqueue
 from sft.data.scope import Scope
-from sft.service import dlp_decision
+from sft.service import dlp_decision, finding_details
 from sft.service.dlp_decision import Decided
 from sft.service.evaluation import DLP_RULE, evaluate, is_shareable
 
@@ -195,7 +196,9 @@ async def record(
     )
     if not changed:
         return False
-    await findings.insert_findings(session, file_id, inspection.findings)
+    # Location hints and previews sealed under the tenant's DLP data key first (#233).
+    found = await finding_details.seal_findings(session, inspection.findings)
+    await findings.insert_findings(session, file_id, found)
     reasons: dict[str, audit.Detail] = {f"reason_{r.value}": True for r in inspection.reasons}
     owner: dict[str, audit.Detail] = (
         {"transfer_id": transfer_id}

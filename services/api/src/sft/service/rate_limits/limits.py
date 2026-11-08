@@ -15,7 +15,8 @@ request rates, G for `inviteUser` and `sendTransfer`, H, I and J), and group G's
 link emails, which the notification worker applies (#178, abuse 7.2). Group K joins with its
 routes. Group D's byte caps and group E's concurrent streams are budgets and leases, not
 rates: `sft.service.rate_limits.downloads` (#180). Group F's per-file part-URL count and the
-tenant's daily upload volume come with the upload follow-ups.
+tenant's daily upload volume are a PostgreSQL count and a budget: `sft.service.rate_limits.uploads`
+(#165).
 """
 
 from __future__ import annotations

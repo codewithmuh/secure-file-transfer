@@ -3,17 +3,19 @@
 #
 # - Plus plan, threat protection enforced, admin-only sign-up; MFA required: TOTP, or a passkey with user verification.
 #   No SMS, no email codes. Our user ID is the username and the address a verified alias (sft.runtime.cognito); the
-#   schema adds custom:tenant_id (immutable) and custom:enrolment_id, which only the notification worker writes.
+#   schema adds custom:tenant_id (immutable) and custom:enrolment_id, which only the notification worker writes, and
+#   custom:sso_groups, which only a tenant's identity provider writes, through its attribute mapping (#231).
 # - Cognito sends its own few emails through our SES identity in this Region, with its configuration set (ADR-0015,
 #   developer email sending). Invitations are ours: the worker calls AdminCreateUser with MessageAction=SUPPRESS.
 # - Managed login on a Cognito prefix domain, *.auth.<region>.amazoncognito.com, which the DNS Firewall already admits
 #   (modules/network). The prefix carries a hash of the account, never its ID, so nobody can claim our names first.
 # - One confidential app client: the authorization code grant with PKCE, one callback URL, token revocation on,
-#   members may write no attribute. Cognito makes its first client secret, which lands in state; the key rotation job
+#   members may write no attribute (identity providers write only what they map). Cognito makes its first client secret, which lands in state; the key rotation job
 #   replaces it before the API uses the client, so state only keeps a dead value (encryption and keys 6.4).
 # - The edge's sign-in web ACL guards the pool's endpoints (abuse 3).
 #
-# The pre-authentication and audit triggers (ADR-0016, consequences) are not here yet: they arrive with their issue.
+# The pre- and post-authentication triggers (ADR-0016, consequences) are modules/signin-triggers' function (#238);
+# the pool names it in lambda_config.
 
 locals {
   zone_name      = "sft.${var.domain}"
@@ -72,6 +74,17 @@ resource "aws_cognito_user_pool" "this" {
     advanced_security_mode = "ENFORCED"
   }
 
+  # The sign-in triggers (#238, modules/signin-triggers): failed sign-ins per account and the sign-in audit. Null
+  # only in tests of this module; every environment passes its function.
+  dynamic "lambda_config" {
+    for_each = var.trigger_function_arn == null ? [] : [var.trigger_function_arn]
+
+    content {
+      pre_authentication  = lambda_config.value
+      post_authentication = lambda_config.value
+    }
+  }
+
   email_configuration {
     email_sending_account  = "DEVELOPER"
     source_arn             = var.ses_identity_arn
@@ -106,6 +119,22 @@ resource "aws_cognito_user_pool" "this" {
     }
   }
 
+  # A tenant's identity provider maps its group claim here (FR-26, #231), so the API can map groups to roles.
+  # Federated sign-in writes it at every sign-in, so it must be mutable. Cognito flattens several values into one
+  # string, "[a,b]", URL-encoding each; 2,048 characters is Cognito's most.
+  schema {
+    name                     = "sso_groups"
+    attribute_data_type      = "String"
+    mutable                  = true
+    developer_only_attribute = false
+    required                 = false
+
+    string_attribute_constraints {
+      min_length = 0
+      max_length = 2048
+    }
+  }
+
   lifecycle {
     # Cognito can't change a pool's schema after creation; an attribute added later is a new block, never an edit.
     ignore_changes = [schema]
@@ -133,8 +162,11 @@ resource "aws_cognito_user_pool_client" "api" {
 
   enable_token_revocation       = true
   prevent_user_existence_errors = "ENABLED"
-  read_attributes               = ["email", "email_verified", "custom:tenant_id"]
-  write_attributes              = []
+  read_attributes               = ["email", "email_verified", "custom:tenant_id", "custom:sso_groups"]
+  # Only the attributes an identity provider maps (2.5): Cognito writes a mapped attribute at federated sign-in only
+  # if the client may write it, and skips it silently otherwise. Members still can't write them: the client grants no
+  # aws.cognito.signin.user.admin scope, which UpdateUserAttributes needs, and no direct sign-in flow.
+  write_attributes = ["email", "custom:sso_groups"]
 
   # One sign-in; our own session does the rest (ADR-0016): short tokens, refresh revoked at once by the API.
   access_token_validity  = 5
@@ -146,6 +178,13 @@ resource "aws_cognito_user_pool_client" "api" {
     access_token  = "minutes"
     id_token      = "minutes"
     refresh_token = "minutes"
+  }
+
+  # Tenant SSO (#231): the operator CLI (sft.runtime.sso_providers) adds each tenant's provider to this list when it
+  # creates the provider, without Terraform (authn-authz 2.5). Terraform sets COGNITO at creation and leaves the list
+  # alone afterwards, so an apply never drops a tenant's provider.
+  lifecycle {
+    ignore_changes = [supported_identity_providers]
   }
 }
 

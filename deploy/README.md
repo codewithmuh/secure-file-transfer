@@ -67,6 +67,7 @@ after a failover.
 | `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `audit-partitions` | CronJobs | `python -m sft.workers.<job>` | `jobs`, sft_jobs | Endpoints, Aurora; S3 for deletion, reconciliation and the storage audit (both Regions' files buckets outside dev, and the audit archive for reconciliation, #181) |
 | `audit-archive` | CronJob, every minute | `python -m sft.workers.audit_archive` | `audit-archive`, sft_archive | Endpoints, Aurora, S3 |
 | `key-rotation` | CronJob, hourly, Tokyo only | `python -m sft.workers.key_rotation` | `key-rotation`, no database; the one projected Kubernetes token | Its proxy listener (Cognito; Osaka's Secrets Manager and Cognito outside dev), endpoints (Secrets Manager), the cluster API |
+| `field-keys` | CronJob, daily, Tokyo only | `python -m sft.workers.field_keys` (`FIELD_KEY_STEPS=rotate,backfill,purge`, #236) | `api`, sft_api: it acts as the API, the only role that unwraps field data keys | The database and the endpoints (KMS) |
 | `invite-backlog` | CronJob, always suspended, run by hand | `python -m sft.workers.invite_backlog` | `notifier`, sft_notify | As the notifier |
 | `migrate` | Job, PreSync hook | `python -m sft.data.migrate` | `migrate`, sft_migrate | Endpoints, Aurora |
 
@@ -154,9 +155,10 @@ and checked on every rendered container by `tests/test_rendered.py`:
 ## Alerts
 
 `alerts/` holds alert rules in Prometheus rule format, each with its runbook and a `promtool test rules` unit test in
-`alerts/tests/` (`alerts/test.sh`, CI's deploy job): `ScanFailed` (#175) and `DlpInspectorFailing` (#176). The chart
-doesn't load them yet: nothing in the clusters evaluates rules before ADR-0009's monitoring stack and M7's alerting as
-code, which take them from here.
+`alerts/tests/` (`alerts/test.sh`, CI's deploy job): `ScanFailed` (#175) and `DlpInspectorFailing` (#176), and
+`BreakGlassActive`, `BreakGlassSelfApproved` and `BreakGlassSweepStalled` from the operator API's metrics (#232). The
+chart doesn't load them yet: nothing in the clusters evaluates rules before ADR-0009's monitoring stack and M7's
+alerting as code, which take them from here.
 
 ## Checks
 

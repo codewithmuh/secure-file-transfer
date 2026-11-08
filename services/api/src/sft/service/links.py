@@ -778,6 +778,7 @@ async def _session_view(
             return None
         view = await _subject_view(session, subject, now)
         sender = await tenants.sender(session)
+        keys = await fields.tenant_keys(session, tenant_id)
         if _uploader(subject):
             request = await upload_requests.get_request(session, subject.id)
             owner = await users.get_user(session, request.created_by)
@@ -788,7 +789,9 @@ async def _session_view(
             part: SessionTransfer | SessionUploadRequest = SessionUploadRequest(
                 tenant_name=sender.name,
                 requester_email=owner.email,
-                message=_message(tenant_id, request.message_ct),
+                message=keys.open_optional(
+                    fields.UPLOAD_REQUEST_MESSAGE, request.id, request.message_ct
+                ),
                 expires_at=request.expires_at,
                 files_received=count,
                 bytes_received=size,
@@ -803,7 +806,9 @@ async def _session_view(
             part = SessionTransfer(
                 tenant_name=sender.name,
                 sender_email=owner.email,
-                message=_message(tenant_id, transfer.message_ct),
+                message=keys.open_optional(
+                    fields.TRANSFER_MESSAGE, transfer.id, transfer.message_ct
+                ),
                 expires_at=transfer.expires_at,
                 download_limit=transfer.download_limit,
             )
@@ -816,10 +821,6 @@ async def _session_view(
         transfer=part if isinstance(part, SessionTransfer) else None,
         upload_request=part if isinstance(part, SessionUploadRequest) else None,
     )
-
-
-def _message(tenant_id: UUID, sealed: bytes | None) -> str | None:
-    return None if sealed is None else fields.open_sealed(tenant_id, sealed)
 
 
 # ---- the /session routes ----
@@ -932,7 +933,7 @@ class SessionFile:
     uploader learns that much and no reason."""
 
 
-def uploader_file(tenant_id: UUID, file: File) -> SessionFile:
+def uploader_file(keys: fields.TenantKeys, file: File) -> SessionFile:
     """A file as its uploader sees it (FR-12): its name, its declared size until the upload is
     accepted, its state and, while uploading, its plan, so the web app can resume it. Never a
     finding or a scan detail. An unscannable file the tenant policy allowed carries the
@@ -941,7 +942,7 @@ def uploader_file(tenant_id: UUID, file: File) -> SessionFile:
     state = FileState(file.state)
     return SessionFile(
         id=file.id,
-        display_name=fields.open_sealed(tenant_id, file.display_name_ct),
+        display_name=keys.open(fields.FILE_NAME, file.id, file.display_name_ct),
         content_type=file.content_type,
         size=file.actual_size or file.declared_size,
         state=FileState(file.state),
@@ -969,11 +970,13 @@ async def session_files(database: Database, link: LinkCaller) -> list[SessionFil
     if _uploader(caller.subject):
         async with database.transaction(_resource(caller)) as session:
             sent = await files.list_request_files(session, caller.subject.id)
-        return [uploader_file(tenant_id, file) for file in sent]
+            keys = await fields.tenant_keys(session, tenant_id)
+        return [uploader_file(keys, file) for file in sent]
     async with database.transaction(_resource(caller)) as session:
         view = await recipients.link_view(session, caller.subject.id)
         found = await files.list_transfer_files(session, view.transfer_id)
         counted = await recipients.counters(session, caller.subject.id)
+        keys = await fields.tenant_keys(session, tenant_id)
     out = []
     for file in found:
         state = FileState(file.state)
@@ -986,7 +989,7 @@ async def session_files(database: Database, link: LinkCaller) -> list[SessionFil
         out.append(
             SessionFile(
                 id=file.id,
-                display_name=fields.open_sealed(tenant_id, file.display_name_ct),
+                display_name=keys.open(fields.FILE_NAME, file.id, file.display_name_ct),
                 content_type=file.content_type,
                 size=file.actual_size,
                 state=state,

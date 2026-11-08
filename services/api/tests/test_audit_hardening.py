@@ -148,6 +148,13 @@ LOOKUP_COLUMNS = {
     ("link_sessions", "upload_request_id", "SELECT"),
     # lookup_api_key (revision 0021, #215): a key's ID and tenant by its hash.
     *(("api_keys", column, "SELECT") for column in ("id", "tenant_id", "key_hash")),
+    # lookup_sso_domain (revision 0029, #231): the connection of a proven domain, by the domain.
+    *(
+        ("sso_domains", column, "SELECT")
+        for column in ("tenant_id", "domain", "idp_connection_id", "verified_at")
+    ),
+    # field_key_tenants (revision 0031, #236): the tenants' IDs only, for the field key job.
+    ("tenants", "id", "SELECT"),
 }
 LOOKUP_GRANTS = {(table, privilege) for table, _, privilege in LOOKUP_COLUMNS}
 

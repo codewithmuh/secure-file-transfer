@@ -9,13 +9,14 @@
 groups:
   - name: scanning
     rules:
-      # FR-19: a file ended scan_failed, or a scan message reached its dead-letter queue. Files over 2 GB, which no
-      # engine scans until GuardDuty is connected (M6), end scan_failed with their own reason and don't page.
+      # FR-19: a file ended scan_failed, or a scan message, or a GuardDuty result, reached its dead-letter queue. Since
+      # GuardDuty scans files over 2 GB (#234), every scan_failed pages, whatever its reason; a reason left from before,
+      # large_file_scanning_unavailable, no longer occurs.
       - alert: ScanFailed
         expr: |
-          sum(increase(scan_results_total{state="scan_failed", reason!="large_file_scanning_unavailable"}[15m])) > 0
+          sum(increase(scan_results_total{state="scan_failed"}[15m])) > 0
           or
-          max(aws_sqs_approximate_number_of_messages_visible_maximum{dimension_QueueName=~"sft-.+-scan-(small|large)-dlq"}) > 0
+          max(aws_sqs_approximate_number_of_messages_visible_maximum{dimension_QueueName=~"sft-.+-(scan-small|scan-large|guardduty-results)-dlq"}) > 0
         labels:
           severity: page
         annotations:

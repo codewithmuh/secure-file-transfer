@@ -17,7 +17,7 @@
         "subComponents": {},
         "config": {
           "kc.user.profile.config": [
-            "{\"attributes\":[{\"name\":\"username\",\"displayName\":\"${username}\",\"validations\":{\"length\":{\"min\":3,\"max\":255},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"email\",\"displayName\":\"${email}\",\"validations\":{\"email\":{},\"length\":{\"max\":255}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"tenant_id\",\"displayName\":\"Tenant ID (custom:tenant_id)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"enrolment_id\",\"displayName\":\"Enrolment the notification worker made the user for (#197)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false}]}"
+            "{\"attributes\":[{\"name\":\"username\",\"displayName\":\"${username}\",\"validations\":{\"length\":{\"min\":3,\"max\":255},\"username-prohibited-characters\":{},\"up-username-not-idn-homograph\":{}},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"email\",\"displayName\":\"${email}\",\"validations\":{\"email\":{},\"length\":{\"max\":255}},\"required\":{\"roles\":[\"user\"]},\"permissions\":{\"view\":[\"admin\",\"user\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"tenant_id\",\"displayName\":\"Tenant ID (custom:tenant_id)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"enrolment_id\",\"displayName\":\"Enrolment the notification worker made the user for (#197)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"idp_provider_name\",\"displayName\":\"SSO: the tenant provider that brokered the user (#231)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"idp_user_id\",\"displayName\":\"SSO: the subject at the tenant provider (#231)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":false},{\"name\":\"sso_groups\",\"displayName\":\"SSO: the tenant provider's groups (#231)\",\"permissions\":{\"view\":[\"admin\"],\"edit\":[\"admin\"]},\"multivalued\":true}]}"
           ]
         }
       }
@@ -89,6 +89,49 @@
           }
         },
         {
+          "name": "identities, the provider (Cognito's federated identity, #231)",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "idp_provider_name",
+            "claim.name": "identities.providerName",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "false"
+          }
+        },
+        {
+          "name": "identities, the subject (Cognito's federated identity, #231)",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "idp_user_id",
+            "claim.name": "identities.userId",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "false"
+          }
+        },
+        {
+          "name": "custom:sso_groups (#231)",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "sso_groups",
+            "claim.name": "custom:sso_groups",
+            "jsonType.label": "String",
+            "multivalued": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "false",
+            "introspection.token.claim": "false"
+          }
+        },
+        {
           "name": "custom:tenant_id",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-usermodel-attribute-mapper",
@@ -121,6 +164,59 @@
       "webOrigins": [],
       "defaultClientScopes": [],
       "optionalClientScopes": []
+    }
+  ],
+  "identityProviders": [
+    {
+      "alias": "11111111111141118111111111111111",
+      "displayName": "Local Example Co's identity provider (the customer realm), #231",
+      "providerId": "oidc",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "issuer": "http://localhost:8180/realms/customer",
+        "authorizationUrl": "http://localhost:8180/realms/customer/protocol/openid-connect/auth",
+        "tokenUrl": "http://localhost:8080/realms/customer/protocol/openid-connect/token",
+        "jwksUrl": "http://localhost:8080/realms/customer/protocol/openid-connect/certs",
+        "useJwksUrl": "true",
+        "validateSignature": "true",
+        "clientId": "sft-pool",
+        "clientSecret": "local-only-customer-broker-secret",
+        "clientAuthMethod": "client_secret_post",
+        "defaultScope": "openid email",
+        "pkceEnabled": "true",
+        "pkceMethod": "S256",
+        "syncMode": "FORCE",
+        "prompt": "login"
+      }
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "username",
+      "identityProviderAlias": "11111111111141118111111111111111",
+      "identityProviderMapper": "oidc-username-idp-mapper",
+      "config": { "syncMode": "FORCE", "template": "${ALIAS}.${CLAIM.sub}", "target": "LOCAL" }
+    },
+    {
+      "name": "subject",
+      "identityProviderAlias": "11111111111141118111111111111111",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "claim": "sub", "user.attribute": "idp_user_id" }
+    },
+    {
+      "name": "provider",
+      "identityProviderAlias": "11111111111141118111111111111111",
+      "identityProviderMapper": "hardcoded-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "attribute": "idp_provider_name", "attribute.value": "11111111111141118111111111111111" }
+    },
+    {
+      "name": "groups",
+      "identityProviderAlias": "11111111111141118111111111111111",
+      "identityProviderMapper": "oidc-user-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "claim": "groups", "user.attribute": "sso_groups" }
     }
   ],
   "users": [

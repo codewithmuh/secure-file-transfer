@@ -398,6 +398,16 @@ class CounterStore:
     async def release_lease(self, key: str, member: str) -> None:
         await self._call(lambda: self._client.zrem(key, member))
 
+    async def forget_newest(self, key: str) -> None:
+        """Take the newest entry out of a log: the sign-in triggers' pending attempt that
+        succeeded (#238, `sft.service.signin_triggers`). One command on one key."""
+        await self._call(lambda: self._client.zpopmax(key))
+
+    async def holds(self, key: str, member: str) -> bool:
+        """Whether a log still holds `member` (#238): a sign-in attempt nobody took out."""
+        score = await self._call(lambda: self._client.zscore(key, member))
+        return score is not None
+
     async def run(self, calls: Sequence[Call], *, now_ms: int) -> list[Verdict | list[float]]:
         """Many calls in one round trip: a pipeline, not a transaction, so each script still
         touches one key, as cluster mode needs. One answer per call, in order: a `Verdict`, or

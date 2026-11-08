@@ -241,6 +241,7 @@ async def _view(
         if f.state != FileState.REJECTED.value
     ]
     detectors = await findings.detectors_by_file(session, [f.id for f in listed])
+    keys = await fields.tenant_keys(session, tenant_id)
     can_decide = (
         approver
         and transfer.created_by != caller.user_id
@@ -250,22 +251,20 @@ async def _view(
     return ApprovalRequestView(
         summary=brief,
         justification=(
-            "" if justification is None else fields.open_sealed(tenant_id, justification)
+            ""
+            if justification is None
+            else keys.open(fields.JUSTIFICATION, request.confirmation_id, justification)
         ),
         matched_rules=() if decision is None else decision.rules,
         transfer=ApprovalTransferView(
             created_by=transfer.created_by,
-            message=(
-                None
-                if transfer.message_ct is None
-                else fields.open_sealed(tenant_id, transfer.message_ct)
-            ),
+            message=keys.open_optional(fields.TRANSFER_MESSAGE, transfer.id, transfer.message_ct),
             expires_at=transfer.expires_at,
             recipients=await recipient_flags(session, transfer.id, decision, now),
             files=tuple(
                 ApprovalFileView(
                     id=f.id,
-                    display_name=fields.open_sealed(tenant_id, f.display_name_ct),
+                    display_name=keys.open(fields.FILE_NAME, f.id, f.display_name_ct),
                     size=f.declared_size,
                     inspection_state=InspectionState(f.inspection_state),
                     reasons=tuple(InspectionReason(r) for r in f.inspection_reasons),
@@ -279,8 +278,8 @@ async def _view(
                 approver_id=d.approver_id,
                 decision=d.decision,
                 comment=None
-                if d.comment_ct is None
-                else fields.open_sealed(tenant_id, d.comment_ct),
+                if d.comment_ct is None or d.id is None
+                else keys.open(fields.APPROVAL_COMMENT, d.id, d.comment_ct),
                 decided_at=d.decided_at,
             )
             for d in decided
@@ -407,13 +406,18 @@ async def _record(
     tenant_id, user_id = caller.tenant_id, caller.user_id
     assert tenant_id is not None  # noqa: S101 - checked by the caller
     assert user_id is not None  # noqa: S101 - checked by the caller
+    decision_id = uuid7()
+    comment_ct = None
+    if comment is not None:
+        keys = await fields.tenant_keys(session, tenant_id, write=True)
+        comment_ct = keys.seal(fields.APPROVAL_COMMENT, decision_id, comment)
     await dlp_approvals.insert_decision(
         session,
-        decision_id=uuid7(),
+        decision_id=decision_id,
         request_id=request.id,
         approver_id=user_id,
         decision=kind,
-        comment_ct=None if comment is None else fields.seal(tenant_id, comment),
+        comment_ct=comment_ct,
     )
     target = Target(APPROVAL_REQUEST, request.id)
     actor = caller.actor()

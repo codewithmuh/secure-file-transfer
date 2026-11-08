@@ -2,19 +2,20 @@
 FR-53).
 
 The scan worker inserts findings in the transaction that records the file's scan and inspection
-result; the API inserts a transfer's message findings at `createTransfer` (FR-50, #221), under
-`transfer_id` instead of `file_id`. The scan worker may read back only the counts, which the DLP
-decision adds up (`counts_by_file`, revision 0025), never `detail_ct` (revision 0011); so may
-the jobs. The API reads them, counts only, until location hints and masked previews arrive
-encrypted with DLP-8. No column holds a matched value (NFR-26). The deletion job clears a
-deleted file's `detail_ct` in the transaction that marks the file deleted (data model 6,
-`clear_details`), and keeps the counts.
+result, with their location hints and masked previews sealed under the tenant's DLP data key
+(`detail_ct`, #233; `sft.service.finding_details`); the API inserts a transfer's message findings
+at `createTransfer` (FR-50, #221), under `transfer_id` instead of `file_id`, counts only. The scan
+worker may read back only the counts, which the DLP decision adds up (`counts_by_file`, revision
+0025), never `detail_ct` (revision 0011); so may the jobs. The API reads the counts, and the
+details for the file's owner and approvers (`details_by_file`). No column holds a matched value
+(NFR-26). The deletion job clears a deleted file's `detail_ct` in the transaction that marks the
+file deleted (data model 6, `clear_details`), and keeps the counts.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import UUID
 
@@ -22,6 +23,7 @@ from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
+from sft.core.sealed import key_version
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import DlpFinding, File, FileState, Transfer
 from sft.data.scope import ScopeKind
@@ -35,21 +37,45 @@ class Counts:
     low: int
     medium: int
     high: int
+    locations: tuple[str, ...] = field(default=(), repr=False)
+    """The inspector's location hints, on their way to being sealed; never stored as such."""
+    previews: tuple[str, ...] = field(default=(), repr=False)
+    """The inspector's masked previews, likewise."""
+    finding_id: UUID | None = None
+    """The row's ID, set when details are sealed: they are bound to it."""
+    detail_ct: bytes | None = field(default=None, repr=False)
+    """The sealed details (`sft.service.finding_details`)."""
+
+    def with_details(self, finding_id: UUID, detail_ct: bytes) -> Counts:
+        """The same counts with sealed details in place of the plain ones."""
+        return replace(self, locations=(), previews=(), finding_id=finding_id, detail_ct=detail_ct)
+
+
+@dataclass(frozen=True, slots=True)
+class StoredDetails:
+    finding_id: UUID
+    file_id: UUID
+    detector: str
+    detail_ct: bytes = field(repr=False)
 
 
 async def insert_findings(session: AsyncSession, file_id: UUID, found: Sequence[Counts]) -> int:
     """One row per detector that matched in the file; nothing for an empty list."""
     require_scope(session, ScopeKind.TENANT)
     tenant_id = tenant_of(session)
+    if any(c.locations or c.previews for c in found):
+        raise ValueError("finding details are sealed before they are stored")
     rows = [
         {
-            "id": uuid7(),
+            "id": c.finding_id or uuid7(),
             "tenant_id": tenant_id,
             "file_id": file_id,
             "detector": c.detector,
             "count_low": c.low,
             "count_medium": c.medium,
             "count_high": c.high,
+            "detail_ct": c.detail_ct,
+            "dlp_key_version": key_version(c.detail_ct),
         }
         for c in found
     ]
@@ -119,6 +145,30 @@ async def detectors_by_file(
         if file_id is not None:  # the filter leaves only file findings
             found.setdefault(file_id, []).append(detector)
     return found
+
+
+async def details_by_file(session: AsyncSession, file_ids: Sequence[UUID]) -> list[StoredDetails]:
+    """The sealed details of the files' findings, for the API to open for the file's owner and
+    approvers (#233). Only `sft_api` may select `detail_ct`; findings whose details were cleared
+    are left out."""
+    require_scope(session, ScopeKind.TENANT)
+    if not file_ids:
+        return []
+    rows = await session.execute(
+        select(DlpFinding.id, DlpFinding.file_id, DlpFinding.detector, DlpFinding.detail_ct)
+        .where(
+            DlpFinding.file_id.in_(list(file_ids)),
+            DlpFinding.detail_ct.is_not(None),
+            in_scope(DlpFinding, session),
+        )
+        .order_by(DlpFinding.file_id, DlpFinding.detector)
+    )
+    # The filter on `file_id` leaves file findings only; a message's have no details (#221).
+    return [
+        StoredDetails(r[0], r[1], r[2], r[3])
+        for r in rows.tuples()
+        if r[1] is not None and r[3] is not None
+    ]
 
 
 async def clear_details(session: AsyncSession, file_id: UUID) -> None:

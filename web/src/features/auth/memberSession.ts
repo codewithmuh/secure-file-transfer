@@ -2,14 +2,14 @@ import axios from 'axios';
 import { z } from 'zod';
 import { api, type CurrentMember, type Schema } from '@/api';
 import { apiUrl, getConfig } from '@/lib/config';
-import { useAuthStore } from '@/stores/authStore';
+import { useAuthStore, type Member } from '@/stores/authStore';
 import { safeReturnPath } from './returnPath';
 
 /** The fields of `CurrentMember` the web app reads, with the contract's types. */
 interface MemberFields {
   user: Pick<CurrentMember['user'], 'id' | 'email' | 'dlp_approver'>;
   tenant: Pick<CurrentMember['tenant'], 'id' | 'name'>;
-  session: Pick<CurrentMember['session'], 'effective_role'>;
+  session: Pick<CurrentMember['session'], 'effective_role' | 'auth_method'>;
   csrf_token: CurrentMember['csrf_token'];
 }
 
@@ -20,7 +20,10 @@ interface MemberFields {
 const currentMemberSchema: z.ZodType<MemberFields> = z.object({
   user: z.object({ id: z.string().min(1), email: z.string().min(1), dlp_approver: z.boolean() }),
   tenant: z.object({ id: z.string().min(1), name: z.string() }),
-  session: z.object({ effective_role: z.enum(['admin', 'member']) }),
+  session: z.object({
+    effective_role: z.enum(['admin', 'member']),
+    auth_method: z.enum(['passkey', 'password_totp', 'local', 'sso']),
+  }),
   csrf_token: z.string().regex(/^[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{43}$/),
 });
 
@@ -58,6 +61,24 @@ export const SIGN_IN_FAILED_PATH = '/sign-in?error=sign_in_failed';
 
 let pending: Promise<boolean> | null = null;
 
+/** `GET /me`, checked, into the store: the member and the CSRF token of the session the cookie holds now. */
+async function loadMember(): Promise<Member> {
+  const response = await api.get('/me', { skipAuthRedirect: true });
+  const me = currentMemberSchema.parse(response.data);
+  const member: Member = {
+    id: me.user.id,
+    email: me.user.email,
+    name: me.user.email,
+    role: me.session.effective_role,
+    dlpApprover: me.user.dlp_approver,
+    authMethod: me.session.auth_method,
+    tenantId: me.tenant.id,
+    tenantName: me.tenant.name,
+  };
+  useAuthStore.getState().setAuth(member, me.csrf_token);
+  return member;
+}
+
 /**
  * Asks the API who is signed in (`GET /me`) and puts the member and their CSRF token in the store. The session is an
  * HttpOnly cookie, so this is how a page load or a deep link finds out it is still signed in; no token is ever kept
@@ -67,24 +88,8 @@ let pending: Promise<boolean> | null = null;
 export function restoreMemberSession(): Promise<boolean> {
   if (pending) return pending;
   useAuthStore.getState().beginMemberCheck();
-  pending = api
-    .get('/me', { skipAuthRedirect: true })
-    .then((response) => {
-      const me = currentMemberSchema.parse(response.data);
-      useAuthStore.getState().setAuth(
-        {
-          id: me.user.id,
-          email: me.user.email,
-          name: me.user.email,
-          role: me.session.effective_role,
-          dlpApprover: me.user.dlp_approver,
-          tenantId: me.tenant.id,
-          tenantName: me.tenant.name,
-        },
-        me.csrf_token,
-      );
-      return true;
-    })
+  pending = loadMember()
+    .then(() => true)
     .catch(() => {
       useAuthStore.getState().clearAuth();
       return false;
@@ -93,6 +98,21 @@ export function restoreMemberSession(): Promise<boolean> {
       pending = null;
     });
   return pending;
+}
+
+/**
+ * Loads the session again after a step-up sign-in in another window (#232): that sign-in made a new session and revoked
+ * this one, so the CSRF token in memory is stale. Unlike `restoreMemberSession`, the member's status never goes back
+ * to `checking`, so the protected page stays mounted with its form as it was. Resolves the member, or `null` when the
+ * session can't be loaded. A `401` signs the member out as on any request (without leaving the page); any other
+ * failure leaves the store as it was.
+ */
+export async function refreshMemberSession(): Promise<Member | null> {
+  try {
+    return await loadMember();
+  } catch {
+    return null;
+  }
 }
 
 /** The `/auth/callback` page: load the new session, then go to a checked return path. Returns where to go. */

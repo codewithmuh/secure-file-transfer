@@ -164,7 +164,9 @@ async def start_sign_in(
         )
     service = sign_in_service(request)
     try:
-        started = await service.start(method=SignInMethod(method), return_to=return_to)
+        started = await service.start(
+            method=SignInMethod(method), return_to=return_to, sso_domain=sso_domain
+        )
     except (StateStoreUnavailableError, SignInUnavailableError) as exc:
         raise _unavailable() from exc
     response = _redirect(started.location)
@@ -288,6 +290,8 @@ def open_sign_in(
         redirect_uri=settings.oidc_redirect_uri,
         discovery_url=settings.oidc_discovery_url,
         revocation_url=settings.oidc_revocation_url,
+        hint_parameter=settings.oidc_idp_hint_parameter,
+        groups_claim=settings.oidc_groups_claim,
     )
     states = ValkeyStateStore.from_url(settings.valkey_url.get_secret_value(), iam=iam)
     config = SignInConfig(

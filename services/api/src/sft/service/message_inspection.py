@@ -23,14 +23,17 @@ from sft.data import dlp_policy, findings
 from sft.data.findings import Counts
 from sft.dlp.detect import inspect_text
 from sft.dlp.units import TenantDetector
+from sft.service import fields
 from sft.service.dlp_definitions import detector_unit, open_definition
 
 
 async def tenant_units(session: AsyncSession, tenant_id: UUID) -> list[TenantDetector]:
-    """The tenant's live, enabled detectors as the detector library takes them."""
+    """The tenant's live, enabled detectors as the detector library takes them, their
+    definitions opened with the tenant's DLP data key (#233)."""
     found = await dlp_policy.scan_detectors(session)
+    keys = await fields.tenant_keys(session, tenant_id, fields.KeyPurpose.DLP)
     return [
-        detector_unit(d.id, open_definition(tenant_id, d.definition_ct)) for d in found.detectors
+        detector_unit(d.id, open_definition(keys, d.id, d.definition_ct)) for d in found.detectors
     ]
 
 

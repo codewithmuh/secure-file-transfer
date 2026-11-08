@@ -1,4 +1,4 @@
-import type { DlpFinding, DlpRecipientCheck, Transfer, TransferDlp, TransferState } from '@/api';
+import type { DlpFinding, DlpLocation, DlpRecipientCheck, Transfer, TransferDlp, TransferState } from '@/api';
 
 /**
  * What the sender's transfer page shows of a DLP decision (#219, #220; FR-41 to FR-43, FR-45, FR-46):
@@ -68,4 +68,19 @@ export function filesToRemove(dlp: Pick<TransferDlp, 'decision' | 'files'>): str
         (notInspected && file.inspection.state !== 'inspected' && file.inspection.state !== 'pending'),
     )
     .map((file) => file.file_id);
+}
+
+/** The parts of a location hint (#233), in reading order, each as an i18n key and its values: an archive member,
+ * then its page, sheet and row, slide, line or paragraph, then the part of the document. */
+export function locationParts(location: DlpLocation): { key: string; values: Record<string, string | number> }[] {
+  const parts: { key: string; values: Record<string, string | number> }[] = [];
+  if (location.member) parts.push({ key: 'dlp.location.member', values: { member: location.member } });
+  if (location.page) parts.push({ key: 'dlp.location.page', values: { n: location.page } });
+  if (location.sheet !== undefined) parts.push({ key: 'dlp.location.sheet', values: { sheet: location.sheet } });
+  if (location.row) parts.push({ key: 'dlp.location.row', values: { n: location.row } });
+  if (location.slide) parts.push({ key: 'dlp.location.slide', values: { n: location.slide } });
+  if (location.line) parts.push({ key: 'dlp.location.line', values: { n: location.line } });
+  if (location.paragraph) parts.push({ key: 'dlp.location.paragraph', values: { n: location.paragraph } });
+  if (location.part) parts.push({ key: `dlp.location.part.${location.part}`, values: {} });
+  return parts;
 }

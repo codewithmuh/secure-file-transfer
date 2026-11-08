@@ -11,10 +11,13 @@ from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from sft.core.addresses import is_plain_address
+from sft.data.models import BreakGlassGrant
 from sft.data.models import Tenant as TenantRow
 from sft.data.models import User as UserRow
+from sft.service.sso import RecordedSso
 
 TenantStatus = Literal["active", "suspended"]
 Locale = Literal["en", "ja"]
@@ -108,3 +111,120 @@ class OperatorToken(BaseModel):
     expires_at: datetime
     aws_account_id: Annotated[str, Field(pattern=r"^[0-9]{12}$")]
     operator_name: Annotated[str, Field(max_length=128)]
+
+
+# ---- tenant SSO (#231) ----
+
+Hostname = Annotated[str, Field(json_schema_extra={"format": "hostname"})]
+
+
+class TenantSsoUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["oidc", "saml"]
+    provider_name: Annotated[str, Field(min_length=1, max_length=32)]
+    issuer: Annotated[str, Field(max_length=1024)] | SkipJsonSchema[None] = None
+    status: Literal["active", "inactive"]
+    domains: Annotated[
+        list[Hostname], Field(min_length=1, max_length=20, json_schema_extra={"uniqueItems": True})
+    ]
+    sso_required: bool
+    sso_mfa_confirmed_by: UUID | SkipJsonSchema[None] = None
+
+
+class TenantSsoDomain(BaseModel):
+    domain: Hostname
+    verified_at: datetime
+
+
+class TenantSso(BaseModel):
+    tenant_id: UUID
+    idp_connection_id: UUID
+    kind: Literal["oidc", "saml"]
+    provider_name: str
+    issuer: str | None
+    status: Literal["active", "inactive"]
+    domains: Annotated[list[TenantSsoDomain], Field(max_length=20)]
+    sso_required: bool
+    sso_mfa_confirmed_by: UUID | None
+    sso_mfa_confirmed_at: datetime | None
+    updated_at: datetime
+
+    @classmethod
+    def of(cls, recorded: RecordedSso) -> TenantSso:
+        tenant, connection = recorded.tenant, recorded.connection
+        return cls(
+            tenant_id=tenant.id,
+            idp_connection_id=connection.id,
+            kind=connection.kind,  # type: ignore[arg-type] # the table's CHECK allows only these
+            provider_name=connection.provider_name,
+            issuer=connection.issuer or None,
+            status=connection.status,  # type: ignore[arg-type]
+            domains=[
+                TenantSsoDomain(domain=d.domain, verified_at=d.verified_at)
+                for d in recorded.domains
+                if d.verified_at is not None
+            ],
+            sso_required=tenant.sso_required,
+            sso_mfa_confirmed_by=tenant.sso_mfa_confirmed_by,
+            sso_mfa_confirmed_at=tenant.sso_mfa_confirmed_at,
+            updated_at=max(tenant.updated_at, connection.updated_at),
+        )
+
+
+# ---- break-glass (#232) ----
+
+BreakGlassState = Literal["requested", "active", "ended", "expired", "lapsed", "withdrawn"]
+
+
+class BreakGlassRequestCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    incident_id: Annotated[str, Field(min_length=1, max_length=64)]
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    tenant_ids: Annotated[
+        list[UUID], Field(min_length=1, max_length=100, json_schema_extra={"uniqueItems": True})
+    ]
+    duration_minutes: Annotated[int, Field(ge=1, le=60)]
+
+
+class BreakGlassRequest(BaseModel):
+    id: UUID
+    incident_id: str
+    reason: str
+    tenant_ids: list[UUID]
+    duration_minutes: int
+    state: BreakGlassState
+    requester: str
+    approver: str | None
+    self_approved: bool
+    requested_at: datetime
+    approved_at: datetime | None
+    starts_at: datetime | None
+    ends_at: datetime | None
+    ended_at: datetime | None
+    ended_by: str | None
+
+    @classmethod
+    def of(cls, row: BreakGlassGrant) -> BreakGlassRequest:
+        return cls(
+            id=row.id,
+            incident_id=row.incident_id,
+            reason=row.reason,
+            tenant_ids=list(row.tenant_ids),
+            duration_minutes=row.duration_minutes,
+            state=row.state,  # type: ignore[arg-type] # the table's CHECK allows only these
+            requester=row.requester,
+            approver=row.approver,
+            self_approved=row.self_approved,
+            requested_at=row.requested_at,
+            approved_at=row.approved_at,
+            starts_at=row.starts_at,
+            ends_at=row.ends_at,
+            ended_at=row.ended_at,
+            ended_by=row.ended_by,
+        )
+
+
+class BreakGlassRequestList(BaseModel):
+    items: Annotated[list[BreakGlassRequest], Field(max_length=100)]

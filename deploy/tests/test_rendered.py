@@ -841,3 +841,34 @@ def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cogni
                     == settings["USER_POOL_PROVIDER_NAME"]
                     == f"{region}_Example0"
                 )
+
+
+def test_only_the_api_identity_unwraps_field_data_keys_and_never_the_stand_in(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """#236, #233: the API, the scan workers and the field key job name the fields key by its alias, never the local
+    KMS stand-in; the field key job runs as the API (its service account and login role), in Tokyo only."""
+    for env, region, _, obj in pods(rendered):
+        name = component(obj)
+        for container in pod_spec(obj)["containers"]:
+            settings = env_of(container)
+            if name in ("api", "scan-worker", "field-keys"):
+                assert settings["FIELDS_KMS_KEY_ID"] == f"alias/sft/{env}/fields", (
+                    env,
+                    region,
+                    name,
+                )
+            else:
+                assert "FIELDS_KMS_KEY_ID" not in settings, (env, region, name)
+        if name == "field-keys":
+            assert region == "ap-northeast-1"
+            assert pod_spec(obj)["serviceAccountName"] == "api"
+            [container] = pod_spec(obj)["containers"]
+            assert env_of(container)["DATABASE_URL"].startswith("postgresql://sft_api@")
+            assert env_of(container)["FIELD_KEY_STEPS"] == "rotate,backfill,purge"
+    jobs = [
+        (env, region)
+        for env, region, _, obj in pods(rendered)
+        if component(obj) == "field-keys"
+    ]
+    assert len(jobs) == len({env for env, _ in CLUSTERS})

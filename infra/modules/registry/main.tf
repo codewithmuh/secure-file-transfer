@@ -32,6 +32,10 @@ locals {
   # Kyverno's role in each cluster (#103, #104), which reads signatures and attestations to admit an image.
   kyverno_role_arns = [for env, account in var.member_account_ids : "arn:aws:iam::${account}:role/sft-${env}-kyverno"]
 
+  # The Cognito sign-in triggers' role and functions in each account (#238): Lambda pulls sft/app for them.
+  signin_trigger_role_arns = [for env, account in var.member_account_ids : "arn:aws:iam::${account}:role/sft-${env}-signin-trigger"]
+  signin_trigger_functions = [for env, account in var.member_account_ids : "arn:aws:lambda:*:${account}:function:sft-${env}-*-signin-trigger"]
+
   repositories = merge(
     { (var.app_repository) = { lifecycle = true } },
     { for name in var.mirror_repositories : "mirror/${name}" => { lifecycle = false } },
@@ -109,7 +113,7 @@ data "aws_iam_policy_document" "key_use" {
       condition {
         test     = "ArnEquals"
         variable = "aws:PrincipalArn"
-        values   = concat(local.node_role_arns, local.kyverno_role_arns)
+        values   = concat(local.node_role_arns, local.kyverno_role_arns, local.signin_trigger_role_arns)
       }
 
       condition {
@@ -237,6 +241,41 @@ data "aws_iam_policy_document" "pull" {
       test     = "ArnEquals"
       variable = "aws:PrincipalArn"
       values   = local.kyverno_role_arns
+    }
+  }
+
+  # The sign-in triggers' Lambda functions (#238) run sft/app from this registry: Lambda pulls the image for a
+  # function of ours in a member account, and the account pulls for its trigger role. Cross-account container
+  # images need both statements; running it is pending the AWS run.
+  statement {
+    sid     = "SignInTriggerFunctionsPull"
+    actions = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:SourceArn"
+      values   = local.signin_trigger_functions
+    }
+  }
+
+  statement {
+    sid     = "SignInTriggerRolesPull"
+    actions = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+
+    principals {
+      type        = "AWS"
+      identifiers = local.member_account_roots
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = local.signin_trigger_role_arns
     }
   }
 }

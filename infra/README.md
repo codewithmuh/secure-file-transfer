@@ -47,7 +47,7 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
 | `cluster-bootstrap` | Argo CD and its root Application, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
 | `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | [`modules/edge`](modules/edge/README.md) and [`modules/web-cdn`](modules/web-cdn/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
-| `identity` | SES (the `mail.<domain>` identity with DKIM and MAIL FROM, the configuration set `sft-<env>`, its SNS topic into the `ses-events` queue), the member user pool with its domain and app client, and the `sft/<env>/app/*` secrets without values (ADR-0015, ADR-0016, encryption 6.4) | [`modules/ses`](modules/ses/README.md), [`modules/user-pool`](modules/user-pool/README.md), [`modules/app-secrets`](modules/app-secrets/README.md); after `data` and `edge`, before `cluster-bootstrap`, which reads its outputs (#185) |
+| `identity` | SES (the `mail.<domain>` identity with DKIM and MAIL FROM, the configuration set `sft-<env>`, its SNS topic into the `ses-events` queue), the member user pool with its domain and app client and its sign-in triggers (#238), and the `sft/<env>/app/*` secrets without values (ADR-0015, ADR-0016, encryption 6.4) | [`modules/ses`](modules/ses/README.md), [`modules/user-pool`](modules/user-pool/README.md), [`modules/signin-triggers`](modules/signin-triggers/README.md), [`modules/app-secrets`](modules/app-secrets/README.md); after `data` and `edge`, before `cluster-bootstrap`, which reads its outputs (#185) |
 | `retained` | See above | prod only, one root for both Regions |
 
 Every layer is written, and so are the `shared` stack and the bootstrap stacks.
@@ -62,6 +62,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 |---|---|
 | `app-secrets` | One Region's `sft/<env>/app/*` secrets, created without a value: the four keyrings in Tokyo, replicated to Osaka in staging and prod, and the Region's `idp-client` ([README](modules/app-secrets/README.md), #185) |
 | `audit-archive` | One Region's audit archive bucket with Object Lock, its policy and replication to Osaka; in prod, called by the retained stack with its own replication role ([README](modules/audit-archive/README.md), #102) |
+| `break-glass-role` | `sft-<env>-break-glass-db`, which only BreakGlass may assume, with a grant's session tag, to sign in to the database as `sft_breakglass` under an approved grant; the EventBridge rule and topic that page on every assumption ([README](modules/break-glass-role/README.md), #232) |
 | `cluster-bootstrap` | The cluster's platform: Argo CD, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy, operator RBAC ([README](modules/cluster-bootstrap/README.md), #104) |
 | `conventions` | Nothing: names, tags, the state bucket name and the bootstrap role names and ARNs, from the environment, Region and stack. Every root calls it once. |
 | `ses` | One Region's SES setup: the domain identity with Easy DKIM, the Region's MAIL FROM subdomain, SPF and DMARC, the configuration set and its events through SNS into the `ses-events` queue, the identity policy for Cognito ([README](modules/ses/README.md), #185) |
@@ -81,6 +82,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
 | `data-stack` | One environment and Region's data layer: calls `aurora`, `valkey` and `queues` with the network stack's subnets and groups, so every `data` root passes only what differs (#101) |
 | `queues` | Every SQS queue of ADR-0013 and its dead-letter queue, with a queue policy that admits only its one sender ([README](modules/queues/README.md), #101) |
+| `signin-triggers` | One Region's Cognito sign-in triggers: the function (the API image), its role `sft-<env>-signin-trigger` (made in Tokyo), its security group and log group, and the user pool's permission to invoke it ([README](modules/signin-triggers/README.md), #238) |
 | `registry` | ECR repositories, the registry key, the cross-account pull policy, the lifecycle rules, the push role and Osaka replication ([README](modules/registry/README.md), #105) |
 | `user-pool` | One Region's member user pool: Plus tier with threat protection, MFA, admin-only sign-up, managed login on a Cognito prefix domain, the API's app client, the sign-in web ACL ([README](modules/user-pool/README.md), #185) |
 | `valkey` | One Region's counter store: ElastiCache Serverless for Valkey, its IAM-authenticated users and security group ([README](modules/valkey/README.md), #101) |
@@ -305,7 +307,7 @@ under `infra/`. An AWS-owned account that must appear in code, such as the regio
 ## Checks
 
 ```bash
-make infra-check   # what CI runs: conventions, fmt, validate, tflint, Trivy
+make infra-check   # what CI runs: conventions, fmt, validate, tflint, Trivy, terraform test
 make infra-fmt     # terraform fmt, rewriting files
 ```
 
@@ -319,6 +321,7 @@ AWS configuration and none of your environment.
 | `validate` | `terraform init -backend=false -lockfile=readonly` and `validate` for every root, so a missing or stale lock file fails too |
 | `tflint` | Terraform's own rules (preset `all`) and the AWS ruleset, through every root and the modules they call |
 | `trivy` | Trivy's misconfiguration scan, failing on any severity. Exceptions live in [`.trivyignore.yaml`](../.trivyignore.yaml), each with its paths, its reason and its threat-model reference |
+| `test` | `terraform test` for every module with a `tests/` folder, planning it against a mocked AWS provider, so nothing reaches AWS. The edge and web-cdn modules check every WAF rule and its logging this way (#235, abuse 9.2). A module has no lock file, so the dev edge root's pins the provider for the run |
 
 CI runs the same script in [`.github/workflows/infra.yml`](../.github/workflows/infra.yml), job
 `Terraform (fmt, validate, tflint, Trivy)`. The workflow runs on every pull request so the check can be required by
@@ -402,6 +405,10 @@ comment.
   also builds SES identities and configuration sets, the `sft-<env>-<rs>-ses-events` topics, user pools with their
   domain, client and branding (never a user), and the app secrets without a value (no `PutSecretValue` or
   `GetSecretValue`: only the key rotation job writes them). DNS goes through the environment's DNS roles, as the edge's.
+- **Break-glass database role** (#232), in the same Regions (`permissions-break-glass.tf`):
+  `sft-<env>-terraform-break-glass-read` for the plan role and `-break-glass` for the deploy role, which also creates,
+  changes and deletes the role `sft-<env>-break-glass-db` and its inline policies (never passed, no boundary) and the
+  `sft-<env>-<rs>-break-glass-alerts` topics. Its rule is an `sft-<env>-*` rule, under the storage policies.
 - **Shared** (#105), in the shared account (`shared_stack = true`): managed policies `sft-shared-terraform-shared-read`
   and `-write` (`permissions-shared.tf`) for ECR in Tokyo and Osaka, creating KMS keys and aliases (each key's own
   policy then makes the deploy role its administrator), the zone and DNSSEC, IAM roles under `/sft-shared/` only, the
@@ -409,6 +416,7 @@ comment.
 
 **IAM quotas.** With the identity layer, an environment's deploy role has 11 managed policies (data 1, storage 3,
 cluster 3, cluster bootstrap 1, edge 2, identity 1), one over IAM's default limit of 10 per role, and its plan role 5.
+The break-glass database role (#232) adds one to each: 12 and 6.
 So before the bootstrap apply that adds the identity layer's policies, raise each environment account's quota in
 Service Quotas: IAM, "Managed policies per role" (`L-0DA4ABF3`), to 20, in us-east-1, where IAM's global quotas live
 (`aws service-quotas request-service-quota-increase --service-code iam --quota-code L-0DA4ABF3 --desired-value 20

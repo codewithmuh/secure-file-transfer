@@ -83,3 +83,7 @@ jobs:
       - name: Trivy misconfiguration scan
         if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
         run: infra/scripts/check.sh trivy
+
+      - name: terraform test, the modules with tests (the WAF rules and logging, mocked AWS provider)
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh test

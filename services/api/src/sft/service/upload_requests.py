@@ -168,7 +168,7 @@ def access_state(locked_at: datetime | None, verified: bool) -> AccessState:
 
 
 def request_view(
-    tenant_id: UUID,
+    keys: fields.TenantKeys,
     row: UploadRequest,
     now: datetime,
     *,
@@ -184,7 +184,7 @@ def request_view(
         created_at=row.created_at,
         uploader_email=row.uploader_email,
         locale=row.locale,
-        message=None if row.message_ct is None else fields.open_sealed(tenant_id, row.message_ct),
+        message=keys.open_optional(fields.UPLOAD_REQUEST_MESSAGE, row.id, row.message_ct),
         expires_at=row.expires_at,
         revoked_at=row.ended_at if state is UploadRequestState.REVOKED else None,
         revoked_by=row.revoked_by,
@@ -204,9 +204,8 @@ async def _view(
     row = await upload_requests.get_request(session, request_id)
     verified = row.id in await upload_requests.live_session_ids(session, [row.id])
     counted = await files.received_counts(session, [row.id])
-    return request_view(
-        tenant_id, row, now, verified=verified, received=counted.get(row.id, (0, 0))
-    )
+    keys = await fields.tenant_keys(session, tenant_id)
+    return request_view(keys, row, now, verified=verified, received=counted.get(row.id, (0, 0)))
 
 
 # ---- the resource rule (authn and authz 6.4) ----
@@ -312,14 +311,18 @@ async def create_upload_request(
             # Group G, as for sendTransfer: one link email, charged only for a request that passes
             # every check above; a 429 rolls the transaction back with nothing created.
             await limiter.check_all(email_charges(caller, emails, [request.email.lower()], now))
+            request_id = uuid7()
+            keys = await fields.tenant_keys(session, tenant_id, write=request.message is not None)
             row = await upload_requests.insert_request(
                 session,
-                request_id=uuid7(),
+                request_id=request_id,
                 created_by=user_id,
                 email=request.email,
                 locale=locale,
                 message_ct=(
-                    None if request.message is None else fields.seal(tenant_id, request.message)
+                    None
+                    if request.message is None
+                    else keys.seal(fields.UPLOAD_REQUEST_MESSAGE, request_id, request.message)
                 ),
                 expires_at=expires_at,
             )
@@ -336,7 +339,7 @@ async def create_upload_request(
                 ),
             )
             await enqueue(session, UPLOAD_REQUEST_LINK_DUE, {"upload_request_id": row.id})
-            return request_view(tenant_id, row, now, verified=False)
+            return request_view(keys, row, now, verified=False)
 
         async def rebuild(request_id: UUID) -> UploadRequestView | None:
             try:
@@ -395,9 +398,10 @@ async def list_upload_requests(
         ids = [r.id for r in found]
         verified = await upload_requests.live_session_ids(session, ids)
         counted = await files.received_counts(session, ids)
+        keys = await fields.tenant_keys(session, tenant_id)
         items = [
             request_view(
-                tenant_id, r, now, verified=r.id in verified, received=counted.get(r.id, (0, 0))
+                keys, r, now, verified=r.id in verified, received=counted.get(r.id, (0, 0))
             )
             for r in found
         ]

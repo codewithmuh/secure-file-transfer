@@ -25,6 +25,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, and_, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.sealed import key_version
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import (
     ApprovalDecisionKind,
@@ -324,6 +325,8 @@ class ApproverDecision:
     decision: ApprovalDecisionKind
     comment_ct: bytes | None
     decided_at: datetime
+    id: UUID | None = None
+    """The decision's row, which its sealed comment is bound to (#236)."""
 
 
 async def insert_decision(
@@ -346,6 +349,7 @@ async def insert_decision(
             approver_id=approver_id,
             decision=decision.value,
             comment_ct=comment_ct,
+            data_key_version=key_version(comment_ct),
         )
     )
 
@@ -363,6 +367,7 @@ async def list_decisions(session: AsyncSession, request_id: UUID) -> list[Approv
     )
     return [
         ApproverDecision(
+            id=row.id,
             approver_id=row.approver_id,
             decision=ApprovalDecisionKind(row.decision),
             comment_ct=row.comment_ct,

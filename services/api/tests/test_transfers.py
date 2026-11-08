@@ -8,7 +8,7 @@ path against S3Mock, and tests/test_authorization_matrix.py every operation with
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
 import httpx2 as httpx
@@ -18,10 +18,13 @@ from fastapi import FastAPI
 from member_fixtures import RecordingLimiter, app_for, ready_for_dlp, seed_user, session_caller
 from object_fixtures import FakeObjects
 from pg import ScratchDatabase
+from sft.api.rate_limits import get_rate_limiter
+from sft.core.errors import RateLimited
 from sft.data.database import Database
 from sft.data.models import Role
 from sft.service import scan_timing, uploads
 from sft.service.caller import Caller, CallerKind
+from sft.service.rate_limits import Charge
 from sft.service.uploads import UploadPolicy, upload_plan
 
 pytestmark = pytest.mark.anyio
@@ -188,7 +191,7 @@ async def test_a_file_uploads_in_parts_and_reaches_scanning_with_its_message(w: 
         (5 * 10**6, "standard", ["file.scan"]),  # the small pool
         (150 * 10**6, "standard", ["file.scan_large"]),  # ClamAV's large pool (ADR-0019)
         (2 * 10**9, "standard", ["file.scan_large"]),  # ClamAV's side of the boundary
-        (2 * 10**9 + 1, "large", []),  # GuardDuty's (M6): no ClamAV queue
+        (2 * 10**9 + 1, "large", []),  # GuardDuty's (#234): no ClamAV queue
     ],
 )
 async def test_the_scan_pool_follows_the_real_size(
@@ -201,26 +204,25 @@ async def test_the_scan_pool_follows_the_real_size(
     assert stored_class == storage_class
     upload_everything(w, file_id, size)
     done = (await w.client.post(f"/v1/files/{file_id}/complete")).json()
-    if topics:
-        assert done["state"] == "scanning"
-    else:
-        # Nothing scans it before GuardDuty (M6): failed at once, with the reason, not left to wait.
-        assert (done["state"], done["scan_detail"]) == (
-            "scan_failed",
-            "large_file_scanning_unavailable",
-        )
-        assert done["inspection"]["state"] == "skipped"
-        assert w.actions(file_id)[-2:] == ["file.uploaded", "file.scanned"]
+    # Every file waits for its engine's result; GuardDuty's arrives on its own queue (#234).
+    assert done["state"] == "scanning"
+    assert w.actions(file_id)[-1] == "file.uploaded"
     rows = w.db.sql("SELECT topic FROM outbox WHERE payload->>'file_id' = :id", id=file_id)
     assert [topic for (topic,) in rows] == topics
-    # The deadline grows with the size and covers every attempt (data model 3.1).
     [(seconds,)] = w.db.sql(
         "SELECT extract(epoch FROM scan_deadline - now()) FROM files WHERE id = :id", id=file_id
     )
-    assert float(seconds) > scan_timing.ATTEMPTS * scan_timing.attempt_timeout(size).total_seconds()
+    if topics:
+        # The deadline grows with the size and covers every attempt (data model 3.1).
+        attempts = scan_timing.ATTEMPTS * scan_timing.attempt_timeout(size).total_seconds()
+        assert float(seconds) > attempts
+    else:
+        # GuardDuty's result, or the sweep two hours after completion (#234).
+        guardduty = scan_timing.GUARDDUTY_DEADLINE.total_seconds()
+        assert guardduty - 60 < float(seconds) <= guardduty
 
 
-async def test_a_transfer_with_a_file_over_2_gb_is_held_at_send(w: World) -> None:
+async def test_a_transfer_with_a_file_over_2_gb_waits_for_guardduty_at_send(w: World) -> None:
     w.app.state.upload_policy = UploadPolicy(storage_quota=10**10)
     transfer_id = await draft(w)
     size = 2 * 10**9 + 1
@@ -228,7 +230,9 @@ async def test_a_transfer_with_a_file_over_2_gb_is_held_at_send(w: World) -> Non
     upload_everything(w, file_id, size)
     assert (await w.client.post(f"/v1/files/{file_id}/complete")).status_code == 200
     sent = await w.client.post(f"/v1/transfers/{transfer_id}/send")
-    assert (sent.json()["state"], sent.json()["hold_reason"]) == ("held", "file_blocked")
+    # Not held any more (#234): it waits for GuardDuty's result like any file being scanned.
+    assert sent.status_code == 200, sent.text
+    assert (sent.json()["state"], sent.json()["hold_reason"]) == ("submitted", None)
 
 
 # ---- completion's re-checks ----
@@ -499,7 +503,10 @@ async def test_uploads_count_against_group_f_and_the_tenant(w: World) -> None:
     bundles = [ids for ids, _ in w.limiter.checks]
     tenant = ("H.caller_requests", "H.tenant_requests")
     upload = ("F.caller_requests", "F.ip_requests", "H.tenant_requests")
-    assert bundles == [tenant, upload, upload, tenant]
+    # The declaration also spends its size from the tenant's day (#165), once it is made.
+    volume = ("F.tenant_upload_bytes",)
+    assert bundles == [tenant, upload, volume, upload, tenant]
+    assert w.limiter.peeks[-1] == [("F.tenant_upload_bytes", 2)]  # 1 MiB: 2 megabytes, rounded up
     alice = w.users["alice"]
     assert {str(alice.user_id), str(alice.tenant_id)} <= set(w.limiter.checks[1][1].values())
 
@@ -526,3 +533,76 @@ async def test_no_part_urls_once_a_completion_moved_the_file_on(
     assert response.json()["code"] == "invalid_state"
     assert response.json()["current_state"] == "completing"
     assert "file.part_urls_issued" not in w.actions(file_id)
+
+
+# ---- group F's budgets (#165, abuse and rate limits 2.2 F, 6.1) ----
+
+
+async def test_a_file_gets_ten_times_its_part_count_in_part_urls(w: World) -> None:
+    transfer_id = await draft(w)
+    file_id = str((await add(w, transfer_id, 12 * MIB))["id"])  # 3 parts: 30 URLs
+    _, count = upload_plan(12 * MIB)
+    assert count == 3
+    for _ in range(10):
+        issued = await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [1, 2, 3]})
+        assert issued.status_code == 200, issued.text
+    refused = await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [1]})
+    assert refused.status_code == 429
+    assert refused.json()["code"] == "rate_limited"
+    # No wait frees more for this file: its unfinished upload is rejected a day after its last part.
+    assert refused.headers["Retry-After"] == "86400"
+    [(issued_count,)] = w.db.sql(
+        "SELECT part_urls_issued FROM files WHERE id = :id", id=uuid.UUID(file_id)
+    )
+    assert issued_count == 30  # the refused call counted nothing
+    assert w.actions(file_id).count("file.part_urls_issued") == 10
+
+
+async def test_a_call_that_would_pass_the_cap_gets_none_of_its_urls(w: World) -> None:
+    transfer_id = await draft(w)
+    file_id = str((await add(w, transfer_id, 12 * MIB))["id"])
+    for _ in range(9):
+        await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [1, 2, 3]})
+    await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [1]})  # 28
+    refused = await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [1, 2, 3]})
+    assert refused.status_code == 429
+    allowed = await w.client.post(f"/v1/files/{file_id}/parts", json={"part_numbers": [2, 3]})
+    assert allowed.status_code == 200  # 30, exactly the cap
+
+
+@dataclass
+class RefusingAtCharge(RecordingLimiter):
+    """Admits the peek, refuses the charge: a declaration that lost the last of the day's bytes."""
+
+    async def check_all(self, charges: Sequence[Charge]) -> None:
+        self.checks.append((tuple(c.limit.id for c in charges), {}))
+        raise RateLimited(retry_after=600)
+
+
+async def test_a_declaration_refused_its_daily_volume_leaves_nothing(w: World) -> None:
+    transfer_id = await draft(w)
+    refusing = RefusingAtCharge()
+    w.app.dependency_overrides[get_rate_limiter] = lambda: refusing
+    response = await w.client.post(
+        f"/v1/transfers/{transfer_id}/files",
+        json={"display_name": "a.bin", "size": MIB, "content_type": "application/pdf"},
+    )
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "600"
+    assert refusing.peeks == [[("F.tenant_upload_bytes", 2)]]
+    # Rolled back: no file, no reservation, and the multipart upload aborted.
+    assert w.db.sql("SELECT count(*) FROM files WHERE transfer_id = :t", t=transfer_id) == [(0,)]
+    assert w.reserved() == 0
+    assert len(w.objects.aborted) == 1
+
+
+async def test_a_declaration_over_the_days_volume_starts_no_upload(w: World) -> None:
+    transfer_id = await draft(w)
+    w.limiter.refuse = True  # the peek refuses: the day's 200 GB are spent
+    response = await w.client.post(
+        f"/v1/transfers/{transfer_id}/files",
+        json={"display_name": "a.bin", "size": MIB, "content_type": "application/pdf"},
+    )
+    assert response.status_code == 429
+    assert w.objects.aborted == []
+    assert w.db.sql("SELECT count(*) FROM files WHERE transfer_id = :t", t=transfer_id) == [(0,)]

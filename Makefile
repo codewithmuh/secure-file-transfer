@@ -149,7 +149,7 @@ smoke: ## One round trip to every local stack service, and sft_api's row-level s
 
 # The local seed (#182): the local-keycloak connection, a tenant, an admin and a member who sign in
 # through the stack's Keycloak. Idempotent; refuses anything but the local stack.
-.PHONY: seed jobs e2e
+.PHONY: seed jobs field-keys e2e
 seed: ## Seed the local stack with a tenant, an admin and a member, and print how to sign in (after make up)
 	uv run --script local/seed.py
 
@@ -158,6 +158,11 @@ seed: ## Seed the local stack with a tenant, an admin and a member, and print ho
 JOB ?= reconciliation
 jobs: ## Run one lifecycle job against the local stack: make jobs JOB=deletion (after make up)
 	docker compose --profile jobs run --build --rm --no-deps jobs $(JOB)
+
+# The field key job (#236), as the API's workload: STEP=backfill|rotate|rewrap|purge.
+STEP ?= backfill
+field-keys: ## Run one field key job step against the local stack: make field-keys STEP=backfill (after make up)
+	docker compose --profile jobs run --build --rm --no-deps field-keys $(STEP)
 
 # The M2 journey test (#182) against `make up` and `make seed`: one test, steps 1 to 9 of the M2 exit
 # criterion, through the public API, Mailpit's API, S3's API, the job commands and the clock hook.
@@ -176,7 +181,7 @@ clean: ## Remove build, test and cache artifacts
 infra-fmt: ## Format the Terraform under infra/
 	infra/scripts/check.sh fmt-fix
 
-infra-check: ## Check infra/: conventions, fmt, validate, tflint and Trivy (same as CI)
+infra-check: ## Check infra/: conventions, fmt, validate, tflint, Trivy and terraform test (same as CI)
 	infra/scripts/check.sh all
 
 # The deploy config under deploy/ (deploy/README.md): needs helm 3, kubeconform and Docker, at the versions in ci.yml.

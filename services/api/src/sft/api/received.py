@@ -39,7 +39,7 @@ from sft.api.errors import problem_responses
 from sft.api.idempotency import IdempotencyDep
 from sft.api.link_schemas import SessionFileOut
 from sft.api.links import NO_STORE, SESSION_HEADER, LinkDep, get_link_session_caller
-from sft.api.rate_limits import client_ip, rate_limit
+from sft.api.rate_limits import client_ip, get_rate_limiter, rate_limit
 from sft.api.transfer_schemas import (
     File,
     FileCreate,
@@ -52,6 +52,7 @@ from sft.data.database import Database
 from sft.service import downloads, received, uploads
 from sft.service.caller import Caller
 from sft.service.objects import ObjectStore
+from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import SESSION_UPLOAD, TENANT_OPERATION
 
 PREFIX: Final = "/v1"
@@ -60,6 +61,7 @@ DatabaseDep = Annotated[Database, Depends(get_database)]
 ObjectsDep = Annotated[ObjectStore, Depends(get_objects)]
 PolicyDep = Annotated[uploads.UploadPolicy, Depends(get_upload_policy)]
 CallerDep = Annotated[Caller, Depends(get_tenant_caller)]
+LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 UPLOAD_LIMITS: Final = rate_limit(SESSION_UPLOAD, caller=get_link_session_caller)
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 
@@ -109,6 +111,7 @@ async def add_session_upload_file(
     objects: ObjectsDep,
     policy: PolicyDep,
     idempotency: IdempotencyDep,
+    limiter: LimiterDep,
 ) -> SessionFileOut:
     """Declare a file and start its multipart upload (FR-11)."""
     outcome = await received.add_session_file(
@@ -117,6 +120,7 @@ async def add_session_upload_file(
         link.caller,
         uploads.FileRequest(body.display_name, body.size, body.content_type),
         policy=policy,
+        limiter=limiter,
         origin=origin_of(request),
         now=now_of(request),
         idempotency=idempotency,

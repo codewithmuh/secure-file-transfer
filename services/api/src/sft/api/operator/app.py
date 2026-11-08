@@ -29,14 +29,18 @@ an operator checks `listTenants` before retrying a `createTenant` whose answer w
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from prometheus_client import CollectorRegistry, Counter
+from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.engine import make_url
 
 from sft.api.app import _NO_FASTAPI_TELEMETRY, API_TITLE, API_VERSION
@@ -51,9 +55,12 @@ from sft.data import roles
 from sft.data.audit import Origin
 from sft.data.counters import CounterMetrics, CounterStore, ValkeyIam
 from sft.data.database import Database
-from sft.service import operator_auth, operator_tenants
+from sft.data.models import BreakGlassState
+from sft.service import break_glass, operator_auth, operator_tenants, sso
 from sft.service.operator_auth import Operator, OperatorPolicy, Sts
 from sft.service.rate_limits import RateLimiter
+
+log = logging.getLogger(__name__)
 
 PREFIX: Final = "/v1"
 
@@ -104,13 +111,80 @@ def _lifespan(
         )
         app.state.sts = sts or HttpSts(settings.sts_endpoint)
         app.state.policy = policy_of(settings)
+        app.state.break_glass_self_approval = settings.break_glass_self_approval
+        # Break-glass (#232): record expiries and lapses, and keep the alert's gauges current.
+        watch = asyncio.create_task(
+            watch_break_glass(
+                database, BreakGlassMetrics.create(registry), settings.break_glass_sweep_seconds
+            )
+        )
         try:
             yield
         finally:
+            watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watch
             await store.close()
             await database.dispose()
 
     return lifespan
+
+
+@dataclass(frozen=True, slots=True)
+class BreakGlassMetrics:
+    """What the alerts of deploy/alerts/break-glass.rules.yaml read."""
+
+    active: Gauge
+    last_success: Gauge
+    tenant_records_missed: Counter
+
+    @classmethod
+    def create(cls, registry: CollectorRegistry) -> BreakGlassMetrics:
+        active = Gauge(
+            "sft_break_glass_active_grants",
+            "Break-glass grants giving access now (authn and authz 8.3); any pages.",
+            ["self_approved"],
+            registry=registry,
+        )
+        for label in ("true", "false"):
+            active.labels(self_approved=label).set(0)
+        return cls(
+            active=active,
+            last_success=Gauge(
+                "sft_break_glass_sweep_last_success_timestamp_seconds",
+                "When the break-glass sweep last ran to the end, as a Unix time.",
+                registry=registry,
+            ),
+            tenant_records_missed=Counter(
+                "sft_break_glass_tenant_records_missed_total",
+                "Break-glass records not written to a tenant's audit log; any increase alerts.",
+                registry=registry,
+            ),
+        )
+
+    def observe(self, result: break_glass.SweepResult) -> None:
+        for self_approved in (True, False):
+            self.active.labels(self_approved=str(self_approved).lower()).set(
+                result.active.get(self_approved, 0)
+            )
+        if result.tenant_records_missed:
+            self.tenant_records_missed.inc(result.tenant_records_missed)
+        self.last_success.set_to_current_time()
+
+
+async def watch_break_glass(
+    database: Database, metrics: BreakGlassMetrics, interval: float
+) -> None:
+    """Run the break-glass sweep every `interval` seconds until cancelled. A failed run is logged
+    and tried again; the stalled-sweep alert fires if none succeeds for five minutes."""
+    while True:
+        try:
+            metrics.observe(await break_glass.sweep(database))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("the break-glass sweep failed")
+        await asyncio.sleep(interval)
 
 
 def _origin(request: Request) -> Origin:
@@ -242,6 +316,118 @@ def operator_router() -> APIRouter:
     ) -> schemas.Tenant:
         tenant = await operator_tenants.get_tenant(database, operator, tenant_id, origin)
         return schemas.Tenant.of(tenant)
+
+    @router.put(
+        "/operator/tenants/{tenant_id}/sso",
+        operation_id="configureTenantSso",
+        responses=problem_responses(400, 401, 403, 404, 422, 429),
+    )
+    async def configure_tenant_sso(
+        tenant_id: UUID,
+        body: schemas.TenantSsoUpdate,
+        database: DatabaseDep,
+        operator: OperatorDep,
+        origin: OriginDep,
+    ) -> schemas.TenantSso:
+        recorded = await sso.configure_tenant_sso(
+            database,
+            operator,
+            tenant_id,
+            sso.SsoConfiguration(
+                kind=sso.ConnectionKind(body.kind),
+                provider_name=body.provider_name,
+                issuer=body.issuer,
+                status=sso.ConnectionStatus(body.status),
+                domains=body.domains,
+                sso_required=body.sso_required,
+                sso_mfa_confirmed_by=body.sso_mfa_confirmed_by,
+            ),
+            origin=origin,
+        )
+        return schemas.TenantSso.of(recorded)
+
+    @router.post(
+        "/operator/break-glass-requests",
+        operation_id="requestBreakGlass",
+        status_code=201,
+        responses=problem_responses(400, 401, 403, 422, 429),
+    )
+    async def request_break_glass(
+        body: schemas.BreakGlassRequestCreate,
+        database: DatabaseDep,
+        operator: OperatorDep,
+        origin: OriginDep,
+    ) -> schemas.BreakGlassRequest:
+        grant = await break_glass.request(
+            database,
+            operator,
+            break_glass.NewRequest(
+                incident_id=body.incident_id,
+                reason=body.reason,
+                tenant_ids=body.tenant_ids,
+                duration_minutes=body.duration_minutes,
+            ),
+            origin=origin,
+        )
+        return schemas.BreakGlassRequest.of(grant)
+
+    @router.get(
+        "/operator/break-glass-requests",
+        operation_id="listBreakGlassRequests",
+        responses=problem_responses(400, 401, 403, 422, 429),
+    )
+    async def list_break_glass_requests(
+        database: DatabaseDep,
+        operator: OperatorDep,
+        state: schemas.BreakGlassState | None = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    ) -> schemas.BreakGlassRequestList:
+        rows = await break_glass.list_requests(
+            database,
+            operator,
+            state=None if state is None else BreakGlassState(state),
+            limit=limit,
+        )
+        return schemas.BreakGlassRequestList(
+            items=[schemas.BreakGlassRequest.of(row) for row in rows]
+        )
+
+    @router.post(
+        "/operator/break-glass-requests/{break_glass_request_id}/approve",
+        operation_id="approveBreakGlass",
+        responses=problem_responses(401, 403, 404, 409, 429),
+    )
+    async def approve_break_glass(
+        break_glass_request_id: UUID,
+        request: Request,
+        database: DatabaseDep,
+        operator: OperatorDep,
+        origin: OriginDep,
+    ) -> schemas.BreakGlassRequest:
+        grant = await break_glass.approve(
+            database,
+            operator,
+            break_glass_request_id,
+            allow_self_approval=bool(
+                getattr(request.app.state, "break_glass_self_approval", False)
+            ),
+            origin=origin,
+        )
+        return schemas.BreakGlassRequest.of(grant)
+
+    @router.post(
+        "/operator/break-glass-requests/{break_glass_request_id}/end",
+        operation_id="endBreakGlass",
+        responses=problem_responses(401, 403, 404, 429),
+    )
+    async def end_break_glass(
+        break_glass_request_id: UUID,
+        database: DatabaseDep,
+        operator: OperatorDep,
+        origin: OriginDep,
+    ) -> schemas.BreakGlassRequest:
+        grant = await break_glass.end(database, operator, break_glass_request_id, origin=origin)
+        return schemas.BreakGlassRequest.of(grant)
 
     @router.post(
         "/operator/tenants/{tenant_id}/suspend",

@@ -3,10 +3,12 @@
 `SignIn` holds the parts: the database, the OIDC client of the environment's pool, the sign-in
 state store and the CSRF keyring. The API's routes call it; it knows nothing of HTTP.
 
-**Start** (`start`). Picks the connection: the pool's, found by its `provider_name`. A tenant's
-SSO provider, found by a proven email domain, arrives with SSO (M6); until then `method=sso`
-falls back to local sign-in, as the contract allows. Stores the pre-auth record and returns the
-cookie value and the URL of the pool's authorization endpoint.
+**Start** (`start`). Picks the connection: the pool's, found by its `provider_name`, or, for
+`method=sso`, the tenant's provider that a proven domain is linked to (`lookup_sso_domain`, #231),
+when that connection is active. Anything else, an unproven or unlinked domain included, falls back
+to local sign-in, as the contract says, so an unproven domain never routes a sign-in. Stores the
+pre-auth record and returns the cookie value and the URL of the pool's authorization endpoint,
+naming the provider (`identity_provider`, or `kc_idp_hint` for the local stand-in).
 
 **Complete** (`complete`). Takes the pre-auth record once, compares `state`, exchanges the code,
 revokes the refresh token and validates the ID token. Then it resolves the identity from rows,
@@ -15,8 +17,17 @@ token's `identities` claim names must be that connection; the identity is `(conn
 and gives the user and the tenant. A local identity's user must equal `cognito:username`. In the
 tenant's scope it checks the tenant and the user, activates an invited user, creates the session
 under the cap of 10, and audits the sign-in, in one transaction. Every refusal is audited with its
-reason: in the tenant's log when the identity is known, otherwise as a platform event, since there
-is no tenant (authn and authz 2.4). The caller only learns `sign_in_failed`.
+reason: in the tenant's log when the identity or the tenant's connection is known, otherwise as a
+platform event, since there is no tenant (authn and authz 2.4). The caller only learns
+`sign_in_failed`.
+
+**Just in time** (#231). An SSO subject with no identity yet, through a tenant's connection,
+binds to that tenant's user whose address the token names, when the address is on one of the
+domains linked to the connection and the user isn't deactivated and has no identity there yet
+(`user.identity_bound`); otherwise, with the tenant's `sso_jit` on, the member is created, active,
+with the role the token's groups map to or `member` (`user.provisioned`). The address never
+reaches another tenant or a domain the tenant hasn't proven. **SSO required**: a local sign-in
+to a tenant that requires SSO is refused, except for its fallback admins.
 
 **Resolve** (`resolve`). The per-request check of 3.2, through the member session lookup, then in
 the session's tenant: live, not idle, user and tenant active, role from `users`.
@@ -30,6 +41,7 @@ import hmac
 import logging
 import re
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -39,20 +51,28 @@ from uuid import UUID
 
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import Unauthenticated
-from sft.data import audit, member_sessions
+from sft.data import audit, member_sessions, sso
 from sft.data.audit import Actor, Origin, Target
 from sft.data.database import Database
-from sft.data.identities import Connection, Identity, find_connection, find_identity
+from sft.data.identities import (
+    Connection,
+    Identity,
+    find_connection,
+    find_identity,
+    has_identity,
+)
 from sft.data.member_sessions import LiveSession, RevokedReason
-from sft.data.models import ActorType, Outcome, Role, Tenant, User, UserStatus
+from sft.data.models import ActorType, Outcome, Role, SsoGroupRole, Tenant, User, UserStatus
 from sft.data.scope import Scope
 from sft.data.signin_state import PendingSignIn, StateStore
 from sft.data.tenants import get_tenant
-from sft.data.users import accept_invitation, get_user
+from sft.data.users import accept_invitation, get_user, get_user_by_email
 from sft.service.caller import AuthMethod, Caller, CallerKind
 from sft.service.csrf import CsrfKeyring
+from sft.service.domain_rules import DomainError, domain_of, normalize_domain
 from sft.service.oidc import IdToken, OidcClient, OidcError, Pkce
 from sft.service.permissions import authorize
 
@@ -88,6 +108,14 @@ class SignInRefusal(StrEnum):
     USER_MISMATCH = "user_mismatch"
     USER_DEACTIVATED = "user_deactivated"
     TENANT_SUSPENDED = "tenant_suspended"
+    SSO_REQUIRED = "sso_required"
+    """A local sign-in to a tenant that requires SSO, by someone who isn't a fallback admin."""
+    DOMAIN_NOT_PROVEN = "domain_not_proven"
+    """Just in time: the token's address isn't on a domain linked to the connection."""
+    PROVISIONING_OFF = "provisioning_off"
+    """Just in time: nobody has the address, and the tenant creates no member at sign-in."""
+    IDENTITY_CONFLICT = "identity_conflict"
+    """Just in time: the user already has another identity at this connection."""
 
 
 class SessionEnd(StrEnum):
@@ -148,10 +176,28 @@ class SignInConfig:
 
 
 class _RefusedError(Exception):
-    def __init__(self, reason: SignInRefusal, identity: Identity | None = None) -> None:
+    def __init__(
+        self,
+        reason: SignInRefusal,
+        identity: Identity | None = None,
+        *,
+        tenant_id: UUID | None = None,
+    ) -> None:
         super().__init__(reason.value)
         self.reason = reason
         self.identity = identity
+        self.tenant_id = tenant_id
+        """The tenant whose connection the sign-in came through, when no identity is known."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Resolved:
+    """Who a validated token stands for: the identity, or none yet for a first SSO sign-in."""
+
+    connection: Connection
+    subject: str
+    identity: Identity | None
+    method: AuthMethod
 
 
 def safe_return_path(raw: str | None) -> str:
@@ -165,6 +211,15 @@ def safe_return_path(raw: str | None) -> str:
     ):
         return DEFAULT_RETURN
     return raw
+
+
+def role_for_groups(groups: Sequence[str], mapping: Sequence[SsoGroupRole]) -> Role:
+    """The role a member created just in time gets: `admin` if any of their groups maps to it,
+    otherwise `member` (#231)."""
+    held = set(groups)
+    if any(m.group_name in held and m.role == Role.ADMIN for m in mapping):
+        return Role.ADMIN
+    return Role.MEMBER
 
 
 def auth_method_of(token: IdToken, *, federated: bool) -> AuthMethod:
@@ -200,11 +255,13 @@ class SignIn:
 
     # ---- start ----
 
-    async def start(self, *, method: SignInMethod, return_to: str | None) -> Started:
-        # method=sso finds a tenant's provider by its proven domain once SSO exists (M6); until
-        # then every sign-in is local, which the contract allows for an unproven domain.
-        del method
+    async def start(
+        self, *, method: SignInMethod, return_to: str | None, sso_domain: str | None = None
+    ) -> Started:
         try:
+            route = None
+            if method is SignInMethod.SSO and sso_domain:
+                route = await self._domain_route(sso_domain)
             connection = await self._pool_connection()
         except DATABASE_UNAVAILABLE as exc:
             log.warning("sign-in can't reach the database", extra={"error": type(exc).__name__})
@@ -212,6 +269,11 @@ class SignIn:
         if connection is None or connection.status != "active":
             log.error("the user pool's connection is missing or inactive")
             raise SignInUnavailableError
+        provider = LOCAL_IDENTITY_PROVIDER
+        if route is not None:
+            # The tenant's provider: the pool sends the browser on to it (authn and authz 2.4).
+            connection = Connection(route.connection_id, route.tenant_id, "sso", route.status)
+            provider = route.provider_name
         pkce = Pkce.new()
         pending = PendingSignIn(
             state=secrets.token_urlsafe(32),
@@ -225,13 +287,25 @@ class SignIn:
                 state=pending.state,
                 nonce=pending.nonce,
                 pkce=pkce,
-                identity_provider=LOCAL_IDENTITY_PROVIDER,
+                identity_provider=provider,
             )
         except OidcError as exc:
             raise SignInUnavailableError from exc
         cookie = secrets.token_urlsafe(32)
         await self.states.put(cookie, pending)  # StateStoreUnavailableError: the route answers 503
         return Started(cookie=cookie, location=location)
+
+    async def _domain_route(self, raw_domain: str) -> sso.DomainRoute | None:
+        """The active connection a proven, linked domain routes to; None falls back to local."""
+        try:
+            domain = normalize_domain(raw_domain)
+        except DomainError:
+            return None
+        async with self.database.transaction(Scope.lookup()) as session:
+            route = await sso.route_domain(session, domain)
+        if route is None or route.status != "active":
+            return None
+        return route
 
     async def _pool_connection(self) -> Connection | None:
         async with self.database.transaction(Scope.lookup()) as session:
@@ -279,8 +353,8 @@ class SignIn:
             if not code or not state or not _same(state, pending.state):
                 raise _RefusedError(SignInRefusal.STATE_MISMATCH)
             token = await self._token(code, pending)
-            identity, method = await self._identity(token, pending)
-            session_token = await self._create_session(identity, token, method, origin)
+            resolved = await self._identity(token, pending)
+            session_token = await self._create_session(resolved, token, origin)
         except _RefusedError as refused:
             await self._audit_refusal(refused, origin)
             return Completed(location=self._web("/sign-in?error=sign_in_failed"))
@@ -304,9 +378,7 @@ class SignIn:
                 raise _RefusedError(SignInRefusal.STALE_AUTHENTICATION)
         return token
 
-    async def _identity(
-        self, token: IdToken, pending: PendingSignIn
-    ) -> tuple[Identity, AuthMethod]:
+    async def _identity(self, token: IdToken, pending: PendingSignIn) -> _Resolved:
         federated = bool(token.identities)
         async with self.database.transaction(Scope.lookup()) as session:
             if federated:
@@ -325,7 +397,11 @@ class SignIn:
             if connection.status != "active":
                 raise _RefusedError(SignInRefusal.CONNECTION_INACTIVE)
             identity = await find_identity(session, connection.id, subject)
+        method = auth_method_of(token, federated=federated)
         if identity is None:
+            if federated and connection.tenant_id is not None:
+                # A first SSO sign-in: bound or created just in time, in the tenant's scope.
+                return _Resolved(connection, subject, None, method)
             raise _RefusedError(SignInRefusal.UNKNOWN_IDENTITY)
         if connection.tenant_id is not None and identity.tenant_id != connection.tenant_id:
             # One tenant's provider can never sign anyone in to another tenant.
@@ -334,25 +410,74 @@ class SignIn:
             raise _RefusedError(SignInRefusal.IDENTITY_EXPIRED, identity)
         if not federated and token.username != str(identity.user_id):
             raise _RefusedError(SignInRefusal.USER_MISMATCH, identity)
-        return identity, auth_method_of(token, federated=federated)
+        return _Resolved(connection, subject, identity, method)
 
-    async def _create_session(
-        self, identity: Identity, token: IdToken, method: AuthMethod, origin: Origin
-    ) -> str:
+    async def _provision(
+        self, session: AsyncSession, resolved: _Resolved, token: IdToken, tenant: Tenant
+    ) -> Identity:
+        """Bind a first SSO sign-in to the tenant's user with its address, or create the member
+        (module docstring, "Just in time"). In the tenant's scope; refusals name the tenant."""
+        connection, tenant_id = resolved.connection, tenant.id
+        domain = None if token.email is None else domain_of(token.email)
+        linked = await sso.connection_domains(session, connection.id)
+        if token.email is None or domain is None or domain not in linked:
+            raise _RefusedError(SignInRefusal.DOMAIN_NOT_PROVEN, tenant_id=tenant_id)
+        system = Actor(ActorType.SYSTEM)
+        user = await get_user_by_email(session, token.email)
+        if user is not None:
+            if user.status == UserStatus.DEACTIVATED:
+                raise _RefusedError(SignInRefusal.USER_DEACTIVATED, tenant_id=tenant_id)
+            if await has_identity(session, user_id=user.id, connection_id=connection.id):
+                raise _RefusedError(SignInRefusal.IDENTITY_CONFLICT, tenant_id=tenant_id)
+            action = "user.identity_bound"
+        else:
+            if not tenant.sso_jit:
+                raise _RefusedError(SignInRefusal.PROVISIONING_OFF, tenant_id=tenant_id)
+            role = role_for_groups(token.groups, await sso.group_roles(session))
+            user = await sso.provision_user(session, email=token.email, role=role)
+            action = "user.provisioned"
+        identity_id = await sso.bind_identity(
+            session, user_id=user.id, connection_id=connection.id, subject=resolved.subject
+        )
+        if identity_id is None:
+            raise _RefusedError(SignInRefusal.IDENTITY_CONFLICT, tenant_id=tenant_id)
+        await audit.record(
+            session,
+            action=action,
+            actor=system,
+            target=Target("user", user.id),
+            details={
+                "idp_connection_id": connection.id,
+                "identity_id": identity_id,
+                "role": Role(user.role),
+            },
+        )
+        return Identity(identity_id, tenant_id, user.id, None)
+
+    async def _create_session(self, resolved: _Resolved, token: IdToken, origin: Origin) -> str:
+        identity, method = resolved.identity, resolved.method
+        tenant_id = identity.tenant_id if identity is not None else resolved.connection.tenant_id
+        if tenant_id is None:
+            raise _RefusedError(SignInRefusal.UNKNOWN_IDENTITY)
         auth_time = (
             datetime.fromtimestamp(token.auth_time, UTC)
             if token.auth_time is not None
             else datetime.now(UTC)
         )
-        async with self.database.transaction(Scope.tenant(identity.tenant_id)) as session:
-            tenant = await get_tenant(session, identity.tenant_id)
+        async with self.database.transaction(Scope.tenant(tenant_id)) as session:
+            tenant = await get_tenant(session, tenant_id)
             if tenant is None or tenant.status != "active":
-                raise _RefusedError(SignInRefusal.TENANT_SUSPENDED, identity)
+                raise _RefusedError(SignInRefusal.TENANT_SUSPENDED, identity, tenant_id=tenant_id)
+            if identity is None:
+                identity = await self._provision(session, resolved, token, tenant)
             user = await get_user(session, identity.user_id, for_update=True)
             if user is None:
                 raise _RefusedError(SignInRefusal.UNKNOWN_IDENTITY, identity)
             if user.status == UserStatus.DEACTIVATED:
                 raise _RefusedError(SignInRefusal.USER_DEACTIVATED, identity)
+            if method is not AuthMethod.SSO and tenant.sso_required and not user.sso_fallback:
+                # Only the identity provider signs this tenant's members in (authn and authz 2.5).
+                raise _RefusedError(SignInRefusal.SSO_REQUIRED, identity)
             # The caller as the new session will see it, before the session exists: its actor.
             caller = Caller(
                 CallerKind.MEMBER,
@@ -384,8 +509,12 @@ class SignIn:
                 details={
                     "auth_method": method,
                     "identity_id": identity.id,
+                    "idp_connection_id": resolved.connection.id,
                     "sessions_ended": ended,
+                    # A fallback admin's local sign-in to a tenant that requires SSO (2.5).
+                    "sso_fallback_sign_in": method is not AuthMethod.SSO and tenant.sso_required,
                 },
+                security_critical=method is not AuthMethod.SSO and tenant.sso_required,
             )
         return session_token
 
@@ -393,6 +522,18 @@ class SignIn:
         identity = refused.identity
         details = {"reason": refused.reason}
         log.info("sign-in refused", extra={"reason": refused.reason.value})
+        if identity is None and refused.tenant_id is not None:
+            # Through the tenant's connection, with no identity yet: the tenant's log.
+            async with self.database.transaction(Scope.tenant(refused.tenant_id)) as session:
+                await audit.record(
+                    session,
+                    action="member.sign_in_refused",
+                    actor=Actor(ActorType.SYSTEM),
+                    outcome=Outcome.FAILURE,
+                    origin=origin,
+                    details=details,
+                )
+            return
         if identity is None:
             # Nobody is known, so there is no tenant: a platform event, by the sign-in itself.
             async with self.database.transaction(Scope.platform()) as session:

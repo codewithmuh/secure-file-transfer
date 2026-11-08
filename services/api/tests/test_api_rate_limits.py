@@ -1,6 +1,7 @@
 """Rate limits over HTTP: the route dependency, 429 and 503, counting 401s, and client IPs."""
 
 import json
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from ipaddress import ip_network
 from typing import Annotated
@@ -117,6 +118,48 @@ def until_refused(send: Callable[[], Response], limit: int) -> Response:
             assert sent >= burst
             return response
     raise AssertionError("never refused")
+
+
+class Colleague:
+    """A member of the tenant, one of several (`X-Test-Account`)."""
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+
+    def rate_limit_keys(self) -> Mapping[KeyType, KeyValue]:
+        return {KeyType.ACCOUNT: self.account, KeyType.TENANT: TENANT}
+
+
+def colleague(request: Request) -> Colleague:
+    return Colleague(request.headers["x-test-account"])
+
+
+def test_a_tenants_callers_share_its_1000_requests_a_minute(valkey_url: str) -> None:
+    """NFR-14: at most 1,000 API requests per tenant a minute, its members and keys together
+    (abuse 2.2 H, `H.tenant_requests`; #235). Eight members, each far under its own 300, reach
+    the tenant's limit together: GCRA admits 501 at once."""
+    flush(valkey_url)
+    app = app_with_routes(valkey_url)
+
+    @app.get("/v1/test/colleague", dependencies=[rate_limit(TENANT_OPERATION, caller=colleague)])
+    async def as_colleague() -> dict[str, str]:
+        return {"ok": "colleague"}
+
+    accounts = [str(uuid.uuid4()) for _ in range(8)]
+    with TestClient(app) as http:
+        sent = 0
+        while True:
+            account = accounts[sent % len(accounts)]
+            response = http.get("/v1/test/colleague", headers={"x-test-account": account})
+            if response.status_code != 200:
+                break
+            sent += 1
+            assert sent < 600, "never refused"
+    assert sent >= gcra_split(1000)[0]  # the tenant's burst; real time may admit a few more
+    assert sent // len(accounts) < gcra_split(300)[0]  # no member reached its own limit
+    assert response.status_code == 429
+    assert response.json()["code"] == "rate_limited"
+    assert int(response.headers["retry-after"]) >= 1
 
 
 def test_over_the_limit_is_a_429_problem(client: TestClient) -> None:

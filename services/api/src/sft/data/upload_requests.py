@@ -44,6 +44,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, and_, case, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.sealed import key_version
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
 from sft.data.models import (
     DeliveryState,
@@ -86,6 +87,7 @@ async def insert_request(
             email_normalized=email.lower(),
             locale=locale,
             message_ct=message_ct,
+            data_key_version=key_version(message_ct),
             expires_at=expires_at,
             delivery_state=DeliveryState.QUEUED.value,
         )

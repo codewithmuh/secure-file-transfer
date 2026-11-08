@@ -13,6 +13,7 @@ in the shared zone and the Region's Route 53 health check ([ADR-0021](../../../d
 | `load-balancer.tf` | Security group and its rule on `main_nodes`, load balancer, target group, HTTPS listener, the fixed health response, the health check |
 | `dns.tf` | The load balancer's certificate, its validation records, `api-<region-short>` and, in the primary Region, `api` |
 | `waf.tf` | The API and sign-in web ACLs, the block list and NAT IP sets, their logging |
+| `tests/waf.tftest.hcl` | `terraform test` against a mocked provider: every rule's priority, action, limit, window and `429`, the levers and the rollout switch, the NAT IP set, the logging filter and redaction (#235; `infra/scripts/check.sh test`) |
 | `logs.tf` | `aws-waf-logs-sft-<env>-<region-short>-<account-id>` (SSE-KMS, logs key) and `sft-<env>-<region-short>-lb-logs-<account-id>` (SSE-S3) |
 | `web-bucket.tf` | `sft-<env>-<region-short>-web-<account-id>`, read only by the distribution |
 

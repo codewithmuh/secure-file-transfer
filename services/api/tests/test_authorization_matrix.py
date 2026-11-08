@@ -56,6 +56,8 @@ class Draft:
     """A live API key of the tenant's admin, which can be revoked (#215)."""
     upload_request: uuid.UUID = field(default_factory=uuid.uuid4)
     """An open upload request of theirs, which can be read, revoked and unlocked (#212)."""
+    sso_domain: uuid.UUID = field(default_factory=uuid.uuid4)
+    """A proven SSO domain of the tenant, which can be verified again and removed (#231)."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,14 @@ def seed_draft(db: ScratchDatabase, tenant: Tenant, objects: FakeObjects) -> Dra
         id=draft.upload_request,
         tenant=tenant.id,
         owner=tenant.target,
+    )
+    db.sql(
+        "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, verified_at, "
+        "created_by) VALUES (:id, :tenant, :domain, repeat('m', 32), now(), :admin)",
+        id=draft.sso_domain,
+        tenant=tenant.id,
+        domain=f"matrix-{draft.sso_domain.hex[:12]}.example",
+        admin=tenant.admin,
     )
     return draft
 
@@ -547,6 +557,11 @@ ADMIN_ONLY = frozenset(
         "searchAuditEvents",
         "exportAuditEvents",
         "clearEmailSuppression",
+        "getTenantSso",
+        "updateTenantSso",
+        "claimSsoDomain",
+        "verifySsoDomain",
+        "deleteSsoDomain",
     }
 )
 
@@ -616,6 +631,13 @@ EXPECTED: dict[str, dict[str, int]] = {
     "testDlpDetectors": dlp_row(200, step_up=False, item=False),
     "listDlpDecisions": audit_row(200, step_up=False),
     "getDlpReport": audit_row(200, step_up=False),
+    # Tenant SSO (#231): admins only, with a passkey if local, web sessions only; every write
+    # needs a step-up (#232); another tenant's domain is 404.
+    "getTenantSso": admin_row(200, step_up=False, item=False),
+    "updateTenantSso": admin_row(200, step_up=True, item=False),
+    "claimSsoDomain": admin_row(201, step_up=True, item=False),
+    "verifySsoDomain": admin_row(200, step_up=True, item=True),
+    "deleteSsoDomain": admin_row(204, step_up=True, item=True),
 }
 
 # The policy operations, which need the admin role; a transfer's decision (#219) is the owner's.
@@ -789,6 +811,19 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
         "testDlpDetectors": ("POST", "/v1/dlp/detector-tests", {"text": "Sample text"}),
         "listDlpDecisions": ("GET", "/v1/dlp/decisions", None),
         "getDlpReport": ("GET", "/v1/dlp/report", None),
+        "getTenantSso": ("GET", "/v1/tenant/sso", None),
+        "updateTenantSso": ("PATCH", "/v1/tenant/sso", {"jit_provisioning": True}),
+        "claimSsoDomain": (
+            "POST",
+            "/v1/tenant/sso/domains",
+            {"domain": f"claim-{uuid.uuid4().hex[:12]}.example"},
+        ),
+        "verifySsoDomain": (
+            "POST",
+            f"/v1/tenant/sso/domains/{world.draft.sso_domain}/verify",
+            None,
+        ),
+        "deleteSsoDomain": ("DELETE", f"/v1/tenant/sso/domains/{world.draft.sso_domain}", None),
     }[operation]
 
 
@@ -820,6 +855,10 @@ STATE = """
                 WHERE tenant_id = :t
     UNION ALL SELECT 'dlp_approval_decision', id, decision FROM dlp_approval_decisions
                 WHERE tenant_id = :t
+    UNION ALL SELECT 'sso_domain', id, coalesce(verified_at::text, '-') FROM sso_domains
+                WHERE tenant_id = :t
+    UNION ALL SELECT 'sso_settings', id, sso_required || '/' || sso_jit FROM tenants
+                WHERE id = :t
     ORDER BY 1, 2
 """
 
@@ -887,6 +926,7 @@ async def test_authorization_matrix(
         assert str(world.draft.ready) not in response.text
         assert str(world.draft.sent) not in response.text
         assert str(world.draft.upload_request) not in response.text
+        assert str(world.draft.sso_domain) not in response.text
         if world.dlp is not None:
             assert str(world.dlp.rule) not in response.text
             assert str(world.dlp.detector) not in response.text

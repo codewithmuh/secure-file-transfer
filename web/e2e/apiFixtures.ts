@@ -995,3 +995,47 @@ export const dlpDecisionPage: Schema<'DlpDecisionPage'> = {
   ],
   next_cursor: 'next-page',
 };
+
+/** Single sign-on (#231): an active SAML connection, one domain waiting for its TXT record and one proven and linked. */
+export const ssoDomainPendingId = '0190c0de-0000-7000-8000-000000000061';
+const ssoConnectionId = '0190c0de-0000-7000-8000-000000000060';
+
+export const tenantSso: Schema<'TenantSsoSettings'> = {
+  connection: {
+    id: ssoConnectionId,
+    kind: 'saml',
+    provider_name: tenantId.replace(/-/g, ''),
+    issuer: 'https://idp.example.com/saml',
+    status: 'active',
+  },
+  sso_required: false,
+  sso_mfa_confirmed_by: memberId,
+  sso_mfa_confirmed_at: '2026-11-02T00:00:00Z',
+  jit_provisioning: true,
+  group_roles: [
+    { group: 'sft-admins', role: 'admin' },
+    { group: 'All Staff', role: 'member' },
+  ],
+  domains: [
+    {
+      id: ssoDomainPendingId,
+      domain: 'example.co.jp',
+      status: 'pending',
+      txt_record_name: '_sft-verification.example.co.jp',
+      txt_record_value: 'sft-domain-verification=example-not-a-real-value',
+      idp_connection_id: null,
+      verified_at: null,
+      created_at: '2026-11-03T00:00:00Z',
+    },
+    {
+      id: '0190c0de-0000-7000-8000-000000000062',
+      domain: 'example.com',
+      status: 'verified',
+      txt_record_name: '_sft-verification.example.com',
+      txt_record_value: 'sft-domain-verification=example-not-a-real-value',
+      idp_connection_id: ssoConnectionId,
+      verified_at: '2026-11-02T00:00:00Z',
+      created_at: '2026-11-01T00:00:00Z',
+    },
+  ],
+};

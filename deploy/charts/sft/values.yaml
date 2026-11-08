@@ -203,6 +203,9 @@ operatorApi: # namespace sft-operator, port-forward only, never on a load balanc
   terminationGracePeriodSeconds: 60 # 15 s of preStop and its 20 s drain
   env:
     DATABASE_POOL_SIZE: "2"
+    # A requester may approve their own break-glass grant only where a cluster's values say so: the single-maintainer
+    # reference run (authn-authz 8.3, threat model R-08). Such a grant is marked and pages (BreakGlassSelfApproved).
+    BREAK_GLASS_SELF_APPROVAL: "false"
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 768Mi }
@@ -282,6 +285,20 @@ keyRotation:
   deployments: [api]
   resources:
     requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }
+
+# The field key job (#236, encryption and keys 3.2, 7.2), in Tokyo only: it runs as the API (the API's service account, so
+# the sft-<env>-api role, the only one whose fields key statement unwraps field data keys, and the sft_api login). Each
+# run takes `steps` in order: rotate a data key version older than a year, reseal what isn't under the live version
+# (the backfill of #236, and the re-encryption after a rotation), purge versions no row uses. `rewrap` is run by hand
+# (kubectl create job --from=cronjob/field-keys, runbook field-keys).
+fieldKeys:
+  schedule: "37 3 * * *"
+  module: sft.workers.field_keys
+  steps: [rotate, backfill, purge]
+  activeDeadlineSeconds: 3600
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
     limits: { memory: 256Mi }
 
 # The invitation backlog (#193): a one-off pass that invites, through the user pool, every member left `invited` before

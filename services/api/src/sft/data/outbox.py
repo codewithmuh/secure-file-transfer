@@ -65,6 +65,12 @@ class Queue(StrEnum):
     NOTIFY = "notify"
     SES_EVENTS = "ses-events"
     """Not the outbox's: SES's events, through SNS (`sft.service.ses_events`, #185). No topic."""
+    GUARDDUTY_RESULTS = "guardduty-results"
+    """Not the outbox's: GuardDuty's scan results for files over 2 GB, through EventBridge
+    (`sft.service.guardduty`, #234). The large pool's scan workers read it. No topic."""
+    SIGNIN_EVENTS = "signin-events"
+    """Not the outbox's: the Cognito sign-in triggers send to it directly, in the outbox's
+    envelope (`sft.service.signin_triggers`, #238). The notification worker reads it. No topic."""
 
     @property
     def fair(self) -> bool:
@@ -117,8 +123,8 @@ FILE_SCAN_LARGE: Final = Topic("file.scan_large", Queue.SCAN_LARGE)
 pool, so large files don't delay small ones (ADR-0019, #175). Payload `{"file_id": …}`.
 
 Files over 2,000,000,000 bytes (`storage_class = large`) get no scan message: ClamAV can't scan
-them, and GuardDuty's result on the `guardduty-results` intake queue drives them from M6. Until
-then completion records them `scan_failed` (`large_file_scanning_unavailable`)."""
+them, and GuardDuty's result on the `guardduty-results` intake queue drives them (#234,
+`sft.service.guardduty`); with no result by the scan deadline, the sweep fails them."""
 
 TRANSFER_SENT: Final = Topic("transfer.sent", Queue.NOTIFY)
 """The evaluation moved a transfer to `sent`: the notification worker (#178) writes one

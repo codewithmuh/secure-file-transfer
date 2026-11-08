@@ -471,10 +471,11 @@ data "aws_iam_policy_document" "fields" {
 
   source_policy_documents = [data.aws_iam_policy_document.common.json]
 
-  # Called directly, so no kms:ViaService. Both purposes, and always with the tenant in the context.
+  # Called directly, so no kms:ViaService. Both purposes, and always with the tenant in the context. ReEncrypt is the
+  # field key job's re-wrap (#236), which runs as the API: the same key, the same context, newer key material.
   statement {
     sid       = "ApiWrapsTenantDataKeys"
-    actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+    actions   = ["kms:GenerateDataKey", "kms:Decrypt", "kms:ReEncryptFrom", "kms:ReEncryptTo"]
     resources = ["*"]
 
     principals {

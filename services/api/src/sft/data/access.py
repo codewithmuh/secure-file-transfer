@@ -75,6 +75,8 @@ SCOPES_BY_ROLE: Final[Mapping[str, frozenset[ScopeKind]]] = {
     roles.JOBS: frozenset({_SYSTEM, _TENANT}),
     roles.ARCHIVE: frozenset({_SYSTEM}),
     roles.RECOVERY: frozenset({_RECOVERY}),
+    # A person's psql session during break-glass (#232), never this code's: it opens no scope.
+    roles.BREAK_GLASS: frozenset(),
 }
 """The scopes each workload role may open (authentication and authorization 7.3)."""
 

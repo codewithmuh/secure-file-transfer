@@ -13,6 +13,9 @@ describe('safeReturnPath: only same-app paths under allowed routes (#73 defect 4
     '/upload-requests/new',
     '/admin/users',
     '/admin/audit',
+    '/admin/sso',
+    '/approvals/0190c0de-0000-7000-8000-000000000001',
+    '/auth/step-up-complete',
   ])('accepts %s', (path) => {
     expect(safeReturnPath(path)).toBe(path);
   });

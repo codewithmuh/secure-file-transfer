@@ -39,6 +39,11 @@ API_ENV: dict[str, str] = {
     "AUDIT_ARCHIVE_TOKYO_BUCKET": "sft-test-audit-archive",
     "CODE_HMAC_KEYRING": CODE_HMAC_KEYRING,
     "API_KEY_ENVIRONMENT": "dev",
+    # Field encryption (#236): the in-process KMS stand-in, as in the local stack.
+    "FIELDS_KMS_KEY_ID": "local",
+    # No load balancer in front, so no trusted proxy is needed (#129). `local`, not `test`: the
+    # API key environment stays required, as in every environment but the suite's own.
+    "ENVIRONMENT": "local",
 }
 """As environment variables, for tests that read the environment."""
 

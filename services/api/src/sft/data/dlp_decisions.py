@@ -27,6 +27,8 @@ from sqlalchemy import and_, delete, func, insert, select, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.sealed import key_version
+from sft.data import sso
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import (
     DlpConfirmation,
@@ -79,7 +81,8 @@ async def decision_policy(
 ) -> DecisionPolicy | None:
     """The scope's tenant's policy and its live, enabled rules for `direction` (sent files, or
     received files, #221), in the order they were made, read in one statement so they belong to
-    one version. None for a tenant without a policy."""
+    one version, with the tenant's proven SSO domains among the trusted domains (#231). None for
+    a tenant without a policy."""
     require_scope(session, *_TENANT)
     rule_join = and_(
         DlpRule.tenant_id == DlpPolicy.tenant_id,
@@ -130,7 +133,9 @@ async def decision_policy(
         for row in rows
         if row.id is not None
     )
-    return DecisionPolicy(first.version, first.mode, tuple(first.trusted_domains), rules)
+    # The tenant's proven SSO domains are trusted too (FR-45, #231).
+    trusted = tuple(sorted({*first.trusted_domains, *await sso.verified_domains(session)}))
+    return DecisionPolicy(first.version, first.mode, trusted, rules)
 
 
 # ---- decisions ----
@@ -305,7 +310,7 @@ async def insert_confirmation(
     justification_ct: bytes | None,
 ) -> None:
     """The sender's confirmation of a decision of the scope's tenant (FR-42). The justification
-    arrives sealed (`sft.service.fields`); the field key's version stays empty until M6."""
+    arrives sealed (`sft.service.fields`), and the row names its key version (#236)."""
     require_scope(session, *_TENANT)
     await session.execute(
         insert(DlpConfirmation).values(
@@ -315,6 +320,7 @@ async def insert_confirmation(
             decision_id=decision_id,
             confirmed_by=confirmed_by,
             justification_ct=justification_ct,
+            data_key_version=key_version(justification_ct),
         )
     )
 

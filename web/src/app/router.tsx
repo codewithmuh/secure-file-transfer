@@ -1,6 +1,6 @@
 import { createBrowserRouter } from 'react-router';
 import { AppLayout, PublicLayout } from '@/components/layout';
-import { ProtectedRoute, SignInPage, SignInCallbackPage } from '@/features/auth';
+import { ProtectedRoute, SignInPage, SignInCallbackPage, StepUpCompletePage } from '@/features/auth';
 import {
   DashboardPage,
   TransferListPage,
@@ -12,7 +12,7 @@ import {
 } from '@/features/sender';
 import { RecipientPage } from '@/features/recipient';
 import { UploaderPage } from '@/features/uploader';
-import { UserManagementPage, TenantPolicyPage, ApiKeysPage } from '@/features/admin';
+import { UserManagementPage, TenantPolicyPage, ApiKeysPage, SsoPage } from '@/features/admin';
 import { ApprovalQueuePage, ApprovalRequestPage } from '@/features/approvals';
 import { AuditLogPage } from '@/features/audit';
 import {
@@ -33,6 +33,8 @@ import {
 export const router = createBrowserRouter([
   { path: '/sign-in', element: <SignInPage /> },
   { path: '/auth/callback', element: <SignInCallbackPage /> },
+  // The popup of a step-up sign-in lands here, tells the page that opened it, and closes (#232).
+  { path: '/auth/step-up-complete', element: <StepUpCompletePage /> },
 
   {
     element: <PublicLayout />,
@@ -74,6 +76,10 @@ export const router = createBrowserRouter([
       {
         path: '/admin/api-keys',
         element: <ProtectedRoute requiredRole="admin"><ApiKeysPage /></ProtectedRoute>,
+      },
+      {
+        path: '/admin/sso',
+        element: <ProtectedRoute requiredRole="admin"><SsoPage /></ProtectedRoute>,
       },
       {
         path: '/admin/dlp',

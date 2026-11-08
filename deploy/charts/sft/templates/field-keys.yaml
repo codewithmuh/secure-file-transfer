@@ -1,0 +1,53 @@
+{{- if and (eq .Values.part "application") (eq .Values.region "ap-northeast-1") }}
+{{- /*
+The field key job (#236, #233; encryption and keys 3.2, 7.2), in Tokyo only, where the database takes writes. It runs
+as the API: the API's service account, so the sft-<env>-api role, the only one whose fields key statement unwraps a
+field data key, and the sft_api login. Each run takes FIELD_KEY_STEPS in order (sft.service.field_keys): a new data
+key version for a tenant whose live one is a year old, the reseal of every value not under the live version (the
+backfill of M2's unencrypted values, and the re-encryption after a rotation), and the purge of versions no row uses.
+`rewrap` runs by hand after a change of the fields key: kubectl create job --from=cronjob/field-keys (runbook
+field-keys). Suspended in the pilot light, where the database is a read-only replica.
+*/}}
+{{- $job := .Values.fieldKeys }}
+{{- $api := .Values.api }}
+{{- $ctx := dict "root" $ "component" "field-keys" "serviceAccount" $api.serviceAccount }}
+{{- $env := dict
+  "ENVIRONMENT" .Values.environment
+  "FIELDS_KMS_KEY_ID" (printf "alias/sft/%s/fields" .Values.environment)
+  "FIELD_KEY_STEPS" (join "," $job.steps) }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: field-keys
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ .Values.pilotLight }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # the next daily run is the retry; every step reads the stored state first
+      activeDeadlineSeconds: {{ $job.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sft.labels" $ctx | nindent 12 }}
+        spec:
+          {{- include "sft.podCommon" $ctx | nindent 10 }}
+          restartPolicy: Never
+          securityContext:
+            {{- include "sft.podSecurityContext" 10001 | nindent 12 }}
+          containers:
+            {{- include "sft.appContainer" (dict "root" $ "name" "field-keys" "module" $job.module "databaseRole" $api.databaseRole "env" $env "resources" $job.resources "job" true) | nindent 12 }}
+          volumes:
+            {{- include "sft.tmpVolume" . | nindent 12 }}
+{{- end }}

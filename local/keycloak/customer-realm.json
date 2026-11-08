@@ -1,0 +1,95 @@
+{
+  "realm": "customer",
+  "displayName": "A customer's own identity provider, local only (#231)",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "rememberMe": false,
+  "clients": [
+    {
+      "clientId": "sft-pool",
+      "name": "The user pool, brokering this customer's sign-ins (Cognito's federation stand-in)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "local-only-customer-broker-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8180/realms/sft/broker/11111111111141118111111111111111/endpoint"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "basic",
+        "email"
+      ],
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "name": "sft-admins"
+    },
+    {
+      "name": "staff"
+    }
+  ],
+  "users": [
+    {
+      "username": "sso.member",
+      "email": "sso.member@corp.localhost",
+      "emailVerified": true,
+      "firstName": "SSO",
+      "lastName": "Member",
+      "enabled": true,
+      "groups": [
+        "/staff"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "local-only-sso-member-password",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "sso.admin",
+      "email": "sso.admin@corp.localhost",
+      "emailVerified": true,
+      "firstName": "SSO",
+      "lastName": "Admin",
+      "enabled": true,
+      "groups": [
+        "/sft-admins"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "local-only-sso-admin-password",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

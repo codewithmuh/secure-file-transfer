@@ -380,7 +380,12 @@ async def get_transfer_dlp(
     transfer_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep
 ) -> TransferDlpOut:
     view = await transfer_dlp.get_transfer_dlp(
-        database, caller, transfer_id, language=language_of(request), now=_now()
+        database,
+        caller,
+        transfer_id,
+        language=language_of(request),
+        now=_now(),
+        origin=origin_of(request),
     )
     return TransferDlpOut.of(view)
 

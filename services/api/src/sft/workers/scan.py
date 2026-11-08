@@ -43,11 +43,17 @@ For each `file.scan` (small pool) or `file.scan_large` (large pool) message:
    transaction (`sft.service.scans.note_received`), and only the tag follows: `dlp_blocked` for
    one a DLP rule blocked, which the API's read condition refuses.
 
+**Files over 2 GB** (#234) are GuardDuty's: the large pool's workers also read the
+`guardduty-results` queue (`GuardDutyConsumer`). A result is recorded only for a file still
+`scanning`, for the version completion recorded, and when GuardDuty's own tag on that version
+names the same result (`sft.service.guardduty`); then the `scan` tag and the evaluation follow, as
+in step 6, keeping GuardDuty's tag. No result by the deadline is the sweep's `scan_failed`.
+
 While a message is in hand, the loop extends its visibility every half visibility timeout, so a
 long scan isn't handed to a second worker. Metrics (abuse 8.1): `scan_results_total{state,reason}`,
-`scan_deferrals_total`, `dlp_inspection_seconds`, `dlp_inspection_results_total{state,reason}` and
-`dlp_inspector_failures_total{kind}`: detector IDs and counts never appear in a label, and no value
-anywhere (NFR-26).
+`scan_deferrals_total`, `dlp_inspection_seconds`, `dlp_inspection_results_total{state,reason}`,
+`dlp_inspector_failures_total{kind}` and `guardduty_results_total{outcome}`: detector IDs and counts
+never appear in a label, and no value anywhere (NFR-26).
 """
 
 from __future__ import annotations
@@ -88,7 +94,7 @@ from sft.data.models import (
     ScanDetail,
     StorageClass,
 )
-from sft.data.outbox import FILE_SCAN, FILE_SCAN_LARGE, Queue, Topic, enqueue
+from sft.data.outbox import FILE_SCAN, FILE_SCAN_LARGE, OutboxMessage, Queue, Topic, enqueue
 from sft.data.processed import record_processed
 from sft.data.scope import Scope
 from sft.dlp import client as inspector_client
@@ -100,8 +106,9 @@ from sft.dlp.protocol import (
     ProtocolError,
     Result,
 )
+from sft.runtime.kms import open_field_keys
 from sft.runtime.s3 import S3Objects
-from sft.service import scan_timing, scans
+from sft.service import fields, guardduty, scan_timing, scans
 from sft.service.dlp_definitions import inspector_spec, open_definition
 from sft.service.evaluation import evaluate
 from sft.service.objects import SCAN_TAG, ObjectStoreError, ScannedObjects
@@ -402,7 +409,14 @@ def _inspection_result(answer: Result, policy_version: int | None) -> Inspection
         reasons=tuple(InspectionReason(r) for r in answer.reasons),
         engine_version=answer.engine_version,
         findings=tuple(
-            Counts(f.detector, f.counts.low, f.counts.medium, f.counts.high)
+            Counts(
+                f.detector,
+                f.counts.low,
+                f.counts.medium,
+                f.counts.high,
+                locations=tuple(f.locations),
+                previews=tuple(f.previews),
+            )
             for f in answer.findings
         ),
         policy_version=policy_version,
@@ -420,10 +434,14 @@ class InspectorDetectors:
 
 
 async def tenant_detectors(session: AsyncSession, tenant_id: UUID) -> InspectorDetectors:
-    """Read and open the tenant's detectors, in the transaction that reads the file."""
+    """Read and open the tenant's detectors, in the transaction that reads the file, with the
+    message's tenant's DLP data keys (#233): the only keys this worker may unwrap."""
     found = await dlp_policy.scan_detectors(session)
+    if not found.detectors:
+        return InspectorDetectors(found.policy_version)
+    keys = await fields.tenant_keys(session, tenant_id, fields.KeyPurpose.DLP)
     specs = tuple(
-        inspector_spec(d.id, open_definition(tenant_id, d.definition_ct)) for d in found.detectors
+        inspector_spec(d.id, open_definition(keys, d.id, d.definition_ct)) for d in found.detectors
     )
     return InspectorDetectors(found.policy_version, specs)
 
@@ -470,8 +488,8 @@ class ScanConsumer(Consumer):
                 await self._finish(message.tenant_id, file_id)
             return await self._done(scope, str(message.id))
         if target.storage_class is StorageClass.LARGE:
-            # Over 2 GB: GuardDuty's (M6), never ClamAV's. A message from before #175 routed these
-            # here; completion fails them now, and the sweep a file left from before.
+            # Over 2 GB: GuardDuty's (#234), never ClamAV's. A message from before #175 routed
+            # these here; GuardDuty's result records them, or the sweep at their deadline.
             return await self._done(scope, str(message.id))
         size = target.actual_size or 0
         # One lease per attempt: two copies of a message scanning at once hold two, and neither
@@ -656,42 +674,50 @@ class ScanConsumer(Consumer):
             self.metrics.inspection_seconds.observe(answers.inspection_seconds)
 
     async def _finish(self, tenant_id: UUID, file_id: UUID) -> None:
-        """After the result commits: the tag, then the evaluation. Both are safe to repeat."""
-        scope = Scope.tenant(tenant_id)
-        async with self.database.transaction(scope) as session:
-            target = await files.scan_target(session, file_id)
-        if target.state is FileState.SCANNING or target.s3_version_id is None:
-            return
-        value = scans.tag_value(
-            target.state, target.unscannable_allowed, target.inspection_state, target.dlp_blocked
+        await finish(self.database, self.objects, tenant_id, file_id)
+
+
+async def finish(
+    database: Database, objects: ScannedObjects, tenant_id: UUID, file_id: UUID
+) -> None:
+    """After a result commits, whichever engine gave it: the tag, then the evaluation. Both are
+    safe to repeat. The tag is a read-modify-write that keeps the version's other tags, such as
+    GuardDuty's own (ADR-0019)."""
+    scope = Scope.tenant(tenant_id)
+    async with database.transaction(scope) as session:
+        target = await files.scan_target(session, file_id)
+    if target.state is FileState.SCANNING or target.s3_version_id is None:
+        return
+    value = scans.tag_value(
+        target.state, target.unscannable_allowed, target.inspection_state, target.dlp_blocked
+    )
+    try:
+        tags = await objects.object_tags(
+            target.storage_class, target.storage_key, target.s3_version_id
         )
-        try:
-            tags = await self.objects.object_tags(
-                target.storage_class, target.storage_key, target.s3_version_id
+        if tags.get(SCAN_TAG) != value:
+            await objects.put_object_tags(
+                target.storage_class,
+                target.storage_key,
+                target.s3_version_id,
+                {**tags, SCAN_TAG: value},
             )
-            if tags.get(SCAN_TAG) != value:
-                await self.objects.put_object_tags(
-                    target.storage_class,
-                    target.storage_key,
-                    target.s3_version_id,
-                    {**tags, SCAN_TAG: value},
-                )
-        except ObjectStoreError as exc:
-            if exc.code not in GONE:
-                raise
-            # The deletion job removed it already: there is nothing left to tag.
-            log.info("object already deleted; no tag", extra={"file_id": str(file_id)})
-        if target.transfer_id is None:
-            # A received file (#213): its notice was counted with its result; no transfer.
-            return
-        async with self.database.transaction(scope) as session:
-            await evaluate(
-                session,
-                target.transfer_id,
-                actor=scans.SYSTEM,
-                now=datetime.now(UTC),
-                details={"system_actor": SystemActor.SCAN_WORKER},
-            )
+    except ObjectStoreError as exc:
+        if exc.code not in GONE:
+            raise
+        # The deletion job removed it already: there is nothing left to tag.
+        log.info("object already deleted; no tag", extra={"file_id": str(file_id)})
+    if target.transfer_id is None:
+        # A received file (#213): its notice was counted with its result; no transfer.
+        return
+    async with database.transaction(scope) as session:
+        await evaluate(
+            session,
+            target.transfer_id,
+            actor=scans.SYSTEM,
+            now=datetime.now(UTC),
+            details={"system_actor": SystemActor.SCAN_WORKER},
+        )
 
 
 class SmallScanConsumer(ScanConsumer):
@@ -704,6 +730,152 @@ class LargeScanConsumer(ScanConsumer):
     name = "scan-large"
     queue = Queue.SCAN_LARGE
     topic = FILE_SCAN_LARGE
+
+
+class ResultTooEarlyError(Exception):
+    """GuardDuty's result came before the file could take it: completion hasn't committed its
+    last phase, or GuardDuty hasn't tagged the version yet. SQS delivers it again."""
+
+
+GUARDDUTY_OUTCOMES: Final = (
+    "recorded",
+    "late",
+    "not_ours",
+    "other_version",
+    "tag_mismatch",
+    "too_early",
+)
+
+
+@dataclass(frozen=True)
+class GuardDutyMetrics:
+    results: Counter
+
+    @classmethod
+    def create(cls, registry: CollectorRegistry) -> GuardDutyMetrics:
+        metrics = cls(
+            Counter(
+                "guardduty_results_total",
+                "GuardDuty scan results received, by outcome: recorded, late (the file had a "
+                "result already), not_ours, other_version, tag_mismatch (ignored: the object's "
+                "tag names another result) or too_early (delivered again).",
+                ["outcome"],
+                registry=registry,
+            )
+        )
+        for outcome in GUARDDUTY_OUTCOMES:
+            metrics.results.labels(outcome)
+        return metrics
+
+
+class GuardDutyConsumer(Consumer):
+    """The `guardduty-results` queue's consumer (#234, `sft.service.guardduty`), in the large
+    pool's workers: each result for a file over 2 GB, confirmed by GuardDuty's tag on the version,
+    recorded with the message in one transaction, then the `scan` tag and the evaluation, as for
+    ClamAV's results (`finish`). The DLP inspection is `not_inspected` for `too_large`."""
+
+    name: ClassVar[str] = "guardduty-results"
+    queue: ClassVar[Queue] = Queue.GUARDDUTY_RESULTS
+
+    def __init__(
+        self,
+        database: Database,
+        objects: ScannedObjects,
+        metrics: ScanMetrics,
+        guardduty_metrics: GuardDutyMetrics,
+        *,
+        bucket: str,
+    ) -> None:
+        super().__init__(database)
+        self.objects = objects
+        self.metrics = metrics
+        self.guardduty_metrics = guardduty_metrics
+        self.bucket = bucket
+
+    def parse(self, body: str) -> OutboxMessage | None:
+        result = guardduty.parse_result(body, bucket=self.bucket)
+        if result is None:
+            self.guardduty_metrics.results.labels("not_ours").inc()
+            return None
+        return result.as_message()
+
+    async def handle(self, session: AsyncSession, delivery: Delivery) -> None:  # pragma: no cover
+        raise NotImplementedError("the tag is read between transactions: see process")
+
+    async def process(self, delivery: Delivery) -> Outcome:
+        result = guardduty.parse_result(delivery.body, bucket=self.bucket)
+        if result is None:  # pragma: no cover - parse ignored it already, the same way
+            return Outcome.IGNORED
+        scope = Scope.tenant(result.tenant_id)
+        message_id = str(delivery.message.id)
+        extra = {"file_id": str(result.file_id), "status": result.status.value}
+        async with self.database.transaction(scope) as session:
+            try:
+                target: files.ScanTarget | None = await files.scan_target(session, result.file_id)
+            except NotFoundError:
+                target = None
+        if target is None or target.storage_class is not StorageClass.LARGE:
+            # No such file in that tenant (whose ID came from the key): nothing to record it under.
+            self._outcome("not_ours")
+            log.info("GuardDuty result ignored", extra={**extra, "outcome": "not_ours"})
+            return Outcome.PROCESSED
+        if target.state in (FileState.UPLOADING, FileState.COMPLETING):
+            # The object exists, so completion assembled it; its last phase hasn't committed.
+            self._outcome("too_early")
+            raise ResultTooEarlyError("the file isn't scanning yet")
+        if target.state is not FileState.SCANNING:
+            if target.state in SCANNED:
+                await finish(self.database, self.objects, result.tenant_id, result.file_id)
+            return await self._ignore(scope, message_id, "late", extra)
+        if target.s3_version_id != result.version_id:
+            # Not the version completion recorded, which downloads serve (ADR-0018).
+            return await self._ignore(scope, message_id, "other_version", extra)
+        tags = await self.objects.object_tags(
+            StorageClass.LARGE, target.storage_key, result.version_id
+        )
+        check = guardduty.check_tag(result, tags)
+        if check is guardduty.TagCheck.MISSING:
+            self._outcome("too_early")
+            raise ResultTooEarlyError("GuardDuty hasn't tagged the version yet")
+        if check is guardduty.TagCheck.DIFFERS:
+            log.warning("GuardDuty result ignored: the object's tag names another", extra=extra)
+            return await self._ignore(scope, message_id, "tag_mismatch", extra)
+        scan = result.scan_result()
+        async with self.database.transaction(scope) as session:
+            if not await record_processed(session, consumer=self.name, message_id=message_id):
+                return Outcome.DUPLICATE
+            recorded = await scans.record(
+                session,
+                result.file_id,
+                target.transfer_id,
+                scan,
+                guardduty.NOT_INSPECTED,
+                attempts=delivery.receive_count,
+                upload_request_id=target.upload_request_id,
+            )
+        if not recorded:  # pragma: no cover - the sweep failed it between the two transactions
+            self._outcome("late")
+            return Outcome.PROCESSED
+        self._outcome("recorded")
+        self.metrics.results.labels(
+            scan.state.value, scan.detail.value if scan.detail else "none"
+        ).inc()
+        log.info("GuardDuty result recorded", extra={**extra, "state": scan.state.value})
+        await finish(self.database, self.objects, result.tenant_id, result.file_id)
+        return Outcome.PROCESSED
+
+    def _outcome(self, outcome: str) -> None:
+        self.guardduty_metrics.results.labels(outcome).inc()
+
+    async def _ignore(
+        self, scope: Scope, message_id: str, outcome: str, extra: dict[str, str]
+    ) -> Outcome:
+        async with self.database.transaction(scope) as session:
+            if not await record_processed(session, consumer=self.name, message_id=message_id):
+                return Outcome.DUPLICATE
+        self._outcome(outcome)
+        log.info("GuardDuty result ignored", extra={**extra, "outcome": outcome})
+        return Outcome.PROCESSED
 
 
 CONSUMERS: Final[dict[str, type[ScanConsumer]]] = {
@@ -731,6 +903,14 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         iam_region=settings.aws_region if settings.database_iam_auth else None,
     )
     queues = scan_queues(settings)
+    # DLP data keys only (#233, encryption and keys 3.3): never a field data key.
+    keys = open_field_keys(
+        key_id=settings.fields_kms_key_id,
+        region=settings.aws_region,
+        registry=process.registry,
+        purposes=frozenset({fields.KeyPurpose.DLP}),
+    )
+    previous_keys = fields.install(keys)
     objects = S3Objects.create(
         region=settings.aws_region,
         files_bucket=settings.s3_files_bucket,
@@ -772,14 +952,37 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         max_messages=1,
         heartbeat_seconds=visibility // 2,
     )
+    loops = [loop]
+    if consumer_type.queue is Queue.SCAN_LARGE:
+        # GuardDuty's results for files over 2 GB (#234): the large pool reads them too. Short
+        # work, so up to 10 at a time; no heartbeat, the queue's 30 s visibility covers a tag read.
+        loops.append(
+            ConsumerLoop(
+                GuardDutyConsumer(
+                    database,
+                    objects,
+                    consumer.metrics,
+                    GuardDutyMetrics.create(process.registry),
+                    bucket=settings.s3_large_files_bucket,
+                ),
+                queues,
+                loop.metrics,
+            )
+        )
+
+    async def every_loop(stopping: asyncio.Event) -> None:
+        await asyncio.gather(*(each.run(stopping) for each in loops))
+
     closers: list[Callable[[], Awaitable[None]]] = [queues.close, objects.close, database.dispose]
     if store is not None:
         closers.insert(0, store.close)
     try:
-        return await process.run(loop.run, handle_signals=handle_signals)
+        return await process.run(every_loop, handle_signals=handle_signals)
     finally:
         for close in closers:
             await close()
+        fields.install(previous_keys)
+        await keys.close()
 
 
 def main() -> int:

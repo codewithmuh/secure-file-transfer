@@ -351,9 +351,10 @@ files are batched: one per request per 5 minutes, counts only (architecture 4.3)
 **Scanning.** Each file is scanned for malware and inspected for sensitive data in one pass (ADR-0019, ADR-0022);
 `getFile` shows its state, whether it is `shareable`, and `scan_detail`, why it is `unscannable` or `scan_failed`, and
 `getFileInspection` the inspection's findings, counts only. A file over 2,000,000,000 bytes is scanned only by
-GuardDuty Malware Protection, which isn't connected before M6: **in the local and dev builds such a file is never
-scanned**. `completeUpload` answers it `scan_failed` with `scan_detail: large_file_scanning_unavailable`, and sending
-its transfer holds it. Remove it (`deleteFile`) to send the rest.
+GuardDuty Malware Protection (#234): it stays `scanning` after `completeUpload` until GuardDuty's result arrives, at
+most two hours, and its inspection is `not_inspected` for `too_large`, so the tenant's rules for files not inspected
+decide (FR-47). `scan_detail: large_file_scanning_unavailable` is only on files completed before GuardDuty was
+connected; remove such a file (`deleteFile`) and upload it again.
 
 **Download** is two steps, streamed through the API (open question 8, abuse-and-rate-limits section 5):
 

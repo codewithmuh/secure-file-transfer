@@ -241,7 +241,7 @@ def content_url(grant_id: UUID) -> str:
 
 
 def _view(
-    tenant_id: UUID, grant: Grant, file: File, counted: downloads.Counted | None
+    keys: fields.TenantKeys, grant: Grant, file: File, counted: downloads.Counted | None
 ) -> DownloadView:
     remaining = None
     if counted is not None and counted.download_limit is not None:
@@ -254,7 +254,7 @@ def _view(
         request_limit=downloads.REQUEST_LIMIT,
         file=DownloadFile(
             id=file.id,
-            display_name=fields.open_sealed(tenant_id, file.display_name_ct),
+            display_name=keys.open(fields.FILE_NAME, file.id, file.display_name_ct),
             content_type=file.content_type,
             size=file.actual_size or 0,
             sha256=None if file.sha256 is None else file.sha256.hex(),
@@ -461,9 +461,10 @@ async def create_session_download(
                 },
             )
             counted_now = await downloads.counter(session, recipient_id, file_id)
+            keys = await fields.tenant_keys(session, tenant_id)
             # Last before the commit: charged all or none; a refusal rolls the grant back.
             await services.limiter.check_all(charges)
-        return _view(tenant_id, grant, file, counted_now), committed_record(grant)
+        return _view(keys, grant, file, counted_now), committed_record(grant)
 
     async def confirmed(view: DownloadView) -> None:
         async with database.transaction(scope) as session:
@@ -515,7 +516,7 @@ async def _resume(
     )
     counted = await downloads.counter(session, recipient_id, file.id)
     services.metrics.grants.labels(GrantResult.RESUMED.value).inc()
-    return _view(tenant_id, grant, file, counted)
+    return _view(await fields.tenant_keys(session, tenant_id), grant, file, counted)
 
 
 # ---- getSessionDownloadContent ----
@@ -660,6 +661,7 @@ async def open_content(
     try:
         async with database.transaction(scope) as session:
             admitted = await downloads.admit(session, grant.id, stream_id, need=span.length)
+            keys = await fields.tenant_keys(session, tenant_id)
     except BaseException:
         await slot.release()
         raise
@@ -670,7 +672,9 @@ async def open_content(
     headers = {
         **SECURITY_HEADERS,
         "ETag": etag,
-        "Content-Disposition": disposition(fields.open_sealed(tenant_id, file.display_name_ct)),
+        "Content-Disposition": disposition(
+            keys.open(fields.FILE_NAME, file.id, file.display_name_ct)
+        ),
         "Content-Length": str(span.length),
     }
     if wanted is not None:
@@ -945,8 +949,8 @@ async def _received_file(
     return file
 
 
-def _received_view(tenant_id: UUID, grant: Grant, file: File) -> DownloadView:
-    view = _view(tenant_id, grant, file, None)
+def _received_view(keys: fields.TenantKeys, grant: Grant, file: File) -> DownloadView:
+    view = _view(keys, grant, file, None)
     return DownloadView(
         grant_id=view.grant_id,
         url=received_content_url(file.id, grant.id),
@@ -1059,9 +1063,10 @@ async def create_received_download(
                     "byte_budget": grant.byte_budget,
                 },
             )
+            keys = await fields.tenant_keys(session, member.tenant_id)
             # Last before the commit: charged all or none; a refusal rolls the grant back.
             await services.limiter.check_all(charges)
-        return _received_view(member.tenant_id, grant, current), committed_record(grant)
+        return _received_view(keys, grant, current), committed_record(grant)
 
     async def confirmed(view: DownloadView) -> None:
         async with database.transaction(member.scope) as session:
@@ -1109,7 +1114,7 @@ async def _resume_received(
         details={"grant_id": grant.id},
     )
     services.metrics.grants.labels(GrantResult.RESUMED.value).inc()
-    return _received_view(member.tenant_id, grant, file)
+    return _received_view(await fields.tenant_keys(session, member.tenant_id), grant, file)
 
 
 async def open_received_content(
@@ -1168,6 +1173,7 @@ async def open_received_content(
     try:
         async with database.transaction(scope) as session:
             admitted = await downloads.admit(session, grant.id, stream_id, need=span.length)
+            keys = await fields.tenant_keys(session, member.tenant_id)
     except BaseException:
         await slot.release()
         raise
@@ -1179,7 +1185,7 @@ async def open_received_content(
         **SECURITY_HEADERS,
         "ETag": etag,
         "Content-Disposition": disposition(
-            fields.open_sealed(member.tenant_id, file.display_name_ct)
+            keys.open(fields.FILE_NAME, file.id, file.display_name_ct)
         ),
         "Content-Length": str(span.length),
     }

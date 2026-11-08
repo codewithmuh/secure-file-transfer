@@ -277,11 +277,12 @@ def invalid(pointer: str, detail: str) -> Unprocessable:
 # ---- views ----
 
 
-def file_view(tenant_id: UUID, file: File, detectors: Sequence[str] = ()) -> FileView:
+def file_view(keys: fields.TenantKeys, file: File, detectors: Sequence[str] = ()) -> FileView:
+    """The file as the contract shows it, its name opened with the caller's tenant's keys."""
     return FileView(
         id=file.id,
         transfer_id=file.transfer_id,
-        display_name=fields.open_sealed(tenant_id, file.display_name_ct),
+        display_name=keys.open(fields.FILE_NAME, file.id, file.display_name_ct),
         content_type=file.content_type,
         declared_size=file.declared_size,
         actual_size=file.actual_size,
@@ -306,6 +307,7 @@ def file_view(tenant_id: UUID, file: File, detectors: Sequence[str] = ()) -> Fil
 async def transfer_view(
     session: AsyncSession, tenant_id: UUID, transfer: Transfer, now: datetime | None = None
 ) -> TransferView:
+    keys = await fields.tenant_keys(session, tenant_id)
     recipients = await transfers.list_recipients(session, transfer.id)
     transfer_files = await files.list_transfer_files(session, transfer.id)
     detectors = await findings.detectors_by_file(session, [f.id for f in transfer_files])
@@ -330,11 +332,7 @@ async def transfer_view(
         created_at=transfer.created_at,
         expires_in=transfer.expires_in,
         expires_at=transfer.expires_at,
-        message=(
-            None
-            if transfer.message_ct is None
-            else fields.open_sealed(tenant_id, transfer.message_ct)
-        ),
+        message=keys.open_optional(fields.TRANSFER_MESSAGE, transfer.id, transfer.message_ct),
         download_limit=transfer.download_limit,
         notify_on_first_download=transfer.notify_on_first_download,
         submitted_at=transfer.submitted_at,
@@ -342,7 +340,7 @@ async def transfer_view(
         revoked_at=transfer.ended_at if state is TransferState.REVOKED else None,
         revoked_by=transfer.revoked_by,
         hold_reason=transfer.hold_reason,
-        files=tuple(file_view(tenant_id, f, detectors.get(f.id, ())) for f in transfer_files),
+        files=tuple(file_view(keys, f, detectors.get(f.id, ())) for f in transfer_files),
         recipients=tuple(RecipientView(r.id, r.email, r.locale) for r in recipients),
         dlp=dlp,
     )
@@ -467,14 +465,17 @@ async def create_transfer(
             refused = await undeliverable(session, emails, [r.email for r in recipients])
             if refused is not None:
                 raise undeliverable_error(refused)
+            transfer_id = uuid7()
+            message_ct = None
+            if request.message is not None:
+                keys = await fields.tenant_keys(session, tenant_id, write=True)
+                message_ct = keys.seal(fields.TRANSFER_MESSAGE, transfer_id, request.message)
             transfer = await transfers.insert_transfer(
                 session,
-                transfer_id=uuid7(),
+                transfer_id=transfer_id,
                 created_by=user_id,
                 expires_in=expires_in,
-                message_ct=None
-                if request.message is None
-                else fields.seal(tenant_id, request.message),
+                message_ct=message_ct,
                 download_limit=request.download_limit,
                 notify_on_first_download=request.notify_on_first_download,
             )

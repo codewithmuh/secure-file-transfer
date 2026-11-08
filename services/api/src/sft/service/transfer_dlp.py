@@ -12,8 +12,10 @@ until #221). The owner sees it, as do an admin acting as one and an API key with
 (authn and authz 6.3: "an approver who isn't an admin reaches only transfers with an approval
 request"; #220), so one who has decided still sees what they decided on. `approval_request` is the
 transfer's latest request, in whatever state (`sft.service.approval_requests.summary`). Location
-hints and masked previews arrive with DLP-8, so `details_visible` is false for everyone and no
-response holds details to audit.
+hints and masked previews (#233) are shown to the owner and to active approvers of a transfer with
+an approval request, in a web session; an admin acting as one and an API key get counts with
+`details_visible: false` (`sft.service.finding_details`). A response with details writes
+`dlp_findings.details_read`.
 
 - A recipient's flags are worked out as they are read: trusted against the policy's trusted
   domains now, and new if the tenant hadn't first sent to the domain before the decision (or, with
@@ -57,7 +59,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import Conflict, NotFound
 from sft.core.ids import uuid7
-from sft.data import audit, dlp_decisions, dlp_policy, files, findings, tenants, transfers
+from sft.data import (
+    audit,
+    dlp_decisions,
+    dlp_policy,
+    files,
+    findings,
+    sso,
+    tenants,
+    transfers,
+)
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
@@ -71,7 +82,7 @@ from sft.data.models import (
     Transfer,
     TransferState,
 )
-from sft.service import fields
+from sft.service import fields, finding_details
 from sft.service.approval_requests import (
     ApprovalSummaryView,
     NoEligibleApprover,
@@ -83,7 +94,8 @@ from sft.service.approval_requests import request_approval as _request_approval
 from sft.service.caller import Caller, CallerKind
 from sft.service.dlp_decision import KNOWN_FOR, check_recipients, normalise_domain
 from sft.service.evaluation import send
-from sft.service.file_reads import TRANSFERS_READ, FindingView, detector_name
+from sft.service.file_reads import TRANSFERS_READ, FindingView, detector_name, finding_view
+from sft.service.finding_details import Details
 from sft.service.permissions import Reach, authorize
 from sft.service.transfers import (
     TRANSFER,
@@ -145,6 +157,7 @@ async def get_transfer_dlp(
     *,
     language: str | None,
     now: datetime,
+    origin: Origin | None = None,
 ) -> TransferDlpView:
     """`getTransferDlp` (module docstring)."""
     reach = authorize(caller, "getTransferDlp", now=now)
@@ -174,7 +187,18 @@ async def get_transfer_dlp(
         if transfer.dlp_decision_id is not None:
             decision = await dlp_decisions.get_decision(session, transfer.dlp_decision_id)
         recipients = await recipient_flags(session, transfer.id, decision, now)
-        counted, message = await transfer_findings(session, tenant_id, transfer.id, language)
+        details = None
+        if await finding_details.may_see(
+            session, caller, owner=transfer.created_by, transfer_id=transfer.id
+        ):
+            listed = await files.list_transfer_files(session, transfer.id)
+            details = await finding_details.read(session, [f.id for f in listed])
+            await finding_details.record_read(
+                session, caller, Target(TRANSFER, transfer.id), len(details), origin
+            )
+        counted, message = await transfer_findings(
+            session, tenant_id, transfer.id, language, details
+        )
         return TransferDlpView(
             transfer_id=transfer.id,
             state=effective_state(TransferState(transfer.state), transfer.expires_at, now),
@@ -197,6 +221,8 @@ async def recipient_flags(
         known = await dlp_decisions.known_before(session, domains, at=decision.decided_at)
     policy = await dlp_policy.get_policy(session)
     trusted = tuple(policy.trusted_domains) if policy is not None else ()
+    # The tenant's proven SSO domains are trusted too (FR-45, #231), as in the decision.
+    trusted = (*trusted, *await sso.verified_domains(session))
     checks = check_recipients([(r.id, r.domain) for r in rows], trusted, known)
     return tuple(
         RecipientFlags(row.id, row.email, check.trusted, check.new_domain)
@@ -205,10 +231,15 @@ async def recipient_flags(
 
 
 async def transfer_findings(
-    session: AsyncSession, tenant_id: UUID, transfer_id: UUID, language: str
+    session: AsyncSession,
+    tenant_id: UUID,
+    transfer_id: UUID,
+    language: str,
+    details: dict[tuple[UUID, str], Details] | None = None,
 ) -> tuple[tuple[FileFindings, ...], tuple[FindingView, ...]]:
-    """The counted files (not rejected, not removed), each with its findings, and the message's
-    findings (FR-50); counts only."""
+    """The counted files (not rejected, not removed), each with its findings and their details
+    when the caller may see them (#233), and the message's findings (FR-50), counts only: a
+    message keeps no details (#221)."""
     counted = [
         f
         for f in await files.list_transfer_files(session, transfer_id)
@@ -227,29 +258,30 @@ async def transfer_findings(
         dlp_policy.detector_ref(i): name
         for i, name in (await dlp_policy.detector_names(session, sorted(own))).items()
     }
+    keys = await fields.tenant_keys(session, tenant_id)
     files_found = tuple(
         FileFindings(
             file_id=f.id,
-            display_name=fields.open_sealed(tenant_id, f.display_name_ct),
+            display_name=keys.open(fields.FILE_NAME, f.id, f.display_name_ct),
             inspection_state=InspectionState(f.inspection_state),
             reasons=tuple(InspectionReason(r) for r in f.inspection_reasons),
-            findings=_finding_views(found.get(f.id, ()), names, language),
+            findings=_finding_views(found.get(f.id, ()), names, language, details, f.id),
         )
         for f in counted
     )
-    return files_found, _finding_views(message, names, language)
+    return files_found, _finding_views(message, names, language, None, None)
 
 
 def _finding_views(
-    found: Sequence[findings.Counts], names: dict[str, str], language: str
+    found: Sequence[findings.Counts],
+    names: dict[str, str],
+    language: str,
+    details: dict[tuple[UUID, str], Details] | None,
+    file_id: UUID | None,
 ) -> tuple[FindingView, ...]:
     return tuple(
-        FindingView(
-            detector=c.detector,
-            detector_name=names.get(c.detector) or detector_name(c.detector, language),
-            count_low=c.low,
-            count_medium=c.medium,
-            count_high=c.high,
+        finding_view(
+            c, names.get(c.detector) or detector_name(c.detector, language), details, file_id
         )
         for c in found
     )
@@ -357,13 +389,17 @@ async def _confirm_warning(
     assert tenant_id is not None  # noqa: S101 - checked by tenant_scope
     assert user_id is not None  # noqa: S101 - checked by tenant_scope
     confirmation_id = uuid7()
+    justification_ct = None
+    if justification is not None:
+        keys = await fields.tenant_keys(session, tenant_id, write=True)
+        justification_ct = keys.seal(fields.JUSTIFICATION, confirmation_id, justification)
     await dlp_decisions.insert_confirmation(
         session,
         confirmation_id=confirmation_id,
         transfer_id=transfer.id,
         decision_id=decision.id,
         confirmed_by=user_id,
-        justification_ct=None if justification is None else fields.seal(tenant_id, justification),
+        justification_ct=justification_ct,
     )
     target = Target(TRANSFER, transfer.id)
     await audit.record(

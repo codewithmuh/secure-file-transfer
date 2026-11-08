@@ -25,3 +25,9 @@ scanPools:
   large: { replicas: 1 }
 signatureMirror:
   replicas: 1
+
+# dev has one maintainer, so break-glass grants are self-approved, marked and paged (authn-authz 8.3, R-08). A
+# reviewed commit turns it on elsewhere, and only while the run has one operator (docs/runbooks/break-glass.md).
+operatorApi:
+  env:
+    BREAK_GLASS_SELF_APPROVAL: "true"

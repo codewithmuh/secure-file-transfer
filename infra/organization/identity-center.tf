@@ -202,6 +202,8 @@ data "aws_iam_policy_document" "operator" {
       "cognito-idp:CreateIdentityProvider", "cognito-idp:DeleteIdentityProvider",
       "cognito-idp:DescribeIdentityProvider", "cognito-idp:ListIdentityProviders",
       "cognito-idp:UpdateIdentityProvider",
+      # The CLI enables a tenant's provider on the app client (#231); the client's other settings it copies back.
+      "cognito-idp:DescribeUserPoolClient", "cognito-idp:UpdateUserPoolClient",
     ]
     resources = ["arn:aws:cognito-idp:*:*:userpool/*"]
   }

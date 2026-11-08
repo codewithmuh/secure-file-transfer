@@ -572,9 +572,19 @@ def test_only_the_jobs_role_may_delete_and_the_api_role_never_files(
     for table in ("verification_codes", "link_sessions", "download_grants"):
         assert (table, "sft_jobs") in by_table
     # The API deletes only its own idempotency keys and, in a sign-in reset, the user's pool
-    # identities (authn and authz 2.5, revision 0016): never a file, transfer or recipient row.
+    # identities (authn and authz 2.5, revision 0016), and, as the field key job, data key
+    # versions no row uses (revisions 0031, 0032; the foreign keys refuse one in use), and, for a
+    # tenant admin, SSO domain claims and group role mappings (revision 0029): never a file,
+    # transfer or recipient row.
     api_deletes = {table for table, role in by_table if role == "sft_api"}
-    assert api_deletes <= {"idempotency_keys", "user_identities"}
+    assert api_deletes <= {
+        "idempotency_keys",
+        "user_identities",
+        "tenant_data_keys",
+        "tenant_dlp_keys",
+        "sso_domains",
+        "sso_group_roles",
+    }
     assert not any(table in ("files", "transfers") for table, _ in by_table)
 
 
@@ -877,6 +887,12 @@ async def test_a_received_file_past_its_retention_loses_every_copy_and_its_findi
     file_id = seed_received(migrated_db, tenant.id, request_id)
     bucket = buckets[StorageClass.STANDARD]
     put_copies(s3, bucket, key_of(tenant.id, file_id), upload=False)
+    # The DLP data key version the details name (#233, revision 0032): a stand-in wrapped key.
+    migrated_db.sql(
+        "INSERT INTO tenant_dlp_keys (tenant_id, key_version, wrapped_key) "
+        "VALUES (:tenant, 1, decode(repeat('ab', 32), 'hex'))",
+        tenant=tenant.id,
+    )
     migrated_db.sql(
         "INSERT INTO dlp_findings (id, tenant_id, file_id, detector, count_low, count_medium, "
         "count_high, detail_ct, dlp_key_version) VALUES (:id, :tenant, :file, 'jp_my_number', "

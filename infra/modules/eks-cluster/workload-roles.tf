@@ -208,7 +208,7 @@ locals {
       {
         Sid      = "FieldsKeyForTenantDataKeys"
         Effect   = "Allow"
-        Action   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        Action   = ["kms:Decrypt", "kms:GenerateDataKey", "kms:ReEncryptFrom", "kms:ReEncryptTo"]
         Resource = local.key_arns
         Condition = {
           "ForAnyValue:StringEquals" = merge(local.key_alias["fields"], { "kms:EncryptionContextKeys" = ["tenant_id"] })

@@ -194,7 +194,9 @@ async def request_approval(
         transfer_id=transfer.id,
         decision_id=decision.id,
         confirmed_by=user_id,
-        justification_ct=fields.seal(tenant_id, justification),
+        justification_ct=(await fields.tenant_keys(session, tenant_id, write=True)).seal(
+            fields.JUSTIFICATION, confirmation_id, justification
+        ),
     )
     try:
         await dlp_approvals.insert_request(
