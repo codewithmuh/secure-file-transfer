@@ -1,12 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, FileIcon, Mail } from 'lucide-react';
+import { ArrowLeft, FileIcon } from 'lucide-react';
 import { PageShell } from '@/components/layout';
 import {
   Alert,
-  Badge,
   Button,
   Card,
   CardTitle,
@@ -25,6 +24,7 @@ import {
   cancelTransfer,
   invalidateTransfers,
   queryKeys,
+  revokeTransfer,
   sendTransfer,
   uploadApi,
   useFileInspection,
@@ -34,7 +34,10 @@ import { errorMessage, problemCode } from '@/lib/problems';
 import { formatDate, formatFileSize } from '@/lib/formatters';
 import { useDurationLabel } from '@/lib/useDurationLabel';
 import { FileStateBadge, InspectionStateBadge, TransferStateBadge } from './StateBadges';
-import { isBuiltinDetector, NOT_AVAILABLE_STATES } from './states';
+import { isBuiltinDetector, NOT_AVAILABLE_STATES, REVOCABLE_STATES } from './states';
+import { RecipientDelivery } from './RecipientDelivery';
+import { RevokeTransfer, TransferEndBanner } from './RevokeTransfer';
+import { useRevocation } from './revocation';
 import { useActiveUploads } from './polling';
 import { FileUpload, type UploadProgress } from './upload';
 
@@ -47,7 +50,8 @@ const UPLOAD_OVER = new Set<ApiFile['state']>(['scanning', 'clean', 'infected', 
  * The sender's view of a transfer (#196): its state and expiry, each file's scan state and inspection, findings on
  * demand, and its recipients. Polled while something still moves (`useTransfer`). For a draft whose upload stopped (a
  * reload, a closed tab), the member picks each file again and its upload carries on from the parts S3 holds; then
- * the draft can be sent. The delivery table, unlock and revoke come with #199.
+ * the draft can be sent. Each recipient's delivery, verification and downloads are listed with an unlock for a locked
+ * recipient, and the transfer can be revoked (#199); an expired one is read-only.
  */
 export function TransferDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
@@ -78,7 +82,8 @@ export function TransferDetailPage() {
       ) : query.isError ? (
         <Alert>{problemCode(query.error) === 'not_found' ? t('sender.transferNotFound') : errorMessage(query.error, t)}</Alert>
       ) : transfer ? (
-        <TransferView transfer={transfer} />
+        // Keyed by ID: another transfer gets its own view and revocation, never the last one's pending retry.
+        <TransferView key={transfer.id} transfer={transfer} />
       ) : null}
     </PageShell>
   );
@@ -111,13 +116,22 @@ function useStateAnnouncement(transfer: Transfer | undefined): string {
 
 function TransferView({ transfer }: { transfer: Transfer }) {
   const { t, i18n } = useTranslation();
+  const queryClient = useQueryClient();
   const durationLabel = useDurationLabel();
   const isDraft = transfer.state === 'draft';
   const files = transfer.files.filter((file) => file.state !== 'deleted');
+  const revocation = useRevocation(
+    transfer.id,
+    revokeTransfer,
+    useCallback(() => void invalidateTransfers(queryClient), [queryClient]),
+  );
+  const revocable =
+    REVOCABLE_STATES.includes(transfer.state) && revocation.status !== 'revoked' && revocation.status !== 'unconfirmed';
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       <div className="space-y-6 lg:col-span-2">
+        <TransferEndBanner transfer={transfer} revocation={revocation} date={(value) => formatDate(value, i18n.language)} />
         {transfer.state === 'held' && transfer.hold_reason && (
           <Alert variant="warning" role="status">
             {t(`holdReason.${transfer.hold_reason}`)}
@@ -143,36 +157,7 @@ function TransferView({ transfer }: { transfer: Transfer }) {
           )}
         </Card>
 
-        <Card>
-          <CardTitle>{t('sender.recipients')}</CardTitle>
-          <Table label={t('sender.recipients')}>
-            <TableHead>
-              <tr>
-                <TableHeader>{t('common.email')}</TableHeader>
-                <TableHeader>{t('sender.language')}</TableHeader>
-                <TableHeader>{t('common.status')}</TableHeader>
-              </tr>
-            </TableHead>
-            <TableBody>
-              {transfer.recipients.map((recipient) => (
-                <TableRow key={recipient.id}>
-                  <TableCell>
-                    <div className="flex items-center gap-2">
-                      <Mail className="h-4 w-4 text-gray-500" aria-hidden="true" />
-                      <span className="font-medium">{recipient.email}</span>
-                    </div>
-                  </TableCell>
-                  <TableCell>{t(`locales.${recipient.locale}`)}</TableCell>
-                  <TableCell>
-                    <Badge variant={recipient.access_state === 'locked' ? 'danger' : recipient.access_state === 'verified' ? 'success' : 'default'}>
-                      {t(`accessState.${recipient.access_state}`)}
-                    </Badge>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </Card>
+        <RecipientDelivery transfer={transfer} />
       </div>
 
       <div>
@@ -212,6 +197,11 @@ function TransferView({ transfer }: { transfer: Transfer }) {
               </div>
             )}
           </dl>
+          {revocable && (
+            <div className="mt-4 border-t border-gray-100 pt-4">
+              <RevokeTransfer revocation={revocation} />
+            </div>
+          )}
         </Card>
       </div>
     </div>

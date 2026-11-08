@@ -1,13 +1,22 @@
-import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 import { resources, type Language } from '../src/lib/i18n';
+import { checkAxe } from './support/axe';
+import { escapeRegExp } from './support/stack';
 import {
+  codeRequested,
   draft,
   draftId,
+  expired,
+  expiredId,
   fakeAdmin,
   inspection,
+  linkSession,
   myNumberFileId,
   policy,
+  problemOf,
+  recipientStatuses,
+  resolution,
+  sessionFiles,
   transfer,
   transferId,
   transferPage,
@@ -15,15 +24,12 @@ import {
 } from './apiFixtures';
 
 /**
- * axe on every page of the web app (NFR-22, #110), once per language project (playwright.config.ts). Any violation of
- * a WCAG 2.0, 2.1 or 2.2 A or AA rule fails the test, whatever axe's impact rating: NFR-22 asks for WCAG 2.2 AA, not
- * for "no serious ones". axe's best-practice rules, which no WCAG criterion requires, are printed to the console so
- * they show in the CI log, but don't fail. The API is answered from contract-typed fixtures (apiFixtures.ts), so the
- * live pages, their dialogs and menus are checked with real shapes and no backend is needed.
+ * axe on every page of the web app (NFR-22, #110), once per language project (playwright.config.ts), with the check
+ * the browser journey shares (support/axe.ts): any WCAG 2.0, 2.1 or 2.2 A or AA violation fails. The API is answered
+ * from contract-typed fixtures (apiFixtures.ts), so the live pages are checked with real shapes and no backend is
+ * needed: every page, every dialog, every link state and step of the recipient's page, and the sign-in callback's
+ * error state (#168, #198, #199).
  */
-
-// WCAG 2.0, 2.1 and 2.2, levels A and AA: what NFR-22 asks for.
-const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
 /** What the API answers, by path: contract-typed fixtures (apiFixtures.ts), so the live pages show real shapes. */
 const answers: Record<string, unknown> = {
@@ -32,6 +38,10 @@ const answers: Record<string, unknown> = {
   '/v1/transfers': transferPage,
   [`/v1/transfers/${transferId}`]: transfer,
   [`/v1/transfers/${draftId}`]: draft,
+  [`/v1/transfers/${expiredId}`]: expired,
+  [`/v1/transfers/${transferId}/recipients`]: recipientStatuses,
+  [`/v1/transfers/${draftId}/recipients`]: recipientStatuses,
+  [`/v1/transfers/${expiredId}/recipients`]: recipientStatuses,
   [`/v1/files/${myNumberFileId}/inspection`]: inspection,
   '/v1/users': userPage,
 };
@@ -49,29 +59,8 @@ async function mockApi(page: Page): Promise<void> {
 // The project's name is the language it runs in (playwright.config.ts).
 const language = () => test.info().project.name as Language;
 
-type Violation = Awaited<ReturnType<AxeBuilder['analyze']>>['violations'][number];
-
-const describe = (violation: Violation) =>
-  `${violation.impact ?? 'unrated'} ${violation.id}: ${violation.help} (${violation.helpUrl})\n` +
-  violation.nodes.map((node) => `    ${node.target.join(' ')}: ${node.failureSummary ?? ''}`).join('\n');
-
-async function expectNoWcagViolations(page: Page, name: string): Promise<void> {
-  const lang = language();
-  // The page is in the language under test, so the Japanese run doesn't check English pages by mistake.
-  await expect(page.locator('html')).toHaveAttribute('lang', lang);
-
-  const results = await new AxeBuilder({ page }).withTags([...WCAG_TAGS, 'best-practice']).analyze();
-  await test.info().attach(`axe-${name}.json`, { body: JSON.stringify(results.violations, null, 2), contentType: 'application/json' });
-
-  const isWcag = (violation: Violation) => violation.tags.some((tag) => WCAG_TAGS.includes(tag));
-  const bestPractice = results.violations.filter((violation) => !isWcag(violation));
-  if (bestPractice.length > 0) {
-    // The list reporter prints a test's console output, so these show in CI without failing it.
-    console.log(`axe best-practice findings on ${name} (${lang}):\n${bestPractice.map(describe).join('\n')}`);
-  }
-  const failing = results.violations.filter(isWcag);
-  expect(failing.map(describe), `WCAG A/AA axe violations on ${name} (${lang})`).toEqual([]);
-}
+/** The shared axe check (support/axe.ts), in the project's language. */
+const expectNoWcagViolations = (page: Page, name: string) => checkAxe(page, name, language());
 
 test.beforeEach(async ({ page }) => {
   await mockApi(page);
@@ -89,6 +78,7 @@ const memberPages = [
   ['new transfer', '/transfers/new'],
   ['transfer detail', `/transfers/${transferId}`],
   ['draft to resume', `/transfers/${draftId}`],
+  ['expired transfer, read-only', `/transfers/${expiredId}`],
   ['admin users', '/admin/users'],
   ['admin tenant policy', '/admin/policy'],
   // M5's pages, hidden (#195): their routes show NotAvailableYet.
@@ -154,18 +144,203 @@ test('admin users: action menu, invite and deactivate dialogs', async ({ page })
   await expectNoWcagViolations(page, 'invite dialog');
 });
 
-// The recipient's link page: verification first, then, after a (mock) code, the download page. #198 makes it live.
-test('recipient verification and download', async ({ page }) => {
-  await page.goto('/t#fake-link-token');
-  const code = page.getByRole('textbox');
-  await expect(code).toBeVisible();
-  await expectNoWcagViolations(page, 'recipient verification');
+test('transfer detail: the recipients table, then the unlock and revoke dialogs, by keyboard (#199)', async ({ page }) => {
+  await page.goto(`/transfers/${transferId}`);
+  const table = page.getByRole('table', { name: text().delivery.caption });
+  await expect(table.getByRole('rowheader', { name: /tanaka@example\.co\.jp/ })).toBeVisible();
+  await expectNoWcagViolations(page, 'recipients table');
 
-  await code.fill('12345678');
-  await page.getByRole('button', { name: text().recipient.verifyButton, exact: true }).click();
-  await expect(code).toBeHidden();
-  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
-  await expectNoWcagViolations(page, 'recipient download');
+  const unlock = page.getByRole('button', { name: text().delivery.unlockFor.replace('{{email}}', 'tanaka@example.co.jp') });
+  await unlock.focus();
+  await page.keyboard.press('Enter');
+  const unlockDialog = page.getByRole('dialog', { name: text().delivery.unlockTitle });
+  await expect(unlockDialog).toBeVisible();
+  await expect(unlockDialog.getByRole('button', { name: text().common.cancel })).toBeFocused();
+  await expectNoWcagViolations(page, 'unlock dialog');
+  await page.keyboard.press('Escape');
+  await expect(unlockDialog).toBeHidden();
+  await expect(unlock).toBeFocused();
+
+  const revoke = page.getByRole('button', { name: text().delivery.revoke });
+  await revoke.focus();
+  await page.keyboard.press('Enter');
+  const revokeDialog = page.getByRole('dialog', { name: text().delivery.revokeTitle });
+  await expect(revokeDialog).toBeVisible();
+  await expect(revokeDialog.getByText(text().delivery.revokeBody)).toBeVisible();
+  await expectNoWcagViolations(page, 'revoke dialog');
+  await page.keyboard.press('Escape');
+  await expect(revoke).toBeFocused();
+});
+
+test('transfer detail: a revocation not yet confirmed (503) says it stands and offers a retry (#199)', async ({ page }) => {
+  await page.route(`**/v1/transfers/${transferId}/revoke`, (route) =>
+    route.fulfill({ status: 503, json: problemOf(503, 'service_unavailable') }),
+  );
+  await page.goto(`/transfers/${transferId}`);
+  await page.getByRole('button', { name: text().delivery.revoke }).click();
+  await page.getByRole('dialog').getByRole('button', { name: text().delivery.revokeConfirm }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(page.getByText(text().delivery.revokeUnconfirmed)).toBeVisible();
+  await expect(page.getByRole('button', { name: text().delivery.revokeRetry })).toBeVisible();
+  await expectNoWcagViolations(page, 'revocation unconfirmed');
+});
+
+test('admin users: every confirmation dialog (#168)', async ({ page }) => {
+  await page.goto('/admin/users');
+  const dialogs = [
+    ['member@example.com', text().admin.makeAdmin, text().admin.confirm.role.title_admin],
+    ['member@example.com', text().admin.signOutUser, text().admin.confirm.signOut.title],
+    ['member@example.com', text().admin.resetSignIn, text().admin.confirm.reset.title],
+    ['new@example.com', text().admin.resendInvitation, text().admin.confirm.resend.title],
+  ] as const;
+  for (const [email, action, title] of dialogs) {
+    await page.getByRole('button', { name: text().admin.actionsFor.replace('{{email}}', email) }).click();
+    await page.getByRole('menuitem', { name: action }).click();
+    const dialog = page.getByRole('dialog', { name: title });
+    await expect(dialog).toBeVisible();
+    await expectNoWcagViolations(page, `${title} dialog`);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
+  }
+});
+
+test('sign-in callback that failed lands on the sign-in page with its error (#168)', async ({ page }) => {
+  await page.goto('/auth/callback?error=access_denied');
+  await expect(page).toHaveURL(/\/sign-in\?error=sign_in_failed$/);
+  await expect(page.getByText(text().auth.signInFailed)).toBeVisible();
+  await expectNoWcagViolations(page, 'sign-in failed');
+});
+
+// ---- the recipient's link page (#198): every link state and step, with the link in the project's language ----
+
+type LinkAnswers = Record<string, { status: number; json?: unknown }>;
+
+/** Answers the link and session routes, by method and path, over the member fixtures. */
+async function answerLinks(page: Page, links: LinkAnswers): Promise<void> {
+  await page.route(
+    (url) => url.pathname.startsWith('/v1/links/') || url.pathname.startsWith('/v1/session'),
+    (route) => {
+      const request = route.request();
+      const answer = links[`${request.method()} ${new URL(request.url()).pathname}`];
+      if (!answer) return route.fulfill({ status: 404, json: problemOf(404, 'not_found') });
+      return answer.json === undefined ? route.fulfill({ status: answer.status }) : route.fulfill({ status: answer.status, json: answer.json });
+    },
+  );
+}
+
+const LINK = '/t#Fake-link-token_0000000000000000000000';
+
+const resolved = (access: Parameters<typeof resolution>[1] = 'verification_required') => ({
+  'POST /v1/links/resolve': { status: 200, json: resolution(language(), access) },
+});
+
+test('recipient link without its fragment', async ({ page }) => {
+  await page.goto('/t');
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.missingTitle })).toBeFocused();
+  await expectNoWcagViolations(page, 'link without fragment');
+});
+
+const gone = [
+  ['not found', { status: 404, json: problemOf(404, 'link_not_found') }, 'notFoundTitle'],
+  ['revoked', { status: 410, json: problemOf(410, 'link_revoked') }, 'revokedTitle'],
+  ['expired', { status: 410, json: problemOf(410, 'link_expired') }, 'expiredTitle'],
+] as const;
+
+for (const [name, answer, title] of gone) {
+  test(`recipient link ${name}`, async ({ page }) => {
+    await answerLinks(page, { 'POST /v1/links/resolve': answer });
+    await page.goto(LINK);
+    await expect(page).toHaveURL(/\/t$/); // the fragment is gone from the address bar
+    await expect(page.getByRole('heading', { level: 1, name: text().recipient[title] })).toBeFocused();
+    await expectNoWcagViolations(page, `link ${name}`);
+  });
+}
+
+test('recipient link locked', async ({ page }) => {
+  await answerLinks(page, resolved('locked'));
+  await page.goto(LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.lockedTitle })).toBeFocused();
+  await expectNoWcagViolations(page, 'link locked');
+});
+
+test('recipient: code step, a wrong code, then the files and done, by keyboard alone', async ({ page }) => {
+  let attempts = 0;
+  await answerLinks(page, {
+    ...resolved(),
+    'POST /v1/links/codes': { status: 202, json: codeRequested },
+    'GET /v1/session/files': { status: 200, json: sessionFiles },
+    'DELETE /v1/session': { status: 204 },
+  });
+  await page.route('**/v1/links/sessions', (route) =>
+    ++attempts === 1
+      ? route.fulfill({ status: 422, json: problemOf(422, 'code_invalid', { attempts_remaining: 4 }) })
+      : route.fulfill({ status: 201, json: linkSession(language()) }),
+  );
+  await page.goto(LINK);
+  const heading = page.getByRole('heading', { level: 1, name: text().recipient.verifyTitle });
+  await expect(heading).toBeFocused();
+  await expectNoWcagViolations(page, 'code step');
+
+  // Tab to "Email me a code", Enter; the countdown starts and the code input is next.
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: text().recipient.sendCode })).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('status').getByText(text().recipient.codeSent.replace('{{minutes}}', '10'))).toBeVisible();
+  await expect(page.getByRole('button', { name: text().recipient.sendAgain })).toBeDisabled();
+  const code = page.getByRole('textbox', { name: text().recipient.codeLabel });
+  await expect(code).toHaveAttribute('inputmode', 'numeric');
+  await expect(code).toHaveAttribute('autocomplete', 'one-time-code');
+  await page.keyboard.press('Tab'); // the button waits out its countdown, so the code input is next
+  await expect(code).toBeFocused();
+  await page.keyboard.type('111111');
+  await page.keyboard.press('Enter');
+  const wrong = text().recipient.problems.code_invalid_other.replace('{{count}}', '4');
+  await expect(code).toHaveAccessibleDescription(new RegExp(escapeRegExp(wrong)));
+  await expect(code).toBeFocused();
+  await expectNoWcagViolations(page, 'code step, wrong code');
+
+  await page.keyboard.press('Control+A');
+  await page.keyboard.type('123456');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.filesTitle })).toBeFocused();
+  await expect(page.getByText(text().recipient.unscannableWarning)).toBeVisible();
+  await expect(page.getByText(text().recipient.limitReached)).toBeVisible();
+  await expectNoWcagViolations(page, 'files');
+
+  await page.getByRole('button', { name: text().recipient.done }).focus();
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.doneTitle })).toBeFocused();
+  await expectNoWcagViolations(page, 'done');
+});
+
+test('recipient: a session the API ended (401) goes back to the code step with a note', async ({ page }) => {
+  await answerLinks(page, {
+    ...resolved('verified'),
+    'GET /v1/session': { status: 200, json: linkSession(language()) },
+    'GET /v1/session/files': { status: 401, json: problemOf(401, 'session_expired') },
+  });
+  await page.goto(LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.verifyTitle })).toBeFocused();
+  await expect(page.getByText(text().recipient.sessionEnded)).toBeVisible();
+  await expectNoWcagViolations(page, 'session ended');
+});
+
+test('recipient: a verified browser resumes its session with no new code', async ({ page }) => {
+  await answerLinks(page, {
+    ...resolved('verified'),
+    'GET /v1/session': { status: 200, json: linkSession(language()) },
+    'GET /v1/session/files': { status: 200, json: sessionFiles },
+  });
+  await page.goto(LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.filesTitle })).toBeFocused();
+});
+
+test('a Japanese link opened in an English browser shows Japanese (FR-33)', async ({ page }) => {
+  test.skip(language() !== 'en', 'the English browser only');
+  await answerLinks(page, { 'POST /v1/links/resolve': { status: 200, json: resolution('ja') } });
+  await page.goto(LINK);
+  await expect(page.locator('html')).toHaveAttribute('lang', 'ja');
+  await expect(page.getByRole('heading', { level: 1, name: resources.ja.translation.recipient.verifyTitle })).toBeVisible();
 });
 
 // The uploader's link page is M5's: NotAvailableYet in the public layout (#195).

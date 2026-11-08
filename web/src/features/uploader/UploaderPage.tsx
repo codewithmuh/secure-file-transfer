@@ -1,14 +1,7 @@
-import { useAuthStore } from '@/stores/authStore';
-import { VerificationPage } from '@/features/recipient/VerificationPage';
+import { LinkGate } from '@/features/recipient/LinkGate';
 import { UploaderUploadPage } from './UploaderUploadPage';
 
+/** `/u`, M5's: unrouted until then (#195). The same gate as `/t` resolves and verifies the uploader's link (#198). */
 export function UploaderPage() {
-  // Back to the verification step whenever the link session ends, including a 401 from the API.
-  const verified = useAuthStore((s) => s.linkSession !== null);
-
-  if (!verified) {
-    return <VerificationPage mode="uploader" />;
-  }
-
-  return <UploaderUploadPage />;
+  return <LinkGate mode="uploader">{() => <UploaderUploadPage />}</LinkGate>;
 }

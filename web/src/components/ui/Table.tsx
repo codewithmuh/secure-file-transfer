@@ -5,16 +5,19 @@ interface TableProps {
   className?: string;
   /** The table's accessible name, translated: what a screen reader announces at the scroll region's tab stop. */
   label: string;
+  /** What the table holds, as its `<caption>` (WCAG 1.3.1); shown to screen readers only. */
+  caption?: string;
 }
 
 /**
  * A table in a horizontally scrollable region. The region is focusable so keyboard users can scroll a wide table
  * (WCAG 2.1.1), and `label` names it, so the tab stop is announced as, say, "Transfers, region" (WCAG 4.1.2).
  */
-export function Table({ children, className, label }: TableProps) {
+export function Table({ children, className, label, caption }: TableProps) {
   return (
     <div className="overflow-x-auto" tabIndex={0} role="region" aria-label={label}>
       <table className={cn('min-w-full divide-y divide-gray-200', className)}>
+        {caption && <caption className="sr-only">{caption}</caption>}
         {children}
       </table>
     </div>
@@ -42,7 +45,7 @@ export function TableRow({ children, className, onClick }: { children: React.Rea
 
 export function TableHeader({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <th className={cn('px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500', className)}>
+    <th scope="col" className={cn('px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500', className)}>
       {children}
     </th>
   );

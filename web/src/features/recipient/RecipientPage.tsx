@@ -1,14 +1,11 @@
-import { useAuthStore } from '@/stores/authStore';
-import { VerificationPage } from './VerificationPage';
+import { LinkGate } from './LinkGate';
 import { RecipientDownloadPage } from './RecipientDownloadPage';
 
+/** `/t`: the recipient's link page (#198). The gate resolves and verifies; the files come once verified. */
 export function RecipientPage() {
-  // Back to the verification step whenever the link session ends, including a 401 from the API.
-  const verified = useAuthStore((s) => s.linkSession !== null);
-
-  if (!verified) {
-    return <VerificationPage mode="recipient" />;
-  }
-
-  return <RecipientDownloadPage />;
+  return (
+    <LinkGate mode="recipient">
+      {(session, actions) => <RecipientDownloadPage session={session} actions={actions} />}
+    </LinkGate>
+  );
 }

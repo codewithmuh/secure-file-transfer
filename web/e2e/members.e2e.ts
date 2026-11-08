@@ -1,31 +1,10 @@
-import { expect, test, type Page, type Route } from '@playwright/test';
-import { eicar, MIB, myNumber, payload, signIn, unique, wordsText } from './support/stack';
+import { expect, test, type Page } from '@playwright/test';
+import { eicar, MIB, myNumber, payload, signIn, unique, watchParts, wordsText } from './support/stack';
 
 /**
  * #196: a member creates a transfer, uploads it in parts straight to the S3 stand-in, sends it, and watches scan and
  * DLP status, against `make up` and `make seed`.
  */
-
-const S3 = 'http://localhost:9090/';
-
-/** Every part PUT to the S3 stand-in, by object and part number: how many tries, and how many landed. */
-function watchParts(page: Page, decide: (part: string, attempt: number, route: Route) => Promise<boolean> = async () => false) {
-  const tries = new Map<string, number>();
-  const landed = new Map<string, number>();
-  void page.route(`${S3}**`, async (route) => {
-    const request = route.request();
-    if (request.method() !== 'PUT') return route.continue();
-    const url = new URL(request.url());
-    const part = `${url.pathname}#${url.searchParams.get('partNumber')}`;
-    const attempt = (tries.get(part) ?? 0) + 1;
-    tries.set(part, attempt);
-    if (await decide(part, attempt, route)) return;
-    const response = await route.fetch();
-    if (response.ok()) landed.set(part, (landed.get(part) ?? 0) + 1);
-    await route.fulfill({ response });
-  });
-  return { tries, landed };
-}
 
 async function addRecipient(page: Page, address: string): Promise<void> {
   await page.getByLabel("Recipient's email address").fill(address);

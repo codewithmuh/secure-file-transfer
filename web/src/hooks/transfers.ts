@@ -5,14 +5,22 @@
  */
 import { useInfiniteQuery, useQuery, type QueryClient } from '@tanstack/react-query';
 import { api, type Schema, type Transfer, type TransferState } from '@/api';
-import { POLL_INTERVAL_MS, shouldPoll, useActiveUploads } from '@/features/sender/polling';
+import {
+  POLL_INTERVAL_MS,
+  RECIPIENT_POLL_INTERVAL_MS,
+  shouldPoll,
+  shouldPollRecipients,
+  useActiveUploads,
+} from '@/features/sender/polling';
 import type { ApiFile, PartUrl, UploadApi, UploadedParts } from '@/features/sender/upload';
+import { failureOf } from '@/lib/problems';
 
 export const queryKeys = {
   transfers: ['transfers'] as const,
   transferList: (state: TransferState | null) => ['transfers', 'list', state ?? 'all'] as const,
   recentTransfers: ['transfers', 'recent'] as const,
   transfer: (id: string) => ['transfers', 'detail', id] as const,
+  recipients: (id: string) => ['transfers', 'detail', id, 'recipients'] as const,
   inspection: (fileId: string) => ['files', fileId, 'inspection'] as const,
   tenantPolicy: ['tenant-policy'] as const,
   users: ['users'] as const,
@@ -51,6 +59,21 @@ export function useTransfer(id: string) {
     queryFn: async ({ signal }) => (await api.get('/transfers/{transfer_id}', { path: { transfer_id: id }, signal })).data,
     refetchInterval: (query) =>
       shouldPoll(query.state.data, useActiveUploads.getState().ids) ? POLL_INTERVAL_MS : false,
+    staleTime: 0,
+  });
+}
+
+/**
+ * Each recipient's delivery, verification and downloads (`listTransferRecipients`, #199), polled every 10 seconds
+ * while the transfer is `sent` (`shouldPollRecipients`).
+ */
+export function useTransferRecipients(id: string, state: TransferState | undefined) {
+  return useQuery({
+    queryKey: queryKeys.recipients(id),
+    queryFn: async ({ signal }) =>
+      (await api.get('/transfers/{transfer_id}/recipients', { path: { transfer_id: id }, signal })).data.items,
+    enabled: state !== undefined,
+    refetchInterval: shouldPollRecipients(state) ? RECIPIENT_POLL_INTERVAL_MS : false,
     staleTime: 0,
   });
 }
@@ -105,6 +128,36 @@ export async function sendTransfer(transferId: string): Promise<Transfer> {
 
 export async function cancelTransfer(transferId: string): Promise<Transfer> {
   return (await api.post('/transfers/{transfer_id}/cancel', { path: { transfer_id: transferId } })).data;
+}
+
+/** `revokeTransfer`. A `503` means the revocation stands but isn't confirmed yet (`revocation.ts`). */
+export async function revokeTransfer(transferId: string): Promise<Transfer> {
+  return (await api.post('/transfers/{transfer_id}/revoke', { path: { transfer_id: transferId } })).data;
+}
+
+export type RecipientStatus = Schema<'RecipientStatus'>;
+
+/**
+ * How an unlock ended: `unlocked`, or `unconfirmed` when the API answered `503`. The contract says the unlock takes
+ * effect at once and the `503` means only that its audit record isn't in both regions' archive yet, so the page shows
+ * it as done, with the record pending.
+ */
+export type UnlockOutcome = 'unlocked' | 'unconfirmed';
+
+/**
+ * `unlockRecipient`: the failed attempts start again from zero and a new link is emailed; the old one stops working.
+ * Any error but `503` is thrown.
+ */
+export async function unlockRecipient(transferId: string, recipientId: string): Promise<UnlockOutcome> {
+  try {
+    await api.post('/transfers/{transfer_id}/recipients/{recipient_id}/unlock', {
+      path: { transfer_id: transferId, recipient_id: recipientId },
+    });
+    return 'unlocked';
+  } catch (error) {
+    if (failureOf(error).status === 503) return 'unconfirmed';
+    throw error;
+  }
 }
 
 /** The upload engine's calls for one file (`FileUpload`). */

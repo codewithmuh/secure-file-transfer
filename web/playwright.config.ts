@@ -11,6 +11,10 @@ export default defineConfig({
   testDir: 'e2e',
   testMatch: '*.a11y.ts',
   fullyParallel: true,
+  // Two browsers at a time, as CI's 4-CPU runner gets by default. Playwright's default is half the CPUs: 5 in Docker
+  // Desktop on a 10-core Mac, which next to `make up`'s stack fills an 8 GB Docker VM's memory, so it swaps and scans
+  // stall past the timeout. Two finish faster there too.
+  workers: 2,
   forbidOnly: true,
   retries: 0,
   reporter: 'list',
