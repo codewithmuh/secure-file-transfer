@@ -762,7 +762,7 @@ WRONG: list[tuple[str, str, Callable[[], FastAPI], list[str]]] = [
         lambda: app(operator_routes()),
         [
             "the contract serves createTenant (POST /operator/tenants) from the server "
-            "http://127.0.0.1:{local_port}/v1, not from this app's (/v1)"
+            "https://127.0.0.1:{local_port}/v1, not from this app's (/v1)"
         ],
     ),
     (

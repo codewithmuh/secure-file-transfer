@@ -27,9 +27,10 @@ Clusters: dev in Tokyo; staging and prod in Tokyo (`ap-northeast-1`) and Osaka (
 1. The `cluster-bootstrap` stack (#104) installs Argo CD and a root Application, `root`, which renders
    `deploy/argocd` with the cluster's `environment`, `region` and `cluster` facts: the registry host, the database
    and counter store endpoints, the account ID, the Operator role name, the files key ARN, the environment's names
-   in the shared zone (`serviceDomain`) and the user pool's ID and login domain. Only Terraform knows them, and
-   account IDs are never committed. Until the user pool exists, the application part refuses to render and names
-   the missing facts; the operator part doesn't need them.
+   in the shared zone (`serviceDomain`), and from the `identity` layer (#185) the user pool's ID, login domain and
+   app client, the SES configuration set and, in Tokyo outside dev, Osaka's pool and client. Only Terraform knows
+   them, and account IDs are never committed. Until the identity layer exists, the application part refuses to render
+   and names the missing facts; the operator part doesn't need them.
 2. That chart makes the AppProject `sft`: this repository only, the namespaces `sft` and `sft-operator` only, and only
    the kinds the chart renders. No Secrets, no Roles, nothing cluster-scoped but the two Namespaces. It also makes two
    Applications from `deploy/charts/sft` with the cluster's values file. `sft` renders the application (`part:
@@ -60,11 +61,13 @@ after a failover.
 | `notifier` | Deployment, 2 | `python -m sft.workers.notify` | `notifier`, sft_notify | Its proxy listener, endpoints (SES, SQS), Aurora, Valkey |
 | `scan-worker-{small,large}` | Deployment per pool, scan nodes | `python -m sft.workers.scan` | `scan-worker`, sft_scan | Endpoints, Aurora, Valkey, S3, the clamd and inspector beside it |
 | `clamd-{small,large}` | Deployment per pool, scan nodes | the clamav image's `/init-unprivileged` | none | The signature mirror only |
-| `dlp-inspector-{small,large}` | Deployment per pool, scan nodes, port 8070, its own protocol | `python -m sft.dlp.inspector` | none | Nothing at all |
+| `dlp-inspector-{small,large}` | Deployment per pool, scan nodes, port 8070, its own protocol; probes on 8001 | `python -m sft.dlp.inspector` | none | Nothing at all |
 | `signature-mirror` | Deployment, 1 | freshclam, and `python -m http.server` from our image | none | Its proxy listener (ClamAV's database) |
 | `operator-api` | Deployment in `sft-operator`, port-forward only | `python -m sft.api.operator` | `operator-api`, sft_operator | Endpoints (STS), Aurora, Valkey |
 | `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `audit-partitions` | CronJobs | `python -m sft.workers.<job>` | `jobs`, sft_jobs | Endpoints, Aurora; S3 for deletion, reconciliation and the storage audit (both Regions' files buckets outside dev, and the audit archive for reconciliation, #181) |
 | `audit-archive` | CronJob, every minute | `python -m sft.workers.audit_archive` | `audit-archive`, sft_archive | Endpoints, Aurora, S3 |
+| `key-rotation` | CronJob, hourly, Tokyo only | `python -m sft.workers.key_rotation` | `key-rotation`, no database; the one projected Kubernetes token | Its proxy listener (Cognito; Osaka's Secrets Manager and Cognito outside dev), endpoints (Secrets Manager), the cluster API |
+| `invite-backlog` | CronJob, always suspended, run by hand | `python -m sft.workers.invite_backlog` | `notifier`, sft_notify | As the notifier |
 | `migrate` | Job, PreSync hook | `python -m sft.data.migrate` | `migrate`, sft_migrate | Endpoints, Aurora |
 
 Each scan node runs one trio: a worker, a clamd pod and an inspector, held together by required pod affinity. The
@@ -81,8 +84,10 @@ cluster bootstrap.
 Every setting without a default in `sft.core.settings` is in the pod spec of the entry point that reads it, and no
 other; `tests/test_rendered.py` checks this against the settings classes themselves, so a new required setting fails
 CI until the chart sets it. Settings come from the cluster facts and the values: the database and Valkey URLs name
-the workload's own login role and user, with no password (IAM authentication, encryption 6.3, ADR-0014); the queue
-prefix is `sft-<env>-<region-short>-`; the API's sign-in URLs follow the user pool and `api.` and `app.` under
+the workload's own login role and user, with no password: `DATABASE_IAM_AUTH` and `VALKEY_IAM_CACHE`
+(`sft-<env>-<region-short>-valkey`) make each pod sign an IAM token for every new connection (encryption 6.3, ADR-0014,
+#184). The API and the operator API serve TLS on 8000 with a certificate each pod makes at start (`PUBLIC_TLS=generated`,
+encryption 2.2); 8001 stays plain HTTP. The queue prefix is `sft-<env>-<region-short>-`; the API's sign-in URLs follow the user pool and `api.` and `app.` under
 `serviceDomain`; its trusted proxies are the load balancer's subnets.
 
 **One rule for overrides.** A workload's `env` in `charts/sft/values.yaml` or a cluster's values file may add
@@ -92,23 +97,45 @@ account and role) and the secret references win in every workload, and a values 
 dropped. `tests/test_overrides.py` checks this for the API, relay, notifier, scan workers and operator API, and that an
 extra setting still reaches the pod.
 
-The API's five secrets (`CSRF_KEYRING`, `EMAIL_HMAC_KEYRING`, `CODE_HMAC_KEYRING`, `OIDC_CLIENT_ID`,
-`OIDC_CLIENT_SECRET`) come from Secrets Manager through the ExternalSecret `api-secrets`, and the notification
-worker's three keyrings (`EMAIL_HMAC_KEYRING`, `LINK_HMAC_KEYRING`, `CODE_HMAC_KEYRING`, #178, #179) through
-`notifier-secrets`; the cluster-bootstrap stack's `application-secrets` store serves both to the `sft` namespace only,
-and they reach the pods as `secretKeyRef`s (encryption 6.4, "Until then"). Only the notifier's Secret holds K_link. No
-secret value is ever in Git, the values or a rendered manifest. A new keyring version reaches a pod when it restarts.
+The keyrings are read from Secrets Manager by the workloads themselves (encryption 6.4, #184): the API's
+`CSRF_KEYRING`, `EMAIL_HMAC_KEYRING` and `CODE_HMAC_KEYRING`, and the notification worker's `EMAIL_HMAC_KEYRING`,
+`LINK_HMAC_KEYRING` and `CODE_HMAC_KEYRING` (#178, #179), each set to `secretsmanager:sft/<env>/app/<name>`. Each pod
+reads them as its own role at start, refuses to start without them, and reads them again every 5 minutes, so a rotation
+step reaches every pod within one interval and needs no restart (`sft.runtime.secrets`). Only the notifier's role may
+read K_link. The API's user pool client (`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`) still comes through the ExternalSecret
+`api-secrets`, from the cluster-bootstrap stack's `application-secrets` store, which serves the `sft` namespace only,
+as `secretKeyRef`s. No secret value is ever in Git, the values or a rendered manifest.
 The API also gets both regions' audit archive buckets (#177), Tokyo's alone in dev, which has no Osaka.
+The notifier sends with the Region's configuration set (`SES_CONFIGURATION_SET`, `sft-<env>`), whose bounces and
+complaints come back on the `ses-events` queue, and invites members through Cognito's admin API on the Region's pool
+(`USER_POOL_BACKEND=cognito`, #193).
+
+**The first deploy of an environment.** The `identity` layer creates the `sft/<env>/app/*` secrets without a value,
+and only the key rotation job writes them (encryption 6.4). So after the first sync the API and the notifier refuse to
+start without their keyrings, and the API waits on `api-secrets` too, until the job has run once (it then restarts the
+API; the notifier's next restart finds its keyrings); start it rather than wait for the hour:
+
+```bash
+kubectl -n sft create job --from=cronjob/key-rotation key-rotation-first
+```
+
+**Members invited before the pool existed** (#193) stay `invited` until the one-off backlog pass invites them. Run it
+once, after the notifier is up with `USER_POOL_BACKEND=cognito`; running it again is safe, because a member who already
+has an identity on the pool is skipped:
+
+```bash
+kubectl -n sft create job --from=cronjob/invite-backlog invite-backlog-1
+```
 
 ## What every pod gets
 
 The runtime contract of architecture 8 and the pod rules of ADR-0004, written once in `charts/sft/templates/_helpers.tpl`
 and checked on every rendered container by `tests/test_rendered.py`:
 
-- Probes on the internal port 8001: liveness `/healthz`, readiness `/readyz`, for every server of ours. Third-party
-  containers are probed on their own port. The DLP inspector is the exception: it has only its framed protocol, one
-  file per connection, where a TCP probe would count as a bad request, so it has no probes. A crashed inspector
-  exits and is restarted; a hung one fails the scan worker's attempt, which is retried.
+- Probes on the internal port 8001, plain HTTP: liveness `/healthz`, readiness `/readyz`, for every server of ours.
+  Third-party containers are probed on their own port. The DLP inspector serves its probes from a thread on 8001
+  (#184), apart from its framed protocol on 8070, where a probe would count as a bad request and wait behind the file
+  being inspected.
 - A `preStop` sleep (15 s) on the API and the operator API, inside their grace periods. The API's is 150 s, for 15 s of
   sleep and 120 s of download drain (abuse 5.7).
 - `enableServiceLinks: false`, and no Kubernetes API token: `automountServiceAccountToken: false` on every pod and
@@ -153,11 +180,6 @@ the charts with `tests/trivy-values.yaml`.
 - Prometheus scrape configuration: ADR-0009's issue adds the PodMonitors. The network policies already admit
   `monitoring` on 8001.
 - A PriorityClass for the API (capacity 4.2), which is cluster-scoped and so belongs to the cluster bootstrap.
-- **Deploy blocker: TLS on the API's public port.** The edge stack's target group sends HTTPS to the pods' port 8000
-  (encryption 2.1: each pod serves TLS with a certificate it makes at start), but the API serves plain HTTP today, so
-  the load balancer can't reach it until the API serves TLS there. [#184](https://github.com/codewithmuh/secure-file-transfer/issues/184) tracks it.
-- What else the application still needs to run in AWS, outside this chart: signing IAM tokens for Aurora and Valkey
-  (encryption 6.3, ADR-0014), and reading its secrets from Secrets Manager (encryption 6.4). The settings here are
-  already the ones those adapters read.
-- The user pool's stack (ADR-0016), whose ID and login domain the API's settings need, and SES's identity and
-  configuration set (ADR-0015), which the notification worker's `SES_CONFIGURATION_SET` will name.
+- The RDS certificate bundle in the image. `sslmode=verify-full` needs the CA that signed Aurora's certificate
+  (`rds-ca-ecc384-g1`, infra/modules/aurora), which isn't in the system's trust store: the image needs the bundle and
+  the URL `sslrootcert=<its path>` before the first connection in AWS (#184 left it open).

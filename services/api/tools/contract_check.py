@@ -40,7 +40,7 @@ CONTRACT: Final = Path(__file__).resolve().parents[3] / "docs" / "api" / "openap
 
 # The contract's servers. An operation belongs to the server its path item or the document names.
 PUBLIC_SERVER: Final = "/v1"
-OPERATOR_SERVER: Final = "http://127.0.0.1:{local_port}/v1"
+OPERATOR_SERVER: Final = "https://127.0.0.1:{local_port}/v1"
 
 METHODS: Final = ("get", "put", "post", "delete", "options", "head", "patch", "trace")
 

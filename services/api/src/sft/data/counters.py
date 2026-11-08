@@ -27,8 +27,9 @@ fails at once (ADR-0014), so a sick cache doesn't add latency to every request; 
 applies each limit's failure mode. Any failure surfaces as `CounterStoreUnavailableError`.
 
 Locally the URL holds the ACL user and its fake password. In AWS it is `rediss://` with the
-workload's user, and M4 adds a credential provider that signs a 15-minute IAM token, plus the
-cluster client for ElastiCache Serverless; neither changes this interface.
+workload's user: with `iam` (VALKEY_IAM_CACHE), a credential provider signs a 15-minute IAM token
+for each new connection (`sft.data.iam_auth`, #184). The cluster client for ElastiCache Serverless
+is still to come; neither changes this interface.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ from typing import Any, Literal
 import valkey.asyncio as valkey
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from valkey.exceptions import ValkeyError
+
+from sft.data.iam_auth import valkey_iam
 
 CALL_TIMEOUT_SECONDS = 0.05
 BREAKER_ERRORS = 5
@@ -290,6 +293,28 @@ def _verdict(result: Any) -> Verdict:
     return Verdict(allowed=result[0] == 1, wait_ms=int(result[1]))
 
 
+@dataclass(frozen=True, slots=True)
+class ValkeyIam:
+    """Where IAM tokens for Valkey are signed: the serverless cache's name and its region."""
+
+    cache_name: str
+    region: str
+
+    @classmethod
+    def of(cls, cache_name: str | None, region: str) -> ValkeyIam | None:
+        """From VALKEY_IAM_CACHE and AWS_REGION: None where the cache isn't named (locally)."""
+        return None if cache_name is None else cls(cache_name, region)
+
+
+def iam_url(url: str, iam: ValkeyIam | None) -> tuple[str, dict[str, Any]]:
+    """`valkey.from_url`'s URL and extra arguments: with `iam`, the URL without its user and a
+    credential provider that signs in as that user."""
+    if iam is None:
+        return url, {}
+    bare, credentials = valkey_iam(url, iam.cache_name, region=iam.region)
+    return bare, {"credential_provider": credentials}
+
+
 class CounterStore:
     def __init__(
         self,
@@ -311,10 +336,16 @@ class CounterStore:
         self._resting_until = 0.0
 
     @classmethod
-    def connect(cls, url: str, metrics: CounterMetrics) -> CounterStore:
-        """A store for `url`. It opens no connection until the first call needs one."""
+    def connect(
+        cls, url: str, metrics: CounterMetrics, *, iam: ValkeyIam | None = None
+    ) -> CounterStore:
+        """A store for `url`. It opens no connection until the first call needs one. With `iam`
+        (VALKEY_IAM_CACHE, in AWS), each new connection signs in with an IAM token as the URL's
+        user (`sft.data.iam_auth`)."""
+        address, extra = iam_url(url, iam)
         client = valkey.from_url(  # type: ignore[no-untyped-call]
-            url,
+            address,
+            **extra,
             socket_timeout=CALL_TIMEOUT_SECONDS,
             socket_connect_timeout=CALL_TIMEOUT_SECONDS,
             # A refused call is answered by the failure mode, never retried into the latency budget.

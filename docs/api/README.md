@@ -441,7 +441,7 @@ derived CSRF tokens, the operator token exchange, and that API keys can't unlock
 | Action paths | Verbs such as `/send`, `/revoke`, `/unlock`, `/sign-out`, `/reset-sign-in`. The architecture's illustrative `/revocation` becomes `/revoke`. |
 | Audit export | Streamed in the response, at most 1,000,000 events for an admin and 100,000 for an API key; an asynchronous export job only if that proves too small. CSV cells are formula-neutralised (section 8). |
 | Download grant budget | 3 × file size, 20 requests, 24 hours, one session and one stream (ADR-0018) |
-| Operator API address | `http://127.0.0.1:{local_port}/v1`, the local end of the port-forward; the port is the operator's choice |
+| Operator API address | `https://127.0.0.1:{local_port}/v1`, the local end of the port-forward; the port is the operator's choice. The pod serves TLS with a certificate it makes at start (encryption and keys 2.2, #184), which a client accepts without verifying, as the load balancer does: the port-forward is already an authenticated tunnel |
 | Deprecation notice | At least 6 months |
 | DLP decisions by people only | API keys can't confirm a warning, request or decide an approval, read the DLP policy, or see finding details; automation can send transfers that need no confirmation. |
 | What an approver sees | Recipients, file names, the message, findings with masked previews and the justification, never contents: approvers have no download operation. |

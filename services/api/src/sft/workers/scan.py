@@ -65,7 +65,12 @@ from sft.core.settings import EXIT_BAD_SETTINGS, ScanSettings, load_settings
 from sft.core.telemetry import configure_tracing
 from sft.data import files
 from sft.data.access import NotFoundError
-from sft.data.counters import CounterMetrics, CounterStore, CounterStoreUnavailableError
+from sft.data.counters import (
+    CounterMetrics,
+    CounterStore,
+    CounterStoreUnavailableError,
+    ValkeyIam,
+)
 from sft.data.database import Database
 from sft.data.findings import Counts
 from sft.data.models import (
@@ -661,7 +666,9 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
     """The scan worker process: its pools, clients and probes, until a signal."""
     process = WorkerProcess(settings)
     database = Database.connect(
-        settings.database_url.get_secret_value(), pool_size=settings.database_pool_size
+        settings.database_url.get_secret_value(),
+        pool_size=settings.database_pool_size,
+        iam_region=settings.aws_region if settings.database_iam_auth else None,
     )
     queues = scan_queues(settings)
     objects = S3Objects.create(
@@ -675,7 +682,9 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         None
         if settings.valkey_url is None
         else CounterStore.connect(
-            settings.valkey_url.get_secret_value(), CounterMetrics.create(process.registry)
+            settings.valkey_url.get_secret_value(),
+            CounterMetrics.create(process.registry),
+            iam=ValkeyIam.of(settings.valkey_iam_cache, settings.aws_region),
         )
     )
     consumer_type = CONSUMERS[settings.scan_pool]

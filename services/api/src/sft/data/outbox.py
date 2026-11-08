@@ -63,6 +63,8 @@ class Queue(StrEnum):
     SCAN_SMALL = "scan-small"
     SCAN_LARGE = "scan-large"
     NOTIFY = "notify"
+    SES_EVENTS = "ses-events"
+    """Not the outbox's: SES's events, through SNS (`sft.service.ses_events`, #185). No topic."""
 
     @property
     def fair(self) -> bool:

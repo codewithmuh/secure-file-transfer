@@ -3643,7 +3643,7 @@ paths:
 
   /operator/token:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -3706,7 +3706,7 @@ paths:
 
   /operator/tenants:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -3802,7 +3802,7 @@ paths:
 
   /operator/tenants/{tenant_id}:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -3839,7 +3839,7 @@ paths:
 
   /operator/tenants/{tenant_id}/suspend:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -3887,7 +3887,7 @@ paths:
 
   /operator/tenants/{tenant_id}/sso:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -3951,7 +3951,7 @@ paths:
 
   /operator/tenants/{tenant_id}/admin-recovery:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.
@@ -4023,7 +4023,7 @@ paths:
 
   /operator/break-glass-grants:
     servers:
-      - url: http://127.0.0.1:{local_port}/v1
+      - url: https://127.0.0.1:{local_port}/v1
         description: |
           The operator API, through `kubectl port-forward` into the `sft-operator` namespace (authn-authz 8.2). No load
           balancer or ingress routes to it.

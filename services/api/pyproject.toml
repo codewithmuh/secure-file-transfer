@@ -43,6 +43,9 @@ dependencies = [
   # (the default wheels, built without V8 or XFA).
   "lxml>=6.1.3",
   "pypdfium2>=5.14.0",
+  # TLS on the API's public port (#184, encryption and keys 2.2): the ECDSA key and self-signed
+  # certificate each pod makes at start. Already in the lock through joserfc; 50.0.2 is 2026-09-30.
+  "cryptography>=50.0.2",
 ]
 
 [dependency-groups]
@@ -53,7 +56,7 @@ dev = [
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17.3",
-  "types-boto3[s3,sesv2,sqs]>=1.43.121",  # mypy types for the S3, SQS and SES clients
+  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.121",  # mypy types for the AWS clients
   "types-pyyaml>=6.0.12.20260906",
 ]
 

@@ -24,9 +24,10 @@ Every statement through `Database` gets a CLIENT span, a child of the request's 
 named like `SELECT sft`, with the SQL text: its bound parameters, never their values. A failed
 statement's span carries the error's type, never its message, which can quote a value.
 
-In AWS the URL names the workload's login role with no password; M4 adds a `do_connect` hook that
-signs a 15-minute IAM token for each new connection, and `sslmode=verify-full` in the URL
-(encryption and keys 2.2, 6.3).
+In AWS the URL names the workload's login role with no password and has `sslmode=verify-full`
+(encryption and keys 2.2, 6.3). With `iam_region`, a `do_connect` hook gives each new connection an
+IAM token as its password (`sft.data.iam_auth`), so a pooled connection that is replaced after a
+failover signs in with a fresh one.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from sqlalchemy.orm import ORMExecuteState, Session, SessionTransaction
 from sqlalchemy.pool import NullPool
 
 from sft.data.access import SCOPES_BY_ROLE, check_scope, check_write
+from sft.data.iam_auth import TokenSigner, rds_signer
 from sft.data.scope import Scope
 
 _SET_SCOPE = text(
@@ -79,12 +81,34 @@ def psycopg_url(url: str | URL) -> URL:
     return parsed.set(drivername="postgresql+psycopg")
 
 
-def sync_engine(url: str | URL, **options: Any) -> Engine:
+def iam_signer(url: URL, region: str) -> TokenSigner:
+    """IAM tokens for the URL's host, port and login role (`sft.data.iam_auth`)."""
+    if url.username is None or url.host is None:
+        raise ValueError("IAM database authentication needs a user and a host in the URL")
+    if url.password is not None:
+        raise ValueError("with IAM database authentication the URL holds no password")
+    return rds_signer(url.host, url.port or 5432, url.username, region=region)
+
+
+def sign_connections(engine: Engine, signer: TokenSigner) -> None:
+    """Give every new connection of `engine` a token from `signer` as its password."""
+
+    @event.listens_for(engine, "do_connect")
+    def with_token(dialect: object, record: object, cargs: object, cparams: dict[str, Any]) -> None:
+        cparams["password"] = signer.token()
+
+
+def sync_engine(url: str | URL, *, iam_region: str | None = None, **options: Any) -> Engine:
     """A synchronous engine without a pool, for one-shot jobs (bootstrap, migrations) and tests.
 
     It has no scope: it is never used for the application's queries, which go through `Database`.
+    With `iam_region`, each connection signs in with an IAM token.
     """
-    return create_engine(psycopg_url(url), poolclass=NullPool, **options)
+    parsed = psycopg_url(url)
+    engine = create_engine(parsed, poolclass=NullPool, **options)
+    if iam_region is not None:
+        sign_connections(engine, iam_signer(parsed, iam_region))
+    return engine
 
 
 _tracer = trace.get_tracer(__name__)
@@ -213,15 +237,20 @@ class Database:
             raise LoginRoleError(f"logged in as {row!r}, not {self._role} (ADR-0020)")
 
     @classmethod
-    def connect(cls, url: str, *, pool_size: int = 5) -> Database:
-        """A pool for `url`. It opens no connection until the first transaction needs one."""
+    def connect(cls, url: str, *, pool_size: int = 5, iam_region: str | None = None) -> Database:
+        """A pool for `url`. It opens no connection until the first transaction needs one. With
+        `iam_region` (DATABASE_IAM_AUTH, in AWS), each new connection signs in with an IAM token."""
+        parsed = psycopg_url(url)
+        signer = None if iam_region is None else iam_signer(parsed, iam_region)
         engine = create_async_engine(
-            psycopg_url(url),
+            parsed,
             pool_size=pool_size,
             max_overflow=0,
             # A connection that died while idle, after a failover say, is replaced, not handed out.
             pool_pre_ping=True,
         )
+        if signer is not None:
+            sign_connections(engine.sync_engine, signer)
         _trace_statements(engine.sync_engine)
         return cls(engine)
 

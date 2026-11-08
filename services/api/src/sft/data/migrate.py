@@ -162,10 +162,12 @@ def run(
     attempts: int = ATTEMPTS,
     lock_wait_seconds: float = LOCK_WAIT_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
+    iam_region: str | None = None,
 ) -> Plan:
-    """Bring the database at `url` up to this image's head, or check it may run as it is."""
+    """Bring the database at `url` up to this image's head, or check it may run as it is. With
+    `iam_region` (DATABASE_IAM_AUTH, in AWS), `sft_migrate` signs in with an IAM token."""
     script = ScriptDirectory.from_config(alembic_config(script_location=script_location))
-    engine = sync_engine(url)
+    engine = sync_engine(url, iam_region=iam_region)
     try:
         with engine.connect() as connection:
             become_owner(connection, lock_timeout=lock_timeout)
@@ -251,7 +253,10 @@ def run_env() -> None:
     settings = load_settings(MigrationSettings)
     if settings is None:
         raise SystemExit(EXIT_BAD_SETTINGS)
-    engine = sync_engine(settings.migration_database_url.get_secret_value())
+    engine = sync_engine(
+        settings.migration_database_url.get_secret_value(),
+        iam_region=settings.aws_region if settings.database_iam_auth else None,
+    )
     try:
         with engine.connect() as connection:
             become_owner(connection)
@@ -278,7 +283,10 @@ def main() -> int:
         return EXIT_BAD_SETTINGS
     configure_logging(settings.log_level)
     try:
-        decided = run(settings.migration_database_url.get_secret_value())
+        decided = run(
+            settings.migration_database_url.get_secret_value(),
+            iam_region=settings.aws_region if settings.database_iam_auth else None,
+        )
     except MigrationRefusedError as exc:
         log.critical("migration refused", extra={"reason": str(exc)})
         return EXIT_REFUSED

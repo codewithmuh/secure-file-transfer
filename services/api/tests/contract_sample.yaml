@@ -180,7 +180,7 @@ paths:
           $ref: '#/components/responses/ServiceUnavailable'
   /operator/tenants:
     servers:
-    - url: http://127.0.0.1:{local_port}/v1
+    - url: https://127.0.0.1:{local_port}/v1
     post:
       operationId: createTenant
       x-permission: operator.tenant.create

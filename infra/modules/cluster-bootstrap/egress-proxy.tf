@@ -12,11 +12,27 @@ locals {
       clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "api" } }]
     },
     {
-      # The notification worker: Cognito's admin API, for invitations.
+      # The notification worker: Cognito's admin API, for invitations; and its one-off invitation backlog (#193).
       name    = "notifier"
       port    = local.proxy_ports["notifier"]
       domains = ["cognito-idp.${var.region}.amazonaws.com"]
-      clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "notifier" } }]
+      clients = [
+        { namespace = "sft", podLabels = { "app.kubernetes.io/component" = "notifier" } },
+        { namespace = "sft", podLabels = { "app.kubernetes.io/component" = "invite-backlog" } },
+      ]
+    },
+    {
+      # The key rotation job, Tokyo only (encryption 6.4, #185): the app clients' secrets in Cognito, and in staging and
+      # prod Osaka's pool and Osaka's Secrets Manager, where Osaka's idp-client lives. Tokyo's Secrets Manager is the
+      # endpoint's.
+      name = "key-rotation"
+      port = local.proxy_ports["key-rotation"]
+      domains = concat(
+        ["cognito-idp.${var.region}.amazonaws.com"],
+        var.region == "ap-northeast-1" && var.environment != "dev"
+        ? ["cognito-idp.ap-northeast-3.amazonaws.com", "secretsmanager.ap-northeast-3.amazonaws.com"] : [],
+      )
+      clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "key-rotation" } }]
     },
     {
       # The signature mirror: ClamAV's database (ADR-0019).

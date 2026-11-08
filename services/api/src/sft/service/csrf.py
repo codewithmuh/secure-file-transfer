@@ -18,40 +18,61 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-from dataclasses import dataclass
+from collections.abc import Mapping
 
 from sft.core.keyrings import CSRF_KEY_ID, KeyringError, parse_keyring
 
 __all__ = ["CsrfKeyring", "KeyringError"]
 
 
-@dataclass(frozen=True, slots=True)
 class CsrfKeyring:
-    """The loaded keyring: the key that issues tokens, and every key that verifies them."""
+    """The loaded keyring: the key that issues tokens, and every key that verifies them.
 
-    active_id: str
-    keys: dict[str, bytes]
+    `reload` swaps in a new version of the secret whole (`sft.runtime.secrets`); each method reads
+    the ring once, so it never mixes two versions.
+    """
+
+    __slots__ = ("_ring",)
+
+    def __init__(self, active_id: str, keys: Mapping[str, bytes]) -> None:
+        if active_id not in keys:
+            raise KeyringError("the CSRF keyring's active key must be one of its keys")
+        self._ring: tuple[str, Mapping[str, bytes]] = (active_id, dict(keys))
 
     @classmethod
     def from_json(cls, raw: str) -> CsrfKeyring:
         """Read the keyring; `KeyringError`, which never holds a key, if it is malformed."""
-        entries = parse_keyring(raw, name="CSRF", key_id=CSRF_KEY_ID)
-        [active] = [entry.id for entry in entries if entry.state == "active"]
-        return cls(active, {entry.id: entry.key for entry in entries})
+        return cls(*_read(raw))
+
+    def reload(self, raw: str) -> None:
+        """Take a new version of the secret; a malformed one raises `KeyringError` and changes
+        nothing."""
+        self._ring = _read(raw)
+
+    @property
+    def active_id(self) -> str:
+        return self._ring[0]
 
     def token_for(self, session_token: str) -> str:
         """The CSRF token of the session whose raw token this is, under the active key."""
-        return f"{self.active_id}.{_mac(self.keys[self.active_id], session_token)}"
+        active_id, keys = self._ring
+        return f"{active_id}.{_mac(keys[active_id], session_token)}"
 
     def verify(self, session_token: str, presented: str | None) -> bool:
         """Whether `presented` is this session's token under any key in the ring."""
         if not presented:
             return False
         key_id, dot, mac = presented.partition(".")
-        key = self.keys.get(key_id)
+        key = self._ring[1].get(key_id)
         if not dot or key is None:
             return False
         return hmac.compare_digest(mac.encode(), _mac(key, session_token).encode())
+
+
+def _read(raw: str) -> tuple[str, dict[str, bytes]]:
+    entries = parse_keyring(raw, name="CSRF", key_id=CSRF_KEY_ID)
+    [active] = [entry.id for entry in entries if entry.state == "active"]
+    return active, {entry.id: entry.key for entry in entries}
 
 
 def _mac(key: bytes, session_token: str) -> str:

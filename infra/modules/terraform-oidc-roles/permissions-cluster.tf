@@ -25,7 +25,7 @@ locals {
     for r in [
       "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
       "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
-      "external-secrets-platform", "external-secrets-app",
+      "external-secrets-platform", "external-secrets-app", "key-rotation",
     ] : "${local.cluster_env_prefix}-${r}"
   ]
   cluster_role_arns = [for n in local.cluster_role_names : "arn:aws:iam::${var.account_id}:role/${n}"]

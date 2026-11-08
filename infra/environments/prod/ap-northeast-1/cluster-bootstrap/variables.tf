@@ -49,19 +49,7 @@ variable "github_app" {
   default = null
 }
 
-variable "cognito_login_domain" {
-  description = "The user pool's managed login domain in this Region, for the API's proxy listener. Null until the pool exists."
-  type        = string
-  default     = null
-}
-
 variable "domain" {
   description = "The maintainer's domain; the shared zone is sft.<domain> (PRD open question 5). TF_VAR_domain, never committed."
   type        = string
-}
-
-variable "cognito_user_pool_id" {
-  description = "This Region's user pool ID, for member sign-in (ADR-0016). Null until the user pool exists."
-  type        = string
-  default     = null
 }

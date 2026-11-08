@@ -103,7 +103,7 @@ record lets only Amazon's certificate authority issue certificates for the domai
 
 | Hop | How |
 |---|---|
-| Load balancer to API pods | HTTPS target group. Each pod serves TLS 1.2 or later with a certificate it generates at start. The load balancer doesn't validate target certificates, so this encrypts the hop without authenticating it; security groups and network policies decide who can reach the pods. It is needed because the Nitro system's automatic encryption between instances doesn't cover traffic through a load balancer. The load balancer offers TLS 1.0 and up to targets, so the pod's TLS settings enforce the 1.2 minimum. |
+| Load balancer to API pods | HTTPS target group. Each pod serves TLS 1.2 or later with a certificate it generates at start: an ECDSA P-256 key kept in memory only, and in TLS 1.2 only ECDHE with AEAD suites (`PUBLIC_TLS=generated`, #184). The operator API's port serves TLS the same way. The load balancer doesn't validate target certificates, so this encrypts the hop without authenticating it; security groups and network policies decide who can reach the pods. It is needed because the Nitro system's automatic encryption between instances doesn't cover traffic through a load balancer. The load balancer offers TLS 1.0 and up to targets, so the pod's TLS settings enforce the 1.2 minimum. |
 | Pods and nodes to AWS APIs (S3, KMS, SQS, Secrets Manager, STS, ECR, SES, EC2, EKS Auth) | HTTPS through the VPC endpoints (architecture 3.1, ADR-0021); AWS APIs require TLS 1.2. Bucket and queue policies also deny requests with `aws:SecureTransport` false. The notification worker sends email through SES's API endpoint, never through NAT. |
 | Pods to Cognito, GitHub and ClamAV's database | An HTTPS `CONNECT` tunnel through the egress proxy's listener for that workload, then the NAT gateways (ADR-0021). TLS runs end to end from the pod, so the proxy sees only the name and the byte counts. |
 | SES to recipients' mail servers | A configuration set with TLS policy `Require`: a message is delivered only over TLS. A mail server without TLS gets no email (section 9). |
@@ -744,7 +744,9 @@ What is deliberately not a secret here:
 
 - Each workload connects as its own PostgreSQL login role (`sft_api`, `sft_scan`, `sft_notify`, `sft_relay`,
   `sft_jobs`, `sft_archive`, `sft_migrate`, `sft_operator`) with IAM database authentication. The pod's role signs a
-  15-minute connection token locally; IAM authentication requires TLS.
+  15-minute connection token locally; IAM authentication requires TLS. As built (#184, `sft.data.iam_auth`): a token
+  for each new connection, reused for at most 10 minutes so it always has 5 left, for Aurora and, the same way, for
+  each workload's Valkey user (ADR-0014).
 - Aurora can manage the master password in Secrets Manager, but AWS doesn't support that for clusters in an Aurora
   global database. So the deploy role sets it with Terraform write-only arguments, and the secret is the password's
   one source. A new ephemeral random password goes into the secret's `secret_string_wo`. The cluster's
@@ -763,20 +765,24 @@ What is deliberately not a secret here:
 - The application reads its secrets from Secrets Manager through the VPC endpoint at start and every 5 minutes, and
   keeps them only in memory. Not through environment variables or Kubernetes Secrets: that keeps them out of etcd and
   lets the application hold several keyring versions at once.
-- **Until then (as built, #106).** The API reads its settings from environment variables only (architecture 8), so
-  for now its secrets reach it through External Secrets. The cluster-bootstrap stack's `application-secrets` store,
-  which only the `sft` namespace may use, reads `csrf-hmac`, `email-hmac`, `code-hmac` (#179), `link-hmac` (#178,
-  for the notification worker's own Secret, `notifier-secrets`, never the API's) and the Region's `idp-client` as its
-  own role, `sft-<env>-external-secrets-app`, which may read exactly those ARNs and nothing else. The
+- **As built (#184).** The API and the notification worker read their keyrings from Secrets Manager themselves, as
+  their own roles: each keyring setting names its secret (`CSRF_KEYRING=secretsmanager:sft/<env>/app/csrf-hmac`), the
+  process reads it at start and refuses to start without a well-formed keyring, and reads it again every 5 minutes,
+  swapping in a new version whole (`sft.runtime.secrets`). A failed read or a malformed version keeps the loaded one,
+  logs the keyring's name and counts `sft_keyring_refresh_failures_total`. So a rotation step reaches every pod within
+  one interval, without a restart, and the three-interval wait in 6.5 covers a missed read. Locally and in tests the
+  setting holds the keyring itself. The API's role reads `csrf-hmac`, `email-hmac` and `code-hmac`, the notification
+  worker's `link-hmac`, `code-hmac` and `email-hmac`, and nothing else does. Only the Region's `idp-client` still comes
+  through External Secrets: the cluster-bootstrap stack's `application-secrets` store, which only the `sft` namespace
+  may use, reads it as its own role, `sft-<env>-external-secrets-app`, which may read exactly those ARNs, into the
+  Secret `api-secrets` (EKS encrypts it in etcd with the secrets key, #103), read at start. A client secret rotation
+  adds a second secret before removing the old one (6.5), so a restart within the overlap is enough. The
   `platform-secrets` store, for `argocd`, `monitoring` and `grafana`, reads as `sft-<env>-external-secrets-platform`,
   which may read only `sft/{env}/platform/*`. The controller's own Pod Identity role reads no secret: it may only
   assume those two roles, each of which trusts only it, and the workload boundary allows no other `sts:AssumeRole`.
-  So an ExternalSecret can't cross from one store's secrets to the other's, whatever key it names. They land in one
-  Secret, `api-secrets`, which EKS encrypts in etcd with the secrets key (envelope encryption, #103), and the API's
-  pod reads it as environment variables at start. So a new keyring version reaches the API only when its pods
-  restart: the key rotation job must roll the API's Deployment after it writes, and before the overlap in 6.5 ends.
-  When the application reads Secrets Manager itself, the ExternalSecret, the store and those statements go, and the
-  API's role (which already may read them) is the only reader again.
+  So an ExternalSecret can't cross from one store's secrets to the other's, whatever key it names. Not built yet: a
+  pod that meets an unknown key ID refreshing at once (6.5); it waits for the next interval, which the staged step
+  makes safe.
 - Each role can read only its own secrets: `secretsmanager:GetSecretValue` on named ARNs, and Decrypt limited by
   `kms:EncryptionContext:SecretARN`.
 - In Osaka the same names resolve to the replicas. Replicas are read-only, and the key rotation job runs only in Tokyo.
@@ -803,6 +809,18 @@ What is deliberately not a secret here:
     and replication actions, a principal with broad Secrets Manager rights could drop the policy, or promote the replica
     out from under it, and then read the value.
   - Nobody else writes a secret.
+- **The key rotation job, as built (#185).** `sft.workers.key_rotation`, an hourly CronJob in Tokyo with the role
+  `sft-<env>-key-rotation`. Terraform creates the six secrets without a value (infra `modules/app-secrets`), so the
+  job's first run writes every first version, and the API and notification worker pods start only after it. Each run
+  takes at most one step of 6.5 per keyring, and for each app client adds a client secret once the stored one is a year
+  old or no longer live, deleting the older one 15 minutes later in Tokyo and a day later in Osaka, whose pods it
+  can't restart. A keyring step needs nothing more: the pods read their keyrings every 5 minutes (#184), so each has
+  loaded a staged key well before the job activates it. Only the API's user pool client still reaches a pod at start,
+  through `api-secrets`, so after a new client secret in Tokyo the job has External Secrets sync `api-secrets` and
+  restarts the `api` Deployment. For that it is the one pod with a Kubernetes token: projected, for 10 minutes, with a
+  Role that may only get and annotate that ExternalSecret and patch that Deployment, by name. It never retires an
+  `email-hmac` key: only the database knows when no suppression row uses it, and the job has no database role, so
+  that stays an operator's step.
 - **State holds no live secret value.** Terraform writes values only through write-only arguments. When it creates a
   Cognito app client, Cognito generates a first client secret that does land in state; the key rotation job's first run
   replaces it before the API uses the client, so state only ever keeps a dead value.

@@ -14,6 +14,12 @@ JSON list of keys, each an object with
 its own rules (`sft.service.csrf.CsrfKeyring`, `sft.core.pseudonyms.EmailKeyring`). The settings
 call it too, so a bad keyring stops the process at startup (`sft.core.settings`). No message ever
 contains a key.
+
+A keyring setting holds either the keyring itself (the local stack and the tests) or, in AWS, a
+reference to its secret, `secretsmanager:sft/<env>/app/<name>` (encryption and keys 6.4). The
+process reads a referenced secret at startup and every 5 minutes after (`sft.runtime.secrets`),
+and each keyring's `reload` swaps in the new version whole, so a rotation takes effect without a
+restart. A malformed new version is refused and the loaded one stays.
 """
 
 from __future__ import annotations
@@ -34,6 +40,10 @@ EMAIL_KEY_ID: Final = re.compile(r"[A-Za-z0-9-]{1,32}")
 """An email-hmac key ID: what a pseudonym carries after its `e` (encryption and keys 6.2)."""
 _STATES: Final = ("staged", "active", "verify")
 MIN_KEY_BYTES: Final = 32
+
+SECRET_REFERENCE: Final = "secretsmanager:"  # noqa: S105 - a prefix, not a secret
+"""What a keyring setting starts with when it names the keyring's secret instead of holding it."""
+_SECRET_ID: Final = re.compile(r"[A-Za-z0-9/_+=.@-]{1,512}")
 
 
 class KeyringError(ValueError):
@@ -89,6 +99,25 @@ def parse_keyring(
     if needs_activation and active[0].activated_at is None:
         raise KeyringError(f"{name} key {active[0].id}: the active key needs its activated_at")
     return keys
+
+
+def secret_reference(raw: str, *, name: str) -> str | None:
+    """The secret ID a keyring setting names (`secretsmanager:<id>`), or None if it holds the
+    keyring itself."""
+    if not raw.startswith(SECRET_REFERENCE):
+        return None
+    secret_id = raw.removeprefix(SECRET_REFERENCE)
+    if not _SECRET_ID.fullmatch(secret_id):
+        raise KeyringError(f"the {name} keyring's reference must name a secret ID")
+    return secret_id
+
+
+def check_keyring_setting(
+    raw: str, *, name: str, key_id: re.Pattern[str], needs_activation: bool = False
+) -> None:
+    """For the settings: a reference to a secret, or a keyring that `parse_keyring` accepts."""
+    if secret_reference(raw, name=name) is None:
+        parse_keyring(raw, name=name, key_id=key_id, needs_activation=needs_activation)
 
 
 def _time(value: object, name: str, ident: str) -> datetime | None:

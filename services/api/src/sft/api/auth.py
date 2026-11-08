@@ -42,6 +42,7 @@ from sft.api.members import UserOut
 from sft.api.rate_limits import rate_limit
 from sft.core.errors import FieldError, ServiceUnavailable, Unprocessable
 from sft.core.settings import Settings
+from sft.data.counters import ValkeyIam
 from sft.data.database import Database
 from sft.data.models import Role
 from sft.data.signin_state import LIFETIME_SECONDS, StateStoreUnavailableError, ValkeyStateStore
@@ -275,8 +276,11 @@ async def get_current_member(
     )
 
 
-def open_sign_in(settings: Settings, database: Database) -> SignIn:
-    """The sign-in service for the app's lifespan: nothing connects until the first sign-in."""
+def open_sign_in(
+    settings: Settings, database: Database, csrf: CsrfKeyring, *, iam: ValkeyIam | None = None
+) -> SignIn:
+    """The sign-in service for the app's lifespan: nothing connects until the first sign-in. The
+    CSRF keyring is the app's, so a refresh reaches sign-in too."""
     oidc = OidcClient(
         issuer=settings.oidc_issuer,
         client_id=settings.oidc_client_id,
@@ -285,8 +289,7 @@ def open_sign_in(settings: Settings, database: Database) -> SignIn:
         discovery_url=settings.oidc_discovery_url,
         revocation_url=settings.oidc_revocation_url,
     )
-    states = ValkeyStateStore.from_url(settings.valkey_url.get_secret_value())
-    csrf = CsrfKeyring.from_json(settings.csrf_keyring.get_secret_value())
+    states = ValkeyStateStore.from_url(settings.valkey_url.get_secret_value(), iam=iam)
     config = SignInConfig(
         provider_name=settings.oidc_provider_name,
         web_origin=settings.web_origin,

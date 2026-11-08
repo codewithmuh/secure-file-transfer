@@ -49,7 +49,7 @@ from sft.api.rate_limits import get_rate_limiter
 from sft.core.settings import OperatorSettings
 from sft.data import roles
 from sft.data.audit import Origin
-from sft.data.counters import CounterMetrics, CounterStore
+from sft.data.counters import CounterMetrics, CounterStore, ValkeyIam
 from sft.data.database import Database
 from sft.service import operator_auth, operator_tenants
 from sft.service.operator_auth import Operator, OperatorPolicy, Sts
@@ -85,10 +85,15 @@ def _lifespan(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # As in the public app: neither the pool nor the counter store connects yet.
-        database = Database.connect(url, pool_size=settings.database_pool_size)
+        database = Database.connect(
+            url,
+            pool_size=settings.database_pool_size,
+            iam_region=settings.aws_region if settings.database_iam_auth else None,
+        )
         app.state.database = database
         metrics = CounterMetrics.create(registry)
-        store = CounterStore.connect(settings.valkey_url.get_secret_value(), metrics)
+        iam = ValkeyIam.of(settings.valkey_iam_cache, settings.aws_region)
+        store = CounterStore.connect(settings.valkey_url.get_secret_value(), metrics, iam=iam)
         app.state.rate_limiter = RateLimiter(store, metrics)
         app.state.platform_audit_failures = Counter(
             "sft_operator_platform_audit_failures_total",

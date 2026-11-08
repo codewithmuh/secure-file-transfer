@@ -9,20 +9,29 @@ parses the file itself, and deletes the file's scratch directory when the file i
 It holds nothing between files and has nothing to authenticate with: no token, no IAM role, no
 database, no network out (architecture 2). It logs one line per file: the state, the reasons,
 the size and the duration. Never a value, a hint or a file name (T-99).
+
+Its health is on a port of its own (INTERNAL_PORT, 8001), plain HTTP from a thread (#184):
+`/healthz` answers while the process runs, `/readyz` once the inspector listens and until it
+stops. A probe on the inspector's port would be a malformed request, logged and counted as an
+inspection error, and would wait behind the file being inspected, since the inspector takes one
+connection at a time. The health port serves nothing else: no metrics, nothing about a file.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import shutil
 import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import FrameType
 from typing import IO, Final
@@ -186,18 +195,75 @@ def _copy(conn: socket.socket, out: IO[bytes], count: int, child: Child) -> bool
     return True
 
 
+class Health:
+    """What the health port reports: listening, and whether the inspector is stopping."""
+
+    def __init__(self) -> None:
+        self.listening = False
+        self.stopping = False
+
+    @property
+    def ready(self) -> bool:
+        return self.listening and not self.stopping
+
+
+def health_server(host: str, port: int, health: Health) -> ThreadingHTTPServer:
+    """`/healthz` and `/readyz` on their own port, served from a daemon thread."""
+
+    class Probe(BaseHTTPRequestHandler):
+        server_version = "sft-inspector"
+        sys_version = ""
+
+        def do_GET(self) -> None:
+            if self.path == "/healthz":
+                self._answer(200, "ok")
+            elif self.path == "/readyz":
+                if health.ready:
+                    self._answer(200, "ready")
+                else:
+                    self._answer(503, "stopping" if health.stopping else "starting")
+            else:
+                self._answer(404, "not_found")
+
+        def _answer(self, status: int, state: str) -> None:
+            body = json.dumps({"status": state}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass  # probes every few seconds would drown the per-file lines
+
+    server = ThreadingHTTPServer((host, port), Probe)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, name="health", daemon=True).start()
+    return server
+
+
 def serve(settings: InspectorSettings, inspector: Inspector) -> int:
-    """Accept scan workers until SIGTERM, one at a time."""
+    """Accept scan workers until SIGTERM, one at a time, with the health port beside them."""
     stopping = False
+    health = Health()
 
     def stop(_signum: int, _frame: FrameType | None) -> None:
         nonlocal stopping
         stopping = True
+        health.stopping = True
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, stop)
-    with socket.create_server((settings.bind_host, settings.inspector_port), backlog=8) as server:
-        log.info("inspector listening", extra={"port": settings.inspector_port})
+    probes = health_server(settings.bind_host, settings.internal_port, health)
+    with (
+        probes,
+        socket.create_server((settings.bind_host, settings.inspector_port), backlog=8) as server,
+    ):
+        health.listening = True
+        log.info(
+            "inspector listening",
+            extra={"port": settings.inspector_port, "internal_port": settings.internal_port},
+        )
         try:
             while not stopping:
                 conn, _address = server.accept()
@@ -213,7 +279,9 @@ def serve(settings: InspectorSettings, inspector: Inspector) -> int:
                         },
                     )
         except KeyboardInterrupt:
+            health.stopping = True
             log.info("inspector stopping")
+        probes.shutdown()
     return 0
 
 

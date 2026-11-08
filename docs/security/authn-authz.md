@@ -192,7 +192,10 @@ does.
   as the client `sft-notify-local`, whose service account may only manage the realm's users. The steps are the same: the
   user with our user ID as the username and a temporary password Keycloak makes them replace at the first sign-in,
   the identity, then the invitation through Mailpit. A sign-in reset (below) deletes and creates the Keycloak user the
-  same way. Cognito's adapter replaces it with #193; until then dev invites nobody. Each pool user carries the
+  same way. In AWS Cognito's admin API does it (#193, `sft.runtime.cognito`): `AdminCreateUser` with
+  `MessageAction=SUPPRESS`, so the invitation is always ours, in the tenant's language; our user ID is the username and
+  the address a verified alias, never moved from another user (`ForceAliasCreation` off). Members left `invited` before
+  the pool existed are invited by a one-off pass (`invite-backlog`). Each pool user carries the
   enrolment it was made for (`invitation`, or the reset's ID), so a redelivered message reuses its own user and never
   deletes it; the identity is recorded with the invitation's `email.sent` event. An address in use for another tenant
   is logged in the tenant's log exactly as an invitation (`email.sent`, `member_invitation`) and in the platform log

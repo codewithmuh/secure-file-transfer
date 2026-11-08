@@ -9,8 +9,9 @@
 The API's settings (sft.core.settings.Settings): member sign-in against this region's user pool (ADR-0016,
 authn-authz 2 and 3), the region's files buckets and key (ADR-0012, #114), the audit archive of both regions for
 security-critical records (#177; dev has no Osaka, architecture 3.3, so its records go to Tokyo's alone), and the load
-balancer's subnets as the only trusted proxies (ADR-0002). The client ID and secret and the three keyrings come from
-the External Secrets Secret.
+balancer's subnets as the only trusted proxies (ADR-0002). Its three keyrings name their secrets, which the API reads
+itself at start and every 5 minutes (encryption 6.4, #184); the user pool client's ID and secret come from the
+External Secrets Secret.
 */}}
 {{- $archive := dict "AUDIT_ARCHIVE_TOKYO_BUCKET" (printf "sft-%s-apne1-audit-archive-%s" .Values.environment (toString $c.accountId)) }}
 {{- if ne .Values.environment "dev" }}
@@ -28,8 +29,11 @@ the External Secrets Secret.
   "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
   "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr
   "ENVIRONMENT" .Values.environment
-  "SCAN_SMALL_POOL_MAX_BYTES" (toString .Values.scanSmallPoolMaxBytes)) $archive $w.env }}
-{{- $secretEnv := dict "CSRF_KEYRING" "api-secrets" "EMAIL_HMAC_KEYRING" "api-secrets" "CODE_HMAC_KEYRING" "api-secrets" "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
+  "SCAN_SMALL_POOL_MAX_BYTES" (toString .Values.scanSmallPoolMaxBytes)
+  "CSRF_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "csrf-hmac"))
+  "EMAIL_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "email-hmac"))
+  "CODE_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "code-hmac"))) $archive $w.env }}
+{{- $secretEnv := dict "OIDC_CLIENT_ID" "api-secrets" "OIDC_CLIENT_SECRET" "api-secrets" }}
 # The API service (architecture 2): every HTTP call, behind the load balancer, at least 3 pods across 3 AZs.
 apiVersion: apps/v1
 kind: Deployment
@@ -108,9 +112,9 @@ spec:
     name: api
     port: 8000
 ---
-# The API's secrets (encryption 6.1), from Secrets Manager in this region through the application store, which only
-# this namespace may use (cluster-bootstrap, #104). The keyrings are whole secrets; the user pool client's secret holds
-# client_id and client_secret. One sync wave early, so the Secret exists before the API's pods start.
+# The user pool client of this region (encryption 6.1), from Secrets Manager through the application store, which only
+# this namespace may use (cluster-bootstrap, #104): its secret holds client_id and client_secret. The keyrings aren't
+# here: the API reads them itself (#184). One sync wave early, so the Secret exists before the API's pods start.
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -128,12 +132,6 @@ spec:
     creationPolicy: Owner
     deletionPolicy: Retain
   data:
-    - secretKey: CSRF_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/csrf-hmac" .Values.environment }} }
-    - secretKey: EMAIL_HMAC_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/email-hmac" .Values.environment }} }
-    - secretKey: CODE_HMAC_KEYRING
-      remoteRef: { key: {{ printf "sft/%s/app/code-hmac" .Values.environment }} }
     - secretKey: OIDC_CLIENT_ID
       remoteRef: { key: {{ printf "sft/%s/app/idp-client/%s" .Values.environment .Values.region }}, property: client_id }
     - secretKey: OIDC_CLIENT_SECRET

@@ -203,15 +203,19 @@ resource "helm_release" "argocd_root" {
               # The facts deploy/argocd's schema requires, and the user pool's once it exists (null is left out,
               # so the application chart names what is missing).
               cluster = { for k, v in {
-                registry           = local.registry
-                databaseHost       = var.database_host
-                accountId          = var.account_id
-                operatorRoleName   = var.operator_role_name
-                serviceDomain      = var.service_domain
-                valkeyHost         = var.valkey_host
-                filesKeyArn        = var.files_key_arn
-                userPoolId         = var.cognito_user_pool_id
-                cognitoLoginDomain = var.cognito_login_domain
+                registry            = local.registry
+                databaseHost        = var.database_host
+                accountId           = var.account_id
+                operatorRoleName    = var.operator_role_name
+                serviceDomain       = var.service_domain
+                valkeyHost          = var.valkey_host
+                filesKeyArn         = var.files_key_arn
+                userPoolId          = var.cognito_user_pool_id
+                cognitoLoginDomain  = var.cognito_login_domain
+                sesConfigurationSet = var.ses_configuration_set
+                appClientId         = var.cognito_app_client_id
+                standbyUserPoolId   = try(var.standby_user_pool.user_pool_id, null)
+                standbyAppClientId  = try(var.standby_user_pool.client_id, null)
               } : k => v if v != null }
             }
           }

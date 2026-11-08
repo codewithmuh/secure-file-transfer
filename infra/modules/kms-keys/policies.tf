@@ -1002,9 +1002,14 @@ data "aws_iam_policy_document" "secrets" {
         roles   = [local.role_arns["external-secrets-platform"]]
         secrets = [local.secret_arns.platform]
       }
+      # The API's and the notification worker's keyrings and this Region's client, as the store role's IAM allows
+      # (modules/eks-cluster); code-hmac and link-hmac too since #178 and #179 (#185).
       ApplicationSecretStoreReadsApiSecrets = {
-        roles   = [local.role_arns["external-secrets-app"]]
-        secrets = [local.secret_arns.email_hmac, local.secret_arns.csrf_hmac, local.secret_arns.idp_here]
+        roles = [local.role_arns["external-secrets-app"]]
+        secrets = [
+          local.secret_arns.email_hmac, local.secret_arns.csrf_hmac, local.secret_arns.code_hmac,
+          local.secret_arns.link_hmac, local.secret_arns.idp_here,
+        ]
       }
       BreakGlassReadsTheMasterPassword = {
         roles   = var.break_glass_principal_arn_patterns

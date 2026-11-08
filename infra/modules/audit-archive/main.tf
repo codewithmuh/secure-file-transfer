@@ -26,7 +26,7 @@ locals {
   bucket_id = one(concat(aws_s3_bucket.guarded[*].id, aws_s3_bucket.unguarded[*].id))
 
   role_arns = {
-    for name in ["api", "operator", "archive", "recovery"] :
+    for name in ["api", "operator", "archive", "recovery", "jobs"] :
     name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
   }
 

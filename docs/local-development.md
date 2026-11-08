@@ -133,7 +133,8 @@ role with the same password.
   applied, so archived records can be deleted locally. Immutability (NFR-15) is tested in AWS.
 - **Both archive regions are one S3Mock.** The API writes each security-critical record to `sft-local-audit-archive`
   and to `sft-local-audit-archive-osaka` (#177), so a test can stop one, by pointing its setting at a bucket that
-  doesn't exist, and see the `503`. The cross-region route and its IAM are M4's.
+  doesn't exist, and see the `503`. In AWS, Tokyo reaches Osaka's archive through the network layer's cross-Region S3
+  endpoint, with the IAM and bucket policy of both Regions' archive (#185).
 - **CORS allows every origin.** In AWS, browser part uploads need the bucket's CORS rule, which exposes `ETag`
   (Terraform, M3 and M4). `completeUpload` lists the parts server side, so the browser never needs `ETag`.
 - **Part URLs name `localhost:9090`.** The API calls S3Mock in-network (`s3:9090`), but a browser uploads parts from
@@ -214,8 +215,9 @@ role with the same password.
   don't expire, where Cognito's work for 3 days. An address that already signs in for another tenant gets
   `invitation_address_in_use` instead; the inviting tenant's audit log records an invitation email as for anyone, and
   the conflict is in the platform audit log only. "Resend invitation" on an invited user, and "Reset sign-in" on an
-  active one, send a new invitation; a newer one replaces one still on its way. In dev the worker has no pool adapter until #193 (`USER_POOL_BACKEND=none`), so
-  invited users stay `invited`.
+  active one, send a new invitation; a newer one replaces one still on its way. In AWS the worker does the same
+  through Cognito's admin API (`USER_POOL_BACKEND=cognito`, #193), and members invited before the pool existed are
+  invited by the one-off `invite-backlog` pass.
 - **Sign-out.** The API's logout URL is Keycloak's logout endpoint without an ID token hint, so Keycloak asks to
   confirm the logout. The API session has ended either way, and the next sign-in asks for the password again
   (`prompt=login`).

@@ -17,8 +17,9 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `member.invited`: with a user pool (`sft.service.user_pool`; Keycloak locally, #197), the
   member's pool user with a temporary password, its identity, then `member_invitation` with that
   password; an address that already signs in locally for another tenant gets
-  `invitation_address_in_use` instead and no pool user. Without a pool (dev until Cognito, #193):
-  recorded, and nothing sent.
+  `invitation_address_in_use` instead and no pool user. Cognito's admin API in AWS (#193),
+  Keycloak's locally. Without a pool: recorded, and nothing sent; `invite_backlog` invites those
+  members once the pool exists.
 - `member.sign_in_reset`: the same, after deleting the member's pool user: a new user, a new
   identity, a new invitation (authn and authz 2.5). The API already ended the sessions and deleted
   the old identities.
@@ -593,9 +594,9 @@ class Notifier:
         )
 
     async def _invited(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
-        # M4 creates the user pool's user and its temporary password; until then the user stays
-        # `invited`, and nothing is sent (#178).
-        log.info("invitation left for the user pool (M4)", extra={"outbox_id": str(message.id)})
+        # No pool here: the user stays `invited`, and nothing is sent (#178). `invite_backlog`
+        # invites them once the pool exists (#193).
+        log.info("invitation left for the user pool", extra={"outbox_id": str(message.id)})
         return _Plan()
 
     async def _enrol(self, message: OutboxMessage, pool: UserPool, *, reset: bool) -> Done:
@@ -752,3 +753,30 @@ def _id(message: OutboxMessage, key: str) -> UUID:
     if not isinstance(value, UUID):
         raise ValueError(f"a {message.topic} message names one {key}")
     return value
+
+
+async def invite_backlog(database: Database, *, provider_name: str) -> int:
+    """Invite, through the pool named `provider_name`, every member left `invited` before it
+    existed (#193): a new `member.invited` message each, which the notifier handles as any new
+    invitation. Run once, when the environment's pool first exists (`python -m
+    sft.workers.notify invite-backlog`). A user who already has an identity on the pool was
+    invited through it and is skipped; one whose invitation is still in the queue may get a
+    second email, whose password replaces the first's. How many it invited."""
+    invited, after = 0, None
+    while True:
+        async with database.transaction(Scope.system()) as session:
+            page = await users.invited_everywhere(session, after=after)
+        if not page:
+            return invited
+        for tenant_id, user_id in page:
+            async with database.transaction(Scope.tenant(tenant_id)) as session:
+                connection = await identities.pool_connection(session, provider_name)
+                if connection is None or connection.status != "active":
+                    raise ValueError("the user pool's connection is missing or inactive")
+                if await identities.has_identity(
+                    session, user_id=user_id, connection_id=connection.id
+                ):
+                    continue
+                await users.invite_again(session, user_id)
+                invited += 1
+        after = page[-1][1]

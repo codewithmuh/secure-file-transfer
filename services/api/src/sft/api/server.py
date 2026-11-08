@@ -2,10 +2,12 @@
 
 Two uvicorn servers share one event loop:
 
-- public (`PUBLIC_PORT`, 8000): the API, the only port the load balancer's listener routes to;
+- public (`PUBLIC_PORT`, 8000): the API, the only port the load balancer's listener routes to. In
+  AWS it serves TLS (`PUBLIC_TLS`, `sft.runtime.tls`; encryption and keys 2.2), because the target
+  group speaks HTTPS to it;
 - internal (`INTERNAL_PORT`, 8001): `/healthz`, `/readyz` and `/metrics`, for the kubelet, the
-  load balancer's target health check and Prometheus. A routing mistake on the public side can't
-  expose them, and probes and scrapes don't count as API requests.
+  load balancer's target health check and Prometheus, always plain HTTP. A routing mistake on the
+  public side can't expose them, and probes and scrapes don't count as API requests.
 
 On SIGTERM or SIGINT:
 
@@ -33,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import ssl
 from collections.abc import Callable
 
 import uvicorn
@@ -43,15 +46,20 @@ from sft.api.app import create_app
 from sft.api.observability import HttpMetrics, RequestContextMiddleware
 from sft.core.settings import ServerSettings, Settings
 from sft.runtime.internal import Readiness, Server, create_internal_app, internal_config
+from sft.runtime.tls import server_context
 
 log = logging.getLogger(__name__)
 
 
-def _config(app: ASGIApp, host: str, port: int, *, drain: int) -> uvicorn.Config:
+def _config(
+    app: ASGIApp, host: str, port: int, *, drain: int, tls: ssl.SSLContext | None = None
+) -> uvicorn.Config:
     return uvicorn.Config(
         app,
         host=host,
         port=port,
+        # Our own context (sft.runtime.tls), so the generated key never needs a file.
+        ssl_context_factory=None if tls is None else (lambda _config, _default: tls),
         lifespan="on",
         timeout_graceful_shutdown=drain,
         # Each request runs in a fresh context, so its IDs can't leak into another's logs.
@@ -86,12 +94,18 @@ class ApiServer:
             app = create_app(settings, registry=self.metrics.registry)
         public_app = RequestContextMiddleware(app, self.metrics)
         internal_app = create_internal_app(self.readiness, self.metrics.registry)
+        tls = server_context(
+            settings.public_tls,
+            cert_file=settings.public_tls_cert_file,
+            key_file=settings.public_tls_key_file,
+        )
         self._public = Server(
             _config(
                 public_app,
                 settings.bind_host,
                 settings.public_port,
                 drain=settings.shutdown_drain_seconds,
+                tls=tls,
             )
         )
         self._internal = Server(
@@ -159,6 +173,7 @@ class ApiServer:
                     extra={
                         "version": self.settings.app_version,
                         "public_port": self.settings.public_port,
+                        "public_tls": self.settings.public_tls,
                         "internal_port": self.settings.internal_port,
                     },
                 )

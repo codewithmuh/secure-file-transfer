@@ -5,7 +5,8 @@
 # #102), so each permission needs both sides.
 #
 # clamd, the DLP inspector and the signature mirror get no role and no service account token (architecture 3.1).
-# The database bootstrap, recovery and key rotation jobs (encryption 4.3) get theirs with the issues that build them.
+# The database bootstrap and recovery jobs (encryption 4.3) get theirs with the issues that build them; the key
+# rotation job's is below (#185).
 
 locals {
   # Namespaces and service accounts agreed with the Helm chart (#106) and cluster-bootstrap (#104).
@@ -17,6 +18,7 @@ locals {
     jobs             = { namespace = "sft", service_accounts = ["jobs"], description = "Lifecycle jobs" }
     archive          = { namespace = "sft", service_accounts = ["audit-archive"], description = "Audit archive job" }
     migrate          = { namespace = "sft", service_accounts = ["migrate"], description = "Migrations job" }
+    key_rotation     = { namespace = "sft", service_accounts = ["key-rotation"], description = "Key rotation job" }
     operator         = { namespace = "sft-operator", service_accounts = ["operator-api"], description = "Operator API" }
     karpenter        = { namespace = "karpenter", service_accounts = ["karpenter"], description = "Karpenter controller" }
     lb_controller    = { namespace = "kube-system", service_accounts = ["aws-load-balancer-controller"], description = "AWS Load Balancer Controller" }
@@ -105,13 +107,10 @@ locals {
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
   ]
-  # What the application store gives the sft namespace as environment variables: the API's csrf-hmac, email-hmac and
-  # code-hmac and its Region's client (#106, #179), and the notification worker's link-hmac, code-hmac and email-hmac
-  # (#178). Until the application reads Secrets Manager itself (encryption 6.4).
-  api_store_secrets = concat(
-    local.app_secrets["email-hmac"], local.app_secrets["csrf-hmac"], local.app_secrets["code-hmac"],
-    local.app_secrets["link-hmac"], local.idp_client_secrets,
-  )
+  # What the application store gives the sft namespace as environment variables: only the API's user pool client of
+  # its Region (#106). The API and the notification worker read their keyrings themselves, as their own roles, every 5
+  # minutes (encryption 6.4, #184).
+  api_store_secrets = local.idp_client_secrets
 
   valkey_caches = [for r, p in local.regional_prefixes : "arn:aws:elasticache:${r}:${var.account_id}:serverlesscache:${p}-valkey"]
 
@@ -323,7 +322,7 @@ locals {
       {
         Sid      = "CognitoMemberAdministration"
         Effect   = "Allow"
-        Action   = ["cognito-idp:AdminCreateUser", "cognito-idp:AdminDeleteUser", "cognito-idp:AdminDisableUser", "cognito-idp:AdminGetUser", "cognito-idp:AdminUserGlobalSignOut"]
+        Action   = ["cognito-idp:AdminCreateUser", "cognito-idp:AdminDeleteUser", "cognito-idp:AdminDisableUser", "cognito-idp:AdminGetUser", "cognito-idp:AdminUpdateUserAttributes", "cognito-idp:AdminSetUserPassword", "cognito-idp:AdminUserGlobalSignOut"] # ggignore: IAM action names, not a password
         Resource = [for r in var.cluster_regions : "arn:aws:cognito-idp:${r}:${var.account_id}:userpool/*"]
       },
       {
@@ -415,6 +414,30 @@ locals {
     ]
 
     migrate = [local.database["migrate"]]
+
+    # Writes the four keyrings and both pools' client secrets, first versions included (encryption 6.4, 6.5, #185):
+    # the only writer of their values. Tokyo only; it reaches Osaka's idp-client through the Osaka endpoint.
+    key_rotation = [
+      {
+        Sid      = "WriteAppSecrets"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
+        Resource = concat(local.app_secrets["code-hmac"], local.app_secrets["email-hmac"], local.app_secrets["link-hmac"], local.app_secrets["csrf-hmac"], local.idp_client_secrets)
+      },
+      {
+        Sid       = "SecretsKeyThroughSecretsManager"
+        Effect    = "Allow"
+        Action    = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["secrets"], StringEquals = { "kms:ViaService" = local.via["secretsmanager"] }, StringLike = { "kms:EncryptionContext:SecretARN" = concat(local.app_secrets["code-hmac"], local.app_secrets["email-hmac"], local.app_secrets["link-hmac"], local.app_secrets["csrf-hmac"], local.idp_client_secrets) } }
+      },
+      {
+        Sid      = "RotateAppClientSecrets"
+        Effect   = "Allow"
+        Action   = ["cognito-idp:AddUserPoolClientSecret", "cognito-idp:ListUserPoolClientSecrets", "cognito-idp:DeleteUserPoolClientSecret", "cognito-idp:ListUserPoolClients"]
+        Resource = [for r in var.cluster_regions : "arn:aws:cognito-idp:${r}:${var.account_id}:userpool/*"]
+      },
+    ]
 
     # Writes its security-critical audit records to the archive (encryption 4.3, decision 12); no Cognito, no files.
     operator = [
@@ -567,7 +590,7 @@ resource "aws_eks_pod_identity_association" "this" {
 locals {
   secret_store_secrets = {
     external_secrets_platform = { secrets = local.platform_secrets, description = "platform-secrets store: sft/<env>/platform/* only" }
-    external_secrets_app      = { secrets = local.api_store_secrets, description = "application-secrets store: the application's keyrings and this Region's client only" }
+    external_secrets_app      = { secrets = local.api_store_secrets, description = "application-secrets store: this Region's user pool client only" }
   }
 
   secret_store_policies = {
