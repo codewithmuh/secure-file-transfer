@@ -3,28 +3,17 @@ import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '@/stores/authStore';
 import { useUIStore } from '@/stores/uiStore';
 import { cn } from '@/lib/cn';
-import {
-  LayoutDashboard,
-  Send,
-  Upload,
-  Users,
-  Settings,
-  FileText,
-  Key,
-  X,
-} from 'lucide-react';
+import { LayoutDashboard, Send, Users, Settings, X } from 'lucide-react';
 
+// Upload requests, the audit log and API keys are M5's, and hidden until then (#195's decision).
 const memberLinks = [
   { to: '/', icon: LayoutDashboard, labelKey: 'sender.dashboard' },
   { to: '/transfers', icon: Send, labelKey: 'sender.transfers' },
-  { to: '/upload-requests', icon: Upload, labelKey: 'sender.uploadRequests' },
 ];
 
 const adminLinks = [
   { to: '/admin/users', icon: Users, labelKey: 'admin.users' },
   { to: '/admin/policy', icon: Settings, labelKey: 'admin.tenantPolicy' },
-  { to: '/admin/audit', icon: FileText, labelKey: 'audit.title' },
-  { to: '/admin/api-keys', icon: Key, labelKey: 'admin.apiKeys' },
 ];
 
 export function Sidebar() {

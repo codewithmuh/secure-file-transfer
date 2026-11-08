@@ -49,8 +49,9 @@ ENV = {
     "WEB_ORIGIN": "http://localhost:3000",
     "MAILPIT_URL": "http://127.0.0.1:8025",
     "S3_ENDPOINT_URL": "http://127.0.0.1:9090",
-    # Part URLs name the stand-in by its in-network host; from the host it is the published port.
-    "S3_PART_HOST": "http://s3:9090",
+    # Part URLs name the stand-in as a browser on the host reaches it (S3_PRESIGN_ENDPOINT_URL,
+    # #195); the test sends them to the published port by its IPv4 address, as it does every call.
+    "S3_PART_HOST": "http://localhost:9090",
     "S3_FILES_BUCKET": "sft-local-files",
     "S3_LARGE_FILES_BUCKET": "sft-local-large-files",
     "LOCAL_POSTGRES_URL": "postgresql://sft:sft-local-only@127.0.0.1:5432/sft",

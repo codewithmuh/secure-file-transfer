@@ -22,6 +22,7 @@ from sft.data.outbox import (
     FILE_SCAN,
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
+    MEMBER_SIGN_IN_RESET,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
@@ -66,6 +67,7 @@ def test_the_service_names_each_topic_it_sends() -> None:
     # The notification worker's own messages (#178, #179): per-recipient links, codes, lockouts.
     assert TOPICS == {
         "member.invited": MEMBER_INVITED,
+        "member.sign_in_reset": MEMBER_SIGN_IN_RESET,
         "file.scan": FILE_SCAN,
         "file.scan_large": FILE_SCAN_LARGE,
         "transfer.sent": TRANSFER_SENT,
@@ -76,6 +78,7 @@ def test_the_service_names_each_topic_it_sends() -> None:
         "recipient.locked": RECIPIENT_LOCKED,
     }
     assert MEMBER_INVITED.queue is Queue.NOTIFY
+    assert MEMBER_SIGN_IN_RESET.queue is Queue.NOTIFY  # a sign-in reset's new invitation (#197)
     assert FILE_SCAN.queue is Queue.SCAN_SMALL
     assert FILE_SCAN_LARGE.queue is Queue.SCAN_LARGE
     notices = (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT)

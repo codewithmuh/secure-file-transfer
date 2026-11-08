@@ -1,4 +1,6 @@
 {
   "apiOrigin": "/v1",
-  "uploadOrigin": ""
+  "uploadOrigin": "http://localhost:9090",
+  "signInOrigin": "http://localhost:8180",
+  "ssoSignIn": false
 }

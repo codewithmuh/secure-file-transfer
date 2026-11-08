@@ -14,8 +14,14 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `recipient.locked`: `recipient_locked` to the transfer's owner and every active tenant admin.
 - `transfer.held`: `transfer_held` to the owner, while the transfer is still held: once per hold.
 - `transfer.returned_to_draft`: `transfer_returned_to_draft` to the owner, while it is a draft.
-- `member.invited`: recorded, and nothing sent: the invitation needs the user pool's user and its
-  temporary password, which Cognito brings in M4 (the open point of #178).
+- `member.invited`: with a user pool (`sft.service.user_pool`; Keycloak locally, #197), the
+  member's pool user with a temporary password, its identity, then `member_invitation` with that
+  password; an address that already signs in locally for another tenant gets
+  `invitation_address_in_use` instead and no pool user. Without a pool (dev until Cognito, #193):
+  recorded, and nothing sent.
+- `member.sign_in_reset`: the same, after deleting the member's pool user: a new user, a new
+  identity, a new invitation (authn and authz 2.5). The API already ended the sessions and deleted
+  the old identities.
 
 **Recorded after the send** (ADR-0013, consumer.py). An email can't share a transaction, so a
 message that sends one is handled in three steps: a short transaction checks that the message
@@ -44,6 +50,12 @@ is recorded with a new, delayed `recipient.link_due` message in the same transac
 recipient stays `queued`, the neutral state of every delay. During a counter store outage the cap
 counts in this pod (group G fails open).
 
+**A pool user before its email.** The pool user and its identity are made after the first
+transaction and before the send (`_Plan.before_send`), so the email names a password the pool
+holds. A redelivery makes a new password: it finds the user an earlier delivery created (by its
+username, our user ID) and gives it the new one; the identity is recorded once. The password goes
+only into the pool and the email, never into the outbox, a log or an audit row.
+
 **Notices to members** go out in the tenant's default language (FR-33); users have no language of
 their own yet. A suspended tenant's messages are recorded and send nothing.
 
@@ -69,7 +81,7 @@ from sft.core.errors import RateLimited
 from sft.core.hmac_keyrings import CodeKeyring, LinkKeyring
 from sft.core.ids import uuid7
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import audit, codes, recipients, suppressions, tenants, transfers, users
+from sft.data import audit, codes, identities, recipients, suppressions, tenants, transfers, users
 from sft.data.audit import Actor, Target
 from sft.data.database import Database
 from sft.data.mail import MailError, MailErrorKind, OutgoingEmail
@@ -78,6 +90,7 @@ from sft.data.models import Outcome as AuditOutcome
 from sft.data.outbox import (
     MAX_DELAY,
     MEMBER_INVITED,
+    MEMBER_SIGN_IN_RESET,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
@@ -93,7 +106,9 @@ from sft.service.email import EmailRenderer
 from sft.service.email.catalog import (
     Email,
     EmailType,
+    InvitationAddressInUse,
     Locale,
+    MemberInvitation,
     RecipientLocked,
     TransferHeld,
     TransferLink,
@@ -102,6 +117,13 @@ from sft.service.email.catalog import (
 )
 from sft.service.rate_limits import Charge
 from sft.service.rate_limits.limits import CROSS_TENANT_LINK_EMAILS, KeyType
+from sft.service.user_pool import (
+    INVITATION_ENROLMENT,
+    TEMPORARY_PASSWORD_DAYS,
+    PoolUserExistsError,
+    UserPool,
+    new_temporary_password,
+)
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +200,13 @@ class _Plan:
     rejected: Callable[[AsyncSession], Awaitable[None]] | None = None
     charge: Callable[[], Awaitable[None]] | None = None
     per_email: bool = False
+    before_send: Callable[[], Awaitable[None]] | None = None
+    """Runs after the first transaction and before the first send, outside any transaction: the
+    pool user an invitation's email names (#197). Raising there sends nothing."""
+    audit_type: EmailType | None = None
+    """The email type the tenant's audit log records, when it must not be the email's own: an
+    address-in-use email is logged as an invitation, so the tenant learns nothing of another
+    tenant (authn and authz 2.5, NFR-12)."""
 
 
 def _details(**more: audit.Detail) -> dict[str, audit.Detail]:
@@ -201,6 +230,7 @@ class Notifier:
         limiter: Limiter,
         metrics: NotifyMetrics,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        pool: UserPool | None = None,
     ) -> None:
         self.database = database
         self.renderer = renderer
@@ -211,11 +241,20 @@ class Notifier:
         self.limiter = limiter
         self.metrics = metrics
         self.clock = clock
+        self.pool = pool
 
     async def handle(self, message: OutboxMessage) -> Done:
         """Do the message's work once (module docstring). Raises to have it delivered again."""
         if message.topic == TRANSFER_SENT.name:
             return await self._fan_out(message)
+        if self.pool is not None and message.topic in (
+            MEMBER_INVITED.name,
+            MEMBER_SIGN_IN_RESET.name,
+        ):
+            return await self._enrol(message, self.pool, reset=message.topic != MEMBER_INVITED.name)
+        if message.topic == MEMBER_SIGN_IN_RESET.name:
+            # Without a pool there is no user to create again: recorded, as an invitation is.
+            return await self._with_emails(message, self._invited)
         prepare = {
             RECIPIENT_LINK_DUE.name: self._link,
             RECIPIENT_CODE_REQUESTED.name: self._code,
@@ -245,6 +284,8 @@ class Notifier:
             if not plan.emails:
                 await record_processed(session, consumer=CONSUMER, message_id=message_id)
                 return Done.PROCESSED
+        if plan.before_send is not None:
+            await plan.before_send()
         sent: list[Email] = []
         delivered = rejected = False
         for email, outgoing in plan.emails:
@@ -308,7 +349,7 @@ class Notifier:
             action="email.sent",
             actor=SYSTEM,
             target=plan.target,
-            details=_details(email_type=email.TYPE),
+            details=_details(email_type=plan.audit_type or email.TYPE),
         )
 
     async def _audit_rejected(self, session: AsyncSession, plan: _Plan, email: Email) -> None:
@@ -318,7 +359,7 @@ class Notifier:
             actor=SYSTEM,
             target=plan.target,
             outcome=AuditOutcome.FAILURE,
-            details=_details(email_type=email.TYPE),
+            details=_details(email_type=plan.audit_type or email.TYPE),
         )
 
     async def _fan_out(self, message: OutboxMessage) -> Done:
@@ -556,6 +597,135 @@ class Notifier:
         # `invited`, and nothing is sent (#178).
         log.info("invitation left for the user pool (M4)", extra={"outbox_id": str(message.id)})
         return _Plan()
+
+    async def _enrol(self, message: OutboxMessage, pool: UserPool, *, reset: bool) -> Done:
+        """An invitation or a sign-in reset, with the pool: the pool user before the email names its
+        password, then the email and the identity, recorded together; or, for an address another
+        tenant's member signs in with, the address-in-use email and nothing in the pool.
+
+        - **A reset superseded** by a newer one (its `reset_id` is no longer the user's
+          `sign_in_reset_id`) does nothing: the newer message sends the invitation.
+        - **Idempotent per message.** The pool user carries the enrolment it was made for (the
+          reset's ID, or `invitation`). A redelivery finds it and gives it a new temporary
+          password; a reset deletes only a user made for another enrolment, so a redelivery never
+          deletes the user it made. The identity replaces the user's earlier one on the pool.
+        - **The tenant's log can't tell** an address in use from an invitation (authn and authz
+          2.5, NFR-12): both record `email.sent` as `member_invitation`; the conflict goes to the
+          platform audit log only.
+        """
+        address_in_use = False
+
+        async def prepare(session: AsyncSession, message: OutboxMessage) -> _Plan:
+            user = await users.get_user(session, _id(message, "user_id"))
+            sender = await tenants.sender(session)
+            if user is None or sender is None or not sender.active:
+                return _Plan()
+            if user.status == UserStatus.DEACTIVATED.value:
+                return _Plan()
+            if reset:
+                enrolment = str(_id(message, "reset_id"))
+                if str(user.sign_in_reset_id) != enrolment:
+                    return _Plan()  # a newer reset superseded this one: its message invites
+            else:
+                enrolment = INVITATION_ENROLMENT
+                if user.status != UserStatus.INVITED.value:
+                    return _Plan()  # they joined meanwhile: nothing to send
+            target = Target(users.TARGET, user.id)
+            if address_in_use:
+                in_use: Email = InvitationAddressInUse(tenant_name=sender.name)
+                plan = _Plan(
+                    [self._to_member(in_use, sender, user.email, message.tenant_id)], target
+                )
+                plan.audit_type = EmailType.MEMBER_INVITATION
+                user_id, tenant_id = user.id, message.tenant_id
+
+                async def platform_record() -> None:
+                    await self._record_address_in_use(tenant_id, user_id, reset=reset)
+
+                plan.before_send = platform_record
+                return plan
+            connection = await identities.pool_connection(session, pool.provider_name)
+            if connection is None or connection.status != "active":
+                # Delivered again until the pool's connection is there; then the dead-letter queue.
+                raise ValueError("the user pool's connection is missing or inactive")
+            password = new_temporary_password()
+            email = MemberInvitation(
+                tenant_name=sender.name,
+                temporary_password=password,
+                valid_days=TEMPORARY_PASSWORD_DAYS,
+            )
+            plan = _Plan([self._to_member(email, sender, user.email, message.tenant_id)], target)
+            subject: list[str] = []
+            user_id, user_email, connection_id = user.id, user.email, connection.id
+
+            async def pool_user() -> None:
+                subject.append(
+                    await self._pool_user(
+                        pool,
+                        tenant_id=message.tenant_id,
+                        user_id=user_id,
+                        email=user_email,
+                        password=password,
+                        enrolment=enrolment,
+                        reset=reset,
+                    )
+                )
+
+            async def identity(session: AsyncSession) -> None:
+                # In the transaction that records the email and its `email.sent` event.
+                await identities.record_identity(
+                    session, user_id=user_id, connection_id=connection_id, subject=subject[-1]
+                )
+
+            plan.before_send = pool_user
+            plan.after = identity
+            return plan
+
+        try:
+            return await self._with_emails(message, prepare)
+        except PoolUserExistsError:
+            log.info("invited address signs in for another tenant", extra={"topic": message.topic})
+            address_in_use = True
+            return await self._with_emails(message, prepare)
+
+    async def _pool_user(
+        self,
+        pool: UserPool,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        email: str,
+        password: str,
+        enrolment: str,
+        reset: bool,
+    ) -> str:
+        """The member's pool user with `password`, made for `enrolment`; its subject. A reset
+        deletes a user made for another enrolment (the old sign-in) first; one made for this
+        enrolment is an earlier delivery's, which the pool gives this delivery's password."""
+        username = str(user_id)
+        if reset:
+            existing = await pool.find_user(username=username)
+            if existing is not None and existing.enrolment != enrolment:
+                await pool.delete_user(username=username)
+        return await pool.create_user(
+            username=username,
+            email=email,
+            tenant_id=tenant_id,
+            temporary_password=password,
+            enrolment=enrolment,
+        )
+
+    async def _record_address_in_use(self, tenant_id: UUID, user_id: UUID, *, reset: bool) -> None:
+        """The conflict, in the platform audit log only (authn and authz 2.5): the tenant's log
+        records an invitation email like any other."""
+        async with self.database.transaction(Scope.platform()) as session:
+            await audit.record(
+                session,
+                action="invitation.address_in_use",
+                actor=SYSTEM,
+                target=Target(users.TARGET, user_id),
+                details=_details(tenant_id=tenant_id, sign_in_reset=reset),
+            )
 
     async def _owner_and_admins(self, session: AsyncSession, owner_id: UUID) -> list[str]:
         addresses: dict[str, str] = {}

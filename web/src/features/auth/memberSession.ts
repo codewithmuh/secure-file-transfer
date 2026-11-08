@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { z } from 'zod';
 import { api, type CurrentMember, type Schema } from '@/api';
+import { apiUrl, getConfig } from '@/lib/config';
 import { useAuthStore } from '@/stores/authStore';
 import { safeReturnPath } from './returnPath';
 
@@ -23,8 +24,35 @@ const currentMemberSchema: z.ZodType<MemberFields> = z.object({
   csrf_token: z.string().regex(/^[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{43}$/),
 });
 
-/** Only an https logout URL is followed (authn-authz 3.5); anything else, such as `javascript:`, fails the check. */
-const signOutResultSchema: z.ZodType<Schema<'SignOutResult'>> = z.object({ logout_url: z.url({ protocol: /^https$/ }) });
+const signOutResultSchema: z.ZodType<Schema<'SignOutResult'>> = z.object({ logout_url: z.url({ protocol: /^https?$/ }) });
+
+/**
+ * Whether the browser may follow the API's logout URL: only to the user pool's own sign-in origin, `signInOrigin` in
+ * the config (authn-authz 3.5): managed login over https in AWS, Keycloak on http://localhost:8180 in the local stack.
+ * A `javascript:` URL, another scheme or another origin is refused, so the API's answer can't send the member anywhere
+ * else.
+ */
+export function isLogoutUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+  return parsed.origin === new URL(getConfig().signInOrigin).origin;
+}
+
+/**
+ * Where the sign-in page sends the browser: `startSignIn` on the API's origin, with the checked path to come back to
+ * (`return_to`), so a deep link lands where it pointed after the user pool. `sso` sends only the address's domain.
+ */
+export function signInUrl(method: 'local' | 'sso', returnTo: string | null | undefined, ssoDomain?: string): string {
+  const params = new URLSearchParams({ method });
+  if (method === 'sso' && ssoDomain) params.set('sso_domain', ssoDomain);
+  params.set('return_to', safeReturnPath(returnTo));
+  return apiUrl(`/auth/sign-in?${params.toString()}`);
+}
 
 export const SIGN_IN_FAILED_PATH = '/sign-in?error=sign_in_failed';
 
@@ -84,7 +112,7 @@ export async function signOutMember(): Promise<void> {
   try {
     const response = await api.post('/auth/sign-out', { body: { all_sessions: false }, skipAuthRedirect: true });
     const result = signOutResultSchema.safeParse(response.data);
-    if (result.success) destination = result.data.logout_url;
+    if (result.success && isLogoutUrl(result.data.logout_url)) destination = result.data.logout_url;
   } catch (error) {
     if (!(axios.isAxiosError(error) && error.response?.status === 401)) throw error;
   }

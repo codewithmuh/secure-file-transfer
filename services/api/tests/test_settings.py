@@ -44,6 +44,7 @@ ENV_NAMES = (
     "CLOCK_OFFSET_SECONDS",
     "DOWNLOAD_RECHECK_SECONDS",
     "DOWNLOAD_STREAMS_PER_POD",
+    "S3_PRESIGN_ENDPOINT_URL",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -93,6 +94,7 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     # Unset is the strictest environment, so a pod spec that forgets it gets no test hook (#182).
     assert (s.environment, s.clock_offset_seconds) == ("prod", 0)
     assert (s.download_recheck_seconds, s.download_streams_per_pod) == (30.0, 100)
+    assert s.s3_presign_endpoint_url is None  # in AWS S3 signs its own host (#195)
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -392,3 +394,24 @@ def test_the_secret_check_catches_a_default() -> None:
         optional: SecretStr | None = None
 
     assert secret_fields_with_defaults(Leaky) == ["with_default", "optional"]
+
+
+def test_part_urls_may_name_the_stand_in_as_the_browser_sees_it(
+    clean_env: pytest.MonkeyPatch,
+) -> None:
+    """Locally the API calls S3Mock in-network and signs part URLs for the host's address (#195)."""
+    clean_env.setenv("S3_ENDPOINT_URL", "http://s3:9090")
+    clean_env.setenv("S3_PRESIGN_ENDPOINT_URL", "http://localhost:9090")
+    s = Settings()
+    assert (s.s3_endpoint_url, s.s3_presign_endpoint_url) == (
+        "http://s3:9090",
+        "http://localhost:9090",
+    )
+
+
+def test_a_presign_endpoint_needs_the_s3_stand_in(clean_env: pytest.MonkeyPatch) -> None:
+    """S3_PRESIGN_ENDPOINT_URL without S3_ENDPOINT_URL would sign real S3's part URLs for another
+    host: refused at startup (#195)."""
+    clean_env.setenv("S3_PRESIGN_ENDPOINT_URL", "http://localhost:9090")
+    with pytest.raises(ValidationError, match="for the local S3 stand-in only"):
+        Settings()

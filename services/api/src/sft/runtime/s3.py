@@ -19,6 +19,12 @@ It lives in `sft.runtime` because both entry points need it: the API for uploads
 (`sft.service.objects.ObjectStore`), and the scan worker, which reads the recorded version of a
 file once and tags it with its result (`ScannedObjects`, ADR-0019).
 
+**Part URLs a browser can reach** (#195). Locally the API calls S3Mock in-network (`s3:9090`), but
+the browser uploads parts from the host, where the stand-in is `localhost:9090`. With
+`presign_endpoint_url`, part URLs are signed by a second client for that address, and every other
+call keeps `endpoint_url`. S3Mock checks no signature, so the different host costs nothing; in AWS
+neither is set, and S3 signs its own host.
+
 `S3Cleaner` is the lifecycle jobs' (`sft.service.objects.StorageCleaner`, #181): it lists and
 deletes object versions and aborts unfinished uploads, in Tokyo's buckets and in the replicas'
 region where there is one (architecture 4.5). The jobs' role is the only one that may delete.
@@ -71,10 +77,12 @@ class S3Objects:
         *,
         kms_key_id: str | None,
         threads: int,
+        presign_client: S3Client | None = None,
     ) -> None:
         if set(buckets) != set(StorageClass):
             raise ValueError("name a bucket for every storage class")
         self._client = client
+        self._presign_client = presign_client or client
         self._buckets = dict(buckets)
         self._kms_key_id = kms_key_id
         self._executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="s3")
@@ -88,10 +96,15 @@ class S3Objects:
         large_files_bucket: str,
         kms_key_id: str | None = None,
         endpoint_url: str | None = None,
+        presign_endpoint_url: str | None = None,
         threads: int = 8,
     ) -> S3Objects:
         """A store for one region's files buckets. Credentials come from the pod's IAM role.
-        `kms_key_id` is the files key, needed only to start uploads (the API)."""
+        `kms_key_id` is the files key, needed only to start uploads (the API).
+        `presign_endpoint_url`, local only, is the stand-in's address as the browser sees it: only
+        part URLs are signed for it."""
+        if presign_endpoint_url is not None and endpoint_url is None:
+            raise ValueError("a presign endpoint is for the local S3 stand-in only")
         config = Config(
             region_name=region,
             signature_version="s3v4",
@@ -104,9 +117,17 @@ class S3Objects:
             # S3Mock serves buckets by path; AWS by virtual host, the SDK's default there.
             s3={"addressing_style": "path" if endpoint_url else "virtual"},
         )
-        client = boto3.session.Session().client("s3", endpoint_url=endpoint_url, config=config)
+        session = boto3.session.Session()
+        client = session.client("s3", endpoint_url=endpoint_url, config=config)
+        presign_client = (
+            None
+            if presign_endpoint_url is None
+            else session.client("s3", endpoint_url=presign_endpoint_url, config=config)
+        )
         buckets = {StorageClass.STANDARD: files_bucket, StorageClass.LARGE: large_files_bucket}
-        return cls(client, buckets, kms_key_id=kms_key_id, threads=threads)
+        return cls(
+            client, buckets, kms_key_id=kms_key_id, threads=threads, presign_client=presign_client
+        )
 
     async def _call[T](self, fn: Callable[..., T], /, **kwargs: object) -> T:
         loop = asyncio.get_running_loop()
@@ -145,7 +166,7 @@ class S3Objects:
         if not 1 <= expires_in <= PART_URL_SECONDS:
             raise ValueError("a part URL lives at most 15 minutes")
         return await self._call(
-            self._client.generate_presigned_url,
+            self._presign_client.generate_presigned_url,
             ClientMethod="upload_part",
             Params={
                 "Bucket": self._bucket(storage_class),
@@ -273,6 +294,8 @@ class S3Objects:
         """Wait for calls in flight, then close the client. Call it once, at shutdown."""
         await asyncio.to_thread(self._executor.shutdown, wait=True)
         self._client.close()
+        if self._presign_client is not self._client:
+            self._presign_client.close()
 
 
 _PREFIX: Final = "tenants/"

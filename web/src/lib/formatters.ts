@@ -7,9 +7,10 @@ export function formatFileSize(bytes: number): string {
   return `${size.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-export function formatDate(dateString: string): string {
+/** A date and time in the page's language when given (`i18n.language`), else the browser's. */
+export function formatDate(dateString: string, locale?: string): string {
   const date = new Date(dateString);
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',

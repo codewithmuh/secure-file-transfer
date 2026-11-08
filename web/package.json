@@ -10,8 +10,9 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run lint && npm test",
-    "gen:api": "openapi-typescript ../docs/api/openapi.yaml --default-non-nullable=false --output src/api/schema.ts"
+    "check": "npm run typecheck && npm run lint && npm run check:mocks && npm test",
+    "gen:api": "openapi-typescript ../docs/api/openapi.yaml --default-non-nullable=false --output src/api/schema.ts",
+    "check:mocks": "node scripts/check-routed-mocks.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",

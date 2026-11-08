@@ -29,7 +29,7 @@ export default defineConfig(
   },
   // The axe checks and their config run in Node (Playwright), not in the browser.
   {
-    files: ['e2e/**/*.ts', 'playwright.config.ts'],
+    files: ['e2e/**/*.ts', 'playwright.config.ts', 'playwright.e2e.config.ts'],
     languageOptions: { globals: globals.node },
   },
 );

@@ -188,6 +188,19 @@ does.
   address can hold one local sign-in on this service, so they can ask for an invitation to another address or for
   SSO. The inviting tenant sees the user as `invited`, like anyone who hasn't accepted yet, and its audit log records
   that an invitation email was sent. The conflict is recorded only in the platform audit log.
+- **Locally** (#197) Keycloak plays the pool, and the notification worker its admin side through Keycloak's admin API,
+  as the client `sft-notify-local`, whose service account may only manage the realm's users. The steps are the same: the
+  user with our user ID as the username and a temporary password Keycloak makes them replace at the first sign-in,
+  the identity, then the invitation through Mailpit. A sign-in reset (below) deletes and creates the Keycloak user the
+  same way. Cognito's adapter replaces it with #193; until then dev invites nobody. Each pool user carries the
+  enrolment it was made for (`invitation`, or the reset's ID), so a redelivered message reuses its own user and never
+  deletes it; the identity is recorded with the invitation's `email.sent` event. An address in use for another tenant
+  is logged in the tenant's log exactly as an invitation (`email.sent`, `member_invitation`) and in the platform log
+  as `invitation.address_in_use`.
+- **Resets supersede each other** (#197). Every `resetUserSignIn` ends the sessions, deletes the pool identities and
+  gives the user a new `sign_in_reset_id`, carried by its outbox message; the worker acts only on the message of the
+  user's current reset, so a reset while one is still being processed replaces its invitation, and a dead-lettered
+  reset never blocks the next.
 - **SSO member.** No Cognito user is created. The email holds a one-time invitation link,
   `https://app.<domain>/invite#<token>`: 256 random bits, stored as a SHA-256 hash, valid for 7 days, carried in the
   fragment like a link token (4.1). The web app posts the token to `startInvitationSignIn` (`public`), which
@@ -766,7 +779,7 @@ The login roles use IAM database authentication, one per workload (#22).
 | `sft_api` | API service | Tenant, resource or platform, plus the credential lookup functions | Tenant policy on every table; tenant and platform audit inserts; reads its tenant's audit events |
 | `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts; in platform scope, the `tenants` rows alone (`operator_directory`, the tenant directory of `listTenants` and `getTenant`); in a tenant's scope, revoking its `member_sessions` when it suspends the tenant (two columns read, the two of a revocation written). No column grant on file names or messages. |
 | `sft_scan` | Scan worker | Tenant, from the message | Tenant policy. For DLP it reads the tenant's DLP policy, rules, detectors and wrapped DLP data keys, recipient domains and known domains, and inserts findings and decisions; no column grant to select finding details or any field ciphertext (data model 4.2). |
-| `sft_notify` | Notification worker | Tenant, from the message | Tenant policy |
+| `sft_notify` | Notification worker | Tenant, from the message; platform for one event | Tenant policy. It records the `user_identities` row of a pool user it created, replacing the user's earlier one on that pool (2.5), and reads the pool rows of `idp_connections` (no tenant, `kind = 'local'`) to name the connection (`pool_read`, revision 0016). It inserts one platform audit event: an invited address that signs in for another tenant (2.5) |
 | `sft_relay` | Outbox relay | System | `outbox` only: reads and marks rows of every tenant, in system scope |
 | `sft_jobs` | Lifecycle jobs | System to find work, tenant to do it | `jobs_find` reads across tenants in system scope, with column grants limited to what the jobs need; every write under the tenant policy |
 | `sft_archive` | Audit archive job | System | Reads `audit_events` in system scope; no other table |

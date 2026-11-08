@@ -46,7 +46,7 @@ updates:
       web: { patterns: ["*"], update-types: [minor, patch] }
 
   - package-ecosystem: docker
-    directories: [/services/api]
+    directories: [/services/api, /web] # the API image; the web app's local image (#195): Node in step with web/.nvmrc
     schedule: { interval: weekly }
     cooldown: { default-days: 7 } # wait a week before proposing a brand-new release (threat model T-68)
     groups:

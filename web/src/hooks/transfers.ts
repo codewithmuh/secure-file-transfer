@@ -1,0 +1,131 @@
+/**
+ * The TanStack Query hooks over the typed `api` client (#196): the member's transfers, their files and the tenant's
+ * policy. Pages read through these, never through `api` directly, so caching, polling and invalidation live in one
+ * place. Mutations invalidate what they change.
+ */
+import { useInfiniteQuery, useQuery, type QueryClient } from '@tanstack/react-query';
+import { api, type Schema, type Transfer, type TransferState } from '@/api';
+import { POLL_INTERVAL_MS, shouldPoll, useActiveUploads } from '@/features/sender/polling';
+import type { ApiFile, PartUrl, UploadApi, UploadedParts } from '@/features/sender/upload';
+
+export const queryKeys = {
+  transfers: ['transfers'] as const,
+  transferList: (state: TransferState | null) => ['transfers', 'list', state ?? 'all'] as const,
+  recentTransfers: ['transfers', 'recent'] as const,
+  transfer: (id: string) => ['transfers', 'detail', id] as const,
+  inspection: (fileId: string) => ['files', fileId, 'inspection'] as const,
+  tenantPolicy: ['tenant-policy'] as const,
+  users: ['users'] as const,
+  userList: (role: string | null, status: string | null) => ['users', 'list', role ?? 'all', status ?? 'all'] as const,
+};
+
+/** A page of the member's own transfers, newest first, with "load more" through the cursor (`listTransfers`). */
+export function useTransferList(state: TransferState | null, limit = 25) {
+  return useInfiniteQuery({
+    queryKey: queryKeys.transferList(state),
+    initialPageParam: null as string | null,
+    queryFn: async ({ pageParam, signal }) =>
+      (
+        await api.get('/transfers', {
+          query: { limit, ...(state ? { state: [state] } : {}), ...(pageParam ? { cursor: pageParam } : {}) },
+          signal,
+        })
+      ).data,
+    getNextPageParam: (page) => page.next_cursor ?? null,
+  });
+}
+
+/** The five newest, for the dashboard. */
+export function useRecentTransfers() {
+  return useQuery({
+    queryKey: queryKeys.recentTransfers,
+    queryFn: async ({ signal }) => (await api.get('/transfers', { query: { limit: 5 }, signal })).data.items,
+  });
+}
+
+/** One transfer, polled every few seconds while it or a file is still moving (`shouldPoll`): on the service, or in
+ * this tab's uploads. */
+export function useTransfer(id: string) {
+  return useQuery({
+    queryKey: queryKeys.transfer(id),
+    queryFn: async ({ signal }) => (await api.get('/transfers/{transfer_id}', { path: { transfer_id: id }, signal })).data,
+    refetchInterval: (query) =>
+      shouldPoll(query.state.data, useActiveUploads.getState().ids) ? POLL_INTERVAL_MS : false,
+    staleTime: 0,
+  });
+}
+
+/**
+ * A file's findings, fetched only when the member asks: every response with details is audited, so this is never
+ * part of the poll, and is kept once fetched.
+ */
+export function useFileInspection(fileId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.inspection(fileId),
+    queryFn: async ({ signal }) =>
+      (await api.get('/files/{file_id}/inspection', { path: { file_id: fileId }, signal })).data,
+    enabled,
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+}
+
+/** The tenant's policy: every member reads it, for the expiry cap and the default locale. */
+export function useTenantPolicy() {
+  return useQuery({
+    queryKey: queryKeys.tenantPolicy,
+    queryFn: async ({ signal }) => (await api.get('/tenant/policy', { signal })).data,
+    staleTime: 60_000,
+  });
+}
+
+export type TransferCreate = Schema<'TransferCreate'>;
+export type FileCreate = Schema<'FileCreate'>;
+
+/** `createTransfer`, replayed by its `Idempotency-Key` on a retry. */
+export async function createTransfer(body: TransferCreate, idempotencyKey: string): Promise<Transfer> {
+  return (await api.post('/transfers', { body, headers: { 'Idempotency-Key': idempotencyKey } })).data;
+}
+
+/** `addTransferFile`: the file and its upload plan. */
+export async function addTransferFile(transferId: string, body: FileCreate, idempotencyKey: string): Promise<ApiFile> {
+  return (
+    await api.post('/transfers/{transfer_id}/files', {
+      path: { transfer_id: transferId },
+      body,
+      headers: { 'Idempotency-Key': idempotencyKey },
+    })
+  ).data;
+}
+
+export async function sendTransfer(transferId: string): Promise<Transfer> {
+  return (await api.post('/transfers/{transfer_id}/send', { path: { transfer_id: transferId } })).data;
+}
+
+export async function cancelTransfer(transferId: string): Promise<Transfer> {
+  return (await api.post('/transfers/{transfer_id}/cancel', { path: { transfer_id: transferId } })).data;
+}
+
+/** The upload engine's calls for one file (`FileUpload`). */
+export const uploadApi: UploadApi = {
+  async listUploadedParts(fileId): Promise<UploadedParts> {
+    return (await api.get('/files/{file_id}/parts', { path: { file_id: fileId } })).data;
+  },
+  async requestPartUrls(fileId, partNumbers): Promise<PartUrl[]> {
+    return (
+      await api.post('/files/{file_id}/parts', { path: { file_id: fileId }, body: { part_numbers: partNumbers } })
+    ).data.parts;
+  },
+  async completeUpload(fileId): Promise<ApiFile> {
+    return (await api.post('/files/{file_id}/complete', { path: { file_id: fileId } })).data;
+  },
+  async deleteFile(fileId): Promise<void> {
+    await api.delete('/files/{file_id}', { path: { file_id: fileId } });
+  },
+};
+
+/** After a change to transfers: every list and the detail refetch. */
+export function invalidateTransfers(client: QueryClient): Promise<void> {
+  return client.invalidateQueries({ queryKey: queryKeys.transfers });
+}
