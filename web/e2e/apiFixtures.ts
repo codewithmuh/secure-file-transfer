@@ -190,3 +190,139 @@ export const userPage: Schema<'UserPage'> = {
   ],
   next_cursor: null,
 };
+
+/** An expired transfer: read-only on its detail page (#199). */
+export const expiredId = '0190c0de-0000-7000-8000-000000000014';
+export const expired: Transfer = {
+  ...transfer,
+  id: expiredId,
+  state: 'expired',
+  hold_reason: null,
+  sent_at: '2026-11-07T05:10:00Z',
+  files: transfer.files.map((f) => ({ ...f, state: 'deleted', shareable: false })),
+};
+
+const recipientStatus = (
+  id: string,
+  email: string,
+  extra: Partial<Schema<'RecipientStatus'>> = {},
+): Schema<'RecipientStatus'> => ({
+  id,
+  email,
+  locale: 'en',
+  access_state: 'invited',
+  delivery_state: 'sent',
+  notified_at: '2026-11-07T05:11:00Z',
+  first_verified_at: null,
+  last_verified_at: null,
+  failed_attempts: 0,
+  locked_at: null,
+  downloads: [],
+  ...extra,
+});
+
+/** Every delivery and access state the table shows (#199): verified with downloads, locked, bounced, suppressed. */
+export const recipientStatuses: Schema<'RecipientStatusList'> = {
+  items: [
+    recipientStatus('0190c0de-0000-7000-8000-000000000031', 'alice@example.com', {
+      access_state: 'verified',
+      first_verified_at: '2026-11-07T06:00:00Z',
+      last_verified_at: '2026-11-07T08:00:00Z',
+      downloads: [
+        {
+          file_id: '0190c0de-0000-7000-8000-000000000020',
+          count: 1,
+          first_downloaded_at: '2026-11-07T06:01:00Z',
+          last_downloaded_at: '2026-11-07T06:01:00Z',
+        },
+      ],
+    }),
+    recipientStatus('0190c0de-0000-7000-8000-000000000032', 'tanaka@example.co.jp', {
+      locale: 'ja',
+      access_state: 'locked',
+      failed_attempts: 20,
+      locked_at: '2026-11-07T07:00:00Z',
+    }),
+    recipientStatus('0190c0de-0000-7000-8000-000000000033', 'gone@example.org', {
+      delivery_state: 'bounced',
+      failed_attempts: 2,
+    }),
+    recipientStatus('0190c0de-0000-7000-8000-000000000034', 'blocked@example.org', {
+      delivery_state: 'suppressed',
+      notified_at: null,
+    }),
+    recipientStatus('0190c0de-0000-7000-8000-000000000035', 'later@example.org', {
+      delivery_state: 'queued',
+      notified_at: null,
+    }),
+  ],
+};
+
+// ---- the recipient's link page (#198) ----
+
+export const linkSessionId = '0190c0de-0000-7000-8000-0000000000e1';
+
+/** A problem document, as the API answers an error. */
+export function problemOf(status: number, code: Schema<'ProblemCode'>, extra: Partial<Schema<'Problem'>> = {}): Schema<'Problem'> {
+  return { type: `https://secure-file-transfer.example/problems/${code}`, title: code, status, code, ...extra };
+}
+
+export const resolution = (locale: Schema<'Locale'>, access: Schema<'LinkResolution'>['access_state'] = 'verification_required') =>
+  ({
+    kind: 'transfer',
+    access_state: access,
+    locale,
+    ...(access === 'verified' ? { link_session_id: linkSessionId } : {}),
+  }) satisfies Schema<'LinkResolution'>;
+
+export const codeRequested: Schema<'VerificationCodeRequested'> = { code_valid_for_seconds: 600, max_attempts: 5 };
+
+export const linkSession = (locale: Schema<'Locale'>): Schema<'LinkSession'> => ({
+  id: linkSessionId,
+  csrf_token: `k1.${'B'.repeat(43)}`,
+  kind: 'transfer',
+  email: 'tanaka@example.co.jp',
+  locale,
+  expires_at: '2026-11-09T05:00:00Z',
+  transfer: {
+    tenant_name: 'Example Corp',
+    sender_email: 'admin@example.com',
+    message: 'Q4 reports, as discussed.',
+    expires_at: '2026-11-14T05:10:00Z',
+    download_limit: 2,
+  },
+});
+
+/** A clean file, one whose downloads are used up, and an unscannable one allowed by policy, with its warning. */
+export const sessionFiles: Schema<'SessionFileList'> = {
+  items: [
+    {
+      id: '0190c0de-0000-7000-8000-000000000020',
+      display_name: 'report.pdf',
+      content_type: 'application/pdf',
+      size: 10_485_760,
+      state: 'clean',
+      download_limit: 2,
+      downloads_used: 1,
+    },
+    {
+      id: '0190c0de-0000-7000-8000-000000000025',
+      display_name: 'budget.xlsx',
+      content_type: 'application/vnd.ms-excel',
+      size: 2_048_000,
+      state: 'clean',
+      download_limit: 2,
+      downloads_used: 2,
+    },
+    {
+      id: '0190c0de-0000-7000-8000-000000000022',
+      display_name: 'archive.zip',
+      content_type: 'application/zip',
+      size: 4_096_000,
+      state: 'unscannable',
+      warning: 'unscannable',
+      download_limit: 2,
+      downloads_used: 0,
+    },
+  ],
+};

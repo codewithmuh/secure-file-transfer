@@ -129,8 +129,8 @@ check then fails, the web app relied on something the contract no longer says.
 | `/` | Dashboard: the five newest transfers | Member |
 | `/transfers` | Transfer list, with a state filter and "load more" | Member |
 | `/transfers/new` | Create, upload and send a transfer | Member |
-| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand; a draft's upload resumes here | Member |
-| `/t` | Recipient verification + download (live with #198) | Public (link) |
+| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand, each recipient's delivery, verification and downloads, unlock, revoke; a draft's upload resumes here | Member |
+| `/t` | The recipient's link page (#198): the link's state, the code, then each file's download, in the link's language | Public (link) |
 | `/admin/users` | Members and admins: invite, role, DLP approver, sign out everywhere, reset sign-in, deactivate | Admin |
 | `/admin/policy` | Tenant policy | Admin |
 | `/upload-requests`, `/u`, `/admin/audit`, `/admin/api-keys`, `/admin/dlp` | Not available yet (M5): no navigation entry; the URL shows `NotAvailableYet` | — |
@@ -138,13 +138,47 @@ check then fails, the web app relied on something the contract no longer says.
 M5's pages stay in the repository unrouted (`UploadRequestListPage`, `CreateUploadRequestPage`, `UploaderPage`,
 `AuditLogPage`, `ApiKeysPage`): nothing imports them, so the bundle leaves them and their mock data out, and M5 routes
 each again as its operations land. `npm run check:mocks` (part of `npm run check`) walks the imports from
-`src/main.tsx` and fails on mock data or a simulated delay in any page the app can reach; the recipient pages are listed
-there as pending #198.
+`src/main.tsx` and fails on mock data or a simulated delay in any page the app can reach; none is pending since #198.
+
+**The recipient's link page** (`/t`, #198, `features/recipient/`). `captureLinkToken` reads the token from the
+fragment and removes it in `main.tsx`, before the config loads or React renders. `LinkGate` resolves the link, switches
+the page to the link's `locale` (FR-33), gives `404 link_not_found`, `410 link_revoked`, `410 link_expired` and a
+locked link a page each, resumes a session this browser already holds (`resolveLink` says `verified`) without a new
+code, and otherwise asks for one (`VerificationPage`). `RecipientDownloadPage` shows the sender, message and expiry
+only then (FR-14) and each file on its own (FR-6, FR-18). "Download" asks for a grant, checks its `url` from the app
+(`checkContent`: a `GET` cancelled once the headers arrive, since `HEAD` isn't offered), so a `410`, `403` or `401` is
+explained on the page instead of the browser showing the API's JSON, then navigates a hidden link to it, resolved
+against the API's origin (`contentUrl`), so the browser's download manager saves and resumes it. The grant ID is kept
+per session and file in `sessionStorage` only until the download is handed to the browser: a click after an
+interrupted start (a `503`, or the page closed in between) resumes it uncounted, and a click after a hand-off counts a
+new download, since the page can't see whether the browser finished. `LinkGate` is shared with `/u` for M5.
+
+## Browser journey
+
+`web/e2e/journey.e2e.ts` (#200) is M3's exit test: #182's M2 journey, steps 1 to 9, through the browser, in English
+and in Japanese (`playwright.e2e.config.ts`'s `en` and `ja` projects, browser locales `en-US` and `ja-JP`). It runs
+with `make web-e2e`, after `make up` and `make seed`, with the other browser flows (`*.e2e.ts`, English only), and in
+CI's Local stack job on every pull request. It uses only the browser, Mailpit's API, the seed, and the lifecycle jobs
+with the clock's test hook: the container has no Docker, so `local/e2e-jobs.sh` runs the jobs on the host for it. Each
+step runs the same axe check as `make web-a11y` (`e2e/support/axe.ts`) on the live page. A failure names its step and
+keeps the trace and screenshots of every browser in `web/test-results/` (CI keeps them as the `web-e2e-results`
+artifact).
+
+**Browsers (NFR-22).** Chromium, in both languages, on every pull request. Firefox isn't run yet: the journey's time in
+CI is to be measured first, and Firefox joins the PR run if it fits the job's budget, else a nightly run. WebKit
+follows #195's open point: Safari doesn't keep `Secure` cookies on `http://localhost`, so it is checked in dev behind
+real TLS (M4).
+
+#199's lockout test (`e2e/recipients.e2e.ts`) drives the 20 failed attempts through `createLinkSession`, which count
+against the per-IP quota of 30 failed codes an hour: one `make web-e2e` run an hour fits; `make down` and `make up`
+clear the counters (Valkey keeps no volume).
 
 ## Security notes
 
 - Link tokens travel in the URL fragment (`/t#token`), removed with `history.replaceState` before
-  anything else runs (architecture 4.2).
+  anything else runs (architecture 4.2), and kept in memory only; they go only in request bodies. The link session's
+  ID and CSRF token, checked with Zod, are kept in memory too. A download's grant ID is kept in `sessionStorage`: it
+  is not a credential, since the content needs the `__Host-sft_link` cookie of the session that made it.
 - CSRF tokens from `GET /me` are sent in `X-CSRF-Token` on every unsafe request.
 - Part uploads go straight to object storage through their own axios instance (`features/sender/upload.ts`): no base
   URL, no cookies, no default `Content-Type` and none of the app's interceptors, so no CSRF token or link session ever
@@ -165,10 +199,12 @@ code the pages handle its own English and Japanese text and any other code the t
 `Retry-After` on `429` and `503` as a wait. Calls that create something send an `Idempotency-Key` kept for the
 attempt (`src/lib/idempotency.ts`), so "Try again" after a lost answer replays it. The transfer detail page polls
 while the transfer is `submitted` or a file is uploading, completing or scanning (`features/sender/polling.ts`), and
-findings are fetched only on demand, since each response with details is audited.
+findings are fetched only on demand, since each response with details is audited. Each recipient's delivery is polled
+every 10 seconds while the transfer is `sent`. A revocation answered `503` stands but isn't confirmed: the page says
+so, retries in the background and offers "Confirm now" (`features/sender/revocation.ts`).
 
 ## Status
 
 Members create, upload and send transfers and watch their scan and DLP status (#196); admins manage members and the
-tenant policy (#197). The recipient pages become live with #198, the delivery table, unlock and revoke with #199, and
-the M3 browser journey in English and Japanese with #200.
+tenant policy (#197). Recipients verify and download in their link's language (#198); members see each recipient's
+delivery, unlock recipients and revoke transfers (#199); the M3 browser journey runs in English and Japanese (#200).

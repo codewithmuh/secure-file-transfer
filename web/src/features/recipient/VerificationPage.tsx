@@ -1,169 +1,185 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Shield, Mail, ArrowRight, AlertCircle } from 'lucide-react';
-import { Button, Input, Card } from '@/components/ui';
-import { useAuthStore, type LinkMode } from '@/stores/authStore';
+import { Mail } from 'lucide-react';
+import { Alert, Button, Card } from '@/components/ui';
+import { failureOf } from '@/lib/problems';
+import type { LinkMode } from '@/stores/authStore';
+import {
+  goneOf,
+  linkProblemText,
+  RESEND_WAIT_SECONDS,
+  requestCode,
+  verifyCode,
+  type LinkGone,
+  type VerificationCodeRequested,
+  type VerifiedSession,
+} from './linkApi';
+import { StepHeading } from './StepHeading';
+
+const CODE = /^[0-9]{6,10}$/;
 
 interface VerificationPageProps {
   mode: LinkMode;
+  /** The link token, from memory only; it goes only in request bodies. */
+  token: string;
+  /** The API ended the session: say so above the code step. */
+  lapsed: boolean;
+  onVerified: (session: VerifiedSession) => void;
+  onGone: (gone: LinkGone) => void;
 }
 
-/** Verifies the recipient or uploader. The parent page shows its content once the store holds a link session. */
-export function VerificationPage({ mode }: VerificationPageProps) {
+/**
+ * The code step (#198): `requestVerificationCode`, then `createLinkSession` with the code. The page says where the
+ * code went only as the API does ("the address this link was sent to"); the resend wait and a `429 Retry-After` show
+ * as a countdown. Each error is explained by the code input, tied to it with `aria-describedby`.
+ */
+export function VerificationPage({ mode, token, lapsed, onVerified, onGone }: VerificationPageProps) {
   const { t } = useTranslation();
-  const setLinkToken = useAuthStore((s) => s.setLinkToken);
-  const setLinkSession = useAuthStore((s) => s.setLinkSession);
-  const sessionLapsed = useAuthStore((s) => s.linkSessionLapsed);
+  const inputId = useId();
+  const hintId = `${inputId}-hint`;
+  const errorId = `${inputId}-error`;
+  const input = useRef<HTMLInputElement>(null);
 
-  const [step, setStep] = useState<'resolve' | 'code'>('resolve');
-  const [token, setToken] = useState<string | null>(null);
-  const [email, setEmail] = useState<string | null>(null);
+  const [sent, setSent] = useState<VerificationCodeRequested | null>(null);
+  const [waitUntil, setWaitUntil] = useState<number | null>(null);
+  const secondsLeft = useCountdown(waitUntil);
+  const [requesting, setRequesting] = useState(false);
+  const [requestError, setRequestError] = useState<string | null>(null);
   const [code, setCode] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [linkStatus, setLinkStatus] = useState<'valid' | 'revoked' | 'expired' | null>(null);
+  const [codeError, setCodeError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
 
-  useEffect(() => {
-    const fragment = window.location.hash.slice(1);
-    let linkToken: string | null = null;
-    if (fragment) {
-      window.history.replaceState(null, '', window.location.pathname);
-      setLinkToken(mode, fragment);
-      linkToken = fragment;
-    } else {
-      // Back here after the link session lapsed: the fragment is gone, so use the token kept in memory.
-      const kept = useAuthStore.getState().linkToken;
-      if (kept?.mode === mode) linkToken = kept.value;
-    }
-    if (linkToken) {
-      setToken(linkToken);
-      resolveLink(linkToken);
-    }
-  }, []);
-
-  const resolveLink = async (_linkToken: string) => {
-    setLoading(true);
+  const ask = async () => {
+    setRequesting(true);
+    setRequestError(null);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      setLinkStatus('valid');
-      setEmail('user@example.com');
-      setStep('code');
-    } catch {
-      setLinkStatus('expired');
-      setError(t('recipient.linkExpired'));
+      setSent(await requestCode(token));
+      setWaitUntil(Date.now() + RESEND_WAIT_SECONDS * 1000);
+    } catch (error) {
+      const gone = goneOf(error);
+      if (gone) return onGone(gone);
+      const { retryAfter } = failureOf(error);
+      if (retryAfter !== null) setWaitUntil(Date.now() + retryAfter * 1000);
+      setRequestError(linkProblemText(error, t));
     } finally {
-      setLoading(false);
+      setRequesting(false);
     }
   };
 
-  const requestCode = async () => {
-    if (!token) return;
-    setLoading(true);
-    setError(null);
+  const verify = async (event: FormEvent) => {
+    event.preventDefault();
+    const value = code.replace(/\s+/g, '');
+    if (!CODE.test(value)) {
+      setCodeError(t('recipient.codeRequired'));
+      input.current?.focus();
+      return;
+    }
+    setVerifying(true);
+    setCodeError(null);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      setStep('code');
-    } catch {
-      setError(t('auth.signInError'));
+      onVerified(await verifyCode(token, value));
+    } catch (error) {
+      const gone = goneOf(error);
+      if (gone) return onGone(gone);
+      setCodeError(linkProblemText(error, t));
+      input.current?.focus();
     } finally {
-      setLoading(false);
+      setVerifying(false);
     }
   };
 
-  const verifyCode = async () => {
-    if (!token || !code) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      const mockSessionId = crypto.randomUUID();
-      const mockCsrfToken = crypto.randomUUID();
-      setLinkSession(mockSessionId, mockCsrfToken);
-    } catch {
-      setError(t('recipient.codeExpired'));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  if (linkStatus === 'revoked') {
-    return (
-      <Card className="text-center">
-        <AlertCircle className="mx-auto h-12 w-12 text-red-500" />
-        <h2 className="mt-4 text-lg font-semibold text-gray-900">{t('recipient.linkRevoked')}</h2>
-      </Card>
-    );
-  }
-
-  if (linkStatus === 'expired') {
-    return (
-      <Card className="text-center">
-        <AlertCircle className="mx-auto h-12 w-12 text-yellow-500" />
-        <h2 className="mt-4 text-lg font-semibold text-gray-900">{t('recipient.linkExpired')}</h2>
-      </Card>
-    );
-  }
+  const describedBy = [hintId, codeError ? errorId : null].filter(Boolean).join(' ');
 
   return (
     <div className="space-y-6">
-      <div className="text-center">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-600">
-          <Shield className="h-8 w-8 text-white" />
-        </div>
-        <h1 className="mt-4 text-xl font-bold text-gray-900">
-          {mode === 'recipient' ? t('recipient.title') : t('uploader.title')}
-        </h1>
-        <p className="mt-1 text-sm text-gray-500">
-          {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.subtitle', { name: t('uploader.someone') })}
-        </p>
-      </div>
-
       <Card>
-        {step === 'resolve' && !token && (
-          <div className="py-8 text-center">
-            <p className="text-sm text-gray-500">{t('recipient.invalidLink')}</p>
-          </div>
+        <div className="text-center">
+          <Mail className="mx-auto h-10 w-10 text-brand-600" aria-hidden="true" />
+          <StepHeading>{t('recipient.verifyTitle')}</StepHeading>
+          <p className="mt-1 text-sm text-gray-600">
+            {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.subtitle', { name: t('uploader.someone') })}
+          </p>
+        </div>
+
+        {lapsed && (
+          <Alert variant="warning" role="status" className="mt-4">
+            {t('recipient.sessionEnded')}
+          </Alert>
         )}
 
-        {step === 'code' && (
-          <div className="space-y-4">
-            <div className="text-center">
-              <Mail className="mx-auto h-10 w-10 text-brand-600" />
-              <h2 className="mt-3 text-lg font-semibold text-gray-900">{t('recipient.verifyTitle')}</h2>
-              <p className="mt-1 text-sm text-gray-500">{t('recipient.verifySubtitle')}</p>
-              {email && <p className="mt-2 text-sm font-medium text-brand-600">{email}</p>}
-              {sessionLapsed && <p className="mt-2 text-sm text-yellow-700">{t('recipient.sessionEnded')}</p>}
-            </div>
+        <p className="mt-4 text-sm text-gray-700">{t('recipient.verifyIntro')}</p>
+        <div className="mt-3 space-y-2">
+          <Button
+            variant={sent ? 'secondary' : 'primary'}
+            className="w-full"
+            onClick={() => void ask()}
+            loading={requesting}
+            disabled={secondsLeft > 0}
+          >
+            {sent ? t('recipient.sendAgain') : t('recipient.sendCode')}
+          </Button>
+          <div role="status" className="text-sm text-gray-700">
+            {sent && !requestError && t('recipient.codeSent', { minutes: Math.ceil(sent.code_valid_for_seconds / 60) })}
+          </div>
+          {secondsLeft > 0 && <p className="text-sm text-gray-600">{t('recipient.resendIn', { count: secondsLeft })}</p>}
+          {requestError && <Alert>{requestError}</Alert>}
+        </div>
 
-            <Button variant="secondary" onClick={requestCode} loading={loading} className="w-full">
-              {t('recipient.sendCode')}
-            </Button>
-
-            <div className="relative">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-gray-200" />
-              </div>
-              <div className="relative flex justify-center text-sm">
-                <span className="bg-white px-4 text-gray-500">{t('recipient.then')}</span>
-              </div>
-            </div>
-
-            <Input
-              placeholder={t('recipient.codePlaceholder')}
+        <form className="mt-6 space-y-3" onSubmit={(event) => void verify(event)} noValidate>
+          <div className="space-y-1.5">
+            <label htmlFor={inputId} className="block text-sm font-medium text-gray-700">
+              {t('recipient.codeLabel')}
+            </label>
+            <input
+              ref={input}
+              id={inputId}
+              name="code"
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={12}
               value={code}
-              onChange={(e) => { setCode(e.target.value); setError(null); }}
-              error={error ?? undefined}
-              maxLength={8}
-              className="text-center text-lg tracking-widest"
+              onChange={(event) => {
+                setCode(event.target.value);
+                setCodeError(null);
+              }}
+              aria-invalid={codeError ? true : undefined}
+              aria-describedby={describedBy}
+              className="input-field text-center text-lg tracking-widest"
             />
-
-            <Button onClick={verifyCode} className="w-full" loading={loading} disabled={code.length < 6}>
-              {t('recipient.verifyButton')}
-              <ArrowRight className="ml-2 h-4 w-4" />
-            </Button>
+            <p id={hintId} className="text-sm text-gray-600">
+              {t('recipient.codeHint')}
+            </p>
+            {codeError && (
+              <p id={errorId} className="text-sm text-red-700">
+                {codeError}
+              </p>
+            )}
           </div>
-        )}
+          <Button type="submit" className="w-full" loading={verifying}>
+            {t('recipient.verifyButton')}
+          </Button>
+        </form>
       </Card>
     </div>
   );
+}
+
+/** Whole seconds until `until` (a `Date.now()` time), ticking once a second; 0 when it has passed or is null. */
+function useCountdown(until: number | null): number {
+  const left = () => (until === null ? 0 : Math.max(0, Math.ceil((until - Date.now()) / 1000)));
+  const [seconds, setSeconds] = useState(left);
+  useEffect(() => {
+    setSeconds(left());
+    if (until === null) return;
+    const timer = setInterval(() => {
+      const now = left();
+      setSeconds(now);
+      if (now === 0) clearInterval(timer);
+    }, 1000);
+    return () => clearInterval(timer);
+    // `left` reads only `until`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [until]);
+  return seconds;
 }

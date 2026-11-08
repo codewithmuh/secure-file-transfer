@@ -70,12 +70,15 @@ web-a11y: ## Web app: axe accessibility checks on every page, in English and Jap
 	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
 	    && npm run build && npx playwright test'
 
-# Browser flows against the running stack (#195, #196, #197; after `make up` and `make seed`), in the same pinned
-# Playwright image, so no browser is installed on the host. The browser must see the stack as a person does, at
-# http://localhost:3000, :8000, :8180, :8025 and :9090. On Linux (CI) the container shares the host's network. Docker
-# Desktop (macOS) has no host networking by default, so there web/e2e/support/forward.mjs listens on those ports inside
-# the container and forwards them to host.docker.internal, where the stack's 127.0.0.1 ports are. E2E_ARGS passes
-# options on, e.g. E2E_ARGS='e2e/admin.e2e.ts'.
+# Browser flows against the running stack (#195 to #200; after `make up` and `make seed`), in the same pinned
+# Playwright image, so no browser is installed on the host: #200's M3 journey in English and Japanese, and the other
+# flows in English. The browser must see the stack as a person does, at http://localhost:3000, :8000, :8180, :8025 and
+# :9090. On Linux (CI) the container shares the host's network. Docker Desktop (macOS) has no host networking by
+# default, so there web/e2e/support/forward.mjs listens on those ports inside the container and forwards them to
+# host.docker.internal, where the stack's 127.0.0.1 ports are. The journey runs the lifecycle jobs with the clock moved
+# on (#181, #182); the container has no Docker, so local/e2e-jobs.sh runs them on the host for it, through request
+# files in a temporary folder. The report, traces and screenshots are copied to web/test-results/ (owned by you).
+# E2E_ARGS passes options on, e.g. E2E_ARGS='e2e/admin.e2e.ts' or E2E_ARGS='--project ja'.
 E2E_ARGS ?=
 ifeq ($(shell uname -s),Linux)
 E2E_NETWORK := --network host
@@ -85,13 +88,21 @@ E2E_NETWORK :=
 E2E_FORWARD := (node e2e/support/forward.mjs &) && sleep 1
 endif
 .PHONY: web-e2e
-web-e2e: ## Web app: browser flows against the running local stack (needs make up and make seed, and Docker)
-	docker run --rm --init --ipc=host $(E2E_NETWORK) --volume "$(CURDIR)/web:/src/web:ro" --workdir /web \
+web-e2e: ## Web app: browser flows and the M3 journey against the running local stack (needs make up and make seed, and Docker)
+	@mkdir -p web/test-results
+	@jobs="$$(mktemp -d)"; runner=""; \
+	trap '[[ -z "$$runner" ]] || kill "$$runner" 2>/dev/null; rm -rf "$$jobs"' EXIT; \
+	local/e2e-jobs.sh "$$jobs" & runner=$$!; \
+	docker run --rm --init --ipc=host $(E2E_NETWORK) --volume "$(CURDIR)/web:/src/web:ro" \
+	  --volume "$$jobs:/jobs" --env E2E_JOBS_DIR=/jobs --volume "$(CURDIR)/web/test-results:/out" \
+	  --env HOST_IDS="$$(id -u):$$(id -g)" --workdir /web \
 	  $(PLAYWRIGHT_IMAGE) bash -euo pipefail -c 'tar -C /src/web --exclude=./node_modules --exclude=./dist \
 	    --exclude=./test-results -cf - . | tar -xf - \
 	    && npm ci --ignore-scripts \
 	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
-	    && $(E2E_FORWARD) && npx playwright test --config playwright.e2e.config.ts $(E2E_ARGS)'
+	    && $(E2E_FORWARD) && status=0 \
+	    && { npx playwright test --config playwright.e2e.config.ts $(E2E_ARGS) || status=$$?; } \
+	    && { cp -a test-results/. /out/ 2>/dev/null || true; chown -R "$$HOST_IDS" /out; exit "$$status"; }'
 
 # The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
 # The breaking-change check compares the working tree's contract with the one at the merge base of

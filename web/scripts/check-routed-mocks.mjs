@@ -8,11 +8,8 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const src = join(root, 'src');
 
-// The recipient's link page (/t) still fakes its session until #198 makes it live. Remove each entry with #198.
-const PENDING = new Map([
-  ['src/features/recipient/VerificationPage.tsx', '#198'],
-  ['src/features/recipient/RecipientDownloadPage.tsx', '#198'],
-]);
+// A routed page still waiting for the issue that makes it live, by path: none since #198 made /t live.
+const PENDING = new Map([]);
 
 const MOCK = [
   [/\bmock[A-Z_]\w*/, 'mock data'],

@@ -1,3 +1,2 @@
 export { RecipientPage } from './RecipientPage';
-export { VerificationPage } from './VerificationPage';
-export { RecipientDownloadPage } from './RecipientDownloadPage';
+export { LinkGate } from './LinkGate';

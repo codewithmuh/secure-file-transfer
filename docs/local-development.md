@@ -340,12 +340,18 @@ origin's doesn't).
 (`web/public/config.json`) and `WEB_ORIGIN` doesn't change. Vite injects inline scripts, so the CSP is checked only on
 the compose build. `make up` starts the built app again.
 
-**Browser flows** (`make web-e2e`, #195 to #197): Playwright, in the image pinned in the Makefile, against the running,
+**Browser flows** (`make web-e2e`, #195 to #200): Playwright, in the image pinned in the Makefile, against the running,
 seeded stack, so no browser is installed on the host. The browser must see `localhost:3000`, `:8000`, `:8180`,
 `:8025` and `:9090` exactly as a person does. On Linux (CI) the container shares the host's network. Docker Desktop
 (macOS) has no host networking by default, so there `web/e2e/support/forward.mjs` listens on those ports inside the
 container and forwards them to `host.docker.internal`, which reaches the stack's `127.0.0.1` ports; the browser still
-sees `localhost`. CI's Local stack job runs it after `make e2e`.
+sees `localhost`. CI's Local stack job runs it after `make e2e`. It includes the M3 journey (#200) in English and
+Japanese, which runs the expiry and deletion jobs with the clock moved on: the container has no Docker, so
+`local/e2e-jobs.sh` runs them on the host while `make web-e2e` runs, answering request files in a temporary folder.
+Traces, screenshots and the HTML report land in `web/test-results/`. `E2E_ARGS='--project ja'` runs the Japanese
+journey alone. The lockout test's 20 wrong codes count against the per-IP quota of 30 failed codes an hour
+(abuse-and-rate-limits 2.2 A), so run the whole suite at most once an hour, or `make down && make up` first: Valkey
+keeps no volume, so that clears the counters.
 
 ### How to test locally
 
@@ -374,15 +380,22 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
    carries on from the parts S3 already holds. Reload mid-upload, open the draft from "Transfers", choose the same file
    again: only the missing parts go.
 3. **Receive.** Open Mailpit, open the link email (in the recipient's language), click the link. Use a different
-   browser profile or a private window, so the member's session and the recipient's don't mix. The recipient pages are
-   live with #198.
+   browser profile or a private window, so the member's session and the recipient's don't mix. The page is in the
+   link's language whatever the browser's. "Email me a code", read the code in Mailpit, verify, then download each
+   file; the member's detail page shows that recipient verified, with the download and its time. A reload forgets the
+   link (it is kept in memory only): open it from the email again, and the page carries on without a new code. Twenty
+   wrong codes lock the recipient (five a code, one code every 30 seconds); the member's "Unlock and send a new link"
+   emails a new link, and the old one stops working. "Revoke transfer" stops new downloads at once.
 4. **Administer.** Sign in as the admin (the sign-in always asks for the password, so switching users needs no
    cleanup): "Users" to invite (the invitation, with a temporary password, arrives in Mailpit; sign in with it in a
    private window and choose a password), change a role or the DLP approver flag, sign someone out everywhere, reset a
    sign-in (a new invitation arrives) or deactivate; "Tenant policy" for the longest expiry (the member's form follows
    it), unscannable files, the retention of received files and the default language.
 5. **Expiry.** `make e2e`'s clock hook and job commands (#181, #182) expire and delete a transfer on demand:
-   `CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry`.
+   `CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry`. Its link then shows "This link has expired", and the member's
+   list shows it `Expired`.
+6. **Automated.** `make web-a11y` (axe on every page, dialog and link state, no backend), then `make web-e2e` (every
+   browser flow and the M3 journey in both languages, against the seeded stack).
 
 Not available locally yet, and hidden in the app (their URLs say so): upload requests, the audit log, API keys and the
 DLP policy (M5); SSO, passkeys and step-up prompts beyond "Sign in again" (M6).

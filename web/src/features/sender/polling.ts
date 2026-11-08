@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { FileState, Transfer } from '@/api';
+import type { FileState, Transfer, TransferState } from '@/api';
 
 /** How often the detail page asks for the transfer while something is still moving (#196). */
 export const POLL_INTERVAL_MS = 3000;
@@ -39,4 +39,15 @@ export function shouldPoll(
   return transfer.files.some(
     (file) => SERVER_MOVES.includes(file.state) || (file.state === 'uploading' && uploading.has(file.id)),
   );
+}
+
+/**
+ * How often the detail page asks for the recipients' delivery while the transfer is `sent` (#199): slower than the
+ * scans, since emails, verifications and downloads move at a person's pace.
+ */
+export const RECIPIENT_POLL_INTERVAL_MS = 10_000;
+
+/** Whether `listTransferRecipients` is polled: only while the transfer is `sent`, so links are out and in use. */
+export function shouldPollRecipients(state: TransferState | undefined): boolean {
+  return state === 'sent';
 }

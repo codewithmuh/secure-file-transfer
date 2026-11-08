@@ -62,8 +62,11 @@ apiClient.interceptors.request.use((config) => {
   }
 
   if (scope === 'link' && linkSession) {
-    config.headers['X-Link-Session'] = linkSession.id;
-    if (unsafe) config.headers['X-CSRF-Token'] = linkSession.csrfToken;
+    // A request that names its session (resuming another link's session) keeps it; the held session's CSRF token
+    // goes only with the held session.
+    const named = config.headers.get('X-Link-Session');
+    if (named === undefined || named === null) config.headers.set('X-Link-Session', linkSession.id);
+    if (unsafe && (named ?? linkSession.id) === linkSession.id) config.headers.set('X-CSRF-Token', linkSession.csrfToken);
   }
 
   return config;
