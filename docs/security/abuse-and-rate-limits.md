@@ -240,6 +240,12 @@ back, and when two grants race for the last bytes the loser's budgets are refund
 runs to midnight UTC. The 200 MB per member for tenants over 2,500 members isn't built:
 no tenant has member counts that high before the per-tenant overrides of section 10.
 
+**As built for members (#213).** `createReceivedFileDownload` counts per member (300 grant requests an hour, resumes
+included, `D_ACCOUNT`) and per IP, and against the tenant's group H budget; a new grant also spends the tenant's 2,000
+grants an hour and its 500 GB of granted bytes a day, shared with recipients, charged all or none in the grant's
+transaction as above. A member has no byte cap of their own: the files are their own company's. Their content streams
+take group E's places per member (6, `account_streams`), per IP and per tenant.
+
 **Sizing.** At design load the service grants about 40,000 downloads and 1 TB a day (capacity 3.1), a mean of 2 GB
 per tenant. A large tenant of 1,000 members (4 % of the load) has about 1,600 downloads and 40 GB a day, 200 in its
 peak hour. Its caps are 10 times that hour and 12 times that day (25 full 20 GB transfers); above 2,500 members they
@@ -278,6 +284,13 @@ limiter, except the PostgreSQL rows.
 | Tenant | 200 GB of declared uploads in 24 hours | App | `429` |
 | Tenant | 2 TB of files that are uploading, scanning or stored | PostgreSQL | `413 storage_quota_exceeded` |
 
+**As built for uploaders (#213).** An uploader's four operations count per link session and per IP (600 and 1,200 a
+minute, `SESSION_UPLOAD`) and spend none of the tenant's group H budget, as no link session does. The request's rows
+are PostgreSQL's, under the request's row lock: the 101st declaration and the 51st counted file are
+`422 too_many_files`, a total past 20 GB `413 total_too_large`, and `completeSessionUpload` counts again in its first
+phase, so parallel completes can't pass either. Each declaration reserves the requesting tenant's storage quota. The
+per-file part-URL count and the tenant's daily volume are #165's, as for members.
+
 **G. Actions that send email:** `sendTransfer`, `createUploadRequest`, `inviteUser`. Fail open to the per-pod limiter.
 Section 7 explains each cap.
 
@@ -311,12 +324,26 @@ runaway automation can't stop an admin from revoking a leaked transfer. The per-
 | Tenant | 10 exports an hour, 1 at a time | App | `429` |
 | API key | 1 export an hour, each at most 100,000 events | App | `429`; a larger range gets `422 export_too_large` |
 
+As built (#215): a key's requests count per key (`H.caller_requests` under the key's ID) and per tenant, like a
+member's, and a malformed or unknown key is a failed authentication: `401 credentials_invalid`, refused before any
+database query when its format or check is wrong.
+
+As built (#216): `searchAuditEvents` applies the caller's group H limit, the tenant's 60 searches a minute
+(`I.tenant_searches`) and the tenant's group H budget. `exportAuditEvents` applies group H at the route, then, once
+the export's size is known, a key's one an hour (`I.key_exports`), the tenant's 10 an hour (`I.tenant_exports`), and
+one at a time per tenant: a lease in the counter store (`lease:I.tenant_exports:tenant:<id>`), renewed at each page
+and released when the stream ends, which lapses after 2 minutes if a pod dies. During a store outage the lease is
+held in the pod, as group I fails open.
+
 **J. Key and tenant administration:** `createApiKey`, `createTenant`.
 
 | Key | Limit | Enforced by | Over the limit |
 |---|---|---|---|
 | Tenant | 20 new API keys a day; at most 25 active keys (#23 5.2) | App; PostgreSQL | `429`; `422 validation_failed` |
 | Operator | 30 new tenants an hour | App | `429` |
+
+As built (#215): `createApiKey` counts the 25 active keys in PostgreSQL under a transaction-scoped advisory lock, then
+charges `J.api_keys`; a key that can't be made (the 26th, a bad expiry) costs nothing of the 20.
 
 The operator API applies only this limit, and counts only a tenant that is made, in the transaction that makes it,
 as `inviteUser` counts its invitations. It has no per-IP limit and no failed

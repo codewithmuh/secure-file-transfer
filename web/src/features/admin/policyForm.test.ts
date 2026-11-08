@@ -29,10 +29,16 @@ describe('the tenant policy form (#197)', () => {
     });
   });
 
-  it('never sends the domain lists (FR-24, M5)', () => {
+  it('sends a domain list only when it changed, and then whole (FR-24, #217)', () => {
     const body = changedFields(policy, { ...formOf(policy), max_expiry: 'PT1H' }) ?? {};
     expect(Object.keys(body)).not.toContain('allowed_domains');
     expect(Object.keys(body)).not.toContain('blocked_domains');
+    const listed = { ...policy, blocked_domains: ['a.example', 'b.example'] };
+    expect(changedFields(listed, { ...formOf(listed), blocked_domains: ['b.example', 'a.example'] })).toEqual({});
+    expect(changedFields(listed, { ...formOf(listed), blocked_domains: ['a.example'], allowed_domains: ['partner.example'] })).toEqual({
+      allowed_domains: ['partner.example'],
+      blocked_domains: ['a.example'],
+    });
   });
 
   it('treats the same duration in another spelling as unchanged', () => {
@@ -61,12 +67,17 @@ describe('the tenant policy form (#197)', () => {
           { detail: 'Between PT1H and P30D.', pointer: '#/max_expiry' },
           { detail: 'From 1 to 90.', pointer: '#/received_file_retention_days' },
           { detail: 'Unknown field.', pointer: '#/colour' },
+          { detail: 'Not a domain.', pointer: '#/blocked_domains/2' },
           { detail: 'Bad header.', header: 'X-CSRF-Token' },
         ],
       },
     };
     expect(policyFieldErrors(failure)).toEqual({
-      fields: { max_expiry: 'Between PT1H and P30D.', received_file_retention_days: 'From 1 to 90.' },
+      fields: {
+        max_expiry: 'Between PT1H and P30D.',
+        received_file_retention_days: 'From 1 to 90.',
+        blocked_domains: 'Not a domain.',
+      },
       other: ['Unknown field.'],
     });
   });

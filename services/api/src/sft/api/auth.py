@@ -310,6 +310,6 @@ def register(app: FastAPI, settings: Settings | None) -> None:
             allow_credentials=True,
             allow_methods=["GET", "POST", "PATCH", "DELETE"],
             allow_headers=["Content-Type", "X-CSRF-Token", "X-Link-Session", "Idempotency-Key"],
-            expose_headers=["X-Request-Id", "Retry-After", "Location"],
+            expose_headers=["X-Request-Id", "Retry-After", "Location", "Content-Disposition"],
             max_age=600,
         )

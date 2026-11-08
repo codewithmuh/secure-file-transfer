@@ -24,6 +24,8 @@ export const HANDLED_PROBLEMS = [
   'invalid_state',
   'transfer_revoked',
   'transfer_expired',
+  'upload_request_revoked',
+  'upload_request_expired',
   'transfer_empty',
   'upload_incomplete',
   'upload_size_mismatch',
@@ -39,9 +41,19 @@ export const HANDLED_PROBLEMS = [
   'expiry_out_of_range',
   'recipient_domain_not_allowed',
   'recipient_undeliverable',
+  'dlp_decision_changed',
+  'dlp_policy_conflict',
+  'detector_in_use',
+  'no_eligible_approver',
+  'approval_limit_reached',
+  'justification_required',
+  'approvers_insufficient',
+  'self_approval_forbidden',
   'rate_limited',
   'internal_error',
   'service_unavailable',
+  'invalid_cursor',
+  'export_too_large',
 ] as const satisfies readonly Problem['code'][];
 
 export type HandledProblem = (typeof HANDLED_PROBLEMS)[number];

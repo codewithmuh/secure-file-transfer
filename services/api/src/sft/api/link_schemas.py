@@ -56,7 +56,11 @@ class LinkResolution(BaseModel):
 
     @classmethod
     def of(cls, resolution: Resolution) -> LinkResolution:
-        out = cls(kind="transfer", access_state=resolution.access_state, locale=resolution.locale)  # type: ignore[arg-type]
+        out = cls(
+            kind=resolution.kind,
+            access_state=resolution.access_state,
+            locale=resolution.locale,  # type: ignore[arg-type]
+        )
         if resolution.link_session_id is not None:
             out.link_session_id = resolution.link_session_id
         return out
@@ -76,7 +80,7 @@ class LinkSessionTransfer(BaseModel):
 
 
 class LinkSessionUploadRequest(BaseModel):
-    """An upload request's session (M5): declared, so the schema is the contract's."""
+    """An upload request's session (#212): the request, its limits and what has arrived."""
 
     tenant_name: str
     requester_email: EmailAddress
@@ -101,21 +105,38 @@ class LinkSession(BaseModel):
 
     @classmethod
     def of(cls, view: SessionView) -> LinkSession:
-        return cls(
+        out = cls(
             id=view.id,
             csrf_token=view.csrf_token,
-            kind="transfer",
+            kind=view.kind,
             email=view.email,
             locale=view.locale,  # type: ignore[arg-type] # the table's CHECK allows only these
             expires_at=view.expires_at,
-            transfer=LinkSessionTransfer(
-                tenant_name=view.tenant_name,
-                sender_email=view.sender_email,
-                message=view.message,
-                expires_at=view.transfer_expires_at,
-                download_limit=view.download_limit,
-            ),
         )
+        # Exactly one of the two, set so it isn't left out (`response_model_exclude_unset`).
+        if view.transfer is not None:
+            part = view.transfer
+            out.transfer = LinkSessionTransfer(
+                tenant_name=part.tenant_name,
+                sender_email=part.sender_email,
+                message=part.message,
+                expires_at=part.expires_at,
+                download_limit=part.download_limit,
+            )
+        if view.upload_request is not None:
+            asked = view.upload_request
+            out.upload_request = LinkSessionUploadRequest(
+                tenant_name=asked.tenant_name,
+                requester_email=asked.requester_email,
+                message=asked.message,
+                expires_at=asked.expires_at,
+                max_files=asked.max_files,
+                max_file_size=asked.max_file_size,
+                max_total_size=asked.max_total_size,
+                files_received=asked.files_received,
+                bytes_received=asked.bytes_received,
+            )
+        return out
 
 
 class SessionFileOut(BaseModel):
@@ -133,6 +154,19 @@ class SessionFileOut(BaseModel):
 
     @classmethod
     def of(cls, file: SessionFile) -> SessionFileOut:
+        if file.uploader:
+            # An uploader's file (#213): its state, and its plan while uploading; no download
+            # count and no warning, which are a recipient's.
+            mine = cls(
+                id=file.id,
+                display_name=file.display_name,
+                content_type=file.content_type,
+                size=file.size,
+                state=file.state.value,
+            )
+            if file.state.value == "uploading":
+                mine.upload = UploadPlan(part_size=file.part_size, part_count=file.part_count)
+            return mine
         out = cls(
             id=file.id,
             display_name=file.display_name,

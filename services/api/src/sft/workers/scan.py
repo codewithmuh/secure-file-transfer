@@ -5,7 +5,8 @@ For each `file.scan` (small pool) or `file.scan_large` (large pool) message:
 
 1. **Re-read the file** in the message's tenant scope; the message is only a prompt (T-50). A file
    that isn't `scanning` any more has its tag and its transfer's evaluation made good (both are
-   safe to repeat), and the message is done.
+   safe to repeat), and the message is done. In the same transaction, the tenant's live, enabled
+   detectors (keyword lists, #218) and the DLP policy version they belong to.
 2. **The tenant's cap.** A tenant runs at most 4 small-file scans at once, and one fewer
    large-file scans than the large pool has workers (at least one), counted with leases in the
    counter store. A scan over the cap is written to the outbox again, delayed 30 seconds, in the
@@ -14,12 +15,13 @@ For each `file.scan` (small pool) or `file.scan_large` (large pool) message:
    counter store the caps are skipped (ADR-0019).
 3. **One read, two engines.** The worker reads the object version recorded at completion, never
    the latest, and tees each chunk to clamd (`INSTREAM`, `sft.workers.clamd`) and to the DLP
-   inspector (`sft.dlp.client`) at once. The inspector may stop after the first 64 KiB of a type it
-   can't read; clamd still gets every byte. The read follows clamd, never the inspector: the
-   inspector may fall 64 MiB behind, and if it stays that far behind for 30 seconds it is dropped
-   for the attempt (a failed inspection), so a slow inspector can't make clamd time out. Each
-   engine has a timeout that grows with the file's size (`sft.service.scan_timing`). No
-   transaction is open meanwhile (data model 2.5).
+   inspector (`sft.dlp.client`) at once; the tenant's detectors go to the inspector first, with
+   the file's size, and are forgotten with the file. The inspector may stop after the first
+   64 KiB of a type it can't read; clamd still gets every byte. The read follows clamd, never
+   the inspector: the inspector may fall 64 MiB behind, and if it stays that far behind for 30
+   seconds it is dropped for the attempt (a failed inspection), so a slow inspector can't make
+   clamd time out. Each engine has a timeout that grows with the file's size
+   (`sft.service.scan_timing`). No transaction is open meanwhile (data model 2.5).
 4. **Map the answers** (ADR-0019, abuse 6.4): clean, infected, or unscannable for encrypted
    content and every limit alert. The inspector's answer is checked against its schema; an error,
    a crash, a timeout or an answer that breaks the schema is a failed attempt, as is any clamd
@@ -27,13 +29,16 @@ For each `file.scan` (small pool) or `file.scan_large` (large pool) message:
    visibility timeout. On the last receive (the 5th) the worker records what it has instead:
    `scan_failed` if clamd never answered, otherwise clamd's result with the inspection `failed`.
    An infected file needs no inspection: it is recorded at once, its inspection `skipped`.
-5. **Record** the result, the inspection and the findings, with the audit event and the message's
+5. **Record** the result, the inspection (with the policy version whose detectors ran) and the
+   findings, `custom:<id>` for a tenant's own detector, with the audit event and the message's
    `processed_messages` row, in one transaction, only while the file is still `scanning`
    (`sft.service.scans.record`). A duplicate does the work once; a result after `scan_failed`
    changes nothing.
 6. **Then the tag, then the evaluation.** After the commit, the `scan` tag is set on the version,
    keeping its other tags, and the transfer is evaluated under its row lock. If either fails, the
-   message comes back, and step 1 finishes the job.
+   message comes back, and step 1 finishes the job. A file received through an upload request
+   (#213) has no transfer: its result counted towards the request's next notice in step 5's
+   transaction (`sft.service.scans.note_received`), and only the tag follows.
 
 While a message is in hand, the loop extends its visibility every half visibility timeout, so a
 long scan isn't handed to a second worker. Metrics (abuse 8.1): `scan_results_total{state,reason}`,
@@ -63,7 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, ScanSettings, load_settings
 from sft.core.telemetry import configure_tracing
-from sft.data import files
+from sft.data import dlp_policy, files
 from sft.data.access import NotFoundError
 from sft.data.counters import (
     CounterMetrics,
@@ -85,9 +90,16 @@ from sft.data.processed import record_processed
 from sft.data.scope import Scope
 from sft.dlp import client as inspector_client
 from sft.dlp.detect import BUILTIN_DETECTORS
-from sft.dlp.protocol import MalformedAnswerError, ProtocolError, Result
+from sft.dlp.protocol import (
+    KeywordListSpec,
+    MalformedAnswerError,
+    PatternSpec,
+    ProtocolError,
+    Result,
+)
 from sft.runtime.s3 import S3Objects
 from sft.service import scan_timing, scans
+from sft.service.dlp_definitions import inspector_spec, open_definition
 from sft.service.evaluation import evaluate
 from sft.service.objects import SCAN_TAG, ObjectStoreError, ScannedObjects
 from sft.service.scans import InspectionResult, ScanResult, SystemActor
@@ -381,7 +393,7 @@ def _scan_result(answer: ClamdResult) -> ScanResult:
     return ScanResult(FileState.UNSCANNABLE, detail)
 
 
-def _inspection_result(answer: Result) -> InspectionResult:
+def _inspection_result(answer: Result, policy_version: int | None) -> InspectionResult:
     return InspectionResult(
         state=InspectionState(answer.state),
         reasons=tuple(InspectionReason(r) for r in answer.reasons),
@@ -390,7 +402,26 @@ def _inspection_result(answer: Result) -> InspectionResult:
             Counts(f.detector, f.counts.low, f.counts.medium, f.counts.high)
             for f in answer.findings
         ),
+        policy_version=policy_version,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class InspectorDetectors:
+    """What travels with a file to the inspector: the tenant's live, enabled detectors, and the
+    policy version they belong to, which the file records (architecture 4.6, #218)."""
+
+    policy_version: int | None
+    specs: tuple[KeywordListSpec | PatternSpec, ...] = ()
+
+
+async def tenant_detectors(session: AsyncSession, tenant_id: UUID) -> InspectorDetectors:
+    """Read and open the tenant's detectors, in the transaction that reads the file."""
+    found = await dlp_policy.scan_detectors(session)
+    specs = tuple(
+        inspector_spec(d.id, open_definition(tenant_id, d.definition_ct)) for d in found.detectors
+    )
+    return InspectorDetectors(found.policy_version, specs)
 
 
 class ScanConsumer(Consumer):
@@ -429,6 +460,7 @@ class ScanConsumer(Consumer):
                 target = await files.scan_target(session, file_id)
             except NotFoundError:
                 target = None
+            detectors = await tenant_detectors(session, message.tenant_id)
         if target is None or target.state is not FileState.SCANNING:
             if target is not None and target.state in SCANNED:
                 await self._finish(message.tenant_id, file_id)
@@ -445,10 +477,12 @@ class ScanConsumer(Consumer):
         if not await self.leases.acquire(message.tenant_id, member, ttl):
             return await self._defer(scope, str(message.id), file_id)
         try:
-            answers = await self._read_once(target, size)
+            answers = await self._read_once(target, size, detectors.specs)
         finally:
             await self.leases.release(message.tenant_id, member)
-        scan, inspection = self._decide(answers, last=delivery.receive_count >= self.attempts)
+        scan, inspection = self._decide(
+            answers, last=delivery.receive_count >= self.attempts, policy=detectors.policy_version
+        )
         async with self.database.transaction(scope) as session:
             if not await record_processed(session, consumer=self.name, message_id=str(message.id)):
                 return Outcome.DUPLICATE
@@ -460,6 +494,7 @@ class ScanConsumer(Consumer):
                 inspection,
                 attempts=delivery.receive_count,
                 sha256=answers.sha256,
+                upload_request_id=target.upload_request_id,
             )
         if recorded:
             self._count(scan, inspection, answers)
@@ -490,7 +525,12 @@ class ScanConsumer(Consumer):
         log.info("scan deferred: the tenant is at its cap", extra={"file_id": str(file_id)})
         return Outcome.PROCESSED
 
-    async def _read_once(self, target: files.ScanTarget, size: int) -> EngineAnswers:
+    async def _read_once(
+        self,
+        target: files.ScanTarget,
+        size: int,
+        specs: Sequence[KeywordListSpec | PatternSpec] = (),
+    ) -> EngineAnswers:
         if target.s3_version_id is None:  # pragma: no cover - a scanning file has its version
             raise RuntimeError("a scanning file has no recorded version")
         read = self.objects.read_version(
@@ -533,7 +573,7 @@ class ScanConsumer(Consumer):
             start = time.monotonic()
             try:
                 async with asyncio.timeout(scan_timing.inspector_timeout(size).total_seconds()):
-                    answers.inspection = await self._inspect(body, size)
+                    answers.inspection = await self._inspect(body, size, specs)
                 answers.inspection_seconds = time.monotonic() - start
             except Exception as exc:
                 answers.inspection = exc
@@ -556,7 +596,12 @@ class ScanConsumer(Consumer):
             answers.sha256 = digest.digest()
         return answers
 
-    async def _inspect(self, body: AsyncIterator[bytes], size: int) -> Result:
+    async def _inspect(
+        self,
+        body: AsyncIterator[bytes],
+        size: int,
+        specs: Sequence[KeywordListSpec | PatternSpec] = (),
+    ) -> Result:
         async with asyncio.timeout(self.engines.connect_timeout):
             sock = await inspector_client.connect(
                 self.engines.inspector_host, self.engines.inspector_port
@@ -564,12 +609,18 @@ class ScanConsumer(Consumer):
         # Closed whatever happens, at once: a stopped or failed inspection leaves nothing to wait
         # for, and the client has read the answer, if there was one, before it returns.
         with sock:
-            # No tenant detectors before DLP-4 creates them and the DLP data key (ADR-0022).
+            # The tenant's own detectors travel with the file and are forgotten with it (ADR-0022).
             return await inspector_client.inspect(
-                sock, size=size, body=body, builtin_detectors=BUILTIN_DETECTORS
+                sock,
+                size=size,
+                body=body,
+                builtin_detectors=BUILTIN_DETECTORS,
+                tenant_detectors=specs,
             )
 
-    def _decide(self, answers: EngineAnswers, *, last: bool) -> tuple[ScanResult, InspectionResult]:
+    def _decide(
+        self, answers: EngineAnswers, *, last: bool, policy: int | None = None
+    ) -> tuple[ScanResult, InspectionResult]:
         if isinstance(answers.inspection, BaseException):
             kind = _failure_kind(answers.inspection)
             self.metrics.inspector_failures.labels(kind).inc()
@@ -586,7 +637,7 @@ class ScanConsumer(Consumer):
             if not last:
                 raise AttemptFailedError("the inspector didn't answer") from answers.inspection
             return scan, InspectionResult(InspectionState.FAILED)
-        return scan, _inspection_result(answers.inspection)
+        return scan, _inspection_result(answers.inspection, policy)
 
     def _count(
         self, scan: ScanResult, inspection: InspectionResult, answers: EngineAnswers
@@ -624,6 +675,9 @@ class ScanConsumer(Consumer):
                 raise
             # The deletion job removed it already: there is nothing left to tag.
             log.info("object already deleted; no tag", extra={"file_id": str(file_id)})
+        if target.transfer_id is None:
+            # A received file (#213): its notice was counted with its result; no transfer.
+            return
         async with self.database.transaction(scope) as session:
             await evaluate(
                 session,

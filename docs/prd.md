@@ -87,6 +87,10 @@ A tenant admin searches the audit log by person, email address, transfer, action
 "who downloaded the contract we sent on Monday, and from which IP address?". They can export the results. They also
 review DLP decisions, approvals and the files that couldn't be fully inspected (FR-55).
 
+Note (#216): searching by email address finds the people who still have that address in the tenant. A recipient's or
+uploader's address leaves with its transfer's or request's metadata, at most 365 days after it ended (data model 6),
+so an older event is then found by the transfer, the person's ID or the time, no longer by the address.
+
 ### UC-5 Administer a tenant
 
 A tenant admin invites and deactivates members, assigns roles, and sets tenant policy: the longest allowed expiry,

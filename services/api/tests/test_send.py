@@ -19,7 +19,14 @@ import pytest
 from fastapi import FastAPI
 from sqlalchemy import event
 
-from member_fixtures import EMAIL_KEYRING, RecordingLimiter, app_for, seed_user, session_caller
+from member_fixtures import (
+    EMAIL_KEYRING,
+    RecordingLimiter,
+    app_for,
+    ready_for_dlp,
+    seed_user,
+    session_caller,
+)
 from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.data import audit, suppressions
@@ -81,6 +88,9 @@ def add_tenant(
     callers = {}
     for name, role in names:
         callers[name] = session_caller(tenant_id, seed_user(db, tenant_id, role=role.value), role)
+    first = next(iter(callers.values())).user_id
+    assert first is not None
+    ready_for_dlp(db, tenant_id, first)  # the default policy, and example.test known (#219)
     return tenant_id, callers
 
 
@@ -204,7 +214,14 @@ async def test_a_draft_whose_files_are_shareable_is_sent_at_once(w: World) -> No
     )
     assert states == [("queued",), ("queued",)]
     assert outbox_topics(w.db, "transfer_id", transfer_id) == ["transfer.sent"]
-    assert actions(w.db, transfer_id) == ["transfer.submitted", "transfer.sent"]
+    # No rule matched: the DLP decision (#219) lets it go, and is on record.
+    assert actions(w.db, transfer_id) == ["transfer.submitted", "dlp.decided", "transfer.sent"]
+    assert response.json()["dlp"] == {
+        "outcome": "none",
+        "mode": "enforce",
+        "enforced": True,
+        "approval_request_id": None,
+    }
 
 
 async def test_a_draft_with_a_blocked_file_is_held(w: World) -> None:
@@ -221,13 +238,15 @@ async def test_a_draft_with_a_blocked_file_is_held(w: World) -> None:
     assert outbox_topics(w.db, "transfer_id", transfer_id) == ["transfer.held"]
 
 
-async def test_findings_dont_gate_sending_before_dlp_4(w: World) -> None:
+async def test_findings_gate_sending_since_dlp_4(w: World) -> None:
+    # The default policy warns on a My Number (detectors 6): the sender confirms first (#219).
     transfer_id, _ = w.transfer()
     file_id = w.file(transfer_id, state="clean")
     seed_finding(w.db, w.tenant_id, file_id, "jp_my_number", high=3)
     response = await send(w, transfer_id)
-    assert response.json()["state"] == "sent"
-    assert response.json()["dlp"] is None  # no decision before DLP-4
+    assert response.json()["state"] == "awaiting_confirmation"
+    assert response.json()["dlp"]["outcome"] == "warn"
+    assert outbox_topics(w.db, "transfer_id", transfer_id) == ["transfer.awaiting_confirmation"]
     assert response.json()["files"][0]["inspection"]["detectors"] == ["jp_my_number"]
 
 
@@ -598,7 +617,8 @@ async def test_members_and_keys_read_the_policy_and_only_admins_change_it(w: Wor
         assert policy.json()["unscannable_policy"] == "block"
         assert policy.json()["received_file_retention_days"] == 30
         assert policy.json()["allowed_domains"] == []
-    for name, status in (("alice", 403), ("ada_totp", 403), ("key", 401)):
+    # A key is refused with 403 on an operation for web sessions only (#215, T-55).
+    for name, status in (("alice", 403), ("ada_totp", 403), ("key", 403)):
         w.act_as(name)
         assert (
             await w.client.patch("/v1/tenant/policy", json={"max_expiry": "P1D"})
@@ -626,7 +646,7 @@ async def test_members_and_keys_read_the_policy_and_only_admins_change_it(w: Wor
         {},
         {"max_expiry": "PT30M"},
         {"received_file_retention_days": 91},
-        {"allowed_domains": ["example.com"]},
+        {"allowed_domains": ["not a domain"]},  # domain rules are set since #217
     ],
 )
 async def test_a_bad_policy_change_is_refused(w: World, body: dict[str, object]) -> None:

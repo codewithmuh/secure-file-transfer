@@ -26,6 +26,7 @@ from sqlalchemy.exc import ProgrammingError
 from archive_fixtures import FakeArchiveStore, fake_archive
 from member_fixtures import seed_tenant
 from pg import ScratchDatabase
+from sft.core.ids import uuid7
 from sft.core.settings import JobSettings
 from sft.data import downloads
 from sft.data.database import Database
@@ -797,3 +798,308 @@ async def test_the_storage_audit_holds_one_listing_page_at_a_time(
     expected = [e for n in range(5) for e in (("page", n), ("lookup", 200), ("delete", 200))]
     assert cleaner.events == expected
     assert report["orphans_deleted"] == 1000
+
+
+# ---- received files (#213) ----
+
+
+def seed_request(
+    db: ScratchDatabase, tenant: Any, *, expires: timedelta = timedelta(days=7)
+) -> uuid.UUID:
+    request_id = uuid.uuid4()
+    db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, expires_at, delivery_state) VALUES (:id, :tenant, :owner, "
+        "'open', 'up@example.test', 'up@example.test', 'en', now() + CAST(:expires AS interval), "
+        "'sent')",
+        id=request_id,
+        tenant=tenant.id,
+        owner=tenant.target,
+        expires=expires,
+    )
+    return request_id
+
+
+def seed_received(
+    db: ScratchDatabase,
+    tenant_id: uuid.UUID,
+    request_id: uuid.UUID,
+    *,
+    state: str = "clean",
+    size: int = 10,
+    retention: timedelta = timedelta(days=30),
+) -> uuid.UUID:
+    """A received file, as the superuser: a finished one with its retention, as its upload's
+    acceptance set it, and its reservation."""
+    file_id = uuid7()
+    finished = state not in ("uploading", "completing")
+    db.sql(
+        "INSERT INTO files (id, tenant_id, upload_request_id, display_name_ct, content_type, "
+        "declared_size, actual_size, storage_class, storage_key, s3_upload_id, s3_version_id, "
+        "part_size, part_count, state, completion_started_at, scan_deadline, inspection_state, "
+        "scanned_at, retention_until, delete_after) VALUES (:id, :tenant, :request, '\\x0061', "
+        "'text/plain', :size, CASE WHEN :finished THEN :size END, 'standard', "
+        "'tenants/' || :tenant || '/files/' || :id, 'upload-' || :id, "
+        "CASE WHEN :finished THEN 'v1' END, 5242880, greatest(1, ceil(:size / 5242880.0))::int, "
+        ":state, CASE WHEN :state = 'completing' THEN now() - interval '16 minutes' END, "
+        "CASE WHEN :finished THEN now() + interval '1 hour' END, "
+        "CASE WHEN :finished THEN 'inspected' ELSE 'pending' END, "
+        "CASE WHEN :finished THEN now() END, "
+        "CASE WHEN :finished THEN now() + CAST(:retention AS interval) END, "
+        "CASE WHEN :finished THEN now() + CAST(:retention AS interval) END)",
+        id=file_id,
+        tenant=tenant_id,
+        request=request_id,
+        size=size,
+        finished=finished,
+        state=state,
+        retention=retention,
+    )
+    db.sql(
+        "INSERT INTO tenant_usage (tenant_id, bytes_reserved) VALUES (:tenant, :size) "
+        "ON CONFLICT (tenant_id) DO UPDATE SET bytes_reserved = tenant_usage.bytes_reserved + "
+        ":size",
+        tenant=tenant_id,
+        size=size,
+    )
+    return file_id
+
+
+async def test_a_received_file_past_its_retention_loses_every_copy_and_its_finding_details(
+    migrated_db: ScratchDatabase,
+    s3: Any,
+    buckets: dict[StorageClass, str],
+    world: tuple[Jobs, Clock, FakeArchiveStore],
+) -> None:
+    jobs, clock, _ = world
+    tenant = seed_tenant(migrated_db)
+    request_id = seed_request(migrated_db, tenant)
+    file_id = seed_received(migrated_db, tenant.id, request_id)
+    bucket = buckets[StorageClass.STANDARD]
+    put_copies(s3, bucket, key_of(tenant.id, file_id), upload=False)
+    migrated_db.sql(
+        "INSERT INTO dlp_findings (id, tenant_id, file_id, detector, count_low, count_medium, "
+        "count_high, detail_ct, dlp_key_version) VALUES (:id, :tenant, :file, 'jp_my_number', "
+        "0, 0, 2, '\\x00ff', 1)",
+        id=uuid.uuid4(),
+        tenant=tenant.id,
+        file=file_id,
+    )
+    before = reserved(migrated_db, tenant.id)
+    await lifecycle.delete_due_files(jobs)
+    assert file_row(migrated_db, file_id)["state"] == "clean", "kept within its retention"
+    clock.offset = timedelta(days=31)  # past retention_until
+    assert await lifecycle.delete_due_files(jobs) >= 1
+    assert copies(s3, bucket, key_of(tenant.id, file_id)) == (0, 0)
+    row = file_row(migrated_db, file_id)
+    assert row["state"] == "deleted"
+    assert row["deleted_at"] is not None
+    assert reserved(migrated_db, tenant.id) == before - 10
+    assert migrated_db.sql(
+        "SELECT count_high, detail_ct, dlp_key_version FROM dlp_findings WHERE file_id = :id",
+        id=file_id,
+    ) == [(2, None, None)], "the counts stay, the details go"
+    [(details,)] = migrated_db.sql(
+        "SELECT details FROM audit_events WHERE target_id = :id AND action = 'file.deleted'",
+        id=file_id,
+    )
+    assert details["trigger"] == "retention"  # type: ignore[index]
+    assert details["upload_request_id"] == str(request_id)  # type: ignore[index]
+
+
+async def test_the_members_early_delete_is_deleted_at_once_by_the_job(
+    migrated_db: ScratchDatabase,
+    s3: Any,
+    buckets: dict[StorageClass, str],
+    world: tuple[Jobs, Clock, FakeArchiveStore],
+) -> None:
+    jobs, clock, _ = world
+    tenant = seed_tenant(migrated_db)
+    request_id = seed_request(migrated_db, tenant)
+    file_id = seed_received(migrated_db, tenant.id, request_id)
+    bucket = buckets[StorageClass.STANDARD]
+    put_copies(s3, bucket, key_of(tenant.id, file_id), upload=False)
+    # The member's delete (FR-13): removed, delete_after moved to now, the reservation released.
+    migrated_db.sql(
+        "UPDATE files SET removed_at = now(), delete_after = now() WHERE id = :id", id=file_id
+    )
+    migrated_db.sql(
+        "UPDATE tenant_usage SET bytes_reserved = bytes_reserved - 10 WHERE tenant_id = :t",
+        t=tenant.id,
+    )
+    before = reserved(migrated_db, tenant.id)
+    clock.offset = timedelta(seconds=1)
+    assert await lifecycle.delete_due_files(jobs) >= 1
+    assert copies(s3, bucket, key_of(tenant.id, file_id)) == (0, 0)
+    assert file_row(migrated_db, file_id)["state"] == "deleted"
+    assert reserved(migrated_db, tenant.id) == before, "released once, by the delete"
+    [(details,)] = migrated_db.sql(
+        "SELECT details FROM audit_events WHERE target_id = :id AND action = 'file.deleted'",
+        id=file_id,
+    )
+    assert details["trigger"] == "early_delete"  # type: ignore[index]
+
+
+async def test_a_requests_expiry_rejects_its_open_uploads_and_never_shortens_retention(
+    migrated_db: ScratchDatabase, world: tuple[Jobs, Clock, FakeArchiveStore]
+) -> None:
+    jobs, clock, _ = world
+    tenant = seed_tenant(migrated_db)
+    request_id = seed_request(migrated_db, tenant, expires=timedelta(hours=1))
+    received = seed_received(migrated_db, tenant.id, request_id)
+    uploading = seed_received(migrated_db, tenant.id, request_id, state="uploading")
+    kept = file_row(migrated_db, received)["delete_after"]
+    clock.offset = timedelta(hours=2)
+    assert await lifecycle.expire_upload_requests(jobs) >= 1
+    [(state,)] = migrated_db.sql("SELECT state FROM upload_requests WHERE id = :id", id=request_id)
+    assert state == "expired"
+    assert file_row(migrated_db, uploading)["state"] == "rejected"
+    row = file_row(migrated_db, received)
+    assert row["state"] == "clean"
+    assert row["delete_after"] == kept, "the request's expiry never shortens retention"
+    await lifecycle.delete_due_files(jobs)
+    assert file_row(migrated_db, received)["state"] == "clean"
+    [(details,)] = migrated_db.sql(
+        "SELECT details FROM audit_events WHERE target_id = :id "
+        "AND action = 'upload_request.expired'",
+        id=request_id,
+    )
+    assert details["uploads_rejected"] == 1  # type: ignore[index]
+
+
+async def test_reconciliation_finishes_a_received_completion_with_its_retention(
+    migrated_db: ScratchDatabase,
+    s3: Any,
+    buckets: dict[StorageClass, str],
+    world: tuple[Jobs, Clock, FakeArchiveStore],
+) -> None:
+    jobs, _, _ = world
+    tenant = seed_tenant(migrated_db)
+    migrated_db.sql(
+        "INSERT INTO tenant_policies (tenant_id, default_locale, received_file_retention_days) "
+        "VALUES (:t, 'en', 7)",
+        t=tenant.id,
+    )
+    request_id = seed_request(migrated_db, tenant)
+    file_id = seed_received(migrated_db, tenant.id, request_id, state="completing", size=6 * MIB)
+    revoked_request = seed_request(migrated_db, tenant)
+    rejected = seed_received(
+        migrated_db, tenant.id, revoked_request, state="completing", size=6 * MIB
+    )
+    migrated_db.sql(
+        "UPDATE upload_requests SET state = 'revoked', ended_at = now() WHERE id = :id",
+        id=revoked_request,
+    )
+    bucket = buckets[StorageClass.STANDARD]
+    for target in (file_id, rejected):
+        key = key_of(tenant.id, target)
+        upload_id = s3.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+        for number, size in ((1, 5 * MIB), (2, MIB)):
+            s3.upload_part(
+                Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=number, Body=b"z" * size
+            )
+        migrated_db.sql(
+            "UPDATE files SET s3_upload_id = :upload, part_count = 2 WHERE id = :id",
+            upload=upload_id,
+            id=target,
+        )
+    await lifecycle.reconcile(jobs)
+    [(state, retention, delete_after)] = migrated_db.sql(
+        "SELECT state, retention_until, delete_after FROM files WHERE id = :id", id=file_id
+    )
+    assert state == "scanning"
+    assert retention == delete_after
+    assert timedelta(days=6) < retention - datetime.now(UTC) <= timedelta(days=7)
+    assert migrated_db.sql(
+        "SELECT topic FROM outbox WHERE payload->>'file_id' = :id", id=str(file_id)
+    ) == [("file.scan",)]
+    assert file_row(migrated_db, rejected)["state"] == "rejected", "a revoked request takes none"
+    [(details,)] = migrated_db.sql(
+        "SELECT details FROM audit_events WHERE target_id = :id AND action = 'file.rejected'",
+        id=rejected,
+    )
+    assert details["reason"] == "request_not_open"  # type: ignore[index]
+
+
+# ---- retired DLP revisions (#218; data model 6) ----
+
+
+async def test_the_cleanup_deletes_only_the_dlp_revisions_nothing_needs(
+    migrated_db: ScratchDatabase,
+) -> None:
+    tenant = seed_tenant(migrated_db)
+    rule, detectors = (
+        uuid.uuid4(),
+        {name: uuid.uuid4() for name in ("live", "rule", "file", "gone")},
+    )
+
+    def detector(detector_id: uuid.UUID, revision: int, *, retired: bool) -> None:
+        migrated_db.sql(
+            "INSERT INTO dlp_detectors (id, revision, tenant_id, name, kind, definition_ct, "
+            "created_by, retired_at) VALUES (:id, :revision, :t, 'k', 'keywords', '\\x00'::bytea, "
+            ":admin, CASE WHEN :retired THEN now() - interval '1 day' END)",
+            id=detector_id,
+            revision=revision,
+            t=tenant.id,
+            admin=tenant.admin,
+            retired=retired,
+        )
+
+    # A keyword list changed once: its first revision is replaced, its second live.
+    detector(detectors["live"], 1, retired=True)
+    detector(detectors["live"], 2, retired=False)
+    # Deleted keyword lists: one a live rule still names, one a finding names, one nothing names.
+    for name in ("rule", "file", "gone"):
+        detector(detectors[name], 1, retired=True)
+    for revision, retired in ((1, True), (2, False)):
+        migrated_db.sql(
+            "INSERT INTO dlp_rules (id, revision, tenant_id, name, direction, condition, "
+            "detectors, action, created_by, retired_at) VALUES (:id, :revision, :t, 'r', 'sent', "
+            "'content', ARRAY[:a, :b], 'warn', :admin, "
+            "CASE WHEN :retired THEN now() - interval '1 day' END)",
+            id=rule,
+            revision=revision,
+            t=tenant.id,
+            a=f"custom:{detectors['live']}",
+            b=f"custom:{detectors['rule']}",
+            admin=tenant.admin,
+            retired=retired,
+        )
+    transfer_id, _ = seed_transfer(migrated_db, tenant.id, tenant.target, state="sent")
+    file_id = seed_file(migrated_db, tenant.id, transfer_id, state="clean")
+    migrated_db.sql(
+        "INSERT INTO dlp_findings (id, tenant_id, file_id, detector, count_low, count_medium, "
+        "count_high) VALUES (:id, :t, :f, :d, 0, 0, 1)",
+        id=uuid.uuid4(),
+        t=tenant.id,
+        f=file_id,
+        d=f"custom:{detectors['file']}",
+    )
+    database = Database.connect(migrated_db.url(JOBS), pool_size=1)
+    try:
+        jobs = Jobs(
+            database=database,
+            metrics=JobMetrics.create(CollectorRegistry()),
+            now=lambda: datetime.now(UTC),
+        )
+        report = await lifecycle.clean_up(jobs)
+        again = await lifecycle.clean_up(Jobs(database, jobs.metrics, jobs.now))
+    finally:
+        await database.dispose()
+    assert migrated_db.sql(
+        "SELECT revision FROM dlp_rules WHERE id = :id ORDER BY revision", id=rule
+    ) == [(2,)]
+    kept = migrated_db.sql(
+        "SELECT id, revision FROM dlp_detectors WHERE tenant_id = :t ORDER BY id, revision",
+        t=tenant.id,
+    )
+    assert set(kept) == {(detectors["live"], 2), (detectors["rule"], 1), (detectors["file"], 1)}
+    assert report["dlp_rules_deleted"] >= 1
+    assert report["dlp_detectors_deleted"] >= 2
+    assert again.get("dlp_rules_deleted", 0) == again.get("dlp_detectors_deleted", 0) == 0
+    tables = migrated_db.sql(
+        "SELECT details->>'table' FROM audit_events WHERE action = 'retention.rows_deleted' "
+        "AND tenant_id = :t ORDER BY 1",
+        t=tenant.id,
+    )
+    assert tables == [("dlp_detectors",), ("dlp_rules",)]

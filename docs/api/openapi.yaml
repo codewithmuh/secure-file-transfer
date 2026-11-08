@@ -1250,7 +1250,8 @@ paths:
         500 GB of granted bytes a day per tenant.
 
         Errors: `403 permission_denied`, `403 download_grant_exhausted`, `409 file_not_shareable`,
-        `429 rate_limited`, `503 service_unavailable`.
+        `422 validation_failed` (a body that isn't a `DownloadRequest`), `429 rate_limited`,
+        `503 service_unavailable`.
 
         Requirements: FR-6, FR-12, FR-16, FR-17, FR-18, NFR-15.
       x-permission: file.download_received
@@ -1280,6 +1281,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
         '429':
           $ref: '#/components/responses/TooManyRequests'
         '503':
@@ -3352,7 +3355,7 @@ paths:
 
         Errors: `401 reauthentication_required`, `403 permission_denied` (not an approver),
         `403 self_approval_forbidden`, `409 invalid_state` (not pending), `409 transfer_revoked`,
-        `409 transfer_expired`.
+        `409 transfer_expired`, `422 validation_failed` (the body).
 
         Requirements: FR-43, FR-44, FR-54.
       x-permission: dlp_approval.decide
@@ -3382,6 +3385,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableContent'
         '429':
           $ref: '#/components/responses/TooManyRequests'
 

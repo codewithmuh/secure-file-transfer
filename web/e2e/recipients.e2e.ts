@@ -1,6 +1,6 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { checkAxe } from './support/axe';
-import { codesTo, escapeRegExp, linkEmail, newCode, payload, signIn, unique, wordsText } from './support/stack';
+import { codesTo, escapeRegExp, linkEmail, newCode, payload, sendPastWarning, signIn, unique, wordsText } from './support/stack';
 
 /**
  * #199: a recipient locked out after 20 failed attempts (NFR-14) shows `locked` on the member's page; unlocking
@@ -48,7 +48,8 @@ test('a locked recipient shows locked; unlock sends a new link, the old one is n
   await page.getByTestId('transfer-files').setInputFiles(payload(name, wordsText(64 * 1024, 5)));
   await page.getByRole('button', { name: 'Send transfer' }).click();
   await expect(page).toHaveURL(/\/transfers\/[0-9a-f-]{36}$/, { timeout: 120_000 });
-  await expect(page.getByText('Sent', { exact: true }).first()).toBeVisible({ timeout: 180_000 });
+  // A recipient domain new to the tenant is warned about (DLP-4, #219): confirm it.
+  await sendPastWarning(page);
   const detail = page.url();
 
   const old = await linkEmail(request, address);

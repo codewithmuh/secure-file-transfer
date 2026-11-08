@@ -12,7 +12,7 @@ Run with `make seed` after `make up`. It writes, as the local server's superuser
 
 - the `local-keycloak` connection in `idp_connections`: the stack's Keycloak, standing in for the
   user pool (ADR-0016), which the API names in `OIDC_PROVIDER_NAME`;
-- a tenant, with its policy;
+- a tenant, with its policy and its default DLP policy (#218);
 - an admin and a member, each with a `user_identities` row bound to its Keycloak subject in
   local/keycloak/sft-realm.json, so both sign in through Keycloak as members do through Cognito;
 - with `--suppress ADDRESS`, a suppression entry for that address in the tenant (#174), so a test
@@ -156,6 +156,15 @@ def seed(connection: psycopg.Connection, suppress: list[str]) -> dict[str, int]:
             "ON CONFLICT DO NOTHING",
             {**user, "tenant": TENANT_ID, "connection": connection_id},
         )
+    # The default DLP policy of detectors 6 (#218), as createTenant writes it: the migration that
+    # gives existing tenants theirs ran before this seed, so the seed writes its tenant's.
+    admin = next(user["user_id"] for user in USERS if user["role"] == "admin")
+    run(
+        "dlp_policies",
+        "SELECT dlp_default_policy(%(tenant)s, %(admin)s, 'en') "
+        "WHERE NOT EXISTS (SELECT FROM dlp_policies WHERE tenant_id = %(tenant)s)",
+        {"tenant": TENANT_ID, "admin": admin},
+    )
     for address in suppress:
         run(
             "email_suppressions",

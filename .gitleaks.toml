@@ -1,0 +1,13 @@
+# gitleaks: the default rules, plus the format of this service's own secrets (authn-authz 5.1).
+# The pre-commit hook and the CI job read this file from the repository root.
+
+title = "secure-file-transfer"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "sft-api-key"
+description = "A secure-file-transfer tenant API key: sft_<env>_<43 base62>_<6 base62 CRC-32>"
+regex = '''\bsft_(?:dev|stg|prd)_[0-9A-Za-z]{43}_[0-9A-Za-z]{6}\b'''
+keywords = ["sft_dev_", "sft_stg_", "sft_prd_"]

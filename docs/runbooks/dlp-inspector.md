@@ -39,6 +39,10 @@ readiness `/readyz` that it listens on 8070. A probe never reaches the framed pr
 - `sandbox_unavailable` means the child process couldn't start its sandbox (seccomp, rlimits): check the node's kernel
   and the pod's security context.
 - `timeout` on most files means the inspector is starved of CPU, or the scratch volume is slow.
+- `bad_request` on every file of **one tenant** means the inspector refuses that tenant's own detectors (#218), which
+  the API checks when they are saved: an inspector image newer than the API's, whose detector library is stricter.
+  Scans of one tenant failing before any engine runs (the message reaches the dead-letter queue, the file waits for
+  the scan sweep) mean the worker couldn't open a stored detector definition.
 
 ## Mitigate
 
@@ -47,6 +51,9 @@ readiness `/readyz` that it listens on 8070. A probe never reaches the framed pr
 2. **Timeouts**: check the scan nodes' CPU and scratch throughput; capacity 4.2 sizes the inspector.
 3. **One file fails every attempt** (a parser bug on that input): the file stays blocked, which is correct. Keep the
    inspector's log line and the file's ID for the fuzzing corpus; the member removes the file.
+4. **One tenant's files fail** (`bad_request`, or a definition the worker can't open): bring the worker and the
+   inspector to the same build; if that isn't it, ask the tenant's admin to change or delete the keyword list the
+   newer library refuses (`updateDlpDetector`, `deleteDlpDetector`).
 
 ## Escalate
 

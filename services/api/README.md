@@ -145,6 +145,7 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `AUDIT_ARCHIVE_OSAKA_BUCKET` | none | The audit archive bucket in Osaka; unset only where there is no Osaka (dev), and records then go to Tokyo's alone |
 | `AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL`, `AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL` | none | Local only, for S3Mock; in AWS the SDK finds each region's S3 endpoint |
 | `CODE_HMAC_KEYRING` | none, required | K_code (`sft/{env}/app/code-hmac`), the shape of `CSRF_KEYRING`: the API checks verification codes' HMACs with it (#179); a secret |
+| `API_KEY_ENVIRONMENT` | none, required unless `ENVIRONMENT=test` | `dev`, `stg` or `prd`: the `sft_<env>_` of every API key this API makes and takes (#215, authn-authz 5.1); `dev` locally |
 
 Whatever sends email (the notification worker) also reads `MailSettings`:
 

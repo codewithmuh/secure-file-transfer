@@ -4,6 +4,8 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sft.service.email.catalog import (
+    ApiKeyExpiring,
+    ApiKeyFirstExport,
     DlpApprovalDecided,
     DlpApprovalExpired,
     DlpApprovalRequested,
@@ -35,6 +37,7 @@ SENDER = "sender@customer.example"
 EXPIRES = datetime(2026, 11, 20, 3, 0, tzinfo=UTC)  # 12:00 in Japan
 TRANSFER_ID = UUID("5f0c1f6e-1d7b-4a43-9a43-1c1c7f0a0001")
 REQUEST_ID = UUID("5f0c1f6e-1d7b-4a43-9a43-1c1c7f0a0002")
+KEY_PREFIX = "sft_dev_" + "Ab3dEf7h"  # a prefix only, never a key
 
 # Secrets, each distinct, so a test sees exactly where each one appears.
 LINK_TOKEN = "LINKtokenLINKtokenLINKtokenLINKtokenLINKtok"  # noqa: S105 - fake
@@ -69,6 +72,8 @@ SAMPLES: dict[EmailType, Email] = {
         DlpApprovalExpired(tenant_name=TENANT, transfer_id=TRANSFER_ID),
         DlpNoEligibleApprover(tenant_name=TENANT),
         DlpPolicyChanged(tenant_name=TENANT, changes=(PolicyChange.RULE_ADDED,)),
+        ApiKeyExpiring(tenant_name=TENANT, key_prefix=KEY_PREFIX, expires_at=EXPIRES),
+        ApiKeyFirstExport(tenant_name=TENANT, key_prefix=KEY_PREFIX),
     )
 }
 

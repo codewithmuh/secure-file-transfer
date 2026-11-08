@@ -21,6 +21,9 @@ export interface GateActions {
   done: () => void;
 }
 
+/** The kind of link each page serves: `/t` a transfer's, `/u` an upload request's. */
+const LINK_KINDS = { recipient: 'transfer', uploader: 'upload_request' } as const satisfies Record<LinkMode, string>;
+
 type Phase =
   | { name: 'resolving' }
   | { name: 'missing' }
@@ -31,9 +34,10 @@ type Phase =
   | { name: 'done' };
 
 /**
- * The steps of a public link page before its content (#198), for `/t` now and `/u` in M5:
+ * The steps of a public link page before its content (#198), for `/t` and `/u` (#212):
  *
- * 1. `resolveLink` with the token `captureLinkToken` kept from the fragment. `404 link_not_found`, `410 link_revoked`,
+ * 1. `resolveLink` with the token `captureLinkToken` kept from the fragment. A link of the other kind (a transfer's on
+ *    `/u`) is shown as not found. `404 link_not_found`, `410 link_revoked`,
  *    `410 link_expired` and a `locked` link each get their own page. `verified` with a `link_session_id` resumes that
  *    session with `getLinkSession`, with no new code: the link opened again in this browser (a second tab, or the same
  *    tab after a reload). A reload alone doesn't: the token is in memory only, so the reloaded page has none and asks
@@ -75,6 +79,8 @@ export function LinkGate({
         const resolution = await resolveLink(token);
         if (!live) return;
         applyLinkLocale(resolution.locale);
+        // A transfer's link opened on `/u`, or a request's on `/t`: this page can't serve it.
+        if (resolution.kind !== LINK_KINDS[mode]) return show({ name: 'gone', gone: 'not_found' });
         if (resolution.access_state === 'locked') return show({ name: 'gone', gone: 'locked' });
         if (resolution.access_state === 'verified' && resolution.link_session_id) {
           try {
@@ -120,7 +126,7 @@ export function LinkGate({
       return (
         <Card className="text-center">
           <Shield className="mx-auto h-10 w-10 text-brand-600" aria-hidden="true" />
-          <StepHeading>{t('recipient.title')}</StepHeading>
+          <StepHeading>{t(mode === 'uploader' ? 'uploader.title' : 'recipient.title')}</StepHeading>
           <div className="mt-4 flex items-center justify-center gap-2 text-sm text-gray-600" role="status">
             <Spinner size="sm" />
             {t('recipient.resolving')}
@@ -128,7 +134,7 @@ export function LinkGate({
         </Card>
       );
     case 'gone':
-      return <GonePage gone={shown.gone} />;
+      return <GonePage gone={shown.gone} mode={mode} />;
     case 'error':
       return (
         <LinkState icon={AlertCircle} title={t('recipient.errorTitle')} body={linkProblemText(shown.error, t)}>
@@ -153,22 +159,32 @@ export function LinkGate({
     case 'verified':
       return <>{children(shown.session, actions)}</>;
     case 'done':
-      return <LinkState icon={CheckCircle2} title={t('recipient.doneTitle')} body={t('recipient.doneBody')} />;
+      return (
+        <LinkState
+          icon={CheckCircle2}
+          title={t('recipient.doneTitle')}
+          body={t(mode === 'uploader' ? 'uploader.doneBody' : 'recipient.doneBody')}
+        />
+      );
   }
 }
 
 const GONE_PAGES = {
-  not_found: { icon: AlertCircle, title: 'recipient.notFoundTitle', body: 'recipient.notFoundBody' },
-  revoked: { icon: AlertCircle, title: 'recipient.revokedTitle', body: 'recipient.revokedBody' },
-  expired: { icon: Clock, title: 'recipient.expiredTitle', body: 'recipient.expiredBody' },
-  locked: { icon: Lock, title: 'recipient.lockedTitle', body: 'recipient.lockedBody' },
+  not_found: { icon: AlertCircle, title: 'recipient.notFoundTitle', body: 'notFoundBody' },
+  revoked: { icon: AlertCircle, title: 'recipient.revokedTitle', body: 'revokedBody' },
+  expired: { icon: Clock, title: 'recipient.expiredTitle', body: 'expiredBody' },
+  locked: { icon: Lock, title: 'recipient.lockedTitle', body: 'lockedBody' },
 } as const;
 
-/** The not-found, revoked, expired and locked pages: each says what happened and what to do. */
-export function GonePage({ gone }: { gone: LinkGone }) {
+/**
+ * The not-found, revoked, expired and locked pages: each says what happened and what to do, to a recipient in terms
+ * of the sender, to an uploader in terms of the person who asked for the files (#212).
+ */
+export function GonePage({ gone, mode = 'recipient' }: { gone: LinkGone; mode?: LinkMode }) {
   const { t } = useTranslation();
   const page = GONE_PAGES[gone];
-  return <LinkState icon={page.icon} title={t(page.title)} body={t(page.body)} testId={`link-${gone}`} />;
+  const body = mode === 'uploader' ? (`uploader.${page.body}` as const) : (`recipient.${page.body}` as const);
+  return <LinkState icon={page.icon} title={t(page.title)} body={t(body)} testId={`link-${gone}`} />;
 }
 
 function LinkState({

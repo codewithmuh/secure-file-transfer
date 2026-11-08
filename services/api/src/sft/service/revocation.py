@@ -15,7 +15,8 @@ against the tenant's request budget (`SAFETY_ACTION`, abuse 2.2 H).
 
 States (data model 3.2): `submitted`, `awaiting_confirmation`, `pending_approval`, `held` and
 `sent` can be revoked; a draft or a cancelled transfer is `409 invalid_state`, an expired one
-`409 transfer_expired`. A pending DLP approval request is withdrawn with DLP-4, which builds them.
+`409 transfer_expired`. A pending DLP approval request is withdrawn in the same transaction
+(`dlp_approval.withdrawn`, #220; data model 3.6).
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from sft.data.database import Database
 from sft.data.models import TransferState
 from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
+from sft.service.evaluation import WithdrawReason, withdraw_approval_request
 from sft.service.permissions import authorize
 from sft.service.transfers import (
     TRANSFER,
@@ -104,6 +106,16 @@ async def revoke_transfer(
                 revoked_by=caller.user_id,
                 hold_reason=None,
             )
+            if state is TransferState.PENDING_APPROVAL:
+                await withdraw_approval_request(
+                    session,
+                    transfer.id,
+                    reason=WithdrawReason.REVOKED,
+                    actor=caller.actor(),
+                    origin=origin,
+                    details=audit_details(caller),
+                    now=now,
+                )
             sessions = await link_sessions.revoke_for_transfer(session, transfer.id)
             open_uploads = await files.cancel_files(session, transfer.id)
             for file in open_uploads:

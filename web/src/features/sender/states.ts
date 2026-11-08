@@ -54,6 +54,14 @@ export const inspectionStateVariant: Record<Schema<'InspectionState'>, BadgeVari
   skipped: 'default',
 };
 
+/** What a DLP rule does when it matches (FR-41): from recording only to blocking. */
+export const dlpActionVariant: Record<Schema<'DlpAction'>, BadgeVariant> = {
+  allow_and_record: 'default',
+  warn: 'warning',
+  require_approval: 'info',
+  block: 'danger',
+};
+
 /** Where a recipient's link email stands (#199, FR-7). `queued` never says why (NFR-12). */
 export const deliveryStateVariant: Record<DeliveryState, BadgeVariant> = {
   pending: 'default',
@@ -73,10 +81,7 @@ export const accessStateVariant: Record<AccessState, BadgeVariant> = {
   locked: 'danger',
 };
 
-/**
- * The states `revokeTransfer` takes (#199, FR-20): the contract's list. `awaiting_confirmation` and
- * `pending_approval` can't happen before M5's DLP-4, so in M3 that is `submitted`, `held` and `sent`.
- */
+/** The states `revokeTransfer` takes (#199, FR-20): the contract's list. */
 export const REVOCABLE_STATES: readonly TransferState[] = [
   'submitted',
   'awaiting_confirmation',
@@ -87,9 +92,6 @@ export const REVOCABLE_STATES: readonly TransferState[] = [
 
 /** The states in which a locked recipient can be unlocked: the transfer still shares its files (`409` otherwise). */
 export const UNLOCKABLE_STATES: readonly TransferState[] = REVOCABLE_STATES;
-
-/** The M5 states: DLP confirmation and approval can't happen before DLP-4, and their actions are hidden (#195). */
-export const NOT_AVAILABLE_STATES: readonly TransferState[] = ['awaiting_confirmation', 'pending_approval'];
 
 /** Built-in detectors with a name in i18n.ts (`detectors.<id>`); a tenant's own (`custom:`) show `detector_name`. */
 export const BUILTIN_DETECTORS = [

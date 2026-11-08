@@ -25,8 +25,10 @@ pointing at the recipient; another tenant's entry for the same address never cou
 **Expiry is read, not waited for.** A transfer past `expires_at` shows as `expired` at once, before
 the lifecycle job records it (architecture 4.2).
 
-Not here yet: recipient domains against the tenant's allowed and blocked domains (FR-24, M5). The
-default locale is the tenant's `default_locale`.
+**The domain rules** (FR-24, FR-45, #217; `sft.service.domain_rules`) apply first: an address
+outside the tenant's allowed domains, or in a blocked one, is refused with
+`422 recipient_domain_not_allowed`, pointing at the recipient. The default locale is the tenant's
+`default_locale`.
 """
 
 from __future__ import annotations
@@ -53,7 +55,16 @@ from sft.core.errors import (
 )
 from sft.core.ids import uuid7
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import audit, files, findings, suppressions, tenants, transfers
+from sft.data import (
+    audit,
+    dlp_approvals,
+    dlp_decisions,
+    files,
+    findings,
+    suppressions,
+    tenants,
+    transfers,
+)
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
@@ -68,7 +79,7 @@ from sft.data.models import (
     TransferState,
 )
 from sft.data.scope import Scope
-from sft.service import fields
+from sft.service import domain_rules, fields
 from sft.service.caller import Caller, CallerKind
 from sft.service.evaluation import is_shareable
 from sft.service.idempotency import IdempotentRequest, Outcome, once
@@ -107,7 +118,7 @@ class TransferRequest:
 @dataclass(frozen=True, slots=True)
 class FileView:
     id: UUID
-    transfer_id: UUID
+    transfer_id: UUID | None
     display_name: str
     content_type: str
     declared_size: int
@@ -126,12 +137,21 @@ class FileView:
     """The detectors that matched in the file (`File.inspection`), counts in `getFileInspection`."""
     sha256: str | None = None
     """The scanned version's SHA-256, in hex, once the scan worker has read it (#180)."""
+    upload_request_id: UUID | None = None
+    """A received file's upload request (#213); exactly one of it and `transfer_id` is set."""
+    retention_until: datetime | None = None
+    """When a received file is deleted (FR-13)."""
+    dlp_blocked: bool = False
+    """A received file a DLP rule blocked (FR-51): false until #221."""
 
     @property
     def shareable(self) -> bool:
         """FR-16, data model 3.1. An `unscannable` file allowed by policy is shareable, and the
-        web app shows FR-18's warning from its state."""
-        return is_shareable(self.state, self.unscannable_allowed, self.inspection_state)
+        web app shows FR-18's warning from its state. A received file a DLP rule blocked isn't."""
+        return (
+            is_shareable(self.state, self.unscannable_allowed, self.inspection_state)
+            and not self.dlp_blocked
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +159,17 @@ class RecipientView:
     id: UUID
     email: str
     locale: str
+
+
+@dataclass(frozen=True, slots=True)
+class DlpSummaryView:
+    """The transfer's current DLP decision in brief (the contract's `TransferDlpSummary`)."""
+
+    outcome: str
+    mode: str
+    enforced: bool
+    approval_request_id: UUID | None = None
+    """The transfer's latest approval request, in whatever state (#220)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +190,8 @@ class TransferView:
     hold_reason: str | None
     files: tuple[FileView, ...]
     recipients: tuple[RecipientView, ...]
+    dlp: DlpSummaryView | None = None
+    """The current DLP decision in brief, once there is one (#219)."""
 
     @property
     def total_size(self) -> int:
@@ -264,6 +297,9 @@ def file_view(tenant_id: UUID, file: File, detectors: Sequence[str] = ()) -> Fil
         inspection_reasons=tuple(InspectionReason(r) for r in file.inspection_reasons),
         detectors=tuple(detectors),
         sha256=None if file.sha256 is None else file.sha256.hex(),
+        upload_request_id=file.upload_request_id,
+        retention_until=file.retention_until,
+        dlp_blocked=file.dlp_blocked,
     )
 
 
@@ -276,6 +312,17 @@ async def transfer_view(
     state = TransferState(transfer.state)
     if now is not None:
         state = effective_state(state, transfer.expires_at, now)
+    dlp = None
+    if transfer.dlp_decision_id is not None:
+        summary = await dlp_decisions.decision_summary(session, transfer.dlp_decision_id)
+        if summary is not None:
+            latest = await dlp_approvals.latest_request(session, transfer.id)
+            dlp = DlpSummaryView(
+                summary.outcome,
+                summary.mode,
+                summary.enforced,
+                approval_request_id=None if latest is None else latest.id,
+            )
     return TransferView(
         id=transfer.id,
         state=state,
@@ -297,6 +344,7 @@ async def transfer_view(
         hold_reason=transfer.hold_reason,
         files=tuple(file_view(tenant_id, f, detectors.get(f.id, ())) for f in transfer_files),
         recipients=tuple(RecipientView(r.id, r.email, r.locale) for r in recipients),
+        dlp=dlp,
     )
 
 
@@ -338,6 +386,11 @@ async def undeliverable(
             by_pseudonym.setdefault(pseudonym, index)
     found = await suppressions.suppressed(session, by_pseudonym)
     return min((by_pseudonym[p] for p in found), default=None)
+
+
+def recipient_pointer(index: int) -> str:
+    """Where a recipient's address is in `TransferCreate`, for a refusal of it."""
+    return json_pointer("recipients", index, "email")
 
 
 def undeliverable_error(index: int) -> Unprocessable:
@@ -405,6 +458,12 @@ async def create_transfer(
             policy = await tenants.get_policy(session)
             expires_in = _expiry(request.expires_in, policy.max_expiry)
             recipients = _recipients(request.recipients, policy.default_locale)
+            # The domain rules first (FR-45), then the suppression list.
+            domain_rules.check(
+                domain_rules.DomainRules.of(policy),
+                [r.email for r in recipients],
+                recipient_pointer,
+            )
             refused = await undeliverable(session, emails, [r.email for r in recipients])
             if refused is not None:
                 raise undeliverable_error(refused)
@@ -488,6 +547,7 @@ class SummaryView:
     file_count: int
     recipient_count: int
     total_size: int
+    dlp_outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -551,6 +611,7 @@ async def list_transfers(
             file_count=summary.file_count,
             recipient_count=summary.recipient_count,
             total_size=summary.total_size,
+            dlp_outcome=summary.dlp_outcome,
         )
         for summary in found
     ]

@@ -35,8 +35,9 @@ describe('problemMessage (#196)', () => {
 
   it('falls back on the status for a code it does not handle, as the contract says', () => {
     const t = tIn('en');
-    expect(problemMessage(failureOf(apiError(409, problem(409, 'dlp_decision_changed'))), t)).toBe(
-      resources.en.translation.problems.status409,
+    // The link pages explain `link_revoked` themselves; the shared messages fall back on its status.
+    expect(problemMessage(failureOf(apiError(410, problem(410, 'link_revoked'))), t)).toBe(
+      resources.en.translation.problems.status410,
     );
     expect(problemMessage(failureOf(apiError(418, problem(418, 'brand_new_code'))), t)).toBe(
       resources.en.translation.problems.unknown,

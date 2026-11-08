@@ -1,0 +1,10 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}An API key of {{ tenant_name }} expires soon{% endblock %}
+{% block body %}
+The API key {{ key_prefix }}… of {{ tenant_name }} expires on {{ expires_at }}. After that, the automation that uses it stops working.
+
+To keep it working, a tenant admin creates a new key, switches the automation over to it, then revokes this one. You get this email because you own the key or are a tenant admin.
+
+View the API keys:
+{{ api_keys_url }}
+{% endblock %}

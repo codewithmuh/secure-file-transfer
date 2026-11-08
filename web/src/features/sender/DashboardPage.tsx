@@ -1,16 +1,17 @@
 import { useTranslation } from 'react-i18next';
 import { Link, useNavigate } from 'react-router';
-import { Send, ArrowUpRight } from 'lucide-react';
+import { Send, ArrowUpRight, Inbox } from 'lucide-react';
 import { Alert, Card, CardTitle, Button, Spinner } from '@/components/ui';
 import { PageShell } from '@/components/layout';
 import { useRecentTransfers } from '@/hooks/transfers';
+import { useRecentUploadRequests } from '@/hooks/uploadRequests';
 import { errorMessage } from '@/lib/problems';
 import { formatDate, formatFileSize } from '@/lib/formatters';
-import { TransferStateBadge } from './StateBadges';
+import { TransferStateBadge, UploadRequestStateBadge } from './StateBadges';
 
 /**
- * The dashboard (#196): the five newest transfers and the way to send one. No counts: the API has no aggregate
- * operation, and counting one page would mislead. Upload requests are M5 and hidden (#195).
+ * The dashboard (#196): the five newest transfers and the way to send one, and the five newest upload requests and the
+ * way to ask for files (#212). No counts: the API has no aggregate operation, and counting one page would mislead.
  */
 export function DashboardPage() {
   const { t, i18n } = useTranslation();
@@ -21,10 +22,16 @@ export function DashboardPage() {
     <PageShell
       title={t('sender.dashboard')}
       actions={
-        <Button onClick={() => navigate('/transfers/new')}>
-          <Send className="mr-2 h-4 w-4" aria-hidden="true" />
-          {t('sender.newTransfer')}
-        </Button>
+        <>
+          <Button variant="secondary" onClick={() => navigate('/upload-requests/new')}>
+            <Inbox className="mr-2 h-4 w-4" aria-hidden="true" />
+            {t('sender.newUploadRequest')}
+          </Button>
+          <Button onClick={() => navigate('/transfers/new')}>
+            <Send className="mr-2 h-4 w-4" aria-hidden="true" />
+            {t('sender.newTransfer')}
+          </Button>
+        </>
       }
     >
       <Card>
@@ -68,6 +75,53 @@ export function DashboardPage() {
           </ul>
         )}
       </Card>
+      <RecentUploadRequests />
     </PageShell>
+  );
+}
+
+/** The five newest upload requests (#212), each with its state and uploader. */
+function RecentUploadRequests() {
+  const { t, i18n } = useTranslation();
+  const recent = useRecentUploadRequests();
+  return (
+    <Card>
+      <div className="mb-4 flex items-center justify-between">
+        <CardTitle>{t('requests.recent')}</CardTitle>
+        <Link to="/upload-requests" className="flex items-center gap-1 text-sm text-brand-700 hover:text-brand-800">
+          {t('common.viewAll')}
+          <ArrowUpRight className="h-4 w-4" aria-hidden="true" />
+        </Link>
+      </div>
+      {recent.isPending ? (
+        <div className="flex justify-center py-6">
+          <Spinner />
+          <span className="sr-only">{t('common.loading')}</span>
+        </div>
+      ) : recent.isError ? (
+        <Alert>{errorMessage(recent.error, t)}</Alert>
+      ) : recent.data.length === 0 ? (
+        <p className="py-6 text-center text-sm text-gray-500">{t('requests.noneYet')}</p>
+      ) : (
+        <ul className="space-y-3">
+          {recent.data.map((request) => (
+            <li key={request.id}>
+              <Link
+                to={`/upload-requests/${request.id}`}
+                className="flex items-center justify-between rounded-lg border border-gray-200 p-4 transition-colors hover:bg-gray-50"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-gray-900">{request.uploader_email}</p>
+                  <p className="text-xs text-gray-500">
+                    {t('common.fileCount', { count: request.file_count })} · {formatDate(request.created_at, i18n.language)}
+                  </p>
+                </div>
+                <UploadRequestStateBadge state={request.state} />
+              </Link>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Card>
   );
 }

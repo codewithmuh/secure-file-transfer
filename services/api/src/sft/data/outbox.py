@@ -150,6 +150,94 @@ RECIPIENT_LOCKED: Final = Topic("recipient.locked", Queue.NOTIFY)
 `recipient_locked` to the transfer's owner and every active tenant admin. Payload
 `{"recipient_id": …}`."""
 
+TRANSFER_FIRST_DOWNLOAD: Final = Topic("transfer.first_download", Queue.NOTIFY)
+"""A transfer whose member asked to be told (FR-8) had its first counted download, by any
+recipient of any file (#214): the notification worker emails `first_download` to the member, with
+no file name. Written once per transfer, by the download's transaction, under a conditional update
+of `transfers.first_download_notified_at` (data model 2.2). Payload `{"transfer_id": …}`."""
+
+UPLOAD_REQUEST_LINK_DUE: Final = Topic("upload_request.link_due", Queue.NOTIFY)
+"""An uploader's link email is due (#212, data model 2.2): the notification worker derives the
+link, emails `upload_request` in the request's locale and records the delivery. Written by the
+request's creation, by an unlock, which issues a new link, and by the worker again, delayed, when
+the address is over the cross-tenant cap (abuse 7.2), as `recipient.link_due` is. Payload
+`{"upload_request_id": …}`."""
+
+UPLOAD_REQUEST_CODE_REQUESTED: Final = Topic("upload_request.code_requested", Queue.NOTIFY)
+"""An uploader asked for a verification code (`requestVerificationCode`, #212): the notification
+worker creates the code, supersedes the request's older ones and emails it to the stored address
+only (data model 2.4). Payload `{"upload_request_id": …}`; the code itself never travels."""
+
+UPLOAD_REQUEST_UPLOADER_LOCKED: Final = Topic("upload_request.uploader_locked", Queue.NOTIFY)
+"""An uploader was locked after 20 failed attempts (#212, NFR-14): the notification worker emails
+`recipient_locked`, in its upload-request variant, to the request's owner and every active tenant
+admin. Payload `{"upload_request_id": …}`."""
+
+UPLOAD_REQUEST_FILES_SETTLED: Final = Topic("upload_request.files_settled", Queue.NOTIFY)
+"""Received files of an upload request settled (#213, architecture 4.3): the notification worker
+emails the member `files_arrived` for the shareable ones and `files_blocked_member` for the blocked
+ones, and the uploader `files_blocked_uploader`, with no finding or scan detail, counts only.
+Written delayed 5 minutes by the scan result that made the request's notice due
+(`sft.data.upload_requests.note_settled`), so one notice covers every file of its window; the
+request is the dedup key. Payload `{"upload_request_id": …}`."""
+
+API_KEY_EXPIRING: Final = Topic("api_key.expiring", Queue.NOTIFY)
+"""An API key expires in 14 or 3 days (#215, authn and authz 5.2): the notification worker emails
+`api_key_expiring` to its owner and every active tenant admin, unless it was revoked meanwhile.
+Queued by the daily cleanup job. Payload `{"api_key_id": …}`."""
+
+API_KEY_FIRST_EXPORT: Final = Topic("api_key.first_export", Queue.NOTIFY)
+"""An API key exported the audit log for the first time (#216, authn and authz 5.3): the
+notification worker emails `api_key_first_export` to every active tenant admin. Payload
+`{"api_key_id": …}`."""
+
+DLP_POLICY_CHANGES: Final = (
+    "rule_added",
+    "rule_changed",
+    "rule_removed",
+    "detector_added",
+    "detector_changed",
+    "detector_removed",
+    "trusted_domains_changed",
+    "mode_changed",
+    "approvers_changed",
+    "approval_timeout_changed",
+)
+"""The kinds of DLP policy change the admins' notice names (FR-54): the email catalog's
+`PolicyChange`, which a test holds this to."""
+
+DLP_POLICY_CHANGED: Final[Mapping[str, Topic]] = {
+    change: Topic(f"dlp_policy.changed.{change}", Queue.NOTIFY) for change in DLP_POLICY_CHANGES
+}
+"""A tenant admin changed the DLP policy, a rule or a detector (#218), or an approver
+designation (#220): the notification worker emails `dlp_policy_changed`, naming the kind, to every
+active admin of the tenant (FR-54). A payload carries IDs only, so the kind is the topic's last
+part: one topic per kind. Payload `{}`."""
+
+TRANSFER_AWAITING_CONFIRMATION: Final = Topic("transfer.awaiting_confirmation", Queue.NOTIFY)
+"""A DLP rule warns or needs approval, so the evaluation moved a transfer to
+`awaiting_confirmation` (#219, architecture 4.6): the notification worker sends the member the
+`dlp_confirmation_needed` email, which names no file or finding. Payload `{"transfer_id": …}`."""
+
+DLP_APPROVAL_REQUESTED: Final = Topic("dlp_approval.requested", Queue.NOTIFY)
+"""A sender requested approval of a transfer (#220, FR-43): the notification worker emails
+`dlp_approval_requested` to each eligible approver while the request is pending, with no file name
+and no approve link. Payload `{"approval_request_id": …}`."""
+
+DLP_APPROVAL_DECIDED: Final = Topic("dlp_approval.decided", Queue.NOTIFY)
+"""An approval request was approved or rejected (#220): `dlp_approval_decided` to the transfer's
+sender, saying which; a rejection's comment stays in the web app. Payload
+`{"approval_request_id": …}`."""
+
+DLP_APPROVAL_EXPIRED: Final = Topic("dlp_approval.expired", Queue.NOTIFY)
+"""The expiry job expired an approval request and returned its transfer to the sender (#220):
+`dlp_approval_expired` to the sender. Payload `{"approval_request_id": …}`."""
+
+DLP_NO_ELIGIBLE_APPROVER: Final = Topic("dlp_approval.no_eligible_approver", Queue.NOTIFY)
+"""A sender's approval request was refused because the tenant has no eligible approver (#220,
+architecture 4.6): `dlp_no_eligible_approver` to every active admin. Payload
+`{"transfer_id": …}`."""
+
 TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
@@ -161,6 +249,19 @@ TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     RECIPIENT_LINK_DUE,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LOCKED,
+    TRANSFER_FIRST_DOWNLOAD,
+    UPLOAD_REQUEST_LINK_DUE,
+    UPLOAD_REQUEST_CODE_REQUESTED,
+    UPLOAD_REQUEST_UPLOADER_LOCKED,
+    UPLOAD_REQUEST_FILES_SETTLED,
+    API_KEY_EXPIRING,
+    API_KEY_FIRST_EXPORT,
+    *DLP_POLICY_CHANGED.values(),
+    TRANSFER_AWAITING_CONFIRMATION,
+    DLP_APPROVAL_REQUESTED,
+    DLP_APPROVAL_DECIDED,
+    DLP_APPROVAL_EXPIRED,
+    DLP_NO_ELIGIBLE_APPROVER,
 )
 """Every topic the service sends. Each feature adds its topics here, with the queue that carries
 them: scans (M2) on `Queue.SCAN_SMALL` and `Queue.SCAN_LARGE`, emails (M1, M2) on `Queue.NOTIFY`.

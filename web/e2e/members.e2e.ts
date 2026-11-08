@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { eicar, MIB, myNumber, payload, signIn, unique, watchParts, wordsText } from './support/stack';
+import { eicar, MIB, myNumber, payload, sendPastWarning, signIn, unique, watchParts, wordsText } from './support/stack';
 
 /**
  * #196: a member creates a transfer, uploads it in parts straight to the S3 stand-in, sends it, and watches scan and
@@ -49,12 +49,13 @@ test('create, upload in parts with an aborted part, send, and watch clean and in
   for (const [part, count] of parts.landed) expect(count, `${part} landed once`).toBe(1);
   for (const [part, count] of parts.tries) if (part !== aborted) expect(count, `${part} sent once`).toBe(1);
 
-  // Scan and DLP status, polled by the page.
+  // Scan and DLP status, polled by the page. The default policy warns about the My Number (DLP-4, #219): the member
+  // confirms, then it is sent, and the DLP panel (which lists the files too) is gone.
+  await sendPastWarning(page);
   for (const name of [plain, staff]) {
     await expect(fileRow(page, name).getByText('Clean', { exact: true })).toBeVisible({ timeout: 90_000 });
     await expect(fileRow(page, name).getByText('Inspected', { exact: true })).toBeVisible();
   }
-  await expect(page.getByText('Sent', { exact: true }).first()).toBeVisible({ timeout: 60_000 });
   await expect(fileRow(page, staff).getByText('My Number (Individual Number)')).toBeVisible();
   await expect(fileRow(page, plain).getByText('Sensitive data found:')).toHaveCount(0);
 

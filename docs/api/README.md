@@ -70,6 +70,12 @@ question 8, [abuse-and-rate-limits](../security/abuse-and-rate-limits.md) sectio
   and `exportAuditEvents` need a sign-in within the last 15 minutes, otherwise `401 reauthentication_required`. The
   web app runs `startSignIn` again the same way in, which forces a fresh sign-in at Cognito and at the tenant's
   identity provider, then retries. An API key may call only `exportAuditEvents` of these, within its own limits.
+- **As built (#215).** A key comes only as `Authorization: Bearer sft_<env>_<secret>_<check>`; a malformed key,
+  another environment's or one whose check fails is refused before any lookup, and an unknown, revoked or expired
+  key, or one whose owner is no longer an active admin or whose tenant is suspended, after it: all
+  `401 credentials_invalid`. A live key gets `403 permission_denied` on every operation for web sessions only, and on
+  any other whose scope it lacks (authn-authz 5.4). Every request a key makes is audited as `api_key.used`, and a
+  request whose record can't be written answers `503`.
 - **A file's API key scope follows its owner.** `getFile` and `deleteFile` list both `transfers:*` and
   `upload_requests:*` because OpenAPI can't make the choice depend on the file. The service checks the scope that
   matches the file: `transfers:*` for a file of a transfer, `upload_requests:*` for a received file. A key with only
@@ -327,6 +333,17 @@ URLs end up in load balancer, CDN and WAF logs, in browser history and in `Refer
 A member uploads only to a `draft`. A draft is never revoked or expired, so the race to handle is a cancellation, by
 the member or by the 7-day job: the upload's next call gets `409 invalid_state` with `current_state: cancelled`.
 
+An uploader uploads to their own request only: every call of their link session finds files through it, so another
+request's file is `404`, and a recipient's session gets `403`. A request takes 100 declarations in all (`422
+too_many_files`). Once it is revoked or has expired, every call of the session is `410 link_revoked` or `410
+link_expired`, and a revocation rejects the uploads still open at once: their parts are never assembled (NFR-6), and
+the files already received stay with the member. `listSessionFiles` lists the uploader's files with their state, an
+`uploading` one with its name, declared size and `upload` plan, so the web app resumes it after a reload; a blocked
+file shows only its state, never a finding or a scan detail (FR-12). `completeSessionUpload` answers a `SessionFile`.
+A received file's `retention_until` counts from the moment its upload is accepted, when it reaches `scanning` (FR-13);
+the member may delete it earlier with `deleteFile`, and its contents go on the next deletion run. Notices of received
+files are batched: one per request per 5 minutes, counts only (architecture 4.3).
+
 **Scanning.** Each file is scanned for malware and inspected for sensitive data in one pass (ADR-0019, ADR-0022);
 `getFile` shows its state, whether it is `shareable`, and `scan_detail`, why it is `unscannable` or `scan_failed`, and
 `getFileInspection` the inspection's findings, counts only. A file over 2,000,000,000 bytes is scanned only by
@@ -350,7 +367,10 @@ stream at a time. Range requests (one range each, `206`; otherwise `416`) and `I
 under the same grant, uncounted. A range is `bytes=<start>-`, `bytes=<start>-<end>` or `bytes=-<suffix>` (pattern
 `^bytes=(\d+-\d*|-\d+)$`); anything else, or a range that doesn't fit the file, gets `416 range_not_satisfiable`. After
 a reload, `resume_grant_id` gets the grant back, in the same session, while it has time, bytes and requests left (FR-6);
-after that, `403 download_grant_exhausted`. Every content request re-checks revocation, and a running stream re-checks
+after that, `403 download_grant_exhausted`. A member's grant of a received file counts no download (received files have
+no limit), is the request owner's alone (a tenant admin gets `403 permission_denied`, another member `404`), takes a
+`{}` body, and its content is `404` once the file is deleted or past its retention. Every content request re-checks
+revocation, and a running stream re-checks
 at least every 30 seconds, so a running download stops within 60 seconds of a revocation (NFR-6). Each re-check also
 counts as activity for the session, a link session or a member session, so a long download doesn't end it for idleness.
 Content is always `application/octet-stream` with `Content-Disposition: attachment`, `nosniff`, a sandbox CSP and
@@ -361,6 +381,22 @@ and `details` hold text an outsider chose (CWE-1236). Every cell is quoted (RFC 
 `+`, `-`, `@`, a tab or a carriage return is prefixed with a single quote (`'`), so a spreadsheet shows it as text. JSON
 exports are unchanged. An admin's export needs a recent sign-in and stops at 1,000,000 events; an API key may export
 once an hour, at most 100,000 events, and the tenant's admins are emailed the first time each key exports.
+
+**As built (#216).** `searchAuditEvents` and `exportAuditEvents` read the tenant's log only, newest first by
+`(occurred_at, id)`. The search's cursor encodes the last event's time and ID, base64url; anything else is
+`400 invalid_cursor`. An `email` filter is resolved at query time to the tenant's users, recipients and upload
+requests (an uploader acts, and is targeted, as its request) with that address (lower-case) and matched as the actor or
+the target by ID; a recipient's address leaves with their transfer's
+metadata (at most 365 days, data model 6), so an older event is then found by ID, not by address. A `target_type` of
+`transfer` with a `target_id` also finds the events on that transfer's files and recipients, such as `download.granted`
+on a file, so UC-4 is one filter. `actor_email` is filled for members, admins, recipients and uploaders still known. An export
+counts the matching events first (`422 export_too_large` over the cap, before any limit is charged), then streams them
+in pages of 1,000, each read in its own short transaction, up to the time it began, so events written meanwhile never
+shift it. The CSV's header row is the `AuditEvent` columns, `details` is one JSON cell with sorted keys, times are
+RFC 3339 and `security_critical` is `true` or `false`. The file name is `audit-events-<UTC time>.csv` or `.json`, and
+CORS exposes `Content-Disposition` to the web app. Each search writes `audit.searched` and each export
+`audit.exported`, with which filters were set (`filter_email: true`, never the address or IP), the format and the row
+count.
 
 ## 9. Requirements coverage
 
@@ -436,7 +472,9 @@ derived CSRF tokens, the operator token exchange, and that API keys can't unlock
 | Problem `type` host (open question 5) | `secure-file-transfer.example` until the subdomain's name is set, before the first deploy |
 | A refused sign-in | `completeSignIn` redirects to the web app with `error=sign_in_failed` and no reason; the audit log has the reason. It is a redirect value, not a problem `code`. |
 | Who owns what an API key creates | The admin who created the key; the audit log names the key as the actor. Deactivating or demoting that admin revokes their keys. |
-| Expiry (FR-3) and its extension (FR-9) | A draft holds a duration (`expires_in`); `expires_at` is set when it is submitted. Extensions are capped over the **whole lifetime**: `expires_at` is never more than 30 days, or the tenant's `max_expiry` if shorter, after `submitted_at`, so repeated extensions can't keep a transfer alive. Extending to the current expiry is a no-op, so a retry is safe. |
+| Expiry (FR-3) and its extension (FR-9) | A draft holds a duration (`expires_in`); `expires_at` is set when it is submitted. Extensions are capped over the **whole lifetime**: `expires_at` is never more than 30 days, or the tenant's `max_expiry` if shorter, after `submitted_at`, so repeated extensions can't keep a transfer alive. Extending to the current expiry is a no-op, so a retry is safe. As built (#214): the cap uses the tenant's `max_expiry` as it is at the extension; open link sessions and their live download grants run on to the new time, each still within its own 24 hours, so a recipient verified before the old time keeps going. |
+| An upload request's expiry (FR-3) | A request is open from creation, so `createUploadRequest` takes a time, `expires_at`: 1 hour to 30 days from the API's now, within `max_expiry`; 7 days, or the maximum if shorter, when left out. As built (#212): a client turns a chosen duration into that time on its own clock, so the API accepts one up to 5 minutes off either way: a time up to 5 minutes short of an hour is kept as given, and one up to 5 minutes past the maximum is cut to the maximum; anything further is `422 expiry_out_of_range`. |
+| A locked uploader | The contract has one lockout code for both subjects: an uploader is `403 recipient_locked` and `resolveLink` `access_state: locked`, as a recipient. The member and the admins get the `recipient_locked` email in its upload-request variant, which links the request's page (#212). |
 | Lengths the PRD doesn't set | Message ≤ 2,000 characters; file name ≤ 255; API keys expire after 90 days by default, at most 365 |
 | Action paths | Verbs such as `/send`, `/revoke`, `/unlock`, `/sign-out`, `/reset-sign-in`. The architecture's illustrative `/revocation` becomes `/revoke`. |
 | Audit export | Streamed in the response, at most 1,000,000 events for an admin and 100,000 for an API key; an asynchronous export job only if that proves too small. CSV cells are formula-neutralised (section 8). |

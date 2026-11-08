@@ -320,6 +320,23 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
             expires=expires,
         )
     seed_transfers(db, tenant_id, marker, rows)
+    # API keys (#215): a live key of the user, named with the marker, whose token is the key's
+    # row name; it expires within 14 days, so the daily job's find step sees it.
+    rows["api_key"], rows["api_key_token"] = uuid.uuid4(), uuid.uuid4()
+    db.sql(
+        "INSERT INTO api_keys (id, tenant_id, created_by, name, key_prefix, key_hash, scopes, "
+        "expires_at) VALUES (:id, :tenant, :user, :marker, 'sft_dev_Isolatn0', "
+        "sha256(convert_to(:token, 'UTF8')), ARRAY['transfers:read', 'audit:read'], "
+        "now() + interval '10 days')",
+        id=rows["api_key"],
+        tenant=tenant_id,
+        user=rows["user"],
+        marker=marker,
+        token=str(rows["api_key_token"]),
+    )
+    seed_dlp(db, tenant_id, marker, rows)
+    seed_dlp_decisions(db, tenant_id, marker, rows)
+    seed_dlp_approvals(db, tenant_id, marker, rows)
     return Seeded(tenant_id, marker, rows)
 
 
@@ -330,8 +347,10 @@ def seed_transfers(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, u
     for key in ("transfer", "recipient", "file", "completing_file"):
         rows[key] = uuid.uuid4()
     db.sql(
-        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in, message_ct) "
-        "VALUES (:id, :tenant, :user, 'draft', interval '7 days', convert_to(:marker, 'UTF8'))",
+        # The member asked for the first-download notice, so a case can try to claim it (#214).
+        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in, message_ct, "
+        "notify_on_first_download) VALUES (:id, :tenant, :user, 'draft', interval '7 days', "
+        "convert_to(:marker, 'UTF8'), true)",
         id=rows["transfer"],
         tenant=tenant_id,
         user=rows["user"],
@@ -452,6 +471,219 @@ def seed_links(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> Non
             session=rows["link_session"],
             age=age,
         )
+    seed_upload_requests(db, tenant_id, rows)
+
+
+def seed_upload_requests(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
+    """Upload requests (#212): an open request of the seeded user, its uploader's link, whose
+    token is the text of `upload_link_token`, a live code, and a live link session, whose token is
+    the text of `upload_session_token`. The marker is in the address and the sealed message."""
+    for key in (
+        "upload_request",
+        "upload_link_token",
+        "upload_code",
+        "upload_session",
+        "upload_session_token",
+    ):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, message_ct, expires_at, link_token_hash, link_key_id, "
+        "link_issued_at, delivery_state) SELECT :id, :tenant, :user, 'open', "
+        "split_part(email, '@', 1) || '@uploader.test', split_part(email, '@', 1) || "
+        "'@uploader.test', 'en', convert_to(split_part(email, '@', 1), 'UTF8'), "
+        "now() - interval '1 minute', sha256(convert_to(:token, 'UTF8')), 'iso', now(), 'sent' "
+        "FROM users WHERE id = :user",
+        id=rows["upload_request"],
+        tenant=tenant_id,
+        user=rows["user"],
+        token=str(rows["upload_link_token"]),
+    )
+    db.sql(
+        "INSERT INTO verification_codes (id, tenant_id, upload_request_id, code_hmac, "
+        "hmac_key_id, expires_at) VALUES (:id, :tenant, :request, "
+        "sha256(convert_to(CAST(:id AS text), 'UTF8')), 'iso', now() + interval '5 minutes')",
+        id=rows["upload_code"],
+        tenant=tenant_id,
+        request=rows["upload_request"],
+    )
+    db.sql(
+        "INSERT INTO link_sessions (id, tenant_id, upload_request_id, session_hash, expires_at) "
+        "VALUES (:id, :tenant, :request, sha256(convert_to(:token, 'UTF8')), "
+        "now() + interval '1 day')",
+        id=rows["upload_session"],
+        tenant=tenant_id,
+        request=rows["upload_request"],
+        token=str(rows["upload_session_token"]),
+    )
+    seed_received_files(db, tenant_id, rows)
+
+
+def seed_received_files(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
+    """Received files (#213): a clean file of the upload request with its retention, an upload
+    still open, the member's grant of the clean file in the seeded member session, and a notice
+    due. The marker is in the names and the upload IDs."""
+    for key in ("received_file", "received_upload", "member_grant"):
+        rows[key] = uuid.uuid4()
+    for key, state in (("received_file", "clean"), ("received_upload", "uploading")):
+        db.sql(
+            "INSERT INTO files (id, tenant_id, upload_request_id, display_name_ct, content_type, "
+            "declared_size, actual_size, storage_class, storage_key, s3_upload_id, s3_version_id, "
+            "part_size, part_count, state, scan_deadline, inspection_state, retention_until, "
+            "delete_after) SELECT :id, :tenant, :request, display_name_ct, 'text/plain', 10, "
+            "CASE WHEN :state = 'clean' THEN 10 END, 'standard', "
+            "'tenants/' || :tenant || '/files/' || :id, s3_upload_id, "
+            "CASE WHEN :state = 'clean' THEN s3_upload_id END, 5242880, 1, :state, "
+            "CASE WHEN :state = 'clean' THEN now() + interval '1 hour' END, "
+            "CASE WHEN :state = 'clean' THEN 'inspected' ELSE 'pending' END, "
+            "CASE WHEN :state = 'clean' THEN now() + interval '30 days' END, "
+            "CASE WHEN :state = 'clean' THEN now() + interval '30 days' END "
+            "FROM files WHERE id = :template",
+            id=rows[key],
+            tenant=tenant_id,
+            request=rows["upload_request"],
+            state=state,
+            template=rows["file"],
+        )
+    db.sql(
+        "INSERT INTO download_grants (id, tenant_id, file_id, s3_version_id, user_id, "
+        "member_session_id, byte_budget, expires_at) SELECT :id, :tenant, :file, s3_version_id, "
+        ":user, :session, 30, now() + interval '1 hour' FROM files WHERE id = :file",
+        id=rows["member_grant"],
+        tenant=tenant_id,
+        file=rows["received_file"],
+        user=rows["user"],
+        session=rows["session"],
+    )
+    db.sql(
+        "UPDATE upload_requests SET notice_due_at = now() + interval '5 minutes', "
+        "arrived_since_notice = 1 WHERE id = :id",
+        id=rows["upload_request"],
+    )
+
+
+def seed_dlp(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
+    """The DLP policy (#218, revision 0024): the default policy, a keyword list at its second
+    revision (the first retired) whose name and terms hold the marker, a rule using it at its
+    second revision, and a deleted keyword list that nothing names, for the cleanup."""
+    db.sql("SELECT dlp_default_policy(:tenant, :user, 'en')", tenant=tenant_id, user=rows["user"])
+    for key in ("dlp_detector", "dlp_rule", "dlp_deleted_detector"):
+        rows[key] = uuid.uuid4()
+    definition = "\\x00" + ('{"kind":"keywords","terms":["' + marker + '"]}').encode().hex()
+    for detector, revision, retired in (
+        (rows["dlp_detector"], 1, True),
+        (rows["dlp_detector"], 2, False),
+        (rows["dlp_deleted_detector"], 1, True),
+    ):
+        db.sql(
+            "INSERT INTO dlp_detectors (id, revision, tenant_id, name, kind, definition_ct, "
+            "created_by, retired_at) VALUES (:id, :revision, :tenant, :marker, 'keywords', "
+            "CAST(:definition AS bytea), :user, CASE WHEN :retired THEN now() - interval '1 day' "
+            "END)",
+            id=detector,
+            revision=revision,
+            tenant=tenant_id,
+            marker=marker,
+            definition=definition,
+            user=rows["user"],
+            retired=retired,
+        )
+    for revision, retired in ((1, True), (2, False)):
+        db.sql(
+            "INSERT INTO dlp_rules (id, revision, tenant_id, name, direction, condition, "
+            "detectors, action, created_by, retired_at) VALUES (:id, :revision, :tenant, :marker, "
+            "'sent', 'content', ARRAY['custom:' || CAST(:detector AS text)], 'warn', :user, "
+            "CASE WHEN :retired THEN now() - interval '1 day' END)",
+            id=rows["dlp_rule"],
+            revision=revision,
+            tenant=tenant_id,
+            marker=marker,
+            detector=rows["dlp_detector"],
+            user=rows["user"],
+            retired=retired,
+        )
+
+
+def seed_dlp_decisions(
+    db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]
+) -> None:
+    """The DLP decision (#219, revision 0025): a decision of the draft transfer that matched the
+    rule's first, retired revision, the transfer pointing at it, a confirmation whose
+    justification holds the marker, a known domain named with the marker, and one 400 days old,
+    for the cleanup."""
+    for key in ("dlp_decision", "dlp_confirmation"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO dlp_decisions (id, tenant_id, transfer_id, policy_version, mode, outcome, "
+        "enforced, untrusted_recipients, new_domains) VALUES (:id, :tenant, :transfer, 1, "
+        "'enforce', 'warn', true, 1, 1)",
+        id=rows["dlp_decision"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+    )
+    db.sql(
+        "INSERT INTO dlp_decision_rules (decision_id, tenant_id, rule_id, rule_revision, action, "
+        "matched_count) VALUES (:decision, :tenant, :rule, 1, 'warn', 3)",
+        decision=rows["dlp_decision"],
+        tenant=tenant_id,
+        rule=rows["dlp_rule"],
+    )
+    db.sql(
+        "UPDATE transfers SET dlp_decision_id = :decision WHERE id = :transfer",
+        decision=rows["dlp_decision"],
+        transfer=rows["transfer"],
+    )
+    db.sql(
+        "INSERT INTO dlp_confirmations (id, tenant_id, transfer_id, decision_id, confirmed_by, "
+        "justification_ct) VALUES (:id, :tenant, :transfer, :decision, :user, "
+        "convert_to(:marker, 'UTF8'))",
+        id=rows["dlp_confirmation"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+        decision=rows["dlp_decision"],
+        user=rows["user"],
+        marker=marker,
+    )
+    for domain, age in ((f"{marker}.example", "1 day"), (f"old-{marker}.example", "400 days")):
+        db.sql(
+            "INSERT INTO dlp_known_domains (tenant_id, domain, first_sent_at, last_sent_at) "
+            "VALUES (:tenant, :domain, now() - CAST(:age AS interval), "
+            "now() - CAST(:age AS interval))",
+            tenant=tenant_id,
+            domain=domain,
+            age=age,
+        )
+
+
+def seed_dlp_approvals(
+    db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]
+) -> None:
+    """DLP approvals (#220, revision 0026): a pending request of the draft transfer for its
+    decision and confirmation, past its expiry, for the expiry job's find, and an approval whose
+    comment holds the marker."""
+    for key in ("dlp_approval_request", "dlp_approval_decision"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO dlp_approval_requests (id, tenant_id, transfer_id, decision_id, "
+        "confirmation_id, requested_by, approvals_required, expires_at) VALUES (:id, :tenant, "
+        ":transfer, :decision, :confirmation, :user, 1, now() - interval '1 hour')",
+        id=rows["dlp_approval_request"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+        decision=rows["dlp_decision"],
+        confirmation=rows["dlp_confirmation"],
+        user=rows["user"],
+    )
+    db.sql(
+        "INSERT INTO dlp_approval_decisions (id, tenant_id, approval_request_id, approver_id, "
+        "decision, comment_ct) VALUES (:id, :tenant, :request, :user, 'approve', "
+        "convert_to(:marker, 'UTF8'))",
+        id=rows["dlp_approval_decision"],
+        tenant=tenant_id,
+        request=rows["dlp_approval_request"],
+        user=rows["user"],
+        marker=marker,
+    )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

@@ -97,7 +97,7 @@ export function VerificationPage({ mode, token, lapsed, onVerified, onGone }: Ve
           <Mail className="mx-auto h-10 w-10 text-brand-600" aria-hidden="true" />
           <StepHeading>{t('recipient.verifyTitle')}</StepHeading>
           <p className="mt-1 text-sm text-gray-600">
-            {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.subtitle', { name: t('uploader.someone') })}
+            {mode === 'recipient' ? t('recipient.subtitle') : t('uploader.verifySubtitle')}
           </p>
         </div>
 
@@ -107,7 +107,7 @@ export function VerificationPage({ mode, token, lapsed, onVerified, onGone }: Ve
           </Alert>
         )}
 
-        <p className="mt-4 text-sm text-gray-700">{t('recipient.verifyIntro')}</p>
+        <p className="mt-4 text-sm text-gray-700">{t(mode === 'recipient' ? 'recipient.verifyIntro' : 'uploader.verifyIntro')}</p>
         <div className="mt-3 space-y-2">
           <Button
             variant={sent ? 'secondary' : 'primary'}

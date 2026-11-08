@@ -31,6 +31,15 @@ recorded `scan_failed` (`large_file_scanning_unavailable`) at completion.
 **The evaluation** (#174, data model 3.2) runs after every removal of a file from a transfer that
 isn't a draft and after every rejection, under the transfer's row lock, so removing the blocked
 file of a held transfer sends the rest, and removing its last counted file makes it a draft again.
+A removal from a transfer awaiting confirmation, or held by a DLP rule, makes a new DLP decision
+on the files left (#219).
+
+**Received files** (#213) share completion's phase 3 (`to_scanning`) and the rejections: a file
+of an upload request gets its `retention_until` when it reaches `scanning`, from the tenant's
+`received_file_retention_days` (FR-13), and has no transfer to evaluate; a file over 2 GB counts
+towards its request's next notice instead (`sft.service.scans.note_received`). A revoked or
+expired request rejects its open uploads at once (`reject_request_uploads`, NFR-6). The uploader's
+calls are `sft.service.received`'s.
 
 Not here yet: group F's per-file part-URL count and the tenant's daily upload volume (abuse and
 rate limits 2.2, 6.1) are byte and per-item budgets the limiter doesn't count yet.
@@ -59,7 +68,7 @@ from sft.core.errors import (
     json_pointer,
 )
 from sft.core.ids import uuid7
-from sft.data import audit, files, transfers, usage
+from sft.data import audit, files, tenants, transfers, usage
 from sft.data.access import NotFoundError
 from sft.data.audit import Actor, Origin, Target
 from sft.data.database import Database
@@ -79,6 +88,7 @@ from sft.service.evaluation import evaluate
 from sft.service.idempotency import IdempotentRequest, Outcome, once, replay
 from sft.service.objects import PART_URL_SECONDS, ObjectStore, ObjectStoreError
 from sft.service.permissions import Reach, authorize
+from sft.service.scans import note_received
 from sft.service.transfers import (
     FileView,
     audit_details,
@@ -136,6 +146,8 @@ class RejectReason(StrEnum):
     UPLOAD_GONE = "upload_gone"
     UPLOAD_ABANDONED = "upload_abandoned"
     """No new part for 24 hours: reconciliation rejects it (data model 6, #181)."""
+    REQUEST_NOT_OPEN = "request_not_open"
+    """The upload request was revoked or expired before the upload was accepted (#213, NFR-6)."""
 
 
 class PlannedUpload(Protocol):
@@ -276,6 +288,8 @@ async def _owned_file(
     """
     try:
         file = await files.get_file(session, file_id)
+        if file.transfer_id is None:
+            raise NotFound  # a received file: the uploader's calls are `sft.service.received`'s
         transfer = await transfers.get_transfer(session, file.transfer_id, lock=lock)
     except NotFoundError:
         raise NotFound from None
@@ -308,8 +322,57 @@ async def reject(
         actor=caller.actor(),
         target=Target(FILE, file.id),
         origin=origin,
-        details=audit_details(caller, transfer_id=file.transfer_id, reason=reason),
+        details=audit_details(caller, **owner_details(file), reason=reason),
     )
+    return rejected
+
+
+class Owned(Protocol):
+    @property
+    def transfer_id(self) -> UUID | None: ...
+    @property
+    def upload_request_id(self) -> UUID | None: ...
+
+
+def owner_details(file: Owned) -> dict[str, audit.Detail]:
+    """A file event's owner in its details: its transfer, or the request it was received through."""
+    if file.upload_request_id is not None:
+        return {"upload_request_id": file.upload_request_id}
+    return {"transfer_id": file.transfer_id}
+
+
+async def reject_request_uploads(
+    session: AsyncSession,
+    request_id: UUID,
+    *,
+    actor: Actor,
+    details: Mapping[str, audit.Detail],
+    now: datetime,
+    origin: Origin | None = None,
+) -> int:
+    """A revoked or expired upload request rejects its files still `uploading` or `completing`,
+    under its row lock, which the caller holds: none of them is ever assembled (NFR-6), and a
+    completion that comes later finds them `rejected`. Each releases its reservation and is
+    audited; the deletion job aborts the uploads. How many."""
+    rejected = 0
+    for file in await files.open_request_uploads(session, request_id):
+        if not await files.reject_open(session, file.id, now=now):
+            continue  # pragma: no cover - the request's row lock holds the state seen
+        if file.removed_at is None:
+            await usage.release_storage(session, file.declared_size)
+        await audit.record(
+            session,
+            action="file.rejected",
+            actor=actor,
+            target=Target(FILE, file.id),
+            origin=origin,
+            details={
+                **details,
+                "upload_request_id": request_id,
+                "reason": RejectReason.REQUEST_NOT_OPEN,
+            },
+        )
+        rejected += 1
     return rejected
 
 
@@ -324,6 +387,8 @@ async def _reject_and_evaluate(
     """`reject`, then the evaluation: a rejection changes the transfer's counted files (data model
     3.1, 3.2). It changes nothing for a draft or an ended transfer."""
     rejected = await reject(session, caller, file, reason, origin)
+    if file.transfer_id is None:  # pragma: no cover - only a transfer's files come here
+        return rejected
     await evaluate(
         session,
         file.transfer_id,
@@ -684,9 +749,10 @@ async def complete_upload(
         raise _store_unavailable() from None  # the file stays `completing`; a retry resumes
 
     # Phase 3: lock again and re-check; a revocation or a removal that landed meanwhile wins.
+    transfer_id = transfer.id
     async with database.transaction(scope) as session:
         try:
-            transfer = await transfers.get_transfer(session, file.transfer_id, lock=True)
+            transfer = await transfers.get_transfer(session, transfer_id, lock=True)
             file = await files.get_file(session, file_id)
         except NotFoundError:  # pragma: no cover - rows aren't deleted while a file is completing
             raise NotFound from None
@@ -750,7 +816,9 @@ class ScanningFile(Protocol):
     @property
     def id(self) -> UUID: ...
     @property
-    def transfer_id(self) -> UUID: ...
+    def transfer_id(self) -> UUID | None: ...
+    @property
+    def upload_request_id(self) -> UUID | None: ...
     @property
     def storage_class(self) -> str: ...
 
@@ -771,23 +839,32 @@ async def to_scanning(
     the pool its size and `small_pool_max` pick (ADR-0019's split, `SCAN_SMALL_POOL_MAX_BYTES`).
     A file only GuardDuty scans is `scan_failed` at once (`large_file_scanning_unavailable`) and
     the evaluation runs. The API's `completeUpload` and reconciliation's re-run (#181) share it,
-    each as its own actor."""
+    each as its own actor.
+
+    A received file (#213) is held under its request's row lock instead: it gets its
+    `retention_until` from now, the tenant's `received_file_retention_days` ahead (FR-13), and
+    its result counts towards the request's next notice rather than a transfer's evaluation."""
     storage_class = StorageClass(file.storage_class)
     deadline = scan_timing.scan_deadline(assembled.size, now, small_pool_max=small_pool_max)
+    received = file.upload_request_id is not None
+    retention = await tenants.received_file_retention_days(session) if received else None
     if not await files.mark_scanning(
         session,
         file.id,
         actual_size=assembled.size,
         s3_version_id=assembled.version_id,
         scan_deadline=deadline,
+        retention_days=retention,
     ):  # pragma: no cover - the lock holds the state seen
-        raise RuntimeError("the file changed under the transfer's row lock")
+        raise RuntimeError("the file changed under its owner's row lock")
     # By the real size: the small or the large ClamAV pool, or GuardDuty's (no message, M6).
     topic = scan_timing.scan_topic(assembled.size, small_pool_max=small_pool_max)
     if topic is not None:
         await enqueue(session, topic, {"file_id": file.id})
-    await transfers.touch_draft(session, file.transfer_id)
+    if file.transfer_id is not None:
+        await transfers.touch_draft(session, file.transfer_id)
     target = Target(FILE, file.id)
+    owner = owner_details(file)
     await audit.record(
         session,
         action="file.uploaded",
@@ -796,7 +873,7 @@ async def to_scanning(
         origin=origin,
         details={
             **details,
-            "transfer_id": file.transfer_id,
+            **owner,
             "actual_size": assembled.size,
             "storage_class": storage_class,
         },
@@ -817,7 +894,7 @@ async def to_scanning(
         inspection_state=InspectionState.SKIPPED,
     )
     if not recorded:  # pragma: no cover - the lock holds the state seen
-        raise RuntimeError("the file changed under the transfer's row lock")
+        raise RuntimeError("the file changed under its owner's row lock")
     await audit.record(
         session,
         action="file.scanned",
@@ -826,13 +903,19 @@ async def to_scanning(
         origin=origin,
         details={
             **details,
-            "transfer_id": file.transfer_id,
+            **owner,
             "state": FileState.SCAN_FAILED,
             "scan_detail": ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
             "inspection_state": InspectionState.SKIPPED,
         },
     )
-    await evaluate(session, file.transfer_id, actor=actor, now=now, origin=origin, details=details)
+    if file.upload_request_id is not None:
+        # Blocked: both sides are told, in the request's next notice (FR-12).
+        await note_received(session, file.upload_request_id, shareable=False)
+    elif file.transfer_id is not None:
+        await evaluate(
+            session, file.transfer_id, actor=actor, now=now, origin=origin, details=details
+        )
 
 
 # ---- deleteFile ----
@@ -849,6 +932,8 @@ async def delete_file(
     async with database.transaction(tenant_scope(caller)) as session:
         try:
             file = await files.get_file(session, file_id)
+            if file.transfer_id is None:
+                raise NotFound  # a received file: `sft.service.received.delete_file`
             transfer = await transfers.get_transfer(session, file.transfer_id, lock=True)
         except NotFoundError:
             raise NotFound from None
@@ -879,6 +964,7 @@ async def delete_file(
                 now=now,
                 origin=origin,
                 details=audit_details(caller),
+                file_removed=True,
             )
 
 

@@ -12,8 +12,11 @@ statement, never read-check-write (data model 1):
 
 Times are the database's. The API reads and writes grants in the recipient's resource scope, which
 reaches that recipient's grants (`DownloadGrant.reach`); which session may use one is the
-service's rule. The lifecycle jobs (`sft_jobs`, revision 0015) find grants across tenants in system
-scope and delete or mark them in each tenant's scope.
+service's rule. A member's grant of a received file (#213, `insert_member_grant`) has the member's
+pair instead, `user_id` and `member_session_id`, and is read and written in the tenant's scope;
+it counts no download, since received files have no limit. The lifecycle jobs (`sft_jobs`,
+revision 0015) find grants across tenants in system scope and delete or mark them in each tenant's
+scope.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from sqlalchemy import ColumnElement, case, delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
-from sft.data.models import DownloadCounter, DownloadGrant
+from sft.data.models import DownloadCounter, DownloadGrant, LinkSession, TransferRecipient
 from sft.data.scope import ScopeKind
 
 LIFETIME: Final = timedelta(hours=24)
@@ -45,14 +48,17 @@ class Grant:
     tenant_id: UUID
     file_id: UUID
     s3_version_id: str
-    recipient_id: UUID
-    link_session_id: UUID
+    recipient_id: UUID | None
+    link_session_id: UUID | None
     byte_budget: int
     bytes_served: int
     request_count: int
     expires_at: datetime
     archived_at: datetime | None
     created_at: datetime
+    user_id: UUID | None = None
+    """A member's grant of a received file (#213): exactly one pair is set."""
+    member_session_id: UUID | None = None
 
     def usable(self, now: datetime) -> bool:
         """Time, requests and bytes left: what a resume needs (FR-6)."""
@@ -76,6 +82,8 @@ _COLUMNS = (
     DownloadGrant.expires_at,
     DownloadGrant.archived_at,
     DownloadGrant.created_at,
+    DownloadGrant.user_id,
+    DownloadGrant.member_session_id,
 )
 
 
@@ -154,6 +162,36 @@ async def insert_grant(
     return await get_grant(session, grant_id)
 
 
+async def insert_member_grant(
+    session: AsyncSession,
+    *,
+    grant_id: UUID,
+    file_id: UUID,
+    s3_version_id: str,
+    user_id: UUID,
+    member_session_id: UUID,
+    size: int,
+    ends_by: datetime,
+) -> Grant:
+    """A member's grant of a received file (#213): the same budget as a recipient's, 3 times
+    `size` bytes and 20 requests, for 24 hours or until `ends_by` (the member session's end). No
+    download is counted. In the tenant's scope; the caller writes `download.granted`."""
+    require_scope(session, ScopeKind.TENANT)
+    await session.execute(
+        insert(DownloadGrant).values(
+            id=grant_id,
+            tenant_id=tenant_of(session),
+            file_id=file_id,
+            s3_version_id=s3_version_id,
+            user_id=user_id,
+            member_session_id=member_session_id,
+            byte_budget=BUDGET_FACTOR * size,
+            expires_at=func.least(func.now() + LIFETIME, ends_by),
+        )
+    )
+    return await get_grant(session, grant_id)
+
+
 async def get_grant(session: AsyncSession, grant_id: UUID) -> Grant:
     row = (
         await session.execute(
@@ -225,6 +263,37 @@ async def record_progress(
     return bool(held)
 
 
+async def extend_for_transfer(session: AsyncSession, transfer_id: UUID) -> int:
+    """Let the live grants of the transfer's recipients run on with their sessions, after
+    `link_sessions.extend_for_transfer` moved those (#214): each to 24 hours after it was made or
+    its session's end, whichever is sooner, as `insert_grant` caps a new one. A grant that has
+    ended stays ended, none is shortened, and nothing else of the grant changes, so its committed
+    record (which holds no expiry) stays as written. How many moved."""
+    require_scope(session, ScopeKind.TENANT)
+    longest = func.least(DownloadGrant.created_at + LIFETIME, LinkSession.expires_at)
+    result = await session.execute(
+        update(DownloadGrant)
+        .where(
+            DownloadGrant.link_session_id == LinkSession.id,
+            LinkSession.recipient_id.in_(
+                select(TransferRecipient.id).where(
+                    TransferRecipient.transfer_id == transfer_id,
+                    in_scope(TransferRecipient, session),
+                )
+            ),
+            LinkSession.revoked_at.is_(None),
+            DownloadGrant.expires_at > func.now(),
+            DownloadGrant.expires_at < longest,
+            in_scope(LinkSession, session),
+            in_scope(DownloadGrant, session),
+        )
+        .values(expires_at=longest)
+        .returning(DownloadGrant.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
 async def mark_archived(session: AsyncSession, grant_id: UUID) -> None:
     """Both regions confirmed the grant's committed record (data model 2.3)."""
     require_scope(session, *_WRITE_SCOPES)
@@ -251,11 +320,13 @@ class Unarchived:
     tenant_id: UUID
     file_id: UUID
     s3_version_id: str
-    recipient_id: UUID
-    link_session_id: UUID
+    recipient_id: UUID | None
+    link_session_id: UUID | None
     byte_budget: int
     expires_at: datetime
     created_at: datetime
+    user_id: UUID | None = None
+    member_session_id: UUID | None = None
 
 
 async def unarchived(
@@ -275,6 +346,8 @@ async def unarchived(
             DownloadGrant.byte_budget,
             DownloadGrant.expires_at,
             DownloadGrant.created_at,
+            DownloadGrant.user_id,
+            DownloadGrant.member_session_id,
         )
         .where(
             DownloadGrant.archived_at.is_(None),
@@ -358,8 +431,10 @@ __all__ = [
     "count_unarchived",
     "counter",
     "delete_expired",
+    "extend_for_transfer",
     "get_grant",
     "insert_grant",
+    "insert_member_grant",
     "mark_archived",
     "record_progress",
     "tenants_with_expired",

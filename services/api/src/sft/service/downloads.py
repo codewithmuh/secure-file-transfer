@@ -13,6 +13,10 @@ order, so a `503` always means nothing was counted (data model 2.3):
 4. One transaction counts the download with one conditional update, inserts the grant and writes
    `download.granted`, marked security-critical. A parallel request that took the last download
    meanwhile gets `403 download_limit_reached`.
+   The transfer's first counted download (any recipient, any file) also writes the member's
+   `transfer.first_download` message there, once per transfer, when they asked for it (FR-8,
+   #214): a conditional update of `first_download_notified_at`, so a retry, a resume or a later
+   download writes none.
 5. The committed record (`download.grant_committed`) is written in the background until both
    regions confirm, then `archived_at` is set; reconciliation rewrites any still missing a minute
    later (#181). Its ID is the grant's, and it holds only what the grant row holds, so a rewrite
@@ -42,6 +46,23 @@ smaller range may still fit. A revocation therefore stops it within two interval
 (NFR-6). `download.completed` (the file's last byte sent) and `download.stopped` (a revocation, an
 expiry, an ended session or an unshareable file cut it) are written as best effort.
 
+**A member's download of a received file** (#213, `create_received_download`,
+`open_received_content`): the request's owner, through a member session only. A tenant admin sees
+the metadata but gets `403 permission_denied`, another member `404`, an API key or a link session
+`401`. The same order as a recipient's grant: group D's request rates (per member and IP, and the
+tenant's group H budget), the checks, the tenant's grant rate and bytes of the day peeked, the
+intent record in both regions, then one transaction under the request's row lock (which an early
+delete takes too) that re-checks the member session and the file, inserts the grant with the
+member's pair and writes `download.granted`, then the committed record in the background. No
+download is counted: received files have no limit. The grant belongs to the member session: 24
+hours, never past the session. Its content (`/v1/files/{file_id}/downloads/{grant_id}/content`)
+is authorised by the grant ID and the member session cookie that made it: no cookie `401`,
+another session's, even the same member's on another device, `404`. Ranges, the budget, the lease
+and the 30-second re-checks work as for a recipient; each re-check reads the member session as a
+request does, which keeps it from ending for idleness (data model 2.3), and stops the stream once
+the session ended or the file is deleted, past its retention or no longer shareable. Group E caps
+the streams per member (6), IP and tenant. A file past its retention, or deleted, is `404`.
+
 Metrics: `download_grants_total{result}`, `download_streams_active`, `download_bytes_total`,
 `download_streams_ended_total{reason}`.
 """
@@ -52,7 +73,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -75,24 +96,34 @@ from sft.core.errors import (
     Unauthenticated,
 )
 from sft.core.ids import uuid7
-from sft.data import audit, downloads, files, link_sessions, recipients
+from sft.data import audit, downloads, files, link_sessions, member_sessions, recipients
 from sft.data import transfers as transfer_rows
+from sft.data import upload_requests as request_rows
 from sft.data.access import NotFoundError
 from sft.data.audit import Actor, ArchivedEvent, Origin, Target
 from sft.data.database import Database
 from sft.data.downloads import Grant
 from sft.data.models import ActorType, File, FileState, InspectionState, Outcome, StorageClass
 from sft.data.models import TransferState as State
+from sft.data.outbox import TRANSFER_FIRST_DOWNLOAD, enqueue
 from sft.data.scope import Scope, Subject
 from sft.service import fields
 from sft.service.audit_archive import AuditArchive, RecordNotConfirmed, intent_first
+from sft.service.caller import Caller, CallerKind
 from sft.service.evaluation import is_shareable
 from sft.service.links import LinkCaller
 from sft.service.objects import FileContent, ObjectStoreError
 from sft.service.permissions import authorize
 from sft.service.rate_limits import RateLimiter
-from sft.service.rate_limits.downloads import DownloadLimits, StreamSlot, grant_charges
-from sft.service.rate_limits.limits import GRANT_REQUEST, KeyType
+from sft.service.rate_limits.downloads import (
+    MEMBER_STREAM_CAPS,
+    DownloadLimits,
+    StreamSlot,
+    grant_charges,
+    received_grant_charges,
+)
+from sft.service.rate_limits.limits import GRANT_REQUEST, RECEIVED_GRANT_REQUEST, KeyType
+from sft.service.upload_requests import sees_tenant
 
 log = logging.getLogger(__name__)
 
@@ -235,22 +266,26 @@ def _view(
 
 def committed_record(grant: Grant | downloads.Unarchived) -> ArchivedEvent:
     """A grant's committed record (data model 2.3): keyed by the grant's own ID and made from its
-    row alone, so reconciliation's rewrite is the same object, which the archive keeps once."""
+    row alone, so reconciliation's rewrite is the same object, which the archive keeps once. A
+    member's grant (#213) names the member and their session."""
+    actor_id: UUID | None
+    if grant.user_id is not None:
+        actor_type, actor_id = ActorType.MEMBER, grant.user_id
+        session = {"member_session_id": str(grant.member_session_id)}
+    else:
+        actor_type, actor_id = ActorType.RECIPIENT, grant.recipient_id
+        session = {"link_session_id": str(grant.link_session_id)}
     return ArchivedEvent(
         id=grant.id,
         tenant_id=grant.tenant_id,
         occurred_at=grant.created_at,
         action="download.grant_committed",
-        actor_type=ActorType.RECIPIENT.value,
-        actor_id=grant.recipient_id,
+        actor_type=actor_type.value,
+        actor_id=actor_id,
         target_type=FILE,
         target_id=grant.file_id,
         outcome=Outcome.SUCCESS.value,
-        details={
-            "grant_id": str(grant.id),
-            "link_session_id": str(grant.link_session_id),
-            "byte_budget": grant.byte_budget,
-        },
+        details={"grant_id": str(grant.id), **session, "byte_budget": grant.byte_budget},
     )
 
 
@@ -397,6 +432,10 @@ async def create_session_download(
             count = await downloads.count_download(session, recipient_id, file_id)
             if count is None:
                 raise Forbidden("download_limit_reached")
+            if await transfer_rows.claim_first_download_notice(session, transfer_id):
+                # The transfer's first counted download, and its member asked to be told (FR-8):
+                # once per transfer, committed with the count or not at all.
+                await enqueue(session, TRANSFER_FIRST_DOWNLOAD, {"transfer_id": transfer_id})
             grant = await downloads.insert_grant(
                 session,
                 grant_id=grant_id,
@@ -560,6 +599,8 @@ async def _find_grant(
     if not held:
         raise Unauthenticated("authentication_required")
     for found in reversed(held):  # the newest first
+        if found.recipient_id is None:
+            continue  # an uploader's session holds no grant (#212)
         scope = Scope.resource(found.tenant_id, Subject.recipient(found.recipient_id))
         async with database.transaction(scope) as session:
             try:
@@ -585,6 +626,8 @@ async def open_content(
     """`getSessionDownloadContent` up to the first byte (module docstring)."""
     found, grant = await _find_grant(database, cookie, grant_id)
     tenant_id, recipient_id = found.tenant_id, found.recipient_id
+    if recipient_id is None:  # pragma: no cover - _find_grant reads recipients' sessions only
+        raise NotFound
     scope = Scope.resource(tenant_id, Subject.recipient(recipient_id))
     async with database.transaction(scope) as session:
         _check_transfer(await recipients.link_view(session, recipient_id), now)
@@ -663,6 +706,12 @@ class Stream:
     storage_key: str
     span: ByteRange
     size: int
+    check: Callable[[AsyncSession], Awaitable[Ended | None]] | None = None
+    """What a re-check reads besides the grant: a member's stream passes its own (#213); a
+    recipient's reads the transfer, the link session and the file."""
+    actor: Actor | None = None
+    """Whose stream it is, in `download.completed` and `download.stopped`: the recipient unless
+    given."""
     sent: int = 0
     unrecorded: int = 0
     ended: Ended | None = None
@@ -718,23 +767,14 @@ class Stream:
             self.unrecorded = 0
             if not holds:
                 return Ended.TAKEN_OVER
-            try:
-                _check_transfer(
-                    await recipients.link_view(session, self.grant.recipient_id),
-                    self.services.clock.now(),
-                )
-            except Gone as gone:
-                return Ended.REVOKED if gone.code == "link_revoked" else Ended.EXPIRED
-            except Unauthenticated:
-                return Ended.SESSION_ENDED
-            if await link_sessions.get_live(session, self.session_id) is None:
-                return Ended.SESSION_ENDED
-            try:
-                file = await files.get_file(session, self.grant.file_id)
-            except NotFoundError:
-                return Ended.NOT_SHAREABLE
-            if not _shareable(file):
-                return Ended.NOT_SHAREABLE
+            if self.check is not None:
+                ended = await self.check(session)
+                if ended is not None:
+                    return ended
+            else:
+                stopped = await self._recipient_check(session)
+                if stopped is not None:
+                    return stopped
         await self.slot.renew()
         self._progress.append((now, self.sent))
         while len(self._progress) > 1 and now - self._progress[1][0] >= SLOW_WINDOW_SECONDS:
@@ -744,6 +784,29 @@ class Stream:
             SLOW_FLOOR_BYTES_PER_SECOND * (now - since)
         ):
             return Ended.SLOW
+        return None
+
+    async def _recipient_check(self, session: AsyncSession) -> Ended | None:
+        """A recipient's stream: the transfer, the link session and the file (NFR-6)."""
+        recipient_id = self.grant.recipient_id
+        if recipient_id is None:  # pragma: no cover - a recipient's grant names them
+            return Ended.SESSION_ENDED
+        try:
+            _check_transfer(
+                await recipients.link_view(session, recipient_id), self.services.clock.now()
+            )
+        except Gone as gone:
+            return Ended.REVOKED if gone.code == "link_revoked" else Ended.EXPIRED
+        except Unauthenticated:
+            return Ended.SESSION_ENDED
+        if await link_sessions.get_live(session, self.session_id) is None:
+            return Ended.SESSION_ENDED
+        try:
+            file = await files.get_file(session, self.grant.file_id)
+        except NotFoundError:
+            return Ended.NOT_SHAREABLE
+        if not _shareable(file):
+            return Ended.NOT_SHAREABLE
         return None
 
     async def finish(self) -> None:
@@ -782,7 +845,7 @@ class Stream:
 
     async def _audit(self, session: AsyncSession, reason: Ended) -> None:
         """Best effort, in the stream's last transaction: never fail closed (abuse 5.4)."""
-        actor = Actor(ActorType.RECIPIENT, self.grant.recipient_id)
+        actor = self.actor or Actor(ActorType.RECIPIENT, self.grant.recipient_id)
         target = Target(FILE, self.grant.file_id)
         details: dict[str, audit.Detail] = {"grant_id": self.grant.id, "bytes_sent": self.sent}
         if reason is Ended.COMPLETED and self.span.end == self.size - 1:
@@ -802,3 +865,355 @@ class Stream:
 
 def store_unavailable() -> ServiceUnavailable:
     return ServiceUnavailable(STORE_RETRY_AFTER, "The file can't be read right now. Try again.")
+
+
+# ---- a member's download of a received file (#213) ----
+
+
+def received_content_url(file_id: UUID, grant_id: UUID) -> str:
+    return f"/v1/files/{file_id}/downloads/{grant_id}/content"
+
+
+def _received_available(file: File, now: datetime) -> bool:
+    """A received file that is there to download: not deleted, not removed by its owner and not
+    past its retention, whatever the deletion job has done yet (FR-13). Otherwise `404`."""
+    return (
+        file.upload_request_id is not None
+        and file.removed_at is None
+        and file.deleted_at is None
+        and FileState(file.state) is not FileState.DELETED
+        and (file.delete_after is None or file.delete_after > now)
+    )
+
+
+def _received_shareable(file: File) -> bool:
+    return _shareable(file) and not file.dlp_blocked
+
+
+@dataclass(frozen=True, slots=True)
+class _Member:
+    tenant_id: UUID
+    user_id: UUID
+    session_id: UUID
+
+    @property
+    def scope(self) -> Scope:
+        return Scope.tenant(self.tenant_id)
+
+    @property
+    def record_actor(self) -> tuple[str, UUID]:
+        """The archive records' actor: made from the grant's row alone, so a member."""
+        return ActorType.MEMBER.value, self.user_id
+
+
+def _member(caller: Caller) -> _Member:
+    if (
+        caller.kind is not CallerKind.MEMBER
+        or caller.tenant_id is None
+        or caller.user_id is None
+        or caller.credential_id is None
+    ):  # pragma: no cover - authorize admits member sessions only
+        raise Unauthenticated("authentication_required")
+    return _Member(caller.tenant_id, caller.user_id, caller.credential_id)
+
+
+def _not_shareable() -> Conflict:
+    return Conflict("file_not_shareable", "This file can't be downloaded.")
+
+
+async def _received_file(
+    session: AsyncSession, caller: Caller, file_id: UUID, now: datetime, *, lock: bool = False
+) -> File:
+    """The received file, if the caller owns its request: another member gets `404`, an admin
+    acting as one `403 permission_denied`; a file deleted or past its retention is `404`. `lock`
+    takes the request's row lock, which an early delete takes too."""
+    try:
+        file = await files.get_file(session, file_id)
+        if file.upload_request_id is None:
+            raise NotFound  # a transfer's file is downloaded by its recipients only
+        request = await request_rows.get_request(session, file.upload_request_id, lock=lock)
+    except NotFoundError:
+        raise NotFound from None
+    if request.created_by != caller.user_id:
+        if sees_tenant(caller, now):
+            raise Forbidden("permission_denied", "Only the request's owner may download its files.")
+        raise NotFound
+    if lock:
+        file = await files.get_file(session, file_id)
+    if not _received_available(file, now):
+        raise NotFound
+    return file
+
+
+def _received_view(tenant_id: UUID, grant: Grant, file: File) -> DownloadView:
+    view = _view(tenant_id, grant, file, None)
+    return DownloadView(
+        grant_id=view.grant_id,
+        url=received_content_url(file.id, grant.id),
+        expires_at=view.expires_at,
+        byte_budget=view.byte_budget,
+        request_limit=view.request_limit,
+        file=view.file,
+        unscannable=view.unscannable,
+        downloads_remaining=None,
+    )
+
+
+async def create_received_download(
+    database: Database,
+    services: DownloadServices,
+    caller: Caller,
+    file_id: UUID,
+    *,
+    resume_grant_id: UUID | None,
+    ip: str,
+    origin: Origin,
+    now: datetime,
+) -> DownloadView:
+    """`createReceivedFileDownload` (module docstring)."""
+    authorize(caller, "createReceivedFileDownload", now=now)
+    member = _member(caller)
+    metrics = services.metrics.grants
+    keys = {
+        KeyType.ACCOUNT: str(member.user_id),
+        KeyType.IP: ip,
+        KeyType.TENANT: str(member.tenant_id),
+    }
+    await services.limiter.check(RECEIVED_GRANT_REQUEST, keys)
+    actor = caller.actor()
+    refusal: tuple[GrantResult, ProblemError] | None = None
+    async with database.transaction(member.scope) as session:
+        file = await _received_file(session, caller, file_id, now)
+        if await member_sessions.get_live_session(session, member.session_id) is None:
+            raise Unauthenticated("session_expired")
+        if resume_grant_id is not None:
+            return await _resume_received(
+                session, services, member, actor, file, resume_grant_id, origin, now
+            )
+        if not _received_shareable(file):
+            refusal = GrantResult.NOT_SHAREABLE, _not_shareable()
+    if refusal is not None:
+        metrics.labels(refusal[0].value).inc()
+        async with database.transaction(member.scope) as session:
+            await audit.record(
+                session,
+                action="download.refused",
+                actor=actor,
+                target=Target(FILE, file_id),
+                outcome=Outcome.FAILURE,
+                origin=origin,
+                details={"reason": refusal[0]},
+            )
+        raise refusal[1]
+    size = file.actual_size or 0
+    version = file.s3_version_id or ""
+    charges = received_grant_charges(keys, size)
+    await services.limiter.peek_all(charges)
+
+    grant_id = uuid7()
+    actor_type, actor_id = member.record_actor
+    intent = ArchivedEvent(
+        id=uuid7(),
+        tenant_id=member.tenant_id,
+        occurred_at=now,
+        action="download.grant_intent",
+        actor_type=actor_type,
+        actor_id=actor_id,
+        target_type=FILE,
+        target_id=file_id,
+        outcome=Outcome.SUCCESS.value,
+        details={"grant_id": str(grant_id), "member_session_id": str(member.session_id)},
+    )
+
+    async def commit() -> tuple[DownloadView, ArchivedEvent]:
+        async with database.transaction(member.scope) as session:
+            # The archive writes took time: under the request's row lock, which an early delete
+            # takes too, read the session and the file again, and end the grant with the session.
+            current = await _received_file(session, caller, file_id, now, lock=True)
+            live = await member_sessions.get_live_session(session, member.session_id)
+            if live is None:
+                raise Unauthenticated("session_expired")
+            if not _received_shareable(current) or current.s3_version_id != version:
+                raise _not_shareable()
+            grant = await downloads.insert_member_grant(
+                session,
+                grant_id=grant_id,
+                file_id=file_id,
+                s3_version_id=version,
+                user_id=member.user_id,
+                member_session_id=member.session_id,
+                size=size,
+                ends_by=live.expires_at,
+            )
+            await audit.record(
+                session,
+                action="download.granted",
+                actor=actor,
+                target=Target(FILE, file_id),
+                origin=origin,
+                security_critical=True,
+                details={
+                    "grant_id": grant_id,
+                    "member_session_id": member.session_id,
+                    "upload_request_id": current.upload_request_id,
+                    "byte_budget": grant.byte_budget,
+                },
+            )
+            # Last before the commit: charged all or none; a refusal rolls the grant back.
+            await services.limiter.check_all(charges)
+        return _received_view(member.tenant_id, grant, current), committed_record(grant)
+
+    async def confirmed(view: DownloadView) -> None:
+        async with database.transaction(member.scope) as session:
+            await downloads.mark_archived(session, view.grant_id)
+
+    try:
+        view = await intent_first(services.archive, intent, commit, on_confirmed=confirmed)
+    except RecordNotConfirmed:
+        metrics.labels(GrantResult.UNAVAILABLE.value).inc()
+        raise
+    except Conflict:
+        metrics.labels(GrantResult.NOT_SHAREABLE.value).inc()
+        raise
+    metrics.labels(GrantResult.GRANTED.value).inc()
+    return view
+
+
+async def _resume_received(
+    session: AsyncSession,
+    services: DownloadServices,
+    member: _Member,
+    actor: Actor,
+    file: File,
+    grant_id: UUID,
+    origin: Origin,
+    now: datetime,
+) -> DownloadView:
+    """The same grant again, while it has time, bytes and requests left (FR-6): only in the
+    member session that made it, for the same file; any other grant is `404`."""
+    try:
+        grant = await downloads.get_grant(session, grant_id)
+    except NotFoundError:
+        raise NotFound from None
+    if grant.member_session_id != member.session_id or grant.file_id != file.id:
+        raise NotFound
+    if not grant.usable(now) or not _received_shareable(file):
+        services.metrics.grants.labels(GrantResult.EXHAUSTED.value).inc()
+        raise Forbidden("download_grant_exhausted")
+    await audit.record(
+        session,
+        action="download.resumed",
+        actor=actor,
+        target=Target(FILE, file.id),
+        origin=origin,
+        details={"grant_id": grant.id},
+    )
+    services.metrics.grants.labels(GrantResult.RESUMED.value).inc()
+    return _received_view(member.tenant_id, grant, file)
+
+
+async def open_received_content(
+    database: Database,
+    services: DownloadServices,
+    caller: Caller,
+    file_id: UUID,
+    grant_id: UUID,
+    *,
+    range_header: str | None,
+    if_range: str | None,
+    ip: str,
+    now: datetime,
+) -> Download:
+    """`getReceivedFileDownloadContent` up to the first byte (module docstring): the grant of
+    this member session and this file only, else `404`."""
+    authorize(caller, "getReceivedFileDownloadContent", now=now)
+    member = _member(caller)
+    scope = member.scope
+    async with database.transaction(scope) as session:
+        try:
+            grant = await downloads.get_grant(session, grant_id)
+        except NotFoundError:
+            raise NotFound from None
+        if grant.member_session_id != member.session_id or grant.file_id != file_id:
+            raise NotFound  # another session's grant, even the same member's (FR-14)
+        if await member_sessions.get_live_session(session, member.session_id) is None:
+            raise Unauthenticated("session_expired")
+        try:
+            file = await files.get_file(session, file_id)
+        except NotFoundError:
+            raise NotFound from None
+    if (
+        not _received_available(file, now)
+        or not _received_shareable(file)
+        or file.s3_version_id != grant.s3_version_id
+    ):
+        raise NotFound
+    size = file.actual_size or 0
+    etag = etag_for(file.id, file.sha256, grant.s3_version_id)
+    wanted = parse_range(range_header, size)
+    if wanted is not None and if_range is not None and if_range.strip() != etag:
+        wanted = None  # the validator changed: the whole file (RFC 9110 13.1.5)
+    span = wanted or ByteRange(0, size - 1)
+
+    stream_id = uuid4()
+    slot = await services.limits.open_stream(
+        {
+            KeyType.ACCOUNT: str(member.user_id),
+            KeyType.IP: ip,
+            KeyType.TENANT: str(member.tenant_id),
+        },
+        stream_id,
+        caps=MEMBER_STREAM_CAPS,
+    )
+    try:
+        async with database.transaction(scope) as session:
+            admitted = await downloads.admit(session, grant.id, stream_id, need=span.length)
+    except BaseException:
+        await slot.release()
+        raise
+    if admitted is None:
+        await slot.release()
+        services.metrics.grants.labels(GrantResult.EXHAUSTED.value).inc()
+        raise Forbidden("download_grant_exhausted")
+    headers = {
+        **SECURITY_HEADERS,
+        "ETag": etag,
+        "Content-Disposition": disposition(
+            fields.open_sealed(member.tenant_id, file.display_name_ct)
+        ),
+        "Content-Length": str(span.length),
+    }
+    if wanted is not None:
+        headers["Content-Range"] = f"bytes {span.start}-{span.end}/{size}"
+
+    async def check(session: AsyncSession) -> Ended | None:
+        # Reading the session as a request does moves its `last_seen_at`, so a long download
+        # keeps it from ending for idleness; its 12 hours still apply (data model 2.3).
+        if await member_sessions.get_live_session(session, member.session_id) is None:
+            return Ended.SESSION_ENDED
+        try:
+            current = await files.get_file(session, file_id)
+        except NotFoundError:
+            return Ended.NOT_SHAREABLE
+        if not _received_available(current, services.clock.now()) or not _received_shareable(
+            current
+        ):
+            return Ended.NOT_SHAREABLE
+        return None
+
+    stream = Stream(
+        database=database,
+        services=services,
+        scope=scope,
+        grant=grant,
+        session_id=member.session_id,
+        stream_id=stream_id,
+        slot=slot,
+        storage_class=StorageClass(file.storage_class),
+        storage_key=file.storage_key,
+        span=span,
+        size=size,
+        check=check,
+        actor=caller.actor(),
+    )
+    return Download(206 if wanted is not None else 200, headers, stream)

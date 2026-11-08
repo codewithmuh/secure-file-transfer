@@ -7,7 +7,7 @@ import { safeReturnPath } from './returnPath';
 
 /** The fields of `CurrentMember` the web app reads, with the contract's types. */
 interface MemberFields {
-  user: Pick<CurrentMember['user'], 'id' | 'email'>;
+  user: Pick<CurrentMember['user'], 'id' | 'email' | 'dlp_approver'>;
   tenant: Pick<CurrentMember['tenant'], 'id' | 'name'>;
   session: Pick<CurrentMember['session'], 'effective_role'>;
   csrf_token: CurrentMember['csrf_token'];
@@ -18,7 +18,7 @@ interface MemberFields {
  * type check fail if what this accepts stops fitting the generated contract types.
  */
 const currentMemberSchema: z.ZodType<MemberFields> = z.object({
-  user: z.object({ id: z.string().min(1), email: z.string().min(1) }),
+  user: z.object({ id: z.string().min(1), email: z.string().min(1), dlp_approver: z.boolean() }),
   tenant: z.object({ id: z.string().min(1), name: z.string() }),
   session: z.object({ effective_role: z.enum(['admin', 'member']) }),
   csrf_token: z.string().regex(/^[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9_-]{43}$/),
@@ -77,6 +77,7 @@ export function restoreMemberSession(): Promise<boolean> {
           email: me.user.email,
           name: me.user.email,
           role: me.session.effective_role,
+          dlpApprover: me.user.dlp_approver,
           tenantId: me.tenant.id,
           tenantName: me.tenant.name,
         },

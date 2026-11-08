@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from email.utils import formataddr
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import boto3
 from botocore.config import Config
@@ -113,6 +114,28 @@ class SesMailer:
             # One SES tenant per tenant, named by its ID, created by createTenant (ADR-0015).
             request["TenantName"] = str(email.tenant_id)
         return request  # type: ignore[return-value]  # built as a dict to add keys conditionally
+
+    def release(self, tenant_id: UUID, address: str) -> None:
+        """`DeleteSuppressedDestination` on the tenant's SES list (ADR-0015, abuse 7.4). An address
+        that isn't on it is released already. Without SES tenants there is no tenant list, and
+        the account-level list is off, so there is nothing to release."""
+        if not self._name_tenants:
+            return
+        try:
+            self._client.delete_suppressed_destination(
+                EmailAddress=address, TenantName=str(tenant_id)
+            )
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", "Unknown"))
+            if code == "NotFoundException":
+                return
+            log.warning("suppression not released", extra={"provider": "ses", "error": code})
+            raise MailError(_KINDS.get(code, MailErrorKind.UNAVAILABLE), code) from None
+        except BotoCoreError as exc:
+            code = type(exc).__name__
+            log.warning("suppression not released", extra={"provider": "ses", "error": code})
+            raise MailError(MailErrorKind.UNAVAILABLE, code) from None
+        log.info("suppression released", extra={"provider": "ses"})
 
     def send(self, email: OutgoingEmail) -> str:
         try:

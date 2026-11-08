@@ -577,3 +577,24 @@ def test_the_entry_point_serves_the_operator_app(
     assert isinstance(served[0].settings, OperatorSettings)
     # Its metrics go to the registry the server's /metrics serves.
     assert built == [served[0].metrics.registry]
+
+
+def test_a_new_tenant_starts_with_the_default_dlp_policy_at_version_1(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    # #218, detectors 6: written as sft_operator in the transaction that makes the tenant, its
+    # rules made by the first admin and named in the tenant's language.
+    response = client.post("/v1/operator/tenants", json=new_tenant(), headers=bearer(token))
+    assert response.status_code == 201, response.text
+    tenant_id = UUID(response.json()["tenant"]["id"])
+    admin_id = UUID(response.json()["first_admin"]["id"])
+    assert migrated_db.sql(
+        "SELECT version, mode, updated_by FROM dlp_policies WHERE tenant_id = :id", id=tenant_id
+    ) == [(1, "enforce", None)]
+    rules = migrated_db.sql(
+        "SELECT name, revision, created_by FROM dlp_rules WHERE tenant_id = :id ORDER BY id",
+        id=tenant_id,
+    )
+    assert len(rules) == 8
+    assert rules[0] == ("Credentials and private keys", 1, admin_id)
+    assert rules[-1] == ("New recipient domain", 1, admin_id)

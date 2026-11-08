@@ -2,14 +2,17 @@
 
 Every function filters with `in_scope`, and every write takes its tenant from the transaction's
 scope (`tenant_of`), never from an argument. Writes run in tenant scope only: a member or an API
-key acts on its own tenant's transfers, and no link session or job creates one through here.
+key acts on its own tenant's transfers, and no link session or job creates one through here. The
+one exception is `claim_first_download_notice`, which a recipient's download runs in its resource
+scope (#214).
 State rules and permissions are the service layer's (`sft.service.transfers`); these functions
 only read and write rows. A row the scope doesn't reach is `NotFoundError`.
 
 **The evaluation's functions** (`lock_for_evaluation`, `change_state`, `recipient_ids`,
-`queue_recipients`, `insert_download_counters`; data model 3.2) also run as the scan worker and
-the lifecycle jobs, whose roles may read neither the message nor an address (revision 0009). So
-they name their columns, and never select a whole row.
+`recipient_domains`, `queue_recipients`, `insert_download_counters`; data model 3.2) also run as
+the scan worker and the lifecycle jobs, whose roles may read neither the message nor an address
+(revision 0009), only a recipient's domain (revision 0025). So they name their columns, and never
+select a whole row.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
 from sft.data.models import (
     DeliveryState,
+    DlpDecision,
     DownloadCounter,
     File,
     FileState,
@@ -163,6 +167,8 @@ class Summary:
     file_count: int
     recipient_count: int
     total_size: int
+    dlp_outcome: str | None = None
+    """The outcome of the transfer's current DLP decision, once there is one (#219)."""
 
 
 EXPIRES_FROM: Final = frozenset(
@@ -230,8 +236,14 @@ async def list_transfers(
         .correlate(Transfer)
         .scalar_subquery()
     )
+    dlp_outcome = (
+        select(DlpDecision.outcome)
+        .where(DlpDecision.id == Transfer.dlp_decision_id, in_scope(DlpDecision, session))
+        .correlate(Transfer)
+        .scalar_subquery()
+    )
     statement = (
-        select(Transfer, file_count, recipient_count, total_size)
+        select(Transfer, file_count, recipient_count, total_size, dlp_outcome)
         .where(in_scope(Transfer, session))
         .order_by(Transfer.id.desc())
         .limit(limit)
@@ -255,8 +267,9 @@ async def list_transfers(
             file_count=int(files_),
             recipient_count=int(recipients),
             total_size=int(size),
+            dlp_outcome=outcome,
         )
-        for t, files_, recipients, size in rows.tuples()
+        for t, files_, recipients, size, outcome in rows.tuples()
     ]
 
 
@@ -274,6 +287,8 @@ class Locked:
     expires_in: timedelta
     expires_at: datetime | None
     download_limit: int | None
+    dlp_decision_id: UUID | None = None
+    """The transfer's current DLP decision (#219)."""
 
 
 async def lock_for_evaluation(session: AsyncSession, transfer_id: UUID) -> Locked:
@@ -289,6 +304,7 @@ async def lock_for_evaluation(session: AsyncSession, transfer_id: UUID) -> Locke
                 Transfer.expires_in,
                 Transfer.expires_at,
                 Transfer.download_limit,
+                Transfer.dlp_decision_id,
             )
             .where(Transfer.id == transfer_id, in_scope(Transfer, session))
             .with_for_update()
@@ -304,6 +320,7 @@ async def lock_for_evaluation(session: AsyncSession, transfer_id: UUID) -> Locke
         expires_in=row.expires_in,
         expires_at=row.expires_at,
         download_limit=row.download_limit,
+        dlp_decision_id=row.dlp_decision_id,
     )
 
 
@@ -343,6 +360,23 @@ async def recipient_ids(session: AsyncSession, transfer_id: UUID) -> list[UUID]:
         .order_by(TransferRecipient.id)
     )
     return list(rows)
+
+
+async def recipient_domains(
+    session: AsyncSession, transfer_id: UUID
+) -> list[tuple[UUID, str | None]]:
+    """Each recipient's ID and domain, never the address: what the DLP decision needs to tell
+    trusted and new domains (architecture 4.6, step 1)."""
+    require_scope(session, ScopeKind.TENANT)
+    rows = await session.execute(
+        select(TransferRecipient.id, TransferRecipient.domain)
+        .where(
+            TransferRecipient.transfer_id == transfer_id,
+            in_scope(TransferRecipient, session),
+        )
+        .order_by(TransferRecipient.id)
+    )
+    return [(row.id, row.domain) for row in rows]
 
 
 async def queue_recipients(session: AsyncSession, transfer_id: UUID) -> int:
@@ -408,6 +442,49 @@ async def notice(session: AsyncSession, transfer_id: UUID) -> Notice | None:
         )
     ).first()
     return None if row is None else Notice(row[0], row[1], TransferState(row[2]), row[3])
+
+
+# ---- extending the expiry and the first-download notice (#214) ----
+
+
+async def extend_expiry(session: AsyncSession, transfer_id: UUID, expires_at: datetime) -> bool:
+    """Move the transfer's `expires_at` to `expires_at` (`extendTransferExpiry`, FR-9); False if
+    the scope doesn't reach it. The caller holds the row lock, has checked the state and the
+    limits, and writes `transfer.expiry_extended`."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        update(Transfer)
+        .where(Transfer.id == transfer_id, in_scope(Transfer, session))
+        .values(expires_at=expires_at)
+        .returning(Transfer.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
+
+
+async def claim_first_download_notice(session: AsyncSession, transfer_id: UUID) -> bool:
+    """Whether this transaction is the one that tells the member of the transfer's first download
+    (FR-8, data model 2.2): one conditional update sets `first_download_notified_at` if the member
+    asked for the notice and it isn't set yet, so it is true once per transfer, whichever
+    recipient and file came first; a resume or a later download finds it set.
+
+    It runs in the download's transaction, in the recipient's resource scope (which reaches their
+    own transfer, `Transfer.reach`) under the transfer's row lock; the caller writes the outbox
+    message and `download.granted` covers the change."""
+    require_scope(session, ScopeKind.TENANT, ScopeKind.RESOURCE)
+    result = await session.execute(
+        update(Transfer)
+        .where(
+            Transfer.id == transfer_id,
+            Transfer.notify_on_first_download.is_(True),
+            Transfer.first_download_notified_at.is_(None),
+            in_scope(Transfer, session),
+        )
+        .values(first_download_notified_at=func.now())
+        .returning(Transfer.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
 
 
 # ---- the lifecycle jobs (sft_jobs, data model 6; #181) ----

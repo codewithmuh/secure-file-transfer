@@ -16,11 +16,16 @@ The rules of the contract's member operations live here:
 - `sso_fallback` needs a tenant that uses SSO, which arrives in M6, so naming a fallback admin is
   `422 validation_failed` for now. `dlp_approver` names only an active user.
 
+A change of `dlp_approver` writes `user.dlp_approver_changed` and an outbox message that emails
+every active admin `dlp_policy_changed` with `approvers_changed` (#220, FR-54), in its transaction.
+An admin may name themselves an approver: they still can't approve their own transfers (T-100).
+
 A role change and a deactivation end every session of the user in the same transaction (authn and
-authz 3.3), so the next request of a session signs in again with the new role, or not at all. Not
-here yet: a demotion or a deactivation also revokes the user's API keys (M5), in that transaction
-too. The admins' emails about role and approver changes come
-with the notification worker.
+authz 3.3), so the next request of a session signs in again with the new role, or not at all. A
+demotion or a deactivation also revokes every API key the user owns, in that transaction too, one
+security-critical `api_key.revoked` each with the reason (#215, authn and authz 5.2), archived with
+the change's own record. The admins' emails about role changes come with the notification
+worker.
 
 **Security-critical records** (#177, architecture 5.2): a deactivation and a demotion commit first,
 then their record goes to the audit archive of both regions (`sft.service.audit_archive`), and the
@@ -71,8 +76,9 @@ from sft.data import audit, identities, member_sessions, users
 from sft.data.audit import ArchivedEvent, Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
-from sft.data.outbox import MEMBER_SIGN_IN_RESET, enqueue
+from sft.data.outbox import DLP_POLICY_CHANGED, MEMBER_SIGN_IN_RESET, enqueue
 from sft.data.scope import Scope
+from sft.service import api_keys
 from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
 from sft.service.idempotency import IdempotentRequest, Outcome, once
@@ -289,6 +295,7 @@ async def update_user(
         return role is Role.MEMBER and _active_admin(user)
 
     demoted = False
+    revoked_keys: list[ArchivedEvent] = []
 
     async def apply(
         session: AsyncSession, user: User, admins: Sequence[UUID]
@@ -302,6 +309,14 @@ async def update_user(
         if role is Role.MEMBER and user.role == Role.MEMBER.value:
             demotion = await audit.latest_critical_event(
                 session, action="user.role_changed", target=Target(users.TARGET, user.id)
+            )
+            # The keys a demotion revoked, now or on the call a retry completes (#215).
+            revoked_keys[:] = await api_keys.revoke_owner_keys(
+                session,
+                user.id,
+                reason=api_keys.RevokeReason.OWNER_DEMOTED,
+                actor=actor,
+                origin=origin,
             )
         return user, demotion
 
@@ -328,11 +343,12 @@ async def update_user(
             await member_sessions.revoke_user_sessions(
                 session, user.id, reason=member_sessions.RevokedReason.ROLE_CHANGED
             )
-            # Here a demotion also revokes the keys they own (M5), in this transaction.
         if dlp_approver is not None and dlp_approver != user.dlp_approver:
             user = await users.set_dlp_approver(
                 session, user.id, dlp_approver, actor=actor, origin=origin
             )
+            # Every active admin is told (FR-54, #220): the notice carries IDs only.
+            await enqueue(session, DLP_POLICY_CHANGED["approvers_changed"], {})
         if sso_fallback is not None and sso_fallback != user.sso_fallback:
             user = await users.set_sso_fallback(
                 session, user.id, sso_fallback, actor=actor, origin=origin
@@ -345,8 +361,8 @@ async def update_user(
     if demotion is None:
         return user
     if demoted:
-        await archive.confirm([demotion])
-    elif await archive.write([demotion]):
+        await archive.confirm([demotion, *revoked_keys])
+    elif await archive.write([demotion, *revoked_keys]):
         # Not a demotion now: an earlier one's record, completed if the archive allows, but
         # this call answers for its own change only, so an outage doesn't fail it.
         log.warning("an earlier demotion's record is still not in both regions")
@@ -366,6 +382,7 @@ async def deactivate_user(
     security-critical record: `200` only once both regions' archive hold it, and a retry after a
     `503` writes it if it is still missing (#177)."""
     authorize(caller, "deactivateUser", now=now)
+    revoked_keys: list[ArchivedEvent] = []
 
     async def apply(
         session: AsyncSession, user: User, admins: Sequence[UUID]
@@ -373,20 +390,28 @@ async def deactivate_user(
         if user.status != UserStatus.DEACTIVATED:
             if _active_admin(user) and list(admins) == [user.id]:
                 raise _last_admin()
-            # Here every key they own is revoked too (M5), in this transaction.
             user = await users.deactivate_user(
                 session, user.id, actor=caller.actor(), origin=origin
             )
             await member_sessions.revoke_user_sessions(
                 session, user.id, reason=member_sessions.RevokedReason.DEACTIVATED
             )
+        # Every key they own, revoked in this transaction (#215); or, on a retry, the keys the
+        # deactivation revoked, whose records it completes.
+        revoked_keys[:] = await api_keys.revoke_owner_keys(
+            session,
+            user.id,
+            reason=api_keys.RevokeReason.OWNER_DEACTIVATED,
+            actor=caller.actor(),
+            origin=origin,
+        )
         event = await audit.latest_critical_event(
             session, action="user.deactivated", target=Target(users.TARGET, user.id)
         )
         return user, event
 
     user, event = await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)
-    await archive.confirm([event] if event else [])
+    await archive.confirm([*([event] if event else []), *revoked_keys])
     return user
 
 

@@ -305,7 +305,7 @@ def test_main_exits_1_when_the_database_is_unreachable(
 def test_main_exits_1_with_one_line_when_the_images_migrations_are_wrong(
     monkeypatch: pytest.MonkeyPatch, json_logs: Logs, error: Exception
 ) -> None:
-    def broken(url: str) -> Plan:
+    def broken(url: str, **_: object) -> Plan:  # `iam_region` too, since #193
         raise error
 
     monkeypatch.setenv("MIGRATION_DATABASE_URL", "postgresql://sft_migrate@127.0.0.1:1/sft")

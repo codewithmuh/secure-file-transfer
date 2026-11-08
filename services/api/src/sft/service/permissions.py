@@ -16,7 +16,9 @@ A permission says what each caller type may reach:
 - `recipient`, `uploader`, `operator`: whether that caller may call it at all.
 
 A caller with no credential the operation accepts gets `401`; one with a credential it accepts
-but no right gets `403` (table 6.3: "a dash means the caller is refused"). The resource rule
+but no right gets `403` (table 6.3: "a dash means the caller is refused"). The member routes read
+API keys too (#215), so a key gets `403 permission_denied` on every operation for web sessions
+only (T-55). The resource rule
 (Own, Tenant, 6.4) is the service function's, using the reach `authorize` returns.
 """
 
@@ -338,6 +340,32 @@ PEOPLE_ONLY: Final = frozenset({"unlockRecipient", "unlockUploader"})
 """Operations an API key is refused with `403`, not `401`: a lockout signals a possible attack, so
 a person decides (authn and authz 4.4, the contract's `unlockRecipient`)."""
 
+DLP_PEOPLE_ONLY: Final = frozenset(
+    {
+        "getDlpPolicy",
+        "updateDlpPolicy",
+        "listDlpRules",
+        "createDlpRule",
+        "getDlpRule",
+        "updateDlpRule",
+        "deleteDlpRule",
+        "listDlpDetectors",
+        "createDlpDetector",
+        "getDlpDetector",
+        "updateDlpDetector",
+        "deleteDlpDetector",
+        "testDlpDetectors",
+        "confirmTransfer",
+        "approveTransfer",
+        "rejectTransfer",
+        "listApprovalRequests",
+        "getApprovalRequest",
+    }
+)
+"""DLP operations an API key is refused with `403`, not `401`: the policy, its rules and detectors
+need a web session, and every DLP decision on record is a person's (authn and authz 5.3, 6.1
+point 4)."""
+
 
 def _by_operation(permissions: tuple[Permission, ...]) -> Mapping[str, Permission]:
     found: dict[str, Permission] = {}
@@ -373,6 +401,12 @@ def authorize(caller: Caller | None, operation_id: str, *, now: datetime) -> Rea
         return ANY
     if caller is not None and caller.kind is CallerKind.API_KEY and operation_id in PEOPLE_ONLY:
         raise Forbidden("permission_denied", "API keys can't unlock: a person decides.")
+    if caller is not None and caller.kind is CallerKind.API_KEY and operation_id in DLP_PEOPLE_ONLY:
+        raise Forbidden("permission_denied", "API keys can't manage or decide DLP: a person does.")
+    if caller is not None and caller.kind is CallerKind.API_KEY and _web_only(permission):
+        # A live key is a credential the member routes read (#215), so one that may not use an
+        # operation is refused with 403, not 401 (table 6.3, T-55).
+        raise Forbidden("permission_denied", "This operation needs a person in the web app.")
     if caller is None or not permission.accepts(caller.kind):
         raise Unauthenticated(
             "authentication_required", bearer=caller is not None and caller.bearer
@@ -390,6 +424,13 @@ def authorize(caller: Caller | None, operation_id: str, *, now: datetime) -> Rea
     if caller.kind is CallerKind.UPLOADER:
         return _allowed(permission.uploader, OWN)
     return ANY  # an operator, on the operator API
+
+
+def _web_only(permission: Permission) -> bool:
+    """A member route that takes no API key: downloads, unlocks, DLP decisions, administration."""
+    if permission.api_key is not None:
+        return False
+    return permission.member is not NONE or permission.admin is not NONE
 
 
 def _allowed(allowed: bool, reach: Reach) -> Reach:

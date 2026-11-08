@@ -3,8 +3,8 @@ import { Link } from 'react-router';
 import { Clock } from 'lucide-react';
 
 /**
- * What an M5 route shows (#195's decision): upload requests, the audit log, API keys and the DLP policy pages are
- * hidden from the navigation, and an old bookmark or a typed URL gets this clear answer instead of a 404 or mock data.
+ * What an M5 route shows (#195's decision): upload requests, the audit log and API keys are hidden from the
+ * navigation, and an old bookmark or a typed URL gets this clear answer instead of a 404 or mock data.
  * Their components stay in the repository, unrouted, as M5's starting point.
  */
 export function NotAvailableYet() {

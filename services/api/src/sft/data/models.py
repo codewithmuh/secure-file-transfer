@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 from enum import StrEnum
 from ipaddress import IPv4Address, IPv6Address
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import (
     ARRAY,
@@ -110,7 +110,7 @@ class TenantPolicy(TenantOwned, Base):
 
     Revision 0005 brings `default_locale`, revision 0009 the transfer and scanning fields of FR-23
     with their defaults: the longest expiry, what happens to unscannable files and how long
-    received files are kept. The domain rules (FR-24) arrive with their feature (M5).
+    received files are kept. Revision 0023 brings the domain rules (FR-24, #217).
     """
 
     __tablename__ = "tenant_policies"
@@ -125,6 +125,8 @@ class TenantPolicy(TenantOwned, Base):
         CheckConstraint(
             "received_file_retention_days BETWEEN 1 AND 90", name="received_file_retention_days"
         ),
+        CheckConstraint("cardinality(allowed_domains) <= 500", name="allowed_domains"),
+        CheckConstraint("cardinality(blocked_domains) <= 500", name="blocked_domains"),
     )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
@@ -134,6 +136,14 @@ class TenantPolicy(TenantOwned, Base):
     received_file_retention_days: Mapped[int] = mapped_column(server_default=text("30"))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    # The recipient domain rules (FR-24, #217, revision 0023): lower-case, IDNA (ASCII) domains,
+    # each covering its subdomains (`sft.service.domain_rules`).
+    allowed_domains: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]")
+    )
+    blocked_domains: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]")
+    )
 
 
 class SchemaCompatibility(Base):
@@ -348,7 +358,12 @@ class User(TenantOwned, Base):
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
-        # The sender of the recipient's transfer, and no one else.
+        # The sender of the recipient's transfer, and no one else; an uploader's link session
+        # reaches the member who asked for the files (#212), whose address the uploader sees.
+        if subject.kind is SubjectKind.UPLOAD_REQUEST:
+            return cls.id.in_(
+                select(UploadRequest.created_by).where(UploadRequest.id == subject.id)
+            )
         if subject.kind is not SubjectKind.RECIPIENT:
             return false()
         return cls.id.in_(
@@ -659,6 +674,14 @@ class Transfer(TenantOwned, Base):
             "last_activity_at",
             postgresql_where=text("state = 'draft'"),
         ),
+        # The transfer's current DLP decision (#219, revision 0025).
+        # `use_alter`: decisions refer to their transfer too, so this key breaks the cycle.
+        ForeignKeyConstraint(
+            ["tenant_id", "dlp_decision_id"],
+            ["dlp_decisions.tenant_id", "dlp_decisions.id"],
+            use_alter=True,
+        ),
+        Index("transfers_tenant_id_dlp_decision_id_idx", "tenant_id", "dlp_decision_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -672,6 +695,8 @@ class Transfer(TenantOwned, Base):
     expires_at: Mapped[datetime | None]
     download_limit: Mapped[int | None]
     notify_on_first_download: Mapped[bool] = mapped_column(server_default=false())
+    first_download_notified_at: Mapped[datetime | None]
+    """When the first counted download wrote the member's notice (#214, revision 0018)."""
     last_activity_at: Mapped[datetime] = mapped_column(server_default=func.now())
     submitted_at: Mapped[datetime | None]
     sent_at: Mapped[datetime | None]
@@ -679,6 +704,7 @@ class Transfer(TenantOwned, Base):
     revoked_by: Mapped[uuid.UUID | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    dlp_decision_id: Mapped[uuid.UUID | None]
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -709,6 +735,10 @@ class TransferRecipient(TenantOwned, Base):
         ForeignKeyConstraint(["tenant_id", "unlocked_by"], ["users.tenant_id", "users.id"]),
         UniqueConstraint("tenant_id", "transfer_id", "email_normalized"),
         Index("transfer_recipients_link_token_hash_key", "link_token_hash", unique=True),
+        # The audit search by email address (#216, revision 0022).
+        Index(
+            "transfer_recipients_tenant_id_email_normalized_idx", "tenant_id", "email_normalized"
+        ),
         CheckConstraint("locale IN ('en', 'ja')", name="locale"),
         CheckConstraint(f"delivery_state IN {sql_values(DeliveryState)}", name="delivery_state"),
         CheckConstraint("email_normalized = lower(email)", name="email_normalized"),
@@ -740,6 +770,9 @@ class TransferRecipient(TenantOwned, Base):
     failed_attempts: Mapped[int] = mapped_column(server_default=text("0"))
     locked_at: Mapped[datetime | None]
     unlocked_by: Mapped[uuid.UUID | None]
+    domain: Mapped[str | None] = mapped_column(Text)
+    """The domain part of `email_normalized`, which a trigger sets on insert (revision 0025), so
+    the evaluation's roles read a domain, never an address."""
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -750,7 +783,8 @@ class TransferRecipient(TenantOwned, Base):
 
 
 class File(TenantOwned, Base):
-    """A file of a transfer (data model 2.3, states in 3.1). Written through `sft.data.files`.
+    """A file of a transfer, or received through an upload request (data model 2.3, states in
+    3.1). Written through `sft.data.files`.
 
     `storage_key` is `tenants/{tenant_id}/files/{id}`; the bucket pair follows `storage_class`.
     `display_name_ct` holds the name as `sft.service.fields` seals it, never as plain text.
@@ -824,11 +858,24 @@ class File(TenantOwned, Base):
             "completion_started_at",
             postgresql_where=text("state = 'completing'"),
         ),
+        # Received files (#213, revision 0020): the request's key, the one-owner check, the
+        # columns only a received file has, and the files of a request (data model 5).
+        ForeignKeyConstraint(
+            ["tenant_id", "upload_request_id"],
+            ["upload_requests.tenant_id", "upload_requests.id"],
+            ondelete="CASCADE",
+        ),
+        Index("files_tenant_id_upload_request_id_idx", "tenant_id", "upload_request_id"),
+        CheckConstraint("num_nonnulls(transfer_id, upload_request_id) = 1", name="owner"),
+        CheckConstraint(
+            "retention_until IS NULL OR upload_request_id IS NOT NULL", name="retention_until"
+        ),
+        CheckConstraint("NOT dlp_blocked OR upload_request_id IS NOT NULL", name="dlp_blocked"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_id: Mapped[uuid.UUID]
-    transfer_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID | None]
     display_name_ct: Mapped[bytes] = mapped_column(LargeBinary)
     data_key_version: Mapped[int | None]
     content_type: Mapped[str] = mapped_column(Text)
@@ -863,11 +910,19 @@ class File(TenantOwned, Base):
     """The SHA-256 of the scanned version, which the scan worker reads in full (revision 0014)."""
     deleted_at: Mapped[datetime | None]
     """When the deletion job removed every object version (revision 0015)."""
+    upload_request_id: Mapped[uuid.UUID | None]
+    """The upload request a received file arrived through (#213, revision 0020)."""
+    retention_until: Mapped[datetime | None]
+    """A received file's deletion, from its upload's acceptance (FR-13)."""
+    dlp_blocked: Mapped[bool] = mapped_column(server_default=false())
+    """A received file a DLP rule blocked (FR-51): false until #221 decides."""
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
-        # A recipient's link session reaches the files of its own transfer; the files of upload
-        # requests arrive with them.
+        # A recipient's link session reaches the files of its own transfer; an uploader's, the
+        # files of its own request (#213).
+        if subject.kind is SubjectKind.UPLOAD_REQUEST:
+            return cls.upload_request_id == subject.id
         if subject.kind is not SubjectKind.RECIPIENT:
             return false()
         return cls.transfer_id.in_(
@@ -997,9 +1052,10 @@ class DlpFinding(TenantOwned, Base):
 
 
 class VerificationCode(TenantOwned, Base):
-    """A one-time code of a recipient, by its HMAC under the `code-hmac` keyring (data model 2.4,
-    revision 0013). The notification worker creates one and supersedes the older ones; the API
-    counts each attempt with one conditional update. Only the newest live code can match."""
+    """A one-time code of a recipient or an uploader, by its HMAC under the `code-hmac` keyring
+    (data model 2.4, revisions 0013 and 0019). The notification worker creates one and supersedes
+    the older ones of its subject; the API counts each attempt with one conditional update. Only
+    the newest live code can match. Exactly one of `recipient_id` and `upload_request_id` is set."""
 
     __tablename__ = "verification_codes"
     __table_args__ = (
@@ -1023,11 +1079,24 @@ class VerificationCode(TenantOwned, Base):
             "expires_at > created_at AND expires_at <= created_at + interval '10 minutes'",
             name="expires_at",
         ),
+        # An uploader's codes (#212, revision 0019).
+        ForeignKeyConstraint(
+            ["tenant_id", "upload_request_id"],
+            ["upload_requests.tenant_id", "upload_requests.id"],
+            ondelete="CASCADE",
+        ),
+        Index(
+            "verification_codes_upload_request_id_created_at_idx",
+            "upload_request_id",
+            text("created_at DESC"),
+        ),
+        CheckConstraint("num_nonnulls(recipient_id, upload_request_id) = 1", name="owner"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_id: Mapped[uuid.UUID]
-    recipient_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID | None]
+    upload_request_id: Mapped[uuid.UUID | None]
     code_hmac: Mapped[bytes] = mapped_column(LargeBinary)
     hmac_key_id: Mapped[str] = mapped_column(Text)
     expires_at: Mapped[datetime]
@@ -1038,8 +1107,9 @@ class VerificationCode(TenantOwned, Base):
 
 
 class LinkSession(TenantOwned, Base):
-    """A verified browser's session for one recipient (data model 2.4, authn and authz 4.3): the
-    SHA-256 of its token, 24 hours at most and 1 hour idle. Revision 0013."""
+    """A verified browser's session for one recipient or one upload request (data model 2.4,
+    authn and authz 4.3): the SHA-256 of its token, 24 hours at most and 1 hour idle. Revision
+    0013; the upload request's key and the one-owner check, revision 0019 (#212)."""
 
     __tablename__ = "link_sessions"
     __table_args__ = (
@@ -1058,20 +1128,31 @@ class LinkSession(TenantOwned, Base):
             "expires_at > created_at AND expires_at <= created_at + interval '24 hours'",
             name="expires_at",
         ),
+        # An uploader's sessions (#212, revision 0019).
+        ForeignKeyConstraint(
+            ["tenant_id", "upload_request_id"],
+            ["upload_requests.tenant_id", "upload_requests.id"],
+            ondelete="CASCADE",
+        ),
+        Index("link_sessions_upload_request_id_idx", "upload_request_id"),
+        CheckConstraint("num_nonnulls(recipient_id, upload_request_id) = 1", name="owner"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_id: Mapped[uuid.UUID]
-    recipient_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID | None]
     session_hash: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     last_seen_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime]
     revoked_at: Mapped[datetime | None]
+    upload_request_id: Mapped[uuid.UUID | None]
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
-        # A recipient's link session reaches the sessions of its own recipient.
+        # A link session reaches the sessions of its own recipient or its own upload request.
+        if subject.kind is SubjectKind.UPLOAD_REQUEST:
+            return cls.upload_request_id == subject.id
         if subject.kind is not SubjectKind.RECIPIENT:
             return false()
         return cls.recipient_id == subject.id
@@ -1118,14 +1199,31 @@ class DownloadGrant(TenantOwned, Base):
         CheckConstraint(
             "(active_stream_id IS NULL) = (active_stream_until IS NULL)", name="active_stream"
         ),
+        # A member's grants of received files (#213, revision 0020).
+        ForeignKeyConstraint(
+            ["tenant_id", "user_id"], ["users.tenant_id", "users.id"], ondelete="CASCADE"
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "member_session_id"],
+            ["member_sessions.tenant_id", "member_sessions.id"],
+            ondelete="CASCADE",
+        ),
+        Index("download_grants_user_id_idx", "user_id"),
+        Index("download_grants_member_session_id_idx", "member_session_id"),
+        CheckConstraint(
+            "(recipient_id IS NOT NULL AND link_session_id IS NOT NULL AND user_id IS NULL "
+            "AND member_session_id IS NULL) OR (recipient_id IS NULL AND link_session_id IS NULL "
+            "AND user_id IS NOT NULL AND member_session_id IS NOT NULL)",
+            name="owner",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_id: Mapped[uuid.UUID]
     file_id: Mapped[uuid.UUID]
     s3_version_id: Mapped[str] = mapped_column(Text)
-    recipient_id: Mapped[uuid.UUID]
-    link_session_id: Mapped[uuid.UUID]
+    recipient_id: Mapped[uuid.UUID | None]
+    link_session_id: Mapped[uuid.UUID | None]
     byte_budget: Mapped[int] = mapped_column(BigInteger)
     bytes_served: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
     request_count: Mapped[int] = mapped_column(server_default=text("0"))
@@ -1134,6 +1232,9 @@ class DownloadGrant(TenantOwned, Base):
     active_stream_until: Mapped[datetime | None]
     archived_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    user_id: Mapped[uuid.UUID | None]
+    """The member of a grant of a received file (#213); exactly one pair is set."""
+    member_session_id: Mapped[uuid.UUID | None]
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -1142,3 +1243,616 @@ class DownloadGrant(TenantOwned, Base):
         if subject.kind is not SubjectKind.RECIPIENT:
             return false()
         return cls.recipient_id == subject.id
+
+
+class UploadRequestState(StrEnum):
+    """The states of an upload request (data model 3.3). Revision 0019's CHECK lists the same."""
+
+    OPEN = "open"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class UploadRequest(TenantOwned, Base):
+    """A member's request for files from one outside address (data model 2.2, states in 3.3;
+    #212, revision 0019). Written through `sft.data.upload_requests`.
+
+    `message_ct` holds the message as `sft.service.fields` seals it, never as plain text. The link
+    and lockout columns work as a recipient's: `link_token_hash` is the SHA-256 of the token the
+    notification worker derives from `link_issued_at` under the `link-hmac` key `link_key_id`, the
+    three set together or not at all; `failed_attempts` and `locked_at` are the lockout of data
+    model 2.4. `purge_after` stays empty until the purge job exists.
+
+    An uploader's link session reaches its own request only; a recipient's none."""
+
+    __tablename__ = "upload_requests"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        ForeignKeyConstraint(["tenant_id", "revoked_by"], ["users.tenant_id", "users.id"]),
+        ForeignKeyConstraint(["tenant_id", "unlocked_by"], ["users.tenant_id", "users.id"]),
+        Index("upload_requests_link_token_hash_key", "link_token_hash", unique=True),
+        Index("upload_requests_tenant_id_email_normalized_idx", "tenant_id", "email_normalized"),
+        # The expiry job's find (data model 5).
+        Index(
+            "upload_requests_expires_at_idx", "expires_at", postgresql_where=text("state = 'open'")
+        ),
+        CheckConstraint(f"state IN {sql_values(UploadRequestState)}", name="state"),
+        CheckConstraint("locale IN ('en', 'ja')", name="locale"),
+        CheckConstraint(f"delivery_state IN {sql_values(DeliveryState)}", name="delivery_state"),
+        CheckConstraint("email_normalized = lower(uploader_email)", name="email_normalized"),
+        CheckConstraint("char_length(uploader_email) BETWEEN 3 AND 254", name="uploader_email"),
+        CheckConstraint(
+            "(message_ct IS NULL) OR (octet_length(message_ct) > 0)", name="message_ct"
+        ),
+        CheckConstraint("octet_length(link_token_hash) = 32", name="link_token_hash"),
+        CheckConstraint(
+            "(link_issued_at IS NULL) = (link_key_id IS NULL) "
+            "AND (link_issued_at IS NULL) = (link_token_hash IS NULL)",
+            name="link",
+        ),
+        CheckConstraint("link_key_id ~ '^[A-Za-z0-9-]{1,32}$'", name="link_key_id"),
+        CheckConstraint("failed_attempts BETWEEN 0 AND 20", name="failed_attempts"),
+        CheckConstraint("(state = 'open') = (ended_at IS NULL)", name="ended"),
+        CheckConstraint("revoked_by IS NULL OR state = 'revoked'", name="revoked_by"),
+        # The batched notices of received files (#213, revision 0020).
+        CheckConstraint(
+            "arrived_since_notice >= 0 AND blocked_since_notice >= 0", name="notice_counts"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    created_by: Mapped[uuid.UUID]
+    state: Mapped[str] = mapped_column(Text)
+    uploader_email: Mapped[str] = mapped_column(Text)
+    email_normalized: Mapped[str] = mapped_column(Text)
+    locale: Mapped[str] = mapped_column(Text)
+    message_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
+    data_key_version: Mapped[int | None]
+    expires_at: Mapped[datetime]
+    link_token_hash: Mapped[bytes | None] = mapped_column(LargeBinary)
+    link_key_id: Mapped[str | None] = mapped_column(Text)
+    link_issued_at: Mapped[datetime | None]
+    delivery_state: Mapped[str] = mapped_column(Text)
+    notified_at: Mapped[datetime | None]
+    failed_attempts: Mapped[int] = mapped_column(server_default=text("0"))
+    locked_at: Mapped[datetime | None]
+    unlocked_by: Mapped[uuid.UUID | None]
+    ended_at: Mapped[datetime | None]
+    revoked_by: Mapped[uuid.UUID | None]
+    purge_after: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    notice_due_at: Mapped[datetime | None]
+    """When the member's and uploader's next notice of received files is due (#213, revision
+    0020): one per request per 5 minutes (architecture 4.3)."""
+    arrived_since_notice: Mapped[int] = mapped_column(server_default=text("0"))
+    """Received files that became shareable since the last notice."""
+    blocked_since_notice: Mapped[int] = mapped_column(server_default=text("0"))
+    """Received files that were blocked since the last notice."""
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # An uploader's link session reaches its own request only; a recipient's none (T-20).
+        if subject.kind is not SubjectKind.UPLOAD_REQUEST:
+            return false()
+        return cls.id == subject.id
+
+
+class ApiKeyScope(StrEnum):
+    """The contract's `ApiKeyScope` (authn and authz 5.2). One list: the migration's CHECK."""
+
+    TRANSFERS_READ = "transfers:read"
+    TRANSFERS_WRITE = "transfers:write"
+    UPLOAD_REQUESTS_READ = "upload_requests:read"
+    UPLOAD_REQUESTS_WRITE = "upload_requests:write"
+    AUDIT_READ = "audit:read"
+
+
+class ApiKeyRevokedReason(StrEnum):
+    """Why a key ended before its expiry (`api_key.revoked`'s `reason`)."""
+
+    ADMIN = "admin"
+    OWNER_DEACTIVATED = "owner_deactivated"
+    OWNER_DEMOTED = "owner_demoted"
+
+
+class ApiKey(TenantOwned, Base):
+    """A tenant API key (data model 2.1, authn and authz 5; revisions 0021 and 0022): only the
+    SHA-256 of the key is stored. `sft.data.api_keys` reads and writes it; a creation and a
+    revocation commit only with their audit event. Link sessions reach none."""
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("key_hash"),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="name"),
+        CheckConstraint("key_prefix ~ '^sft_(dev|stg|prd)_[0-9A-Za-z]{8}$'", name="key_prefix"),
+        CheckConstraint("octet_length(key_hash) = 32", name="key_hash"),
+        CheckConstraint(
+            "cardinality(scopes) BETWEEN 1 AND 5 "
+            f"AND scopes <@ ARRAY[{sql_values(ApiKeyScope)[1:-1]}]::text[]",
+            name="scopes",
+        ),
+        CheckConstraint(
+            "expires_at > created_at AND expires_at <= created_at + interval '365 days'",
+            name="expires_at",
+        ),
+        CheckConstraint("(revoked_at IS NULL) = (revoked_reason IS NULL)", name="revoked"),
+        CheckConstraint(
+            f"revoked_reason IN {sql_values(ApiKeyRevokedReason)}", name="revoked_reason"
+        ),
+        CheckConstraint("expiry_notice IN (14, 3)", name="expiry_notice"),
+        Index("api_keys_tenant_id_created_at_idx", "tenant_id", "created_at"),
+        Index("api_keys_tenant_id_created_by_idx", "tenant_id", "created_by"),
+        Index("api_keys_expires_at_idx", "expires_at", postgresql_where=text("revoked_at IS NULL")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    created_by: Mapped[uuid.UUID]
+    name: Mapped[str] = mapped_column(Text)
+    key_prefix: Mapped[str] = mapped_column(Text)
+    key_hash: Mapped[bytes] = mapped_column(LargeBinary)
+    scopes: Mapped[list[str]] = mapped_column(ARRAY(Text))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    revoked_at: Mapped[datetime | None]
+    revoked_reason: Mapped[str | None] = mapped_column(Text)
+    last_used_at: Mapped[datetime | None]
+    expiry_notice: Mapped[int | None] = mapped_column(SmallInteger)
+    first_exported_at: Mapped[datetime | None]
+    """When the key first exported the audit log (#216, revision 0022)."""
+
+
+# ---- the DLP policy, rules and detectors (#218, revision 0024; data model 2.7) ----
+
+
+class DlpMode(StrEnum):
+    """Monitor records every decision and enforces none; enforce acts on them (FR-52)."""
+
+    MONITOR = "monitor"
+    ENFORCE = "enforce"
+
+
+class DlpDirection(StrEnum):
+    SENT = "sent"
+    RECEIVED = "received"
+
+
+class DlpCondition(StrEnum):
+    """What a rule tests (FR-40): detectors' matches, uninspected files, or a new domain."""
+
+    CONTENT = "content"
+    NOT_INSPECTED = "not_inspected"
+    NEW_DOMAIN = "new_domain"
+
+
+class DlpConfidence(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class DlpRecipientScope(StrEnum):
+    ANY = "any"
+    UNTRUSTED = "untrusted"
+
+
+class DlpAction(StrEnum):
+    """What a matched rule does (FR-41), from the mildest to the strictest."""
+
+    ALLOW_AND_RECORD = "allow_and_record"
+    WARN = "warn"
+    REQUIRE_APPROVAL = "require_approval"
+    BLOCK = "block"
+
+
+class DlpDetectorKind(StrEnum):
+    KEYWORDS = "keywords"
+    PATTERN = "pattern"
+
+
+class DlpPolicy(TenantOwned, Base):
+    """A tenant's DLP settings, one row per tenant, written with the default policy when the
+    tenant is made (detectors 6). `version` goes up by one with every change to this row, a rule
+    or a detector, in that change's transaction."""
+
+    __tablename__ = "dlp_policies"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id", "updated_by"], ["users.tenant_id", "users.id"]),
+        CheckConstraint(f"mode IN {sql_values(DlpMode)}", name="mode"),
+        CheckConstraint("version >= 1", name="version"),
+        CheckConstraint(
+            "cardinality(trusted_domains) <= 500 "
+            "AND trusted_domains::text = lower(trusted_domains::text)",
+            name="trusted_domains",
+        ),
+        CheckConstraint(
+            "approval_timeout BETWEEN interval '1 hour' AND interval '7 days'",
+            name="approval_timeout",
+        ),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
+    mode: Mapped[str] = mapped_column(Text, server_default="enforce")
+    version: Mapped[int] = mapped_column(server_default=text("1"))
+    trusted_domains: Mapped[list[str]] = mapped_column(
+        ARRAY(Text), server_default=text("'{}'::text[]")
+    )
+    approval_timeout: Mapped[timedelta] = mapped_column(Interval, server_default=text("'72 hours'"))
+    updated_by: Mapped[uuid.UUID | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+LIVE_REVISION: Final = text("retired_at IS NULL")
+"""The condition of a rule's or detector's live revision (data model 2.7)."""
+
+
+class DlpDetector(TenantOwned, Base):
+    """A revision of one of the tenant's own detectors (FR-38, FR-39). `definition_ct` is the
+    sealed JSON definition (`sft.service.dlp_definitions`); built-in detectors have no rows."""
+
+    __tablename__ = "dlp_detectors"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", "revision"),
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id", "revision"),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        Index("dlp_detectors_live_idx", "tenant_id", postgresql_where=LIVE_REVISION),
+        Index("dlp_detectors_live_id_key", "id", unique=True, postgresql_where=LIVE_REVISION),
+        Index("dlp_detectors_tenant_id_dlp_key_version_idx", "tenant_id", "dlp_key_version"),
+        CheckConstraint("revision >= 1", name="revision"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="name"),
+        CheckConstraint(f"kind IN {sql_values(DlpDetectorKind)}", name="kind"),
+        CheckConstraint("octet_length(definition_ct) > 0", name="definition_ct"),
+    )
+
+    id: Mapped[uuid.UUID]
+    revision: Mapped[int]
+    tenant_id: Mapped[uuid.UUID]
+    name: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    definition_ct: Mapped[bytes] = mapped_column(LargeBinary)
+    dlp_key_version: Mapped[int | None]
+    enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+    created_by: Mapped[uuid.UUID]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    retired_at: Mapped[datetime | None]
+
+
+class DlpRule(TenantOwned, Base):
+    """A revision of a DLP rule (FR-40, FR-41). A change writes the next revision and retires the
+    one it replaces, so a decision keeps pointing at the revision it applied (#219)."""
+
+    __tablename__ = "dlp_rules"
+    __table_args__ = (
+        PrimaryKeyConstraint("id", "revision"),
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id", "revision"),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        Index("dlp_rules_live_idx", "tenant_id", postgresql_where=LIVE_REVISION),
+        Index("dlp_rules_live_id_key", "id", unique=True, postgresql_where=LIVE_REVISION),
+        CheckConstraint("revision >= 1", name="revision"),
+        CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="name"),
+        CheckConstraint(f"direction IN {sql_values(DlpDirection)}", name="direction"),
+        CheckConstraint(f"condition IN {sql_values(DlpCondition)}", name="condition"),
+        CheckConstraint("cardinality(detectors) <= 64", name="detectors"),
+        CheckConstraint(f"min_confidence IN {sql_values(DlpConfidence)}", name="min_confidence"),
+        CheckConstraint("threshold BETWEEN 1 AND 100000", name="threshold"),
+        CheckConstraint(
+            f"reasons <@ ARRAY[{sql_values(InspectionReason)[1:-1]}]::text[]", name="reasons"
+        ),
+        CheckConstraint(
+            f"recipient_scope IN {sql_values(DlpRecipientScope)}", name="recipient_scope"
+        ),
+        CheckConstraint(f"action IN {sql_values(DlpAction)}", name="action"),
+        CheckConstraint(
+            "approvals_required IN (1, 2) "
+            "AND (approvals_required = 1 OR action = 'require_approval')",
+            name="approvals_required",
+        ),
+        CheckConstraint(
+            "direction = 'sent' OR (action IN ('allow_and_record', 'block') "
+            "AND condition IN ('content', 'not_inspected') AND recipient_scope = 'any')",
+            name="received",
+        ),
+        CheckConstraint(
+            "(condition <> 'content' OR cardinality(detectors) > 0) "
+            "AND (condition <> 'not_inspected' OR cardinality(reasons) > 0)",
+            name="condition_fields",
+        ),
+    )
+
+    id: Mapped[uuid.UUID]
+    revision: Mapped[int]
+    tenant_id: Mapped[uuid.UUID]
+    name: Mapped[str] = mapped_column(Text)
+    direction: Mapped[str] = mapped_column(Text)
+    condition: Mapped[str] = mapped_column(Text)
+    detectors: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=text("'{}'::text[]"))
+    min_confidence: Mapped[str] = mapped_column(Text, server_default="medium")
+    threshold: Mapped[int] = mapped_column(server_default=text("1"))
+    reasons: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=text("'{}'::text[]"))
+    include_sender_24h: Mapped[bool] = mapped_column(server_default=text("false"))
+    recipient_scope: Mapped[str] = mapped_column(Text, server_default="any")
+    action: Mapped[str] = mapped_column(Text)
+    approvals_required: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
+    enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+    created_by: Mapped[uuid.UUID | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    retired_at: Mapped[datetime | None]
+
+
+# ---- the DLP decision (#219, revision 0025; data model 2.7) ----
+
+
+class DlpOutcome(StrEnum):
+    """A decision's outcome: the strictest action of the rules it matched, or `none` (FR-41)."""
+
+    NONE = "none"
+    ALLOW_AND_RECORD = "allow_and_record"
+    WARN = "warn"
+    REQUIRE_APPROVAL = "require_approval"
+    BLOCK = "block"
+
+
+class DlpDecision(TenantOwned, Base):
+    """One DLP decision, never updated: a transfer's evaluation, or a received file's inspection
+    (FR-51, #221). `enforced` is false in monitor mode. The counts say how many recipients were
+    untrusted and how many recipient domains new, never which."""
+
+    __tablename__ = "dlp_decisions"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "file_id"], ["files.tenant_id", "files.id"], ondelete="CASCADE"
+        ),
+        Index("dlp_decisions_tenant_id_transfer_id_idx", "tenant_id", "transfer_id"),
+        Index("dlp_decisions_tenant_id_file_id_idx", "tenant_id", "file_id"),
+        Index("dlp_decisions_tenant_id_decided_at_idx", "tenant_id", text("decided_at DESC")),
+        CheckConstraint("(transfer_id IS NULL) <> (file_id IS NULL)", name="subject"),
+        CheckConstraint("policy_version >= 1", name="policy_version"),
+        CheckConstraint(f"mode IN {sql_values(DlpMode)}", name="mode"),
+        CheckConstraint(f"outcome IN {sql_values(DlpOutcome)}", name="outcome"),
+        CheckConstraint("enforced = (mode = 'enforce')", name="enforced"),
+        CheckConstraint("untrusted_recipients >= 0 AND new_domains >= 0", name="counts"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID | None]
+    file_id: Mapped[uuid.UUID | None]
+    policy_version: Mapped[int]
+    mode: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(Text)
+    enforced: Mapped[bool]
+    untrusted_recipients: Mapped[int]
+    new_domains: Mapped[int]
+    decided_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class DlpDecisionRule(TenantOwned, Base):
+    """A rule a decision matched, at the revision it applied, with the count that crossed its
+    threshold. The key to the revision has no `ON DELETE`: a revision a decision names stays."""
+
+    __tablename__ = "dlp_decision_rules"
+    __table_args__ = (
+        PrimaryKeyConstraint("decision_id", "rule_id"),
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        ForeignKeyConstraint(
+            ["tenant_id", "decision_id"],
+            ["dlp_decisions.tenant_id", "dlp_decisions.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "rule_id", "rule_revision"],
+            ["dlp_rules.tenant_id", "dlp_rules.id", "dlp_rules.revision"],
+        ),
+        Index("dlp_decision_rules_rule_id_rule_revision_idx", "rule_id", "rule_revision"),
+        CheckConstraint(f"action IN {sql_values(DlpAction)}", name="action"),
+        CheckConstraint("matched_count >= 0", name="matched_count"),
+    )
+
+    decision_id: Mapped[uuid.UUID]
+    tenant_id: Mapped[uuid.UUID]
+    rule_id: Mapped[uuid.UUID]
+    rule_revision: Mapped[int]
+    action: Mapped[str] = mapped_column(Text)
+    matched_count: Mapped[int]
+
+
+class DlpConfirmation(TenantOwned, Base):
+    """The sender's confirmation of a decision (FR-42); `justification_ct` is sealed
+    (`sft.service.fields`) and never logged."""
+
+    __tablename__ = "dlp_confirmations"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "decision_id"],
+            ["dlp_decisions.tenant_id", "dlp_decisions.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["tenant_id", "confirmed_by"], ["users.tenant_id", "users.id"]),
+        Index("dlp_confirmations_tenant_id_transfer_id_idx", "tenant_id", "transfer_id"),
+        Index("dlp_confirmations_tenant_id_decision_id_idx", "tenant_id", "decision_id"),
+        Index("dlp_confirmations_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
+        CheckConstraint(
+            "justification_ct IS NULL OR octet_length(justification_ct) > 0",
+            name="justification_ct",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID]
+    decision_id: Mapped[uuid.UUID]
+    confirmed_by: Mapped[uuid.UUID]
+    justification_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
+    data_key_version: Mapped[int | None]
+    confirmed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class DlpKnownDomain(TenantOwned, Base):
+    """A recipient domain the tenant has sent to (FR-46): written when a transfer is sent, and
+    deleted 365 days after `last_sent_at`."""
+
+    __tablename__ = "dlp_known_domains"
+    __table_args__ = (
+        PrimaryKeyConstraint("tenant_id", "domain"),
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        Index("dlp_known_domains_last_sent_at_idx", "last_sent_at"),
+        CheckConstraint(
+            "char_length(domain) BETWEEN 1 AND 253 AND domain = lower(domain)", name="domain"
+        ),
+        CheckConstraint("first_sent_at <= last_sent_at", name="sent_at"),
+    )
+
+    tenant_id: Mapped[uuid.UUID]
+    domain: Mapped[str] = mapped_column(Text)
+    first_sent_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_sent_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class ApprovalState(StrEnum):
+    """A DLP approval request's state (data model 3.6)."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    WITHDRAWN = "withdrawn"
+
+
+class ApprovalDecisionKind(StrEnum):
+    """An approver's answer to an approval request (FR-43)."""
+
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+PENDING_REQUEST: Final = text("state = 'pending'")
+"""The partial indexes' condition: a request still waiting for its approvers (data model 5)."""
+
+
+class DlpApprovalRequest(TenantOwned, Base):
+    """A sender's request for approval of a decision that needs one (FR-43, #220): one pending per
+    transfer, at most 3 per transfer; `ended_at` once it leaves `pending` (data model 3.6)."""
+
+    __tablename__ = "dlp_approval_requests"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "decision_id"],
+            ["dlp_decisions.tenant_id", "dlp_decisions.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "confirmation_id"],
+            ["dlp_confirmations.tenant_id", "dlp_confirmations.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["tenant_id", "requested_by"], ["users.tenant_id", "users.id"]),
+        Index(
+            "dlp_approval_requests_pending_idx",
+            "tenant_id",
+            "created_at",
+            postgresql_where=PENDING_REQUEST,
+        ),
+        Index(
+            "dlp_approval_requests_pending_transfer_id_key",
+            "transfer_id",
+            unique=True,
+            postgresql_where=PENDING_REQUEST,
+        ),
+        Index(
+            "dlp_approval_requests_pending_expires_at_idx",
+            "expires_at",
+            postgresql_where=PENDING_REQUEST,
+        ),
+        Index("dlp_approval_requests_tenant_id_transfer_id_idx", "tenant_id", "transfer_id"),
+        Index("dlp_approval_requests_tenant_id_requested_by_idx", "tenant_id", "requested_by"),
+        Index("dlp_approval_requests_tenant_id_decision_id_idx", "tenant_id", "decision_id"),
+        Index(
+            "dlp_approval_requests_tenant_id_confirmation_id_idx", "tenant_id", "confirmation_id"
+        ),
+        CheckConstraint("approvals_required IN (1, 2)", name="approvals_required"),
+        CheckConstraint(f"state IN {sql_values(ApprovalState)}", name="state"),
+        CheckConstraint("(state = 'pending') = (ended_at IS NULL)", name="ended"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    transfer_id: Mapped[uuid.UUID]
+    decision_id: Mapped[uuid.UUID]
+    confirmation_id: Mapped[uuid.UUID]
+    requested_by: Mapped[uuid.UUID]
+    approvals_required: Mapped[int] = mapped_column(SmallInteger)
+    state: Mapped[str] = mapped_column(Text, server_default=text("'pending'"))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    expires_at: Mapped[datetime]
+    ended_at: Mapped[datetime | None]
+
+
+class DlpApprovalDecision(TenantOwned, Base):
+    """One approver's approval or rejection of a request, once per approver (FR-44); a rejection
+    has a comment, sealed (`sft.service.fields`) and never logged."""
+
+    __tablename__ = "dlp_approval_decisions"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        ForeignKeyConstraint(
+            ["tenant_id", "approval_request_id"],
+            ["dlp_approval_requests.tenant_id", "dlp_approval_requests.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(["tenant_id", "approver_id"], ["users.tenant_id", "users.id"]),
+        UniqueConstraint("approval_request_id", "approver_id"),
+        Index(
+            "dlp_approval_decisions_tenant_id_approver_id_decided_at_idx",
+            "tenant_id",
+            "approver_id",
+            "decided_at",
+        ),
+        Index(
+            "dlp_approval_decisions_tenant_id_data_key_version_idx",
+            "tenant_id",
+            "data_key_version",
+        ),
+        CheckConstraint(f"decision IN {sql_values(ApprovalDecisionKind)}", name="decision"),
+        CheckConstraint("comment_ct IS NULL OR octet_length(comment_ct) > 0", name="comment_ct"),
+        CheckConstraint("decision <> 'reject' OR comment_ct IS NOT NULL", name="reject_comment"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    approval_request_id: Mapped[uuid.UUID]
+    approver_id: Mapped[uuid.UUID]
+    decision: Mapped[str] = mapped_column(Text)
+    comment_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
+    data_key_version: Mapped[int | None]
+    decided_at: Mapped[datetime] = mapped_column(server_default=func.now())

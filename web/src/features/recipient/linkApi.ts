@@ -41,7 +41,10 @@ const resolutionSchema: z.ZodType<LinkResolution> = z.object({
 /** The fields of `LinkSession` the pages read, checked against the generated contract types by the annotation. */
 type LinkSessionFields = Pick<LinkSession, 'id' | 'csrf_token' | 'kind' | 'email' | 'locale' | 'expires_at'> & {
   transfer?: Schema<'LinkSessionTransfer'>;
+  upload_request?: Schema<'LinkSessionUploadRequest'>;
 };
+
+const count = z.number().int().min(0);
 
 const linkSessionSchema: z.ZodType<LinkSessionFields> = z.object({
   id,
@@ -57,6 +60,20 @@ const linkSessionSchema: z.ZodType<LinkSessionFields> = z.object({
       message: z.string().nullable(),
       expires_at: timestamp,
       download_limit: z.number().int().nullable(),
+    })
+    .optional(),
+  // The uploader's request (#212): who asks, the message, the expiry, the limits and what has been received so far.
+  upload_request: z
+    .object({
+      tenant_name: z.string(),
+      requester_email: z.string().min(1),
+      message: z.string().nullable(),
+      expires_at: timestamp,
+      max_files: z.number().int().min(1),
+      max_file_size: z.number().int().min(1),
+      max_total_size: z.number().int().min(1),
+      files_received: count,
+      bytes_received: count,
     })
     .optional(),
 });

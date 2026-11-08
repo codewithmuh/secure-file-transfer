@@ -8,6 +8,8 @@ export interface Member {
   name: string;
   /** `session.effective_role`: a local admin without a passkey sign-in acts as `member` (authn-authz 3.3). */
   role: 'admin' | 'member';
+  /** `user.dlp_approver`: the member may approve other members' transfers (FR-43). */
+  dlpApprover: boolean;
   tenantId: string;
   tenantName: string;
 }

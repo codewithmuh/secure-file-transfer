@@ -49,7 +49,8 @@ test every flow by hand.
 - **axe (NFR-22).** `e2e/pages.a11y.ts` runs axe (WCAG 2.0 to 2.2, A and AA) on every page in the table below, once
   in English and once in Japanese (`playwright.config.ts`), against the built app served by `vite preview`. The API
   is answered from contract-typed fixtures (`e2e/apiFixtures.ts`), so the live pages, the users page's action menu and
-  its dialogs, and the findings table are checked with real shapes and no backend. Any violation of a WCAG 2.0, 2.1 or 2.2 A or AA
+  its dialogs, the findings table, the upload request's revoke, unlock and delete dialogs, the extend expiry dialog
+  and the uploader's code and upload steps are checked with real shapes and no backend. Any violation of a WCAG 2.0, 2.1 or 2.2 A or AA
   rule fails CI's `web-a11y` job, a required check, whatever impact axe gives it. Findings of axe's best-practice
   rules, which no WCAG criterion requires, are printed in the test output and don't fail it. axe needs a real browser
   for checks such as colour contrast, which jsdom can't compute, so this runs in Chromium through Playwright.
@@ -62,8 +63,8 @@ test every flow by hand.
 - **Language.** The app starts in the first of the browser's languages it has (English or Japanese), else English, and
   keeps `<html lang>` in step so screen readers read it in the right voice (WCAG 3.1.1). Every string a page shows or
   announces, `aria-label`s included, comes from `src/lib/i18n.ts`, so no English is read in a Japanese voice
-  (WCAG 3.1.2). Names, emails and file names in the mock data are data, not text to translate. The recipient and
-  uploader pages will switch to the link's `locale` once they call the API (FR-33).
+  (WCAG 3.1.2). Names, emails and file names in the fixtures are data, not text to translate. The recipient and
+  uploader pages switch to the link's `locale` (FR-33).
 
 ## Dependencies
 
@@ -126,18 +127,24 @@ check then fails, the web app relied on something the contract no longer says.
 |---|---|---|
 | `/sign-in` | Sign-in: the password sign-in, and SSO once `config.ssoSignIn` is on (M6) | Public |
 | `/auth/callback` | The web app's landing page after the API's own callback (`completeSignIn`): loads the session, then goes to the checked return path | Public |
-| `/` | Dashboard: the five newest transfers | Member |
-| `/transfers` | Transfer list, with a state filter and "load more" | Member |
-| `/transfers/new` | Create, upload and send a transfer | Member |
-| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand, each recipient's delivery, verification and downloads, unlock, revoke; a draft's upload resumes here | Member |
+| `/` | Dashboard: the five newest transfers and the five newest upload requests (`listTransfers`, `listUploadRequests`) | Member |
+| `/transfers` | Transfer list, with a state filter and "load more"; an admin's "every transfer in the organization" switch (`scope=tenant`, #217) adds the owner and revoke | Member |
+| `/transfers/new` | Create, upload and send a transfer; "email me on the first download" (`notify_on_first_download`, #214) | Member |
+| `/transfers/:id` | Transfer detail: scan and DLP status, findings on demand, each recipient's delivery, verification and downloads, unlock, revoke, extend expiry (`extendTransferExpiry`, #214); a draft's upload resumes here. A DLP decision shows its matched rules, flagged recipients and findings, with confirm, request approval, remove file and cancel (#219, #220) | Member |
+| `/upload-requests` | Upload requests (`listUploadRequests`, `scope=own`): state, link email and the uploader's access as badges with text, a state filter and "load more" (#212); an admin's "every request in the organization" switch (`scope=tenant`, #217) adds the owner and revoke | Member |
+| `/upload-requests/new` | Ask someone for files (`createUploadRequest`): address, language, how long it stays open, message (#212) | Member |
+| `/upload-requests/:id` | One request (`getUploadRequest`): state, expiry, link email, verified or locked, unlock (`unlockUploader`), revoke (`revokeUploadRequest`); the received files (`listUploadRequestFiles`) with findings on demand (`getFileInspection`), download (`createReceivedFileDownload`) and delete (`deleteFile`) (#212, #213) | Member (an admin sees another member's as metadata) |
+| `/approvals`, `/approvals/:id` | DLP approvals (#220): an approver's queue and every request for an admin; a request's page with approve and reject. The sender may open their own request | Approver, admin |
 | `/t` | The recipient's link page (#198): the link's state, the code, then each file's download, in the link's language | Public (link) |
+| `/u` | The uploader's link page (#212, #213): the same link states and code step as `/t`, then the request and the uploads, in the link's language | Public (link) |
 | `/admin/users` | Members and admins: invite, role, DLP approver, sign out everywhere, reset sign-in, deactivate | Admin |
-| `/admin/policy` | Tenant policy | Admin |
-| `/upload-requests`, `/u`, `/admin/audit`, `/admin/api-keys`, `/admin/dlp` | Not available yet (M5): no navigation entry; the URL shows `NotAvailableYet` | — |
+| `/admin/policy` | Tenant policy, with the allowed and blocked recipient domains (#217), and a form that clears a suppressed email address (`clearEmailSuppression`, #217) | Admin |
+| `/admin/audit` | Audit log (#216): filters in the POST body only (T-47), cursor paging, an event's details, CSV and JSON export | Admin |
+| `/admin/api-keys` | API keys (#215): list, create (the secret shown once), revoke | Admin |
+| `/admin/dlp` | DLP policy (#218): settings (mode, trusted domains, approval timeout), rules, keyword lists; every write confirmed | Admin |
 
-M5's pages stay in the repository unrouted (`UploadRequestListPage`, `CreateUploadRequestPage`, `UploaderPage`,
-`AuditLogPage`, `ApiKeysPage`): nothing imports them, so the bundle leaves them and their mock data out, and M5 routes
-each again as its operations land. `npm run check:mocks` (part of `npm run check`) walks the imports from
+Every M5 page is routed: upload requests and the uploader (#212, #213), the audit log and API keys (#215, #216), the
+DLP policy and approvals (#218, #220). `npm run check:mocks` (part of `npm run check`) walks the imports from
 `src/main.tsx` and fails on mock data or a simulated delay in any page the app can reach; none is pending since #198.
 
 **The recipient's link page** (`/t`, #198, `features/recipient/`). `captureLinkToken` reads the token from the
@@ -151,7 +158,34 @@ explained on the page instead of the browser showing the API's JSON, then naviga
 against the API's origin (`contentUrl`), so the browser's download manager saves and resumes it. The grant ID is kept
 per session and file in `sessionStorage` only until the download is handed to the browser: a click after an
 interrupted start (a `503`, or the page closed in between) resumes it uncounted, and a click after a hand-off counts a
-new download, since the page can't see whether the browser finished. `LinkGate` is shared with `/u` for M5.
+new download, since the page can't see whether the browser finished. `LinkGate` is shared with `/u`.
+
+**Upload requests** (#212, #213, `features/sender/`). The create form turns the chosen duration into the
+`expires_at` the contract takes (now plus the duration and two minutes, never past the tenant's cap:
+`uploadRequests.ts`), and keeps that body for the attempt, so "Try again" sends the same body with the same
+`Idempotency-Key` and the API replays its answer instead of creating a second request. Revoking works as for a
+transfer: a `503` is shown as done and retried in the background (`revocation.ts`). Unlocking always emails a new link.
+The received files table polls while a file is scanned; findings are fetched only on demand, as counts per detector.
+"Download" gets a grant (`createReceivedFileDownload`), checks it in the app and hands it to the browser's download
+manager by navigation, as the recipient's page does (`checkContent`, `startDownload`, `contentUrl`); an unscannable
+file shows the FR-18 warning. Only the request's owner downloads or deletes; an admin sees the metadata.
+
+**The uploader's page** (`/u`, #212, #213, `features/uploader/`). `LinkGate` resolves the link (a transfer's link on
+`/u` is "not found"), switches to its `locale`, verifies, then `UploaderUploadPage` shows who asks, the message, the
+expiry and the limits (`LinkSession.upload_request`). Picked files are checked against those limits, declared with
+`addSessionUploadFile` (with an `Idempotency-Key`) and uploaded by the M3 engine (`upload.ts`) over the session's
+operations (`sessionUploadApi`: `listSessionUploadedParts`, `requestSessionUploadPartUrls`, `completeSessionUpload`),
+which the API client sends with `X-Link-Session` and the session's CSRF token. A dropped connection resumes by itself
+when the browser is back online; after a reload a file still `uploading` is picked again (matched on name and size)
+and only its missing parts go. Each file's state comes from `listSessionFiles`, in the uploader's words: a blocked
+file says only "blocked by the company's policy" or "couldn't be scanned" (FR-12). The list is polled, so a revocation
+or an expiry ends the page within 15 seconds.
+
+**Extend expiry and the first-download email** (#214, `features/sender/`). `/transfers/new` sends
+`notify_on_first_download`. On `/transfers/:id` the owner of a submitted, not ended transfer gets "Extend expiry": the
+dialog offers 1, 3, 7 and 14 days after the current expiry and the latest allowed, at most 30 days, or the tenant's
+`max_expiry` if shorter, after `submitted_at` (`extension.ts`), and sends `extendTransferExpiry` with an
+`Idempotency-Key`. When nothing later is allowed, the page says so instead.
 
 ## Browser journey
 
@@ -175,7 +209,7 @@ clear the counters (Valkey keeps no volume).
 
 ## Security notes
 
-- Link tokens travel in the URL fragment (`/t#token`), removed with `history.replaceState` before
+- Link tokens travel in the URL fragment (`/t#token`, `/u#token`), removed with `history.replaceState` before
   anything else runs (architecture 4.2), and kept in memory only; they go only in request bodies. The link session's
   ID and CSRF token, checked with Zod, are kept in memory too. A download's grant ID is kept in `sessionStorage`: it
   is not a credential, since the content needs the `__Host-sft_link` cookie of the session that made it.
@@ -193,13 +227,15 @@ clear the counters (Valkey keeps no volume).
 
 ## Data layer
 
-Pages read the API through TanStack Query hooks in `src/hooks/` (`transfers.ts`, `users.ts`), over the typed `api`
+Pages read the API through TanStack Query hooks in `src/hooks/` (`transfers.ts`, `uploadRequests.ts`, `users.ts`), over the typed `api`
 client, never through `api` directly. Failures go through `src/lib/problems.ts`: `problemMessage` gives each problem
 code the pages handle its own English and Japanese text and any other code the text of its HTTP status, and shows a
 `Retry-After` on `429` and `503` as a wait. Calls that create something send an `Idempotency-Key` kept for the
 attempt (`src/lib/idempotency.ts`), so "Try again" after a lost answer replays it. The transfer detail page polls
 while the transfer is `submitted` or a file is uploading, completing or scanning (`features/sender/polling.ts`), and
-findings are fetched only on demand, since each response with details is audited. Each recipient's delivery is polled
+findings are fetched only on demand, since each response with details is audited. A transfer waiting for an approver
+is polled every 15 seconds; one waiting for its sender's confirmation or held isn't, and its DLP view
+(`getTransferDlp`) is fetched again only when the transfer's state or decision changes (`dlpSignature`). Each recipient's delivery is polled
 every 10 seconds while the transfer is `sent`. A revocation answered `503` stands but isn't confirmed: the page says
 so, retries in the background and offers "Confirm now" (`features/sender/revocation.ts`).
 
@@ -208,3 +244,7 @@ so, retries in the background and offers "Confirm now" (`features/sender/revocat
 Members create, upload and send transfers and watch their scan and DLP status (#196); admins manage members and the
 tenant policy (#197). Recipients verify and download in their link's language (#198); members see each recipient's
 delivery, unlock recipients and revoke transfers (#199); the M3 browser journey runs in English and Japanese (#200).
+Members ask outsiders for files, and uploaders verify and upload on `/u` (#212, #213); members extend a transfer's
+expiry and choose a first-download email (#214).
+Admins manage the DLP policy, rules and keyword lists (#218); senders confirm warnings, clear blocks and request
+approval, and approvers decide requests (#219, #220); `e2e/dlp.e2e.ts` runs those flows in English and Japanese.

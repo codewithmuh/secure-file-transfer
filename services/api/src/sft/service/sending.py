@@ -15,8 +15,10 @@ in order:
    without a counted file (FR-1).
 4. `422 expiry_out_of_range` if the tenant's `max_expiry` has dropped below `expires_in` since the
    draft was made (data model 2.2). The draft is unchanged.
-5. `422 recipient_undeliverable` if this tenant has suppressed an address since the draft was made
-   (abuse 7.4), pointing at the recipient.
+5. `422 recipient_domain_not_allowed` if an address is outside the tenant's domain rules as they
+   are now (FR-24, FR-45, #217), so a domain blocked after the draft was made is refused here; then
+   `422 recipient_undeliverable` if this tenant has suppressed an address since the draft was made
+   (abuse 7.4). Both point at the recipient.
 6. Group G's email caps (abuse 2.2), counted only for a send that passes every check above: each
    recipient is one email against the caller's 200 an hour and the tenant's 2,000, and one link
    email a day of the 20 to that address within the tenant. They are charged all or nothing, in
@@ -29,7 +31,8 @@ spent as a draft never shortens the transfer.
 
 **Cancelling** works from `draft`, `held`, `awaiting_confirmation` and `pending_approval`; a
 cancelled transfer comes back unchanged, any other state is `409 invalid_state`. It sets
-`ended_at`, and `delete_after` on every file, which the deletion job acts on (data model 6). A file
+`ended_at`, and `delete_after` on every file, which the deletion job acts on (data model 6), and
+withdraws a pending approval request (`dlp_approval.withdrawn`, #220). A file
 still `uploading` or `completing` is rejected and its reservation released: cancelling wins over
 the upload, whose next call gets `409 invalid_state`. Only the owner cancels; a tenant admin gets
 403 and revokes instead.
@@ -54,8 +57,9 @@ from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
 from sft.data.models import FileState, Transfer, TransferState
+from sft.service import domain_rules
 from sft.service.caller import Caller
-from sft.service.evaluation import evaluate
+from sft.service.evaluation import WithdrawReason, evaluate, withdraw_approval_request
 from sft.service.permissions import Reach, authorize
 from sft.service.rate_limits import Charge, RateLimiter
 from sft.service.rate_limits.limits import ADDRESS_LINK_EMAILS, LINK_EMAILS, KeyType
@@ -65,6 +69,7 @@ from sft.service.transfers import (
     audit_details,
     check_expiry,
     effective_state,
+    recipient_pointer,
     require_reach,
     tenant_scope,
     transfer_view,
@@ -140,6 +145,10 @@ async def _sendable(
     policy = await tenants.get_policy(session)
     check_expiry(transfer.expires_in, policy.max_expiry, pointer=None)
     recipients = await transfers.list_recipients(session, transfer.id)
+    # The domain rules as they are now (FR-45), then the suppression list.
+    domain_rules.check(
+        domain_rules.DomainRules.of(policy), [r.email for r in recipients], recipient_pointer
+    )
     refused = await undeliverable(session, emails, [r.email for r in recipients])
     if refused is not None:
         raise undeliverable_error(refused)
@@ -268,6 +277,16 @@ async def cancel_transfer(
             ended_at=func.now(),
             hold_reason=None,
         )
+        if state is TransferState.PENDING_APPROVAL:
+            await withdraw_approval_request(
+                session,
+                transfer.id,
+                reason=WithdrawReason.CANCELLED,
+                actor=caller.actor(),
+                origin=origin,
+                details=audit_details(caller),
+                now=now,
+            )
         open_uploads = await files.cancel_files(session, transfer.id)
         for file in open_uploads:
             await reject(session, caller, file, RejectReason.TRANSFER_NOT_OPEN, origin)

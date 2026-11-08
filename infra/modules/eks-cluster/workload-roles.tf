@@ -299,8 +299,9 @@ locals {
       },
     ]
 
-    # Sends email through SES's API and runs the Cognito admin calls for members (authn-authz 2.5): create, delete,
-    # disable and sign out users; the only role with any Cognito permission.
+    # Sends email through SES's API, releases cleared suppressions from a tenant's SES list (#217), and runs the
+    # Cognito admin calls for members (authn-authz 2.5): create, delete, disable and sign out users; the only role
+    # with any Cognito permission.
     notify = [
       {
         Sid      = "ConsumeNotificationQueues"
@@ -318,6 +319,16 @@ locals {
             "arn:aws:ses:${r}:${var.account_id}:configuration-set/*",
           ]
         ])
+      },
+      {
+        # An admin's cleared suppression is released from the tenant's SES list before the next link or code email
+        # (#217, abuse 7.4): `DeleteSuppressedDestination` with the tenant's name. The action names no resource type
+        # in the SES service authorization reference, so it takes `*`, held to the cluster's Regions.
+        Sid       = "ReleaseSuppressedAddress"
+        Effect    = "Allow"
+        Action    = ["ses:DeleteSuppressedDestination"]
+        Resource  = ["*"]
+        Condition = { StringEquals = { "aws:RequestedRegion" = var.cluster_regions } }
       },
       {
         Sid      = "CognitoMemberAdministration"

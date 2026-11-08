@@ -331,6 +331,30 @@ async def test_a_transfer_back_to_draft_emails_the_new_notice(w: World) -> None:
     assert email.subject == "Your transfer is back to draft"
 
 
+async def test_a_first_download_emails_the_member_once_with_no_file_name(w: World) -> None:
+    # #214: in the member's language (the tenant's default), whatever the transfer's state now.
+    w.db.sql(
+        "INSERT INTO tenant_policies (tenant_id, default_locale) VALUES (:t, 'ja')",
+        t=w.tenant.id,
+    )
+    transfer_id, _ = seed_transfer(w.db, w.tenant.id, w.tenant.target, state="revoked")
+    [(owner,)] = w.db.sql("SELECT email FROM users WHERE id = :id", id=w.tenant.target)
+    sent = Sent()
+    worker = notifier(w.database, sent)
+    notice = message(w.tenant.id, "transfer.first_download", transfer_id=transfer_id)
+    assert await worker.handle(notice) is Done.PROCESSED
+    assert await worker.handle(notice) is Done.DUPLICATE
+    [email] = sent.emails
+    assert (email.email_type, email.to) == ("first_download", owner)
+    assert not email.subject.isascii(), "in the tenant's language"
+    assert f"{WEB_APP_URL}/transfers/{transfer_id}" in email.text
+    assert actions(w, transfer_id) == ["email.sent"]
+    # A member who has left gets nothing.
+    w.db.sql("UPDATE users SET status = 'deactivated' WHERE id = :id", id=w.tenant.target)
+    await worker.handle(message(w.tenant.id, "transfer.first_download", transfer_id=transfer_id))
+    assert len(sent.emails) == 1
+
+
 async def test_an_invitation_is_recorded_and_sends_nothing_until_cognito(w: World) -> None:
     sent = Sent()
     worker = notifier(w.database, sent)
@@ -527,6 +551,47 @@ async def test_a_lockout_notice_goes_to_the_owner_and_every_admin(w: World) -> N
     assert {e.email_type for e in sent.emails} == {"recipient_locked"}
 
 
+# ---- the admins' DLP policy notices (#218, FR-54) ----
+
+
+async def test_a_dlp_policy_change_emails_every_active_admin_naming_the_change(w: World) -> None:
+    second = seed_user(w.db, w.tenant.id, role="admin")
+    seed_user(w.db, w.tenant.id, role="admin", status="deactivated")
+    sent = Sent()
+    done = await notifier(w.database, sent).handle(
+        message(w.tenant.id, "dlp_policy.changed.rule_added")
+    )
+    assert done is Done.PROCESSED
+    to = {
+        email
+        for (email,) in w.db.sql(
+            "SELECT email FROM users WHERE id IN (:a, :b)", a=w.tenant.admin, b=second
+        )
+    }
+    assert {e.to for e in sent.emails} == to
+    assert {e.email_type for e in sent.emails} == {"dlp_policy_changed"}
+    assert all("A rule was added" in e.text for e in sent.emails)
+
+
+async def test_an_admin_api_change_reaches_the_admins_through_the_outbox(w: World) -> None:
+    admin = session_caller(w.tenant.id, w.tenant.admin, Role.ADMIN)
+    async with client(w.db, lambda: admin) as http:
+        response = await http.post(
+            "/v1/dlp/detectors",
+            json={"name": "Codenames", "kind": "keywords", "keywords": ["orion-codename"]},
+        )
+        assert response.status_code == 201, response.text
+    sent = Sent()
+    assert await drain(notifier(w.database, sent), w.db, w.tenant.id) == [Done.PROCESSED]
+    [email] = sent.emails
+    assert email.email_type == "dlp_policy_changed"
+    assert "A detector or keyword list was added" in email.text
+    # The notice names the kind of change, never the detector or its terms.
+    for secret in ("Codenames", "orion-codename"):
+        assert secret not in email.text
+        assert secret not in email.html
+
+
 # ---- the worker's process ----
 
 
@@ -601,3 +666,133 @@ async def test_one_link_email_per_recipient_reaches_mailpit(
             await asyncio.sleep(0.1)
         assert len(found) == 1, address
         assert found[0]["Subject"] == "T sent you files"
+
+
+# ---- the batched notice of received files (#213) ----
+
+
+def notice_request(w: World, *, arrived: int, blocked: int, address: str) -> uuid.UUID:
+    """An upload request whose notice is due, with its counts, as scan results leave it."""
+    request_id = uuid.uuid4()
+    w.db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, expires_at, delivery_state, notice_due_at, "
+        "arrived_since_notice, blocked_since_notice) VALUES (:id, :tenant, :owner, 'open', "
+        ":address, lower(:address), 'ja', now() + interval '7 days', 'sent', now(), :arrived, "
+        ":blocked)",
+        id=request_id,
+        tenant=w.tenant.id,
+        owner=w.tenant.target,
+        address=address,
+        arrived=arrived,
+        blocked=blocked,
+    )
+    return request_id
+
+
+def notice_counts(w: World, request_id: uuid.UUID) -> tuple[object, ...]:
+    [row] = w.db.sql(
+        "SELECT arrived_since_notice, blocked_since_notice, notice_due_at IS NOT NULL "
+        "FROM upload_requests WHERE id = :id",
+        id=request_id,
+    )
+    return row
+
+
+def owner_address(w: World) -> str:
+    [(address,)] = w.db.sql("SELECT email FROM users WHERE id = :id", id=w.tenant.target)
+    return str(address)
+
+
+async def test_a_notice_sends_counts_to_both_sides_and_the_uploader_learns_only_the_policy(
+    w: World,
+) -> None:
+    address = unique()
+    request_id = notice_request(w, arrived=3, blocked=2, address=address)
+    sent = Sent()
+    worker = notifier(w.database, sent)
+    done = await worker.handle(
+        message(w.tenant.id, "upload_request.files_settled", upload_request_id=request_id)
+    )
+    assert done is Done.PROCESSED
+    to_owner = {e.email_type: e for e in sent.to(owner_address(w))}
+    assert set(to_owner) == {"files_arrived", "files_blocked_member"}
+    assert "3 files have arrived" in to_owner["files_arrived"].subject
+    assert f"/upload-requests/{request_id}" in to_owner["files_arrived"].text
+    assert "2 files" in to_owner["files_blocked_member"].subject
+    [to_uploader] = sent.to(address)
+    assert to_uploader.email_type == "files_blocked_uploader"
+    assert to_uploader.reply_to == owner_address(w), "replies go to the member who asked"
+    assert any(ord(c) > 0x3000 for c in to_uploader.subject), "in the request's language"
+    for word in ("infected", "scan", "upload-requests", str(request_id)):
+        assert word not in to_uploader.text, word
+    assert notice_counts(w, request_id) == (0, 0, False)
+    assert "upload_request.notice_sent" in actions(w, request_id)
+    # A copy of the message, delivered again, sends nothing more.
+    again = await worker.handle(
+        message(w.tenant.id, "upload_request.files_settled", upload_request_id=request_id)
+    )
+    assert again is Done.PROCESSED
+    assert len(sent.emails) == 3
+
+
+async def test_files_that_settle_while_a_notice_is_sent_make_the_next_one_due(w: World) -> None:
+    request_id = notice_request(w, arrived=1, blocked=0, address=unique())
+    sent = Sent()
+    worker = notifier(w.database, sent)
+    original = sent.__call__
+
+    async def one_more_meanwhile(email: Any) -> str:
+        # A scan result commits between the read and the send: one more file arrived.
+        w.db.sql(
+            "UPDATE upload_requests SET arrived_since_notice = arrived_since_notice + 1 "
+            "WHERE id = :id",
+            id=request_id,
+        )
+        return await original(email)
+
+    worker.send = one_more_meanwhile
+    await worker.handle(
+        message(w.tenant.id, "upload_request.files_settled", upload_request_id=request_id)
+    )
+    assert [e.email_type for e in sent.emails] == ["files_arrived"]
+    assert notice_counts(w, request_id) == (1, 0, True), "the next notice is due"
+    later = w.db.sql(
+        "SELECT delay_seconds FROM outbox WHERE topic = 'upload_request.files_settled' "
+        "AND payload->>'upload_request_id' = :id",
+        id=str(request_id),
+    )
+    assert later == [(300,)]
+
+
+async def test_a_deactivated_owner_gets_no_notice_and_nobody_to_tell_takes_the_counts_off(
+    w: World,
+) -> None:
+    address = unique()
+    request_id = notice_request(w, arrived=1, blocked=1, address=address)
+    w.db.sql("UPDATE users SET status = 'deactivated' WHERE id = :id", id=w.tenant.target)
+    sent = Sent()
+    worker = notifier(w.database, sent)
+    await worker.handle(
+        message(w.tenant.id, "upload_request.files_settled", upload_request_id=request_id)
+    )
+    assert [e.email_type for e in sent.emails] == ["files_blocked_uploader"]
+    assert notice_counts(w, request_id) == (0, 0, False)
+    # Nobody at all: the uploader's address bounced too. The counts still come off.
+    w.db.sql(
+        "UPDATE upload_requests SET blocked_since_notice = 1, notice_due_at = now() WHERE id = :id",
+        id=request_id,
+    )
+    w.db.sql(
+        "INSERT INTO email_suppressions (id, tenant_id, email_hmac, hmac_key_id, reason) "
+        "VALUES (:id, :tenant, :hmac, :key, 'hard_bounce')",
+        id=uuid.uuid4(),
+        tenant=w.tenant.id,
+        hmac=EMAIL_KEYRING.active(address.lower()),
+        key=EMAIL_KEYRING.active_key_id,
+    )
+    await worker.handle(
+        message(w.tenant.id, "upload_request.files_settled", upload_request_id=request_id)
+    )
+    assert len(sent.emails) == 1
+    assert notice_counts(w, request_id) == (0, 0, False)

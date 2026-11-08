@@ -835,7 +835,8 @@ export interface paths {
          *     500 GB of granted bytes a day per tenant.
          *
          *     Errors: `403 permission_denied`, `403 download_grant_exhausted`, `409 file_not_shareable`,
-         *     `429 rate_limited`, `503 service_unavailable`.
+         *     `422 validation_failed` (a body that isn't a `DownloadRequest`), `429 rate_limited`,
+         *     `503 service_unavailable`.
          *
          *     Requirements: FR-6, FR-12, FR-16, FR-17, FR-18, NFR-15.
          */
@@ -2197,7 +2198,7 @@ export interface paths {
          *
          *     Errors: `401 reauthentication_required`, `403 permission_denied` (not an approver),
          *     `403 self_approval_forbidden`, `409 invalid_state` (not pending), `409 transfer_revoked`,
-         *     `409 transfer_expired`.
+         *     `409 transfer_expired`, `422 validation_failed` (the body).
          *
          *     Requirements: FR-43, FR-44, FR-54.
          */
@@ -5172,6 +5173,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -6721,6 +6723,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
         };
     };

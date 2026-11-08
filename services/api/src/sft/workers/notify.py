@@ -37,6 +37,7 @@ import sys
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Protocol
+from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -125,6 +126,18 @@ def threaded_send(
     return send
 
 
+def threaded_release(
+    mailer: Mailer, executor: ThreadPoolExecutor
+) -> Callable[[UUID, str], Awaitable[None]]:
+    """The mailer's suppression release (#217), in `executor` like the sends."""
+
+    async def release(tenant_id: UUID, address: str) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(executor, functools.partial(mailer.release, tenant_id, address))
+
+    return release
+
+
 class ClosablePool(UserPool, Protocol):
     async def aclose(self) -> None: ...
 
@@ -192,10 +205,12 @@ async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = 
     store = CounterStore.connect(settings.valkey_url.get_secret_value(), counter_metrics, iam=iam)
     executor = ThreadPoolExecutor(max_workers=MAIL_THREADS, thread_name_prefix="mail")
     pool = user_pool(settings)
+    mailer = mailer_from_settings(settings)
     notifier = Notifier(
         database,
         renderer=EmailRenderer(settings.web_app_url),
-        send=threaded_send(mailer_from_settings(settings), executor),
+        send=threaded_send(mailer, executor),
+        release=threaded_release(mailer, executor),
         link_keys=link_keys,
         code_keys=code_keys,
         emails=emails,

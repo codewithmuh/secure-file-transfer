@@ -353,7 +353,7 @@ async def test_member_routes_need_exactly_one_credential(harness: Harness) -> No
     assert (await harness.client.get("/v1/me")).status_code == 401
     bearer = await harness.client.get("/v1/me", headers={"Authorization": "Bearer x"})
     assert bearer.status_code == 401
-    # No bearer token is valid yet (API keys come in M5): a failed authentication.
+    # Not an API key (#215): a failed authentication, refused before any lookup.
     assert bearer.json()["code"] == "credentials_invalid"
     assert bearer.headers["www-authenticate"] == 'Bearer error="invalid_token"'
     await harness.sign_in()

@@ -33,9 +33,13 @@ import {
 import { errorMessage, problemCode } from '@/lib/problems';
 import { formatDate, formatFileSize } from '@/lib/formatters';
 import { useDurationLabel } from '@/lib/useDurationLabel';
+import { useAuthStore } from '@/stores/authStore';
+import { ExtendExpiry } from './ExtendExpiry';
 import { FileStateBadge, InspectionStateBadge, TransferStateBadge } from './StateBadges';
-import { isBuiltinDetector, NOT_AVAILABLE_STATES, REVOCABLE_STATES } from './states';
+import { isBuiltinDetector, REVOCABLE_STATES } from './states';
 import { RecipientDelivery } from './RecipientDelivery';
+import { showsDlp } from './dlpView';
+import { TransferDlpPanel } from './TransferDlpPanel';
 import { RevokeTransfer, TransferEndBanner } from './RevokeTransfer';
 import { useRevocation } from './revocation';
 import { useActiveUploads } from './polling';
@@ -51,7 +55,8 @@ const UPLOAD_OVER = new Set<ApiFile['state']>(['scanning', 'clean', 'infected', 
  * demand, and its recipients. Polled while something still moves (`useTransfer`). For a draft whose upload stopped (a
  * reload, a closed tab), the member picks each file again and its upload carries on from the parts S3 holds; then
  * the draft can be sent. Each recipient's delivery, verification and downloads are listed with an unlock for a locked
- * recipient, and the transfer can be revoked (#199); an expired one is read-only.
+ * recipient, and the transfer can be revoked (#199); an expired one is read-only. A transfer a DLP rule warns about,
+ * holds for approval or blocks shows the decision and the sender's choices (`TransferDlpPanel`, #219, #220).
  */
 export function TransferDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
@@ -127,6 +132,8 @@ function TransferView({ transfer }: { transfer: Transfer }) {
   );
   const revocable =
     REVOCABLE_STATES.includes(transfer.state) && revocation.status !== 'revoked' && revocation.status !== 'unconfirmed';
+  // Only the owner can extend (#214): a tenant admin gets `403` on another member's transfer.
+  const isOwner = useAuthStore((s) => s.user?.id === transfer.created_by);
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -137,11 +144,7 @@ function TransferView({ transfer }: { transfer: Transfer }) {
             {t(`holdReason.${transfer.hold_reason}`)}
           </Alert>
         )}
-        {NOT_AVAILABLE_STATES.includes(transfer.state) && (
-          <Alert variant="info" role="status">
-            {t('sender.dlpNotAvailable')}
-          </Alert>
-        )}
+        {showsDlp(transfer) && <TransferDlpPanel transfer={transfer} />}
         {isDraft && <DraftActions transfer={transfer} />}
 
         <Card>
@@ -176,11 +179,16 @@ function TransferView({ transfer }: { transfer: Transfer }) {
                 {transfer.expires_at
                   ? formatDate(transfer.expires_at, i18n.language)
                   : t('sender.expiresAfterSending', { duration: durationLabel(transfer.expires_in) })}
+                {isOwner && revocable && <ExtendExpiry transfer={transfer} />}
               </dd>
             </div>
             <div>
               <dt className="text-gray-500">{t('sender.downloadLimit')}</dt>
               <dd className="mt-0.5 font-medium">{transfer.download_limit ?? t('common.noLimit')}</dd>
+            </div>
+            <div>
+              <dt className="text-gray-500">{t('sender.firstDownloadEmail')}</dt>
+              <dd className="mt-0.5 font-medium">{transfer.notify_on_first_download ? t('common.yes') : t('common.no')}</dd>
             </div>
             <div>
               <dt className="text-gray-500">{t('common.totalSize')}</dt>
@@ -267,13 +275,16 @@ function FileRow({ file }: { file: ApiFile }) {
   );
 }
 
-function DetectorName({ id, fallback }: { id: string; fallback?: string }) {
+export function DetectorName({ id, fallback }: { id: string; fallback?: string }) {
   const { t } = useTranslation();
   return <>{isBuiltinDetector(id) ? t(`detectors.${id}`) : (fallback ?? id)}</>;
 }
 
-/** A file's findings, fetched once when shown (`getFileInspection`); each response with details is audited. */
-function Findings({ fileId }: { fileId: string }) {
+/**
+ * A file's findings, fetched once when shown (`getFileInspection`); each response with details is audited. Shared with
+ * the received files of an upload request (#213).
+ */
+export function Findings({ fileId }: { fileId: string }) {
   const { t } = useTranslation();
   const inspection = useFileInspection(fileId, true);
   if (inspection.isPending) return <Spinner size="sm" className="mt-2" />;
