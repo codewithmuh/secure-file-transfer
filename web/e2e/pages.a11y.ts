@@ -724,10 +724,10 @@ test('uploader: an accepted unscannable file, then taking a file back, by keyboa
   // A blocked file can't be taken back: it has no "Remove".
   await expect(page.getByRole('button', { name: fill(text().uploader.removeFile, { name: 'setup.exe' }) })).toHaveCount(0);
 
-  const remove = page.getByRole('button', { name: fill(text().uploader.removeFile, { name: removable.display_name }) });
+  const remove = page.getByRole('button', { name: fill(text().uploader.removeFile, { name: removable.display_name }), exact: true });
   await remove.focus();
   await page.keyboard.press('Enter');
-  const keep = page.getByRole('button', { name: text().uploader.removeKeep });
+  const keep = page.getByRole('button', { name: text().uploader.removeKeep, exact: true });
   await expect(keep).toBeFocused();
   await expect(page.getByRole('group', { name: fill(text().uploader.removeConfirm, { name: removable.display_name }) })).toBeVisible();
   await expectNoWcagViolations(page, 'uploader remove confirmation');
@@ -735,7 +735,7 @@ test('uploader: an accepted unscannable file, then taking a file back, by keyboa
   await expect(remove).toBeFocused();
 
   await page.keyboard.press('Enter');
-  await page.getByRole('button', { name: text().uploader.removeYes }).click();
+  await page.getByRole('button', { name: text().uploader.removeYes, exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: fill(text().uploader.removed, { name: removable.display_name }) })).toHaveCount(1);
   await expectNoWcagViolations(page, 'uploader file removed');
 });
@@ -784,7 +784,7 @@ test('DLP settings: a domain added, the confirmation, then a conflict with anoth
 test('DLP rules: turn off and delete confirmations, by keyboard (#218)', async ({ page }) => {
   await page.goto('/admin/dlp/rules');
   const t = text().dlpAdmin;
-  const turnOff = page.getByRole('button', { name: fill(t.turnOffNamed, { name: 'My Numbers' }) });
+  const turnOff = page.getByRole('button', { name: fill(t.turnOffNamed, { name: 'My Numbers' }), exact: true });
   await turnOff.focus();
   await page.keyboard.press('Enter');
   const dialog = page.getByRole('dialog', { name: t.confirmTurnOff });
@@ -793,7 +793,7 @@ test('DLP rules: turn off and delete confirmations, by keyboard (#218)', async (
   await page.keyboard.press('Escape');
   await expect(turnOff).toBeFocused();
 
-  await page.getByRole('button', { name: fill(t.deleteNamed, { name: 'My Numbers' }) }).click();
+  await page.getByRole('button', { name: fill(t.deleteNamed, { name: 'My Numbers' }), exact: true }).click();
   await expect(page.getByRole('dialog', { name: t.confirmDeleteRule })).toBeVisible();
   await expectNoWcagViolations(page, 'delete rule dialog');
 });
