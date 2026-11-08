@@ -70,6 +70,10 @@ ENV = {
     "OIDC_REDIRECT_URI": "http://localhost:8000/v1/auth/callback",
     "OIDC_TEST_EMAIL": "dev.member@example.com",
     "OIDC_TEST_PASSWORD": "local-only-member-password",
+    # The web app and the API as the browser reaches them (#195): always localhost, never 127.0.0.1.
+    "WEB_ORIGIN": "http://localhost:3000",
+    "API_ORIGIN": "http://localhost:8000",
+    "S3_BROWSER_ORIGIN": "http://localhost:9090",
 }
 cfg = {key: os.environ.get(key, default) for key, default in ENV.items()}
 
@@ -474,6 +478,153 @@ def check_oidc() -> str:
     return f"discovery; code flow with PKCE as {user}; refresh token revoked"
 
 
+# The web app's response headers (web/nginx.conf, #195): CloudFront's policy with the local origins.
+WEB_CSP = (
+    "default-src 'self'; script-src 'self'; connect-src 'self' http://localhost:8000 "
+    "http://localhost:9090; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; "
+    "form-action 'self' http://localhost:8000"
+)
+
+
+def check_web() -> str:
+    web = cfg["WEB_ORIGIN"]
+    for path in (
+        "/",
+        "/transfers/0190c0de-0000-7000-8000-000000000001",
+        "/config.json",
+    ):
+        response = requests.get(f"{web}{path}", timeout=10, allow_redirects=False)
+        assert response.status_code == 200, (path, response.status_code)
+        headers = response.headers
+        assert headers.get("Content-Security-Policy") == WEB_CSP, (path, headers)
+        assert headers.get("Cache-Control") == "no-cache", (
+            path,
+            headers.get("Cache-Control"),
+        )
+        assert headers.get("X-Content-Type-Options") == "nosniff", path
+        assert headers.get("Referrer-Policy") == "no-referrer", path
+        if path == "/config.json":
+            config = response.json()
+            assert config["apiOrigin"] == f"{cfg['API_ORIGIN']}/v1", config
+            assert config["uploadOrigin"] == cfg["S3_BROWSER_ORIGIN"], config
+        else:
+            assert '<div id="root">' in response.text, (
+                path
+            )  # the SPA fallback: index.html
+    asset = re.search(r'src="(/assets/[^"]+\.js)"', requests.get(web, timeout=10).text)
+    assert asset, "no bundle in index.html"
+    cached = requests.get(f"{web}{asset.group(1)}", timeout=10).headers.get(
+        "Cache-Control"
+    )
+    assert cached == "public, max-age=31536000, immutable", cached
+    missing = requests.get(f"{web}/assets/missing.js", timeout=10)
+    assert missing.status_code == 404, missing.status_code
+    loopback = web.replace("localhost", "127.0.0.1")
+    moved = requests.get(f"{loopback}/transfers?x=1", timeout=10, allow_redirects=False)
+    assert moved.status_code == 308, moved.status_code
+    assert moved.headers.get("Location") == f"{web}/transfers?x=1", moved.headers
+    return "index.html and config.json no-cache, SPA fallback, CSP, immutable assets, 127.0.0.1 redirects"
+
+
+def check_cors() -> str:
+    """The API answers the web app's preflight, and no other origin's (authn-authz 3.4)."""
+    url = f"{cfg['API_ORIGIN']}/v1/auth/sign-out"
+    ask = {
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type,x-csrf-token",
+    }
+    allowed = requests.options(
+        url, headers={"Origin": cfg["WEB_ORIGIN"], **ask}, timeout=10
+    )
+    assert allowed.status_code == 200, allowed.status_code
+    assert allowed.headers.get("Access-Control-Allow-Origin") == cfg["WEB_ORIGIN"], (
+        allowed.headers
+    )
+    assert allowed.headers.get("Access-Control-Allow-Credentials") == "true", (
+        allowed.headers
+    )
+    other = requests.options(
+        url, headers={"Origin": "http://evil.example", **ask}, timeout=10
+    )
+    assert other.status_code >= 400, other.status_code
+    assert "Access-Control-Allow-Origin" not in other.headers, other.headers
+    return "the web app's preflight passes, another origin's is refused"
+
+
+PART_URL_PROBE = """
+import asyncio
+from sft.core.settings import Settings, load_settings
+from sft.data.models import StorageClass
+from sft.runtime.s3 import S3Objects
+
+async def main():
+    settings = load_settings(Settings)
+    store = S3Objects.create(
+        region=settings.aws_region,
+        files_bucket=settings.s3_files_bucket,
+        large_files_bucket=settings.s3_large_files_bucket,
+        kms_key_id=settings.s3_files_kms_key_id,
+        endpoint_url=settings.s3_endpoint_url,
+        presign_endpoint_url=settings.s3_presign_endpoint_url,
+        threads=1,
+    )
+    try:
+        print(await store.part_url(StorageClass.STANDARD, "k", "u", part_number=1, size=1))
+    finally:
+        await store.close()
+
+asyncio.run(main())
+"""
+
+
+def check_part_urls() -> str:
+    """Part URLs name the S3 stand-in as the browser sees it, and a browser's part PUT from the web
+    app's origin passes its preflight and lands (#195)."""
+    signed = in_container("api", PART_URL_PROBE)
+    assert signed.startswith(f"{cfg['S3_BROWSER_ORIGIN']}/{cfg['S3_FILES_BUCKET']}/"), (
+        signed[:60]
+    )
+
+    s3 = aws("s3")
+    bucket, key = cfg["S3_FILES_BUCKET"], f"tenants/smoke/{uuid.uuid4()}"
+    sse = {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": cfg["S3_FILES_KMS_KEY_ID"]}
+    upload_id = s3.create_multipart_upload(Bucket=bucket, Key=key, **sse)["UploadId"]
+    try:
+        browser_s3 = boto3.client(
+            "s3",
+            endpoint_url=cfg["S3_BROWSER_ORIGIN"],
+            region_name=cfg["AWS_REGION"],
+            aws_access_key_id=cfg["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=cfg["AWS_SECRET_ACCESS_KEY"],
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+        )
+        part = {"Bucket": bucket, "Key": key, "UploadId": upload_id, "PartNumber": 1}
+        url = browser_s3.generate_presigned_url(
+            "upload_part", Params=part, ExpiresIn=900
+        )
+        origin = {"Origin": cfg["WEB_ORIGIN"]}
+        preflight = requests.options(
+            url, headers={**origin, "Access-Control-Request-Method": "PUT"}, timeout=10
+        )
+        assert preflight.status_code == 200, preflight.status_code
+        assert preflight.headers.get("Access-Control-Allow-Origin") in (
+            "*",
+            cfg["WEB_ORIGIN"],
+        )
+        # As the upload engine sends it: no cookie, no credentials, no Content-Type of its own.
+        put = requests.put(url, data=b"x" * 1024, headers=origin, timeout=30)
+        assert put.status_code == 200, (put.status_code, put.text[:200])
+        assert put.headers.get("Access-Control-Allow-Origin") in (
+            "*",
+            cfg["WEB_ORIGIN"],
+        )
+        listed = s3.list_parts(Bucket=bucket, Key=key, UploadId=upload_id)["Parts"]
+        assert [p["Size"] for p in listed] == [1024], listed
+    finally:
+        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+    return f"signed for {cfg['S3_BROWSER_ORIGIN']}; a part PUT from the web app's origin, preflight included"
+
+
 CHECKS: dict[str, Callable[[], str]] = {
     "postgres": check_postgres,
     "api-role": check_api_role,
@@ -484,6 +635,9 @@ CHECKS: dict[str, Callable[[], str]] = {
     "inspector": check_inspector,
     "mail": check_mail,
     "oidc": check_oidc,
+    "web": check_web,
+    "cors": check_cors,
+    "part-urls": check_part_urls,
 }
 
 

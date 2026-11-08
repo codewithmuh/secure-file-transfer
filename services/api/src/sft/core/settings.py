@@ -335,6 +335,23 @@ class Settings(ServerSettings, ClockSettings):
         description="Streams one API pod serves at once; the next gets 503, Retry-After: 10 "
         "(abuse 5.7).",
     )
+    # Part URLs a browser can reach (#195): locally the API calls S3Mock in-network (`s3:9090`),
+    # but the browser uploads parts from the host, where the stand-in is `localhost:9090`.
+    s3_presign_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only: the S3 stand-in's address as the browser sees it, used only to "
+        "sign part URLs; every other S3 call keeps S3_ENDPOINT_URL. Needs S3_ENDPOINT_URL. In AWS "
+        "neither is set and S3 signs its own host.",
+    )
+
+    @model_validator(mode="after")
+    def _presign_endpoint_needs_the_stand_in(self) -> Self:
+        if self.s3_presign_endpoint_url is not None and self.s3_endpoint_url is None:
+            raise ValueError(
+                "S3_PRESIGN_ENDPOINT_URL is for the local S3 stand-in only: set S3_ENDPOINT_URL too"
+            )
+        return self
 
     @field_validator("csrf_keyring")
     @classmethod
@@ -700,6 +717,54 @@ class NotifySettings(WorkerSettings, MailSettings):
             value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
         )
         return value
+
+    # The user pool's admin side (#197; authn and authz 2.5): the worker creates an invited
+    # member's pool user and records the identity. Locally Keycloak's admin API stands in for
+    # Cognito's; without a pool (`none`, dev until #193) invitations are recorded, nothing sent.
+    user_pool_backend: Literal["none", "keycloak"] = Field(
+        default="none",
+        description="`keycloak` in the local stack; `none` sends no invitation (dev until #193).",
+    )
+    user_pool_provider_name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="The pool's `idp_connections.provider_name` (the API's OIDC_PROVIDER_NAME), "
+        "whose connection each recorded identity names.",
+    )
+    keycloak_url: str | None = Field(
+        default=None,
+        pattern=_HTTP_URL,
+        description="Keycloak's in-network address, such as http://oidc:8080. Local only.",
+    )
+    keycloak_realm: str | None = Field(
+        default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"
+    )
+    keycloak_client_id: str | None = Field(
+        default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$"
+    )
+    keycloak_client_secret: SecretStr | None = Field(
+        default=None,
+        description="The client whose service account may manage the realm's users. Local only.",
+    )
+
+    @model_validator(mode="after")
+    def _a_pool_names_its_parts(self) -> Self:
+        if self.user_pool_backend == "keycloak":
+            missing = [
+                name
+                for name in (
+                    "user_pool_provider_name",
+                    "keycloak_url",
+                    "keycloak_realm",
+                    "keycloak_client_id",
+                    "keycloak_client_secret",
+                )
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(f"USER_POOL_BACKEND=keycloak needs {', '.join(missing).upper()}")
+        return self
 
     @field_validator("link_hmac_keyring")
     @classmethod

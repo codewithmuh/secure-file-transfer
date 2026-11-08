@@ -570,7 +570,10 @@ def test_only_the_jobs_role_may_delete_and_the_api_role_never_files(
     by_table = {(str(t), str(r)) for t, r in grants}
     for table in ("verification_codes", "link_sessions", "download_grants"):
         assert (table, "sft_jobs") in by_table
-    assert not any(role == "sft_api" for _, role in by_table if _ != "idempotency_keys")
+    # The API deletes only its own idempotency keys and, in a sign-in reset, the user's pool
+    # identities (authn and authz 2.5, revision 0016): never a file, transfer or recipient row.
+    api_deletes = {table for table, role in by_table if role == "sft_api"}
+    assert api_deletes <= {"idempotency_keys", "user_identities"}
     assert not any(table in ("files", "transfers") for table, _ in by_table)
 
 

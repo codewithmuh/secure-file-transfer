@@ -287,6 +287,17 @@ async def change_role(
     return user
 
 
+async def start_sign_in_reset(session: AsyncSession, user_id: UUID) -> tuple[User, UUID]:
+    """Give the user a new pending sign-in reset (#197, revision 0016): its ID supersedes any reset
+    still being processed. The caller writes the reset's audit event and its outbox message with
+    the ID, in the same transaction."""
+    reset_id = uuid7()
+    user = await _update_one(
+        session, [User.id == user_id, in_scope(User, session)], sign_in_reset_id=reset_id
+    )
+    return user, reset_id
+
+
 async def set_dlp_approver(
     session: AsyncSession,
     user_id: UUID,

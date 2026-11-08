@@ -99,6 +99,7 @@ def _lifespan(
             large_files_bucket=settings.s3_large_files_bucket,
             kms_key_id=settings.s3_files_kms_key_id,
             endpoint_url=settings.s3_endpoint_url,
+            presign_endpoint_url=settings.s3_presign_endpoint_url,
         )
         app.state.objects = objects
         app.state.upload_policy = UploadPolicy(
@@ -175,6 +176,8 @@ def create_app(
         Clock() if settings is None else Clock.offset_by(settings.clock_offset_seconds)
     )
     app.state.web_origin = None if settings is None else settings.web_origin
+    # The user pool's connection, whose identities a sign-in reset deletes (#197).
+    app.state.pool_provider = None if settings is None else settings.oidc_provider_name
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
     auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)

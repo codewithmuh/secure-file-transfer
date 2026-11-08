@@ -34,3 +34,13 @@ export function safeReturnPath(raw: string | null | undefined): string {
   const allowed = RETURN_PATH_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   return allowed ? raw : DEFAULT_RETURN_PATH;
 }
+
+/** The path a protected route sent the member here from (`ProtectedRoute`), so sign-in can return to it. */
+export function returnPathOf(state: unknown): string | null {
+  if (typeof state !== 'object' || state === null || !('from' in state)) return null;
+  const from = (state as { from: unknown }).from;
+  if (typeof from !== 'object' || from === null) return null;
+  const { pathname, search } = from as { pathname?: unknown; search?: unknown };
+  if (typeof pathname !== 'string') return null;
+  return `${pathname}${typeof search === 'string' ? search : ''}`;
+}

@@ -13,6 +13,9 @@ is never sent twice (ADR-0013; consumer.py).
   The adapter blocks, so each send runs in this worker's own small thread pool.
 - **The counter store** holds the cross-tenant cap; while it is unreachable the cap counts in this
   pod (abuse 4.5).
+- **The user pool's admin side** (`USER_POOL_BACKEND`, #197): it creates an invited member's pool
+  user and records the identity before the invitation goes out. Locally Keycloak's admin API
+  (`sft.runtime.keycloak`); `none` where there is no pool adapter yet (dev, until #193).
 
 Probes and metrics on the internal port (architecture 8): `emails_sent_total{type}`,
 `email_caps_hit_total{cap}`, `worker_messages_total{consumer,outcome}` and the counter store's.
@@ -38,6 +41,7 @@ from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
 from sft.data.mail import Mailer, OutgoingEmail, mailer_from_settings
 from sft.data.outbox import Queue
+from sft.runtime.keycloak import KeycloakUserPool
 from sft.service.email import EmailRenderer
 from sft.service.notifications import CONSUMER, Done, Notifier, NotifyMetrics
 from sft.service.rate_limits import RateLimiter
@@ -86,6 +90,28 @@ def threaded_send(
     return send
 
 
+def user_pool(settings: NotifySettings) -> KeycloakUserPool | None:
+    """The user pool's admin side the settings name, or None (`USER_POOL_BACKEND=none`)."""
+    if settings.user_pool_backend != "keycloak":
+        return None
+    url, realm, client_id = (
+        settings.keycloak_url,
+        settings.keycloak_realm,
+        settings.keycloak_client_id,
+    )
+    secret, provider = settings.keycloak_client_secret, settings.user_pool_provider_name
+    # NotifySettings refuses a Keycloak pool without its parts; this only narrows the types.
+    if url is None or realm is None or client_id is None or secret is None or provider is None:
+        raise RuntimeError("USER_POOL_BACKEND=keycloak without its settings")
+    return KeycloakUserPool(
+        base_url=url,
+        realm=realm,
+        client_id=client_id,
+        client_secret=secret.get_secret_value(),
+        provider_name=provider,
+    )
+
+
 async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = True) -> int:
     """The notification worker process: its clients and probes, until a signal."""
     process = WorkerProcess(settings)
@@ -101,6 +127,7 @@ async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = 
     counter_metrics = CounterMetrics.create(process.registry)
     store = CounterStore.connect(settings.valkey_url.get_secret_value(), counter_metrics)
     executor = ThreadPoolExecutor(max_workers=MAIL_THREADS, thread_name_prefix="mail")
+    pool = user_pool(settings)
     notifier = Notifier(
         database,
         renderer=EmailRenderer(settings.web_app_url),
@@ -110,6 +137,7 @@ async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = 
         emails=EmailKeyring.from_json(settings.email_hmac_keyring.get_secret_value()),
         limiter=RateLimiter(store, counter_metrics),
         metrics=NotifyMetrics.create(process.registry),
+        pool=pool,
     )
     loop = ConsumerLoop(
         NotifyConsumer(database, notifier), queues, ConsumerMetrics.create(process.registry)
@@ -117,6 +145,8 @@ async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = 
     try:
         return await process.run(loop.run, handle_signals=handle_signals)
     finally:
+        if pool is not None:
+            await pool.aclose()
         await store.close()
         await queues.close()
         await asyncio.to_thread(executor.shutdown, wait=True)

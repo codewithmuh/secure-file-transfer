@@ -595,6 +595,30 @@ def test_the_lifecycle_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None
         assert "bytes_served" not in _columns(listed)
 
 
+def test_the_pool_identities_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("POOL_ROWS", "0016")
+    # 0006 already enabled row-level security on user_identities: the rest of tenant_rls_sql.
+    assert list(module.RLS) == [
+        *tenant_rls_sql(
+            "user_identities",
+            grants={"sft_api": "SELECT, DELETE", "sft_notify": "SELECT, INSERT, DELETE"},
+        )[1:],
+        grant_sql(
+            "idp_connections", "sft_notify", "SELECT", columns=_columns(module.CONNECTION_READ)
+        ),
+        policy_sql(
+            "pool_read",
+            "idp_connections",
+            roles=["sft_notify"],
+            command="SELECT",
+            using=module.POOL_ROWS,
+        ),
+        "ALTER POLICY audit_platform_insert ON audit_events TO sft_api, sft_operator, sft_notify",
+    ]
+    # The worker reads the pool's rows only: never a tenant's own provider.
+    assert "tenant_id IS NULL" in module.POOL_ROWS
+
+
 def test_the_jobs_find_their_work_by_indexes(migrated_db: ScratchDatabase) -> None:
     indexes = {
         str(name)

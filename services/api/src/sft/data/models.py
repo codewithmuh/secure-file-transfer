@@ -342,6 +342,9 @@ class User(TenantOwned, Base):
     invitation_expires_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    sign_in_reset_id: Mapped[uuid.UUID | None]
+    """The sign-in reset being processed, if any (#197, revision 0016): each reset gets a new one,
+    so its outbox message knows whether a newer reset has superseded it."""
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:

@@ -118,6 +118,41 @@ async def test_a_part_url_lives_15_minutes_at_most(objects: S3Objects) -> None:
         )
 
 
+async def test_part_urls_name_the_presign_endpoint_and_nothing_else_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Locally the API reaches S3Mock in-network, the browser on the host (#195): part URLs are
+    signed for the host's address, every other call keeps the in-network one. Signing is local work,
+    so this needs no S3Mock."""
+    for name, value in FAKE_CREDENTIALS.items():
+        monkeypatch.setenv(name, value)
+    store = S3Objects.create(
+        region=REGION,
+        files_bucket="sft-test-files",
+        large_files_bucket="sft-test-large-files",
+        kms_key_id=FILES_KEY,
+        endpoint_url="http://s3:9090",
+        presign_endpoint_url="http://localhost:9090",
+        threads=1,
+    )
+    try:
+        url = await store.part_url(StorageClass.STANDARD, "k", "u", part_number=1, size=5)
+        assert url.startswith("http://localhost:9090/sft-test-files/k?")
+        assert store._client.meta.endpoint_url == "http://s3:9090"
+    finally:
+        await store.close()
+
+
+def test_a_presign_endpoint_without_the_stand_in_is_refused() -> None:
+    with pytest.raises(ValueError, match="local S3 stand-in only"):
+        S3Objects.create(
+            region=REGION,
+            files_bucket="sft-test-files",
+            large_files_bucket="sft-test-large-files",
+            presign_endpoint_url="http://localhost:9090",
+        )
+
+
 async def test_a_missing_bucket_is_an_object_store_error(endpoint: str) -> None:
     store = S3Objects.create(
         region=REGION,

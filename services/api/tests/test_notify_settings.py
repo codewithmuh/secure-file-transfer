@@ -58,3 +58,29 @@ def test_a_bad_keyring_stops_the_worker_and_is_never_echoed(
     with pytest.raises(ValidationError) as refused:
         NotifySettings()
     assert KEY not in str(refused.value.errors(include_input=False))
+
+
+def test_without_a_pool_invitations_wait(env: pytest.MonkeyPatch) -> None:
+    """Dev until #193: no pool adapter, so invitations are recorded and nothing is sent."""
+    s = NotifySettings()
+    assert (s.user_pool_backend, s.keycloak_url, s.keycloak_client_secret) == ("none", None, None)
+
+
+def test_a_keycloak_pool_names_all_its_parts(env: pytest.MonkeyPatch) -> None:
+    """The local stack's pool (#197): Keycloak's admin API, as a client that may manage users."""
+    parts = {
+        "USER_POOL_PROVIDER_NAME": "local-keycloak",
+        "KEYCLOAK_URL": "http://oidc:8080",
+        "KEYCLOAK_REALM": "sft",
+        "KEYCLOAK_CLIENT_ID": "sft-notify-local",
+        "KEYCLOAK_CLIENT_SECRET": "local-only-notify-pool-secret",
+    }
+    env.setenv("USER_POOL_BACKEND", "keycloak")
+    for name, value in parts.items():
+        env.setenv(name, value)
+    s = NotifySettings()
+    assert s.keycloak_client_secret is not None
+    assert "local-only-notify-pool-secret" not in repr(s)
+    env.delenv("KEYCLOAK_CLIENT_SECRET")
+    with pytest.raises(ValidationError, match="KEYCLOAK_CLIENT_SECRET"):
+        NotifySettings()

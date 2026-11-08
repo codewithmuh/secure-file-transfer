@@ -70,6 +70,29 @@ web-a11y: ## Web app: axe accessibility checks on every page, in English and Jap
 	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
 	    && npm run build && npx playwright test'
 
+# Browser flows against the running stack (#195, #196, #197; after `make up` and `make seed`), in the same pinned
+# Playwright image, so no browser is installed on the host. The browser must see the stack as a person does, at
+# http://localhost:3000, :8000, :8180, :8025 and :9090. On Linux (CI) the container shares the host's network. Docker
+# Desktop (macOS) has no host networking by default, so there web/e2e/support/forward.mjs listens on those ports inside
+# the container and forwards them to host.docker.internal, where the stack's 127.0.0.1 ports are. E2E_ARGS passes
+# options on, e.g. E2E_ARGS='e2e/admin.e2e.ts'.
+E2E_ARGS ?=
+ifeq ($(shell uname -s),Linux)
+E2E_NETWORK := --network host
+E2E_FORWARD := true
+else
+E2E_NETWORK :=
+E2E_FORWARD := (node e2e/support/forward.mjs &) && sleep 1
+endif
+.PHONY: web-e2e
+web-e2e: ## Web app: browser flows against the running local stack (needs make up and make seed, and Docker)
+	docker run --rm --init --ipc=host $(E2E_NETWORK) --volume "$(CURDIR)/web:/src/web:ro" --workdir /web \
+	  $(PLAYWRIGHT_IMAGE) bash -euo pipefail -c 'tar -C /src/web --exclude=./node_modules --exclude=./dist \
+	    --exclude=./test-results -cf - . | tar -xf - \
+	    && npm ci --ignore-scripts \
+	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
+	    && $(E2E_FORWARD) && npx playwright test --config playwright.e2e.config.ts $(E2E_ARGS)'
+
 # The API contract checks, as .github/workflows/contract.yml runs them (docs/api/README.md section 11).
 # The breaking-change check compares the working tree's contract with the one at the merge base of
 # HEAD and CONTRACT_BASE. OASDIFF_IMAGE is the workflow's: keep the two in step.

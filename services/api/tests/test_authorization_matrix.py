@@ -277,7 +277,17 @@ def revoke_row() -> dict[str, int]:
     }
 
 
-USER_OPERATIONS = frozenset({"inviteUser", "listUsers", "getUser", "updateUser", "deactivateUser"})
+USER_OPERATIONS = frozenset(
+    {
+        "inviteUser",
+        "listUsers",
+        "getUser",
+        "updateUser",
+        "deactivateUser",
+        "signOutUser",
+        "resetUserSignIn",
+    }
+)
 
 EXPECTED: dict[str, dict[str, int]] = {
     "inviteUser": admin_row(201, step_up=True, item=False),
@@ -285,6 +295,8 @@ EXPECTED: dict[str, dict[str, int]] = {
     "getUser": admin_row(200, step_up=False, item=True),
     "updateUser": admin_row(200, step_up=True, item=True),
     "deactivateUser": admin_row(200, step_up=True, item=True),
+    "signOutUser": admin_row(200, step_up=False, item=True),
+    "resetUserSignIn": admin_row(202, step_up=True, item=True),
     "createTransfer": create_row(201),
     "addTransferFile": own_row(201),
     "requestUploadPartUrls": own_row(200),
@@ -342,6 +354,8 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
         "getUser": ("GET", target, None),
         "updateUser": ("PATCH", target, {"role": "admin"}),
         "deactivateUser": ("POST", f"{target}/deactivate", None),
+        "signOutUser": ("POST", f"{target}/sign-out", None),
+        "resetUserSignIn": ("POST", f"{target}/reset-sign-in", None),
         "createTransfer": (
             "POST",
             "/v1/transfers",

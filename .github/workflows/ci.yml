@@ -63,7 +63,7 @@ jobs:
     # required through this job's existing check (no ruleset change). The name stays: the ruleset names it.
     name: Local stack (up, smoke checks)
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -84,6 +84,11 @@ jobs:
         run: make seed
       - name: The M2 journey, steps 1 to 9 (#182)
         run: make e2e
+      # The web app's browser flows against the same stack (#195, #196, #197): sign-in, uploads,
+      # scan and DLP status, admin pages. Chromium in the pinned Playwright image, on the host's
+      # network, so the browser sees http://localhost:3000 as a person does (Makefile, web-e2e).
+      - name: Web app browser flows (#195 to #197)
+        run: make web-e2e
       - name: Show container logs
         if: failure()
         run: docker compose logs --no-color

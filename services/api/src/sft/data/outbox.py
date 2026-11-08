@@ -93,10 +93,17 @@ def topic_registry(*topics: Topic) -> Mapping[str, Topic]:
 
 
 MEMBER_INVITED: Final = Topic("member.invited", Queue.NOTIFY)
-"""A user was invited (FR-22): the notification worker creates their sign-in and emails the
-invitation (authn and authz 2.5). Payload `{"user_id": …}`. Until Cognito arrives (M4) the
-worker records it and sends nothing: an invitation needs the user pool's user and its temporary
-password, and the user stays `invited`, which is how M4 finds whom to invite (#178)."""
+"""A user was invited (FR-22): the notification worker creates their user in the user pool with a
+temporary password, records the identity and emails the invitation (authn and authz 2.5).
+Payload `{"user_id": …}`. Locally the pool is Keycloak (#197); where the worker has no pool yet
+(dev until Cognito, #193) it records the message and sends nothing, and the user stays `invited`,
+which is how #193 finds whom to invite."""
+
+MEMBER_SIGN_IN_RESET: Final = Topic("member.sign_in_reset", Queue.NOTIFY)
+"""An admin reset a member's sign-in (`resetUserSignIn`, #197): the API has ended their sessions
+and deleted their local identities; the notification worker deletes their user in the pool,
+creates it again with a new temporary password, records the new identity and emails a new
+invitation (authn and authz 2.5, steps 2 and 3). Payload `{"user_id": …}`."""
 
 FILE_SCAN: Final = Topic("file.scan", Queue.SCAN_SMALL)
 """A file of up to 100 MB reached `scanning`: a scan worker of the small pool streams it to clamd
@@ -143,6 +150,7 @@ RECIPIENT_LOCKED: Final = Topic("recipient.locked", Queue.NOTIFY)
 
 TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     MEMBER_INVITED,
+    MEMBER_SIGN_IN_RESET,
     FILE_SCAN,
     FILE_SCAN_LARGE,
     TRANSFER_SENT,

@@ -1,5 +1,6 @@
-"""The member operations of the contract: `inviteUser`, `listUsers`, `getUser`, `updateUser` and
-`deactivateUser` (docs/api/openapi.yaml, tag "Tenant admin"; FR-22).
+"""The member operations of the contract: `inviteUser`, `listUsers`, `getUser`, `updateUser`,
+`deactivateUser`, `signOutUser` and `resetUserSignIn` (docs/api/openapi.yaml, tag "Tenant admin";
+FR-22).
 
 Routes only parse the request and shape the response; the service layer (`sft.service.members`)
 checks the caller's permission and applies the rules. Its refusals are `sft.core.errors`
@@ -12,9 +13,11 @@ caller's own limit applies to (`SAFETY_ACTION`). `inviteUser` also applies group
 limits, the per-address one keyed by the address's pseudonym under the `email-hmac` keyring, in the
 service once the caller may invite (`sft.service.members.INVITE_LIMITS`).
 
-`updateUser` (a demotion) and `deactivateUser` are security-critical records (#177): they answer
-`200` only once the audit archive of both regions holds the record, `503` otherwise, with the change
-kept.
+`updateUser` (a demotion), `deactivateUser`, `signOutUser` and `resetUserSignIn` are
+security-critical records (#177): they answer `200` (`202` for a reset) only once the audit archive
+of both regions holds the record, `503` otherwise, with the change kept. A reset deletes the user's
+identities on the user pool's connections: the pool the API signs members in with
+(`OIDC_PROVIDER_NAME`, `get_pool_connections`).
 
 `inviteUser` takes `Idempotency-Key` (`sft.api.idempotency`, API README 5): a retry with the same
 key and body after a lost answer gets the first `201`, its `Location` and the user as they are now,
@@ -278,6 +281,75 @@ async def deactivate_user(
 ) -> UserOut:
     user = await members.deactivate_user(
         database, caller, user_id, archive=archive, origin=_origin(request), now=_now()
+    )
+    return UserOut.of(user)
+
+
+def get_pool_connections(request: Request) -> members.PoolConnections:
+    """The user pools' connections, whose identities a sign-in reset deletes: the pool this API
+    signs members in with, by its provider name (`OIDC_PROVIDER_NAME`), looked up once per process
+    and only after the caller may reset (`sft.service.members.CachedPoolConnections`). Osaka's pool
+    joins it with the second region (M4). None in an app without settings."""
+    found = getattr(request.app.state, "pool_connections", None)
+    if found is None:
+        provider = getattr(request.app.state, "pool_provider", None)
+        database = getattr(request.app.state, "database", None)
+        if not isinstance(provider, str) or not isinstance(database, Database):
+
+            async def none() -> list[UUID]:
+                return []
+
+            return none
+        found = members.CachedPoolConnections(database, [provider])
+        request.app.state.pool_connections = found
+    return found
+
+
+PoolConnectionsDep = Annotated[members.PoolConnections, Depends(get_pool_connections)]
+
+
+@router.post(
+    "/users/{user_id}/sign-out",
+    operation_id="signOutUser",
+    response_model=UserOut,
+    summary="Sign a user out everywhere",
+    dependencies=[TENANT_LIMITS],
+    responses=problem_responses(401, 403, 404, 429, 503),
+)
+async def sign_out_user(
+    user_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep, archive: ArchiveDep
+) -> UserOut:
+    user = await members.sign_out_user(
+        database, caller, user_id, archive=archive, origin=_origin(request), now=_now()
+    )
+    return UserOut.of(user)
+
+
+@router.post(
+    "/users/{user_id}/reset-sign-in",
+    operation_id="resetUserSignIn",
+    response_model=UserOut,
+    status_code=202,
+    summary="Reset a member's sign-in",
+    dependencies=[TENANT_LIMITS],
+    responses=problem_responses(401, 403, 404, 409, 429, 503),
+)
+async def reset_user_sign_in(
+    user_id: UUID,
+    request: Request,
+    caller: CallerDep,
+    database: DatabaseDep,
+    archive: ArchiveDep,
+    pools: PoolConnectionsDep,
+) -> UserOut:
+    user = await members.reset_user_sign_in(
+        database,
+        caller,
+        user_id,
+        pool_connections=pools,
+        archive=archive,
+        origin=_origin(request),
+        now=_now(),
     )
     return UserOut.of(user)
 

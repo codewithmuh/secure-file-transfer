@@ -30,7 +30,13 @@ from sft.data import (
 from sft.data import tenants as tenant_data
 from sft.data.access import in_scope
 from sft.data.audit import Actor
-from sft.data.identities import find_connection, find_identity
+from sft.data.identities import (
+    delete_identities,
+    find_connection,
+    find_identity,
+    pool_connection,
+    record_identity,
+)
 from sft.data.member_sessions import (
     create_session,
     get_live_session,
@@ -87,6 +93,7 @@ from sft.data.users import (
     lock_active_admins,
     set_dlp_approver,
     set_sso_fallback,
+    start_sign_in_reset,
 )
 
 TENANT, RESOURCE, SYSTEM = ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.SYSTEM
@@ -647,6 +654,49 @@ async def fail_another_tenants_overdue_scan(session: AsyncSession, tenants: Tena
         detail=ScanDetail.DEADLINE_PASSED,
         inspection_state=InspectionState.FAILED,
     )
+
+
+# ---- local identities written by the worker, removed by a reset (#197, revision 0016) ----
+
+# The roles granted `user_identities` in a tenant's scope, and roles that must be refused.
+IDENTITY_READERS = {API: [TENANT], NOTIFY: [TENANT], OPERATOR: [TENANT], SCAN: [TENANT]}
+
+
+@cases.add(scopes=IDENTITY_READERS)
+async def read_another_tenants_identity_or_provider(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs
+    # Their SSO connection is a tenant's provider, never a pool row: nobody reaches it this way.
+    return await pool_connection(session, theirs.marker)
+
+
+@cases.add(scopes=USER_WRITERS)
+async def reset_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    started = await start_sign_in_reset(session, tenants.theirs.rows["user"])
+    await audit.record(session, action="user.sign_in_reset", actor=ADMIN)
+    return started
+
+
+@cases.add(scopes={API: [TENANT], NOTIFY: [TENANT], OPERATOR: [TENANT]})
+async def delete_another_tenants_identity(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    removed = await delete_identities(session, theirs["user"], [theirs["connection"]])
+    await audit.record(session, action="user.sign_in_reset", actor=ADMIN)
+    return removed
+
+
+@cases.add(scopes={NOTIFY: [TENANT], API: [TENANT], SCAN: [TENANT]})
+async def bind_a_subject_to_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    bound = await record_identity(
+        session,
+        user_id=theirs["user"],
+        connection_id=theirs["connection"],
+        subject=f"new-{uuid.uuid4()}",
+    )
+    await audit.record(session, action="email.sent", actor=Actor(ActorType.SYSTEM))
+    return bound
 
 
 # ---- links, codes and link sessions (#178, #179) ----

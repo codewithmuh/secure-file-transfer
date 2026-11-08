@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useAuthStore } from '@/stores/authStore';
 import { csrfToken, currentMember, header, member, problem, setUpApi } from '@/test/apiHarness';
-import { finishSignIn, restoreMemberSession, signOutMember, SIGN_IN_FAILED_PATH } from './memberSession';
+import {
+  finishSignIn,
+  isLogoutUrl,
+  restoreMemberSession,
+  signInUrl,
+  signOutMember,
+  SIGN_IN_FAILED_PATH,
+} from './memberSession';
 
 const token = csrfToken('member');
 
@@ -125,8 +132,15 @@ describe('signOutMember: with the session restored on load, sign-out must end it
     expect(api.location.assign).not.toHaveBeenCalled();
   });
 
-  it.each(['javascript:alert(1)', 'http://auth.example.com/logout', 'not a url'])(
-    'ignores a logout URL that is not https: %s',
+  it.each([
+    'javascript:alert(1)',
+    'http://auth.example.com/logout',
+    'https://evil.example/logout',
+    'https://auth.example.com.evil.example/logout',
+    'data:text/html,hi',
+    'not a url',
+  ])(
+    'ignores a logout URL that is not on the sign-in origin: %s',
     async (logoutUrl) => {
       const api = await setUpApi(() => ({ status: 200, data: { logout_url: logoutUrl } }));
       useAuthStore.getState().setAuth(member, token);
@@ -136,4 +150,48 @@ describe('signOutMember: with the session restored on load, sign-out must end it
       expect(api.location.assign).toHaveBeenCalledWith('/sign-in');
     },
   );
+});
+
+describe('signOutMember in the local stack: Keycloak is the sign-in origin (#195)', () => {
+  it('follows the http logout URL of the configured sign-in origin', async () => {
+    const logoutUrl = 'http://localhost:8180/realms/sft/protocol/openid-connect/logout';
+    const api = await setUpApi(() => ({ status: 200, data: { logout_url: logoutUrl } }), '/', {
+      apiOrigin: 'http://localhost:8000/v1',
+      signInOrigin: 'http://localhost:8180',
+    });
+    useAuthStore.getState().setAuth(member, token);
+
+    await signOutMember();
+
+    expect(api.location.assign).toHaveBeenCalledWith(logoutUrl);
+  });
+
+  it('refuses another port, scheme or host than the sign-in origin', async () => {
+    await setUpApi(() => ({ status: 404 }), '/', { signInOrigin: 'http://localhost:8180' });
+    expect(isLogoutUrl('http://localhost:8180/realms/sft/protocol/openid-connect/logout')).toBe(true);
+    expect(isLogoutUrl('http://localhost:8181/logout')).toBe(false);
+    expect(isLogoutUrl('https://localhost:8180/logout')).toBe(false);
+    expect(isLogoutUrl('http://127.0.0.1:8180/logout')).toBe(false);
+    expect(isLogoutUrl('javascript://localhost:8180/%0aalert(1)')).toBe(false);
+  });
+});
+
+describe('signInUrl: startSignIn on the API origin, with return_to (#195)', () => {
+  it('uses the config\'s apiOrigin and the contract\'s return_to, checked', async () => {
+    await setUpApi(() => ({ status: 404 }), '/', { apiOrigin: 'http://localhost:8000/v1' });
+    expect(signInUrl('local', '/transfers/0190c0de-0000-7000-8000-000000000001')).toBe(
+      'http://localhost:8000/v1/auth/sign-in?method=local&return_to=%2Ftransfers%2F0190c0de-0000-7000-8000-000000000001',
+    );
+    // A crafted path goes to the dashboard instead; the API checks it again.
+    expect(signInUrl('local', '//evil.example')).toBe('http://localhost:8000/v1/auth/sign-in?method=local&return_to=%2F');
+    expect(signInUrl('local', null)).toContain('return_to=%2F');
+  });
+
+  it('stays relative behind the dev server\'s proxy, and sends only the domain for SSO', async () => {
+    await setUpApi(() => ({ status: 404 }));
+    expect(signInUrl('sso', '/admin/users', 'example.co.jp')).toBe(
+      '/v1/auth/sign-in?method=sso&sso_domain=example.co.jp&return_to=%2Fadmin%2Fusers',
+    );
+    expect(signInUrl('local', '/')).not.toContain('return_path');
+  });
 });

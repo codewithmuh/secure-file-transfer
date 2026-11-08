@@ -15,7 +15,9 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 - **Docker** with Compose v2.20 or later and Docker Engine 25 or later (the healthchecks use start intervals). Give
   Docker about 3 GB of memory: clamd and Keycloak use about 1 GB each, the rest about 300 MB together.
 - **uv** and **pre-commit**. `make setup` checks for all three and says which one is missing.
-- These ports free on 127.0.0.1: 1025, 3310, 5432, 6379, 8000, 8001, 8025, 8180, 9090 and 9324.
+- These ports free on 127.0.0.1 and on `::1`: 1025, 3000, 3310, 5432, 6379, 8000, 8001, 8025, 8180, 9090 and 9324.
+  A browser tries `localhost` on `::1` first, so another program listening on `[::]:3000` (a dev server, say) answers
+  in place of the web app: stop it before `make up`.
 
 | Command | What it does |
 |---|---|
@@ -25,6 +27,7 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 | `make seed` | Writes a tenant, an admin and a member who sign in through Keycloak, and prints how (section 7). Idempotent |
 | `make jobs JOB=<job>` | Runs one lifecycle job once: `expiry`, `deletion`, `reconciliation`, `storage-audit` or `cleanup` (section 7) |
 | `make e2e` | The M2 journey test against the running, seeded stack (section 7) |
+| `make web-e2e` | The web app's browser flows against the running, seeded stack, in the pinned Playwright image (section 8) |
 | `make test` | The API's tests. While the stack runs, the database tests use its server as `sft`, unless `TEST_DATABASE_URL` is set; they make and drop their own databases and leave `sft` alone |
 | `make down` | Stops and removes the containers; the database and S3 objects stay |
 | `make reset` | Stops everything and deletes the local data; the next `make up` starts empty and seeds again |
@@ -47,7 +50,8 @@ weekly. The configuration files are in [`local/`](../local/).
 | `valkey` | ElastiCache Serverless for Valkey ([ADR-0014](adr/0014-rate-limit-counters.md)) | `valkey/valkey:9.1.3-alpine` | 6379 | ACL user `sft-local`; the default user is off |
 | `mail` | SES ([ADR-0015](adr/0015-email-ses.md)) | `axllent/mailpit:v1.33.0` | 1025 (SMTP), 8025 (web UI and API) | Nothing; it catches every message |
 | `clamd` | The clamd pods ([ADR-0019](adr/0019-malware-scanning-clamav-guardduty.md)) | `clamav/clamav:1.5.4-debian` | 3310 | The signatures built into the pinned image |
-| `oidc` | The Cognito user pool and its app client ([ADR-0016](adr/0016-member-sign-in-cognito.md)) | `quay.io/keycloak/keycloak:26.8.1` | 8180 | Realm `sft`, confidential client `sft-api-local` and a test member, re-imported on every start |
+| `oidc` | The Cognito user pool and its app client ([ADR-0016](adr/0016-member-sign-in-cognito.md)) | `quay.io/keycloak/keycloak:26.8.1` | 8180 | Realm `sft`, confidential client `sft-api-local`, the notification worker's client `sft-notify-local` (it may only manage the realm's users) and the test admin and member, re-imported when the container is created |
+| `web` | The web app on its own origin: S3 and CloudFront ([ADR-0008](adr/0008-web-app-s3-cloudfront.md)) | Built from [`web/Dockerfile`](../web/Dockerfile): the production bundle behind `nginxinc/nginx-unprivileged:1.30.6-alpine` | 3000 | [`local/web/config.json`](../local/web/config.json), mounted read-only (section 8) |
 
 The stack also runs the API (`:8000`) and the scan pipeline of ADR-0019 and ADR-0022 (#175, #176): a scan worker per
 pool, `scan-worker-small` (`:8012`, files up to 100 MB) and `scan-worker-large` (`:8013`, over 100 MB up to 2 GB),
@@ -55,7 +59,9 @@ each port serving only `/healthz`, `/readyz` and `/metrics`, and `inspector`, th
 The inspector is only on the `inspection` network, which is internal: it can open no connection out and reach neither
 the database nor the counter store, and only the scan workers reach it (`make smoke` checks both). It runs non-root on
 a read-only root file system, with 4 GiB of scratch in memory. The notification worker, `notifier` (`:8014`, #178,
-#179), sends every link, code and notice into Mailpit, linking to `WEB_ORIGIN`. `s3-init` is a one-shot container that seeds the S3
+#179), sends every link, code and notice into Mailpit, linking to `WEB_ORIGIN`. It is also the only service that may
+manage the user pool's users (authn-authz 2.5, #197): for an invitation or a sign-in reset it creates the member's
+Keycloak user with a temporary password, records the identity, then emails the invitation (section 4, member sign-in). `s3-init` is a one-shot container that seeds the S3
 stand-in on every `make up` and exits; repeating it is safe. So are the three database jobs of section 3, which run
 before the API starts.
 
@@ -74,6 +80,7 @@ over all of them.
 | OIDC client | `sft-api-local` / `local-only-oidc-client-secret`, callback `http://localhost:8000/v1/auth/callback` |
 | Test member | `dev.member@example.com` / `local-only-member-password`. User ID (`cognito:username`) `22222222-2222-4222-8222-222222222222`, tenant (`custom:tenant_id`) `11111111-1111-4111-8111-111111111111`, subject (`sub`) `33333333-3333-4333-8333-333333333333`. `make seed` writes this user and its identity (section 7). |
 | Test admin | `dev.admin@example.com` / `local-only-admin-password`. User ID `44444444-4444-4444-8444-444444444444`, the same tenant, subject `55555555-5555-4555-8555-555555555555`. `make seed` writes it too. |
+| Notification worker's pool client | `sft-notify-local` / `local-only-notify-pool-secret`: a Keycloak client whose service account may only manage the realm's users (#197) |
 | Keycloak admin console | `admin` / `local-only-admin` at <http://localhost:8180/admin> |
 | Mail catcher | No sign-in; it accepts any SMTP credentials. Web UI at <http://localhost:8025> |
 
@@ -128,7 +135,11 @@ role with the same password.
   and to `sft-local-audit-archive-osaka` (#177), so a test can stop one, by pointing its setting at a bucket that
   doesn't exist, and see the `503`. The cross-region route and its IAM are M4's.
 - **CORS allows every origin.** In AWS, browser part uploads need the bucket's CORS rule, which exposes `ETag`
-  (Terraform, M3 and M4).
+  (Terraform, M3 and M4). `completeUpload` lists the parts server side, so the browser never needs `ETag`.
+- **Part URLs name `localhost:9090`.** The API calls S3Mock in-network (`s3:9090`), but a browser uploads parts from
+  the host, so compose sets `S3_PRESIGN_ENDPOINT_URL=http://localhost:9090`, used only to sign part URLs (#195). S3Mock
+  checks no signature, so the different host costs nothing; the settings refuse it without `S3_ENDPOINT_URL`, so it is
+  never set in AWS, where S3 signs its own host. The scan workers keep reading through `s3:9090`.
 - **No lifecycle rules, replication to Osaka or GuardDuty Malware Protection.** Large-file scans can't be tested
   locally; tests put recorded GuardDuty events on `sft-local-guardduty-results` themselves.
 - **Files over 2,000,000,000 bytes are never scanned, locally and in dev, until M6.** Only GuardDuty scans them, and
@@ -192,7 +203,22 @@ role with the same password.
   `http://localhost` as a secure context and keep them, so nothing about them differs from AWS.
 - **Nothing persists.** The realm is imported from [`local/keycloak/sft-realm.json`](../local/keycloak/sft-realm.json)
   when the container is created, so change that file, not the admin console, and run `make down && make up` to pick a
-  change up: `make up` alone keeps a running container and its realm.
+  change up: `make up` alone keeps a running container and its realm. That includes the users the notification worker
+  created for invited members: after `make down`, their identities are still in the database but their Keycloak users
+  are gone, so they can't sign in until an admin resets their sign-in ("Reset sign-in" on the users page), which
+  creates them again and emails a new invitation.
+- **Invitations** (#197, authn-authz 2.5). Locally the notification worker plays Cognito's admin side: it creates the
+  invited member's Keycloak user (username = our user ID, the address verified, `tenant_id` set) with a temporary
+  password, records the identity, and emails `member_invitation` through Mailpit. At the first sign-in Keycloak makes
+  them choose their own password, as Cognito does; there is no TOTP enrollment locally. Keycloak's temporary passwords
+  don't expire, where Cognito's work for 3 days. An address that already signs in for another tenant gets
+  `invitation_address_in_use` instead; the inviting tenant's audit log records an invitation email as for anyone, and
+  the conflict is in the platform audit log only. "Resend invitation" on an invited user, and "Reset sign-in" on an
+  active one, send a new invitation; a newer one replaces one still on its way. In dev the worker has no pool adapter until #193 (`USER_POOL_BACKEND=none`), so
+  invited users stay `invited`.
+- **Sign-out.** The API's logout URL is Keycloak's logout endpoint without an ID token hint, so Keycloak asks to
+  confirm the logout. The API session has ended either way, and the next sign-in asks for the password again
+  (`prompt=login`).
 
 ### ClamAV
 
@@ -212,6 +238,8 @@ Every stack service uses the `x-hardening` anchor of `compose.yaml`: a read-only
 dropped, `no-new-privileges` and a tmpfs `/tmp`. Each runs as a non-root user, including the images that default to
 root (ElasticMQ, Mailpit and the ClamAV entrypoint), and every port binds to 127.0.0.1. The exceptions:
 
+- **`web`** runs nginx as uid 101 with a read-only root file system; it writes only its pid and temporary files to
+  `/tmp`.
 - **`oidc`** has a writable root file system, because Keycloak's `start-dev` rebuilds into `/opt/keycloak/lib` at
   startup. It still runs as uid 1000 with every capability dropped. A read-only Keycloak needs a pre-built image,
   which isn't worth one more build for a local stand-in.
@@ -280,6 +308,79 @@ make up && make seed && make e2e
 
 It talks to the service only through the public API, Mailpit's API, S3's API, the job commands and the clock's hook,
 so in M4 it runs against dev with the seed and the clock replaced there. Two local shortcuts are named in the test:
-part URLs name the in-network `s3:9090`, which it sends to `127.0.0.1:9090`, and it reads the audit log from the
+it sends part URLs, which name `localhost:9090` (section 4), to `127.0.0.1:9090`, and it reads the audit log from the
 database until an audit search operation exists. It is skipped unless `SFT_E2E=1` (`make e2e` sets it), so `make test`
 never starts it. CI's Local stack job runs `make seed` and `make e2e` after the smoke checks, on every pull request.
+
+## 8. The web app and how to test locally
+
+**The `web` service** (#195) serves the production bundle the way CloudFront does in AWS ([ADR-0008](adr/0008-web-app-s3-cloudfront.md),
+[`web/nginx.conf`](../web/nginx.conf)), on its own origin, so CORS, `Origin` and `Sec-Fetch-Site: same-site` are
+exercised as in AWS:
+
+- `http://localhost:3000`, always `localhost`, never `127.0.0.1`, which redirects (`308`) to `localhost`: the API
+  checks `Origin` against `WEB_ORIGIN` exactly, and cookies are kept per host name. Chrome, Edge and Firefox keep the
+  `Secure` and `__Host-` cookies on `http://localhost`; Safari is checked in dev behind real TLS (M4).
+- A path without a file extension serves `index.html` (the router takes it from there); a missing file is a `404`.
+  `index.html` and `config.json` are `no-cache`, hashed assets `immutable`.
+- CloudFront's response headers with the local origins: `Content-Security-Policy: default-src 'self'; script-src
+  'self'; connect-src 'self' http://localhost:8000 http://localhost:9090; frame-ancestors 'none'; base-uri 'none';
+  object-src 'none'; form-action 'self' http://localhost:8000`, `X-Content-Type-Options: nosniff`, `X-Frame-Options:
+  DENY` and `Referrer-Policy: no-referrer`. No HSTS: the stack is plain http.
+- [`local/web/config.json`](../local/web/config.json) names the API (`http://localhost:8000/v1`), the S3 stand-in for
+  part uploads (`http://localhost:9090`) and Keycloak (`http://localhost:8180`), which sign-out may go to; SSO is off.
+
+`make smoke` checks the web app, its headers, the part-URL host and CORS (the web app's preflight passes, another
+origin's doesn't).
+
+**Hot reload.** `docker compose stop web`, then `cd web && npm install && npm run dev`: the same
+`http://localhost:3000`, with Vite's proxy sending `/v1` to the API, so the API is same-origin there
+(`web/public/config.json`) and `WEB_ORIGIN` doesn't change. Vite injects inline scripts, so the CSP is checked only on
+the compose build. `make up` starts the built app again.
+
+**Browser flows** (`make web-e2e`, #195 to #197): Playwright, in the image pinned in the Makefile, against the running,
+seeded stack, so no browser is installed on the host. The browser must see `localhost:3000`, `:8000`, `:8180`,
+`:8025` and `:9090` exactly as a person does. On Linux (CI) the container shares the host's network. Docker Desktop
+(macOS) has no host networking by default, so there `web/e2e/support/forward.mjs` listens on those ports inside the
+container and forwards them to `host.docker.internal`, which reaches the stack's `127.0.0.1` ports; the browser still
+sees `localhost`. CI's Local stack job runs it after `make e2e`.
+
+### How to test locally
+
+```bash
+make setup                # once: prerequisites, API dependencies, git hooks
+make up                   # API, workers, Keycloak, Mailpit, S3Mock, ... and the web app on :3000
+make seed                 # once per fresh database: tenant, admin and member with Keycloak identities
+make smoke                # optional: one round trip to every service, the web app and CORS
+```
+
+Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
+
+| Who | Sign in | Where |
+|---|---|---|
+| Member | `dev.member@example.com` / `local-only-member-password` | http://localhost:3000 |
+| Admin | `dev.admin@example.com` / `local-only-admin-password` | http://localhost:3000 |
+| Recipient | no sign-in: the link and the code arrive in Mailpit | http://localhost:8025 |
+| Keycloak console | `admin` / `local-only-admin` | http://localhost:8180/admin |
+
+1. **Send.** Sign in as the member, "New transfer": add a recipient (any address; Mailpit catches everything), pick
+   files, send. The detail page shows each file going `Scanning`, then `Clean` and `Inspected`. To see the scanner and
+   DLP work: an EICAR test file becomes `Infected` and holds the transfer; a text file with a synthetic My Number shows
+   the `jp_my_number` detector ("My Number (Individual Number)"), and "Show findings" lists where. Write the EICAR file
+   yourself, never into the repository: `make web-e2e` builds both at run time (`web/e2e/support/stack.ts`).
+2. **Resume an upload.** Cut the network mid-upload: the page retries each part and, when the network is back,
+   carries on from the parts S3 already holds. Reload mid-upload, open the draft from "Transfers", choose the same file
+   again: only the missing parts go.
+3. **Receive.** Open Mailpit, open the link email (in the recipient's language), click the link. Use a different
+   browser profile or a private window, so the member's session and the recipient's don't mix. The recipient pages are
+   live with #198.
+4. **Administer.** Sign in as the admin (the sign-in always asks for the password, so switching users needs no
+   cleanup): "Users" to invite (the invitation, with a temporary password, arrives in Mailpit; sign in with it in a
+   private window and choose a password), change a role or the DLP approver flag, sign someone out everywhere, reset a
+   sign-in (a new invitation arrives) or deactivate; "Tenant policy" for the longest expiry (the member's form follows
+   it), unscannable files, the retention of received files and the default language.
+5. **Expiry.** `make e2e`'s clock hook and job commands (#181, #182) expire and delete a transfer on demand:
+   `CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry`.
+
+Not available locally yet, and hidden in the app (their URLs say so): upload requests, the audit log, API keys and the
+DLP policy (M5); SSO, passkeys and step-up prompts beyond "Sign in again" (M6).

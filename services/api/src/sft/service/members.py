@@ -27,6 +27,21 @@ then their record goes to the audit archive of both regions (`sft.service.audit_
 call answers `200` only once both hold it, `503` otherwise, with the change kept. A retry finds the
 change already made and writes the record of its latest event if it is still missing, then
 answers `200` (API README 5).
+
+**Forced sign-out and sign-in reset** (#197; authn and authz 2.5, 3.3, 3.6), both security-critical
+records the same way:
+
+- `sign_out_user` ends every session of the user, without deactivating them; they can sign in
+  again. Every call is the admin's own action and writes its own event, naming the sessions it
+  ended, even none.
+- `reset_user_sign_in` ends every session and deletes the user's identities on the user pool's
+  connections in one transaction, so no old credential maps to the user any more, and starts a new
+  reset: a new `sign_in_reset_id` and the outbox message `member.sign_in_reset` with it. The
+  notification worker then makes the pool user again and emails a new invitation, unless a newer
+  reset has superseded that message meanwhile: so a reset while one is still being processed
+  replaces its invitation, and a reset whose message was dead-lettered never blocks the next. A
+  deactivated user can't be reset (`409 invalid_state`). SSO members reset at their own identity
+  provider: they have no identity on the pool to delete (M6 refuses them by name).
 """
 
 from __future__ import annotations
@@ -52,10 +67,11 @@ from sft.core.errors import (
     json_pointer,
 )
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import audit, member_sessions, users
+from sft.data import audit, identities, member_sessions, users
 from sft.data.audit import ArchivedEvent, Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, User, UserStatus
+from sft.data.outbox import MEMBER_SIGN_IN_RESET, enqueue
 from sft.data.scope import Scope
 from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
@@ -372,3 +388,127 @@ async def deactivate_user(
     user, event = await _change(database, caller, user_id, at_stake=_active_admin, apply=apply)
     await archive.confirm([event] if event else [])
     return user
+
+
+SIGNED_OUT_BY_ADMIN: Final = "user.signed_out_by_admin"
+SIGN_IN_RESET: Final = "user.sign_in_reset"
+
+PoolConnections = Callable[[], Awaitable[Sequence[UUID]]]
+"""The user pools' connection IDs, resolved once and kept (`sft.api.members`), only after the
+caller may reset a sign-in."""
+
+
+async def sign_out_user(
+    database: Database,
+    caller: Caller,
+    user_id: UUID,
+    *,
+    archive: AuditArchive,
+    origin: Origin,
+    now: datetime,
+) -> User:
+    """`signOutUser`: every session of the user ends; the user stays as they are. Every call is an
+    admin action with its own security-critical event, naming how many sessions it ended (0 if
+    none were left): `200` only once both regions' archive hold it (#177)."""
+    authorize(caller, "signOutUser", now=now)
+    async with database.transaction(_tenant_scope(caller)) as session:
+        user = await users.get_user(session, user_id, for_update=True)
+        if user is None:
+            raise NotFound
+        ended = await member_sessions.revoke_user_sessions(
+            session, user.id, reason=member_sessions.RevokedReason.SIGNED_OUT_BY_ADMIN
+        )
+        target = Target(users.TARGET, user.id)
+        earlier = await audit.latest_critical_event(
+            session, action=SIGNED_OUT_BY_ADMIN, target=target
+        )
+        await audit.record(
+            session,
+            action=SIGNED_OUT_BY_ADMIN,
+            actor=caller.actor(),
+            target=target,
+            origin=origin,
+            details={"sessions_ended": ended},
+            security_critical=True,
+        )
+        event = await audit.latest_critical_event(
+            session, action=SIGNED_OUT_BY_ADMIN, target=target
+        )
+    # The earlier sign-out's record too: a retry after a `503` completes it.
+    await archive.confirm([e for e in (earlier, event) if e is not None])
+    return user
+
+
+async def reset_user_sign_in(
+    database: Database,
+    caller: Caller,
+    user_id: UUID,
+    *,
+    pool_connections: PoolConnections,
+    archive: AuditArchive,
+    origin: Origin,
+    now: datetime,
+) -> User:
+    """`resetUserSignIn`: every call ends the user's sessions, deletes their pool identities and
+    starts a new reset (a new `sign_in_reset_id`) with its outbox message, in one transaction. The
+    new reset supersedes one still being processed, whose message then sends nothing, so only the
+    newest invitation goes out; a reset whose message was dead-lettered never blocks the next. A
+    security-critical record: `202` only once both regions' archive hold it and the previous
+    reset's, which a retry after a `503` completes (#177)."""
+    authorize(caller, "resetUserSignIn", now=now)
+    pools = await pool_connections()
+    async with database.transaction(_tenant_scope(caller)) as session:
+        user = await users.get_user(session, user_id, for_update=True)
+        if user is None:
+            raise NotFound
+        if user.status == UserStatus.DEACTIVATED:
+            raise Conflict(
+                "invalid_state",
+                "A deactivated user's sign-in can't be reset.",
+                current_state=UserStatus.DEACTIVATED,
+            )
+        target = Target(users.TARGET, user.id)
+        earlier = await audit.latest_critical_event(session, action=SIGN_IN_RESET, target=target)
+        ended = await member_sessions.revoke_user_sessions(
+            session, user.id, reason=member_sessions.RevokedReason.SIGN_IN_RESET
+        )
+        removed = await identities.delete_identities(session, user.id, pools)
+        user, reset_id = await users.start_sign_in_reset(session, user.id)
+        await audit.record(
+            session,
+            action=SIGN_IN_RESET,
+            actor=caller.actor(),
+            target=target,
+            origin=origin,
+            details={"sessions_ended": ended, "identities_removed": removed, "reset_id": reset_id},
+            security_critical=True,
+        )
+        await enqueue(session, MEMBER_SIGN_IN_RESET, {"user_id": user.id, "reset_id": reset_id})
+        event = await audit.latest_critical_event(session, action=SIGN_IN_RESET, target=target)
+    await archive.confirm([e for e in (earlier, event) if e is not None])
+    return user
+
+
+class CachedPoolConnections:
+    """The user pools' connection IDs by provider name, looked up once (lookup scope) and kept:
+    they don't change while the process runs. Nothing is looked up until a reset needs them."""
+
+    def __init__(self, database: Database, provider_names: Sequence[str]) -> None:
+        self.database = database
+        self.provider_names = tuple(provider_names)
+        self.lookups = 0
+        self._ids: tuple[UUID, ...] | None = None
+
+    async def __call__(self) -> Sequence[UUID]:
+        if self._ids is None:
+            self.lookups += 1
+            found: list[UUID] = []
+            async with self.database.transaction(Scope.lookup()) as session:
+                for name in self.provider_names:
+                    connection = await identities.find_connection(session, name)
+                    if connection is not None and connection.tenant_id is None:
+                        found.append(connection.id)
+            if not found:
+                return ()  # not seeded yet: look again next time
+            self._ids = tuple(found)
+        return self._ids

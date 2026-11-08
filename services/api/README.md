@@ -136,6 +136,7 @@ Environment variables only, typed and checked at startup (`src/sft/core/settings
 | `S3_LARGE_FILES_BUCKET` | none, required | The files bucket for files over 2 GB, which GuardDuty scans (ADR-0019) |
 | `S3_FILES_KMS_KEY_ID` | none, required | The files key for SSE-KMS; S3Mock takes only the bare key ID |
 | `S3_ENDPOINT_URL` | none | Local only, for S3Mock; in AWS the SDK finds S3's endpoint |
+| `S3_PRESIGN_ENDPOINT_URL` | none | Local only: the S3 stand-in as the browser reaches it (`http://localhost:9090`), used only to sign part URLs; refused without `S3_ENDPOINT_URL` (#195) |
 | `TENANT_STORAGE_QUOTA_BYTES` | `2000000000000` | Each tenant's storage quota (abuse and rate limits 6.1) |
 | `AUDIT_ARCHIVE_TOKYO_BUCKET` | none, required | The audit archive bucket in Tokyo, which every security-critical record reaches before a `2xx` (#177) |
 | `AUDIT_ARCHIVE_OSAKA_BUCKET` | none | The audit archive bucket in Osaka; unset only where there is no Osaka (dev), and records then go to Tokyo's alone |
@@ -576,8 +577,10 @@ held and back-to-draft notices. It records each message after the send, in a tra
 is delivered again and a recorded success is never sent twice. A retry rebuilds the same link: the token is derived
 from the recipient's ID and `link_issued_at` with `link-hmac`, and only its SHA-256 is stored. It checks the
 suppression list first, then the cross-tenant cap (100 link emails a day to one address, abuse 7.2), which holds the
-email back with a delayed message and leaves the recipient `queued`. `member.invited` is recorded and sends nothing
-until Cognito (M4). Metrics: `emails_sent_total{type}`, `email_caps_hit_total{cap}`, `worker_messages_total`.
+email back with a delayed message and leaves the recipient `queued`. `member.invited` and `member.sign_in_reset`
+(#197) create the member's user in the user pool with a temporary password, record the identity, then send the
+invitation; without a pool adapter (`USER_POOL_BACKEND=none`, dev until Cognito, #193) they are recorded and send
+nothing. Metrics: `emails_sent_total{type}`, `email_caps_hit_total{cap}`, `worker_messages_total`.
 
 It reads a worker's settings (as the relay's below, its role `sft_notify`), `MailSettings` above, and:
 
@@ -587,6 +590,9 @@ It reads a worker's settings (as the relay's below, its role `sft_notify`), `Mai
 | `EMAIL_HMAC_KEYRING` | none, required | As the API's: the suppression list's pseudonyms and the cap's key; a secret |
 | `LINK_HMAC_KEYRING` | none, required | K_link (`sft/{env}/app/link-hmac`), which only this worker reads; keep an old key 14 days after a rotation (data model 2.2); a secret |
 | `CODE_HMAC_KEYRING` | none, required | K_code: each new code's HMAC; a secret |
+| `USER_POOL_BACKEND` | `none` | The user pool's admin side (#197, authn-authz 2.5): `keycloak` in the local stack, where the worker creates an invited member's pool user with a temporary password and records the identity before the invitation; `none` records invitations and sends nothing (dev, until #193) |
+| `USER_POOL_PROVIDER_NAME` | none | With a pool: its `idp_connections.provider_name` (the API's `OIDC_PROVIDER_NAME`) |
+| `KEYCLOAK_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | none | With `USER_POOL_BACKEND=keycloak`, all required: Keycloak's in-network address, the realm, and the client whose service account may manage the realm's users; the secret is a secret. Local only |
 
 Its tests (`tests/test_notify.py`) run it against PostgreSQL with every email recorded; one sends through the SMTP
 adapter to Mailpit when `TEST_MAIL_CATCHER_URL` and `TEST_SMTP_PORT` are set, and the cross-tenant cap's counts in

@@ -5,7 +5,7 @@
 import { AxiosError, AxiosHeaders, type AxiosResponse, type InternalAxiosRequestConfig } from 'axios';
 import { vi } from 'vitest';
 import { apiClient } from '@/lib/api';
-import { loadConfig } from '@/lib/config';
+import { loadConfig, resetConfig, type AppConfig } from '@/lib/config';
 import { useAuthStore } from '@/stores/authStore';
 
 export interface FakeReply {
@@ -30,11 +30,24 @@ export function problem(status: number, code: string): FakeReply {
   return { status, data: { type: `https://secure-file-transfer.example/problems/${code}`, title: code, status, code } };
 }
 
-export async function setUpApi(handler: FakeHandler, pathname = '/'): Promise<Harness> {
+/** The runtime config the tests load, as `public/config.json` has it but with an https sign-in origin. */
+export const testConfig: AppConfig = {
+  apiOrigin: '/v1',
+  uploadOrigin: 'https://files.example',
+  signInOrigin: 'https://auth.example.com',
+  ssoSignIn: false,
+};
+
+export async function setUpApi(
+  handler: FakeHandler,
+  pathname = '/',
+  config: Partial<AppConfig> = {},
+): Promise<Harness> {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => new Response(JSON.stringify({ apiOrigin: '/v1', uploadOrigin: '' }), { status: 200 })),
+    vi.fn(async () => new Response(JSON.stringify({ ...testConfig, ...config }), { status: 200 })),
   );
+  resetConfig();
   await loadConfig();
 
   const href = `https://app.example${pathname}`;

@@ -49,8 +49,11 @@ services:
       # The email-hmac keyring (#145), per-address rate limits' pseudonyms: 32 bytes of "y".
       EMAIL_HMAC_KEYRING: &email-keyring '[{"id":"local","state":"active","key":"eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXl5eXk=","activated_at":"2026-01-01T00:00:00Z"}]'
       # The files buckets (#114, ADR-0012) on the S3 stand-in, with the files key's bare ID. The SDK signs part
-      # URLs with fake keys; S3Mock checks no signature. Part URLs name the in-network host `s3`.
+      # URLs with fake keys; S3Mock checks no signature. Every S3 call goes to the in-network host `s3`, but part
+      # URLs name `localhost:9090`, where the browser reaches the stand-in (#195): S3Mock checks no signature, so
+      # the different host costs nothing. In AWS neither is set.
       S3_ENDPOINT_URL: http://s3:9090
+      S3_PRESIGN_ENDPOINT_URL: http://localhost:9090
       S3_FILES_BUCKET: sft-local-files
       S3_LARGE_FILES_BUCKET: sft-local-large-files
       S3_FILES_KMS_KEY_ID: 00000000-0000-4000-8000-000000000001
@@ -94,6 +97,14 @@ services:
       CODE_HMAC_KEYRING: *code-keyring
       # K_link, which only this worker reads: 32 bytes of "w".
       LINK_HMAC_KEYRING: '[{"id":"local","state":"active","key":"d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c="}]'
+      # The user pool's admin side (#197): an invited member's Keycloak user with a temporary password,
+      # its identity, then the invitation through Mailpit. Only this worker may manage the pool's users.
+      USER_POOL_BACKEND: keycloak
+      USER_POOL_PROVIDER_NAME: local-keycloak
+      KEYCLOAK_URL: http://oidc:8080
+      KEYCLOAK_REALM: sft
+      KEYCLOAK_CLIENT_ID: sft-notify-local
+      KEYCLOAK_CLIENT_SECRET: local-only-notify-pool-secret
       AWS_ACCESS_KEY_ID: local-fake
       AWS_SECRET_ACCESS_KEY: local-fake
     ports: ["127.0.0.1:8014:8001"] # /healthz, /readyz and /metrics
@@ -103,6 +114,24 @@ services:
       sqs: { condition: service_healthy }
       valkey: { condition: service_healthy }
       mail: { condition: service_healthy }
+      oidc: { condition: service_healthy }
+
+  web: # the web app (#195): the production bundle behind nginx, on its own origin as in AWS (ADR-0008)
+    <<: *hardening
+    build: { context: ./web }
+    # The local origins: the API on :8000, the S3 stand-in on :9090 for part uploads, Keycloak on :8180 for
+    # sign-out. Mounted, never built in, like CloudFront's config.json: one bundle for every environment.
+    volumes: ["./local/web/config.json:/usr/share/nginx/html/config.json:ro"]
+    # Always http://localhost:3000, never 127.0.0.1 (which redirects here): the API checks Origin against
+    # WEB_ORIGIN exactly, and cookies are per host name.
+    ports: ["127.0.0.1:3000:8080"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/config.json"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+      start_interval: 1s
 
   # ---- The scan pipeline (ADR-0019, ADR-0022; #175, #176): one worker per pool, beside clamd and the DLP inspector ----
 
