@@ -26,7 +26,7 @@ dependencies = [
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
-  "boto3>=1.43.121",
+  "boto3>=1.43.123",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
   # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
@@ -53,8 +53,8 @@ dev = [
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17.3",
-  "types-boto3[s3,sesv2,sqs]>=1.43.121",  # mypy types for the S3, SQS and SES clients
-  "types-pyyaml>=6.0.12.20260906",
+  "types-boto3[s3,sesv2,sqs]>=1.43.123",  # mypy types for the S3, SQS and SES clients
+  "types-pyyaml>=6.0.12.20261030",
 ]
 
 [build-system]
