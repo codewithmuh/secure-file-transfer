@@ -1,6 +1,9 @@
 import { expect, test, type Page } from '@playwright/test';
 import { payload, readBytes, sendPastWarning, signIn, unique, USERS, wordsText } from './support/stack';
 
+/** The API's own origin: the web app's nginx serves only the bundle, so a relative /v1 path never reaches the API. */
+const API = 'http://localhost:8000';
+
 /**
  * M5's administration in the browser (#215, #216, #217), against `make up` and `make seed`: an admin creates an API
  * key, sees it once, uses it from the test and revokes it; searches, pages, opens and exports the audit log; and
@@ -36,18 +39,18 @@ test('an API key: created, shown once, used with curl, revoked, then refused (#2
 
   // The key works as a bearer token, the way automation uses it.
   const bearer = { Authorization: `Bearer ${secret}` };
-  const listed = await request.get('/v1/transfers?scope=tenant', { headers: bearer });
+  const listed = await request.get(`${API}/v1/transfers?scope=tenant`, { headers: bearer });
   expect(listed.status()).toBe(200);
   // A web-only operation is refused (T-55), and a scope the key lacks too.
-  expect((await request.get('/v1/users', { headers: bearer })).status()).toBe(403);
-  expect((await request.post('/v1/audit/events/search', { headers: bearer, data: {} })).status()).toBe(403);
+  expect((await request.get(`${API}/v1/users`, { headers: bearer })).status()).toBe(403);
+  expect((await request.post(`${API}/v1/audit/events/search`, { headers: bearer, data: {} })).status()).toBe(403);
 
   await row(page, name).getByRole('button', { name: `Revoke ${name}` }).click();
   await page.getByRole('dialog', { name: 'Revoke API key' }).getByRole('button', { name: 'Revoke' }).click();
   await expect(row(page, name).getByText('Revoked', { exact: true })).toBeVisible();
 
   // Lookups aren't cached: the next request is refused.
-  const refused = await request.get('/v1/transfers', { headers: bearer });
+  const refused = await request.get(`${API}/v1/transfers`, { headers: bearer });
   expect(refused.status()).toBe(401);
   expect(((await refused.json()) as { code: string }).code).toBe('credentials_invalid');
 });
