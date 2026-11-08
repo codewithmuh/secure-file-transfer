@@ -14,9 +14,15 @@ when it is sent (`expiry_out_of_range`), never to a transfer already submitted. 
 `unscannable_policy` applies to files scanned after it (data model 3.1). A new
 `received_file_retention_days` applies to files received from then on (FR-13).
 
-The domain rules (FR-24) arrive in M5. Until then the policy shows no allowed or blocked domains,
-and a change that sets any is refused with `422 validation_failed`, rather than stored and not
-enforced.
+**The domain rules** (FR-24, #217): `allowed_domains` and `blocked_domains`, up to 500 each,
+lower-case and in their IDNA form, each covering its subdomains (`sft.service.domain_rules`). A
+list sent replaces the list. The audit record holds how many domains each list gained and lost,
+never the domains: `details` holds no tenant-chosen text (data model 2.5), as the DLP trusted
+domains' change records counts too. New rules apply to new transfers and upload requests and to
+each send, never to recipients already notified.
+
+**Clearing a suppressed address** (`clearEmailSuppression`, FR-7, abuse 7.4) is
+`sft.service.email_suppressions`.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ from sft.data.audit import Origin, Target
 from sft.data.database import Database
 from sft.data.models import UnscannablePolicy
 from sft.data.tenants import Policy
+from sft.service import domain_rules
 from sft.service.caller import Caller
 from sft.service.permissions import authorize
 from sft.service.transfers import MAX_EXPIRY, MIN_EXPIRY, tenant_scope
@@ -77,19 +84,37 @@ async def update_tenant_policy(
     authorize(caller, "updateTenantPolicy", now=now)
     if change.max_expiry is not None and not MIN_EXPIRY <= change.max_expiry <= MAX_EXPIRY:
         raise _invalid("max_expiry", "max_expiry is between 1 hour and 30 days.")
-    for name in ("allowed_domains", "blocked_domains"):
-        if getattr(change, name):
-            raise _invalid(name, "Domain rules arrive with FR-24; none can be set yet.")
+    allowed = (
+        None
+        if change.allowed_domains is None
+        else domain_rules.normalize_rules(change.allowed_domains, "allowed_domains")
+    )
+    blocked = (
+        None
+        if change.blocked_domains is None
+        else domain_rules.normalize_rules(change.blocked_domains, "blocked_domains")
+    )
     scope = tenant_scope(caller)
     async with database.transaction(scope) as session:
+        before = await tenants.get_policy(session)
         policy = await tenants.update_policy(
             session,
             max_expiry=change.max_expiry,
             unscannable_policy=change.unscannable_policy,
             received_file_retention_days=change.received_file_retention_days,
             default_locale=change.default_locale,
+            allowed_domains=allowed,
+            blocked_domains=blocked,
         )
         details: dict[str, audit.Detail] = {}
+        for name, new, old in (
+            ("allowed_domains", allowed, before.allowed_domains),
+            ("blocked_domains", blocked, before.blocked_domains),
+        ):
+            if new is not None:
+                details[f"{name}_added"] = len(set(new) - set(old))
+                details[f"{name}_removed"] = len(set(old) - set(new))
+                details[f"{name}_count"] = len(new)
         if change.max_expiry is not None:
             details["max_expiry_seconds"] = int(change.max_expiry.total_seconds())
         if change.unscannable_policy is not None:

@@ -3,32 +3,76 @@ import { resources, type Language } from '../src/lib/i18n';
 import { checkAxe } from './support/axe';
 import { escapeRegExp } from './support/stack';
 import {
+  apiKeyCreated,
+  apiKeyPage,
+  approvalNeeded,
+  approvalNeededDlp,
+  approvalNeededId,
+  approvalQueue,
+  auditPage,
+  blocked,
+  blockedDlp,
+  blockedId,
   codeRequested,
+  dlpDetectors,
+  dlpPolicy,
+  dlpRules,
   draft,
   draftId,
   expired,
   expiredId,
+  extendableTransfer,
   fakeAdmin,
   inspection,
+  keywordList,
+  keywordListPath,
   linkSession,
   myNumberFileId,
+  myNumberRuleId,
+  openRequest,
+  pending,
+  pendingDlp,
+  pendingId,
+  pendingRequest,
+  pendingRequestId,
   policy,
   problemOf,
+  queueRequest,
+  queueRequestId,
+  receivedFiles,
+  receivedFindingsFileId,
+  receivedInspection,
   recipientStatuses,
+  rejected,
+  rejectedDlp,
+  rejectedId,
+  rejectedRequest,
+  rejectedRequestId,
   resolution,
   sessionFiles,
+  tenantTransferPage,
+  tenantUploadRequestPage,
   transfer,
   transferId,
   transferPage,
+  unsentRecipients,
+  uploaderFiles,
+  uploaderResolution,
+  uploaderSession,
+  uploadRequestId,
+  uploadRequestPage,
   userPage,
+  warned,
+  warnedDlp,
+  warnedId,
 } from './apiFixtures';
 
 /**
  * axe on every page of the web app (NFR-22, #110), once per language project (playwright.config.ts), with the check
  * the browser journey shares (support/axe.ts): any WCAG 2.0, 2.1 or 2.2 A or AA violation fails. The API is answered
  * from contract-typed fixtures (apiFixtures.ts), so the live pages are checked with real shapes and no backend is
- * needed: every page, every dialog, every link state and step of the recipient's page, and the sign-in callback's
- * error state (#168, #198, #199).
+ * needed: every page, every dialog, every link state and step of the recipient's and the uploader's pages, and the
+ * sign-in callback's error state (#168, #198, #199, #212, #213, #214).
  */
 
 /** What the API answers, by path: contract-typed fixtures (apiFixtures.ts), so the live pages show real shapes. */
@@ -44,6 +88,36 @@ const answers: Record<string, unknown> = {
   [`/v1/transfers/${expiredId}/recipients`]: recipientStatuses,
   [`/v1/files/${myNumberFileId}/inspection`]: inspection,
   '/v1/users': userPage,
+  '/v1/upload-requests': uploadRequestPage,
+  [`/v1/upload-requests/${uploadRequestId}`]: openRequest,
+  [`/v1/upload-requests/${uploadRequestId}/files`]: receivedFiles,
+  [`/v1/files/${receivedFindingsFileId}/inspection`]: receivedInspection,
+  '/v1/api-keys': apiKeyPage,
+  '/v1/audit/events/search': auditPage,
+  // DLP (#218 to #220).
+  '/v1/dlp/policy': dlpPolicy,
+  '/v1/dlp/rules': dlpRules,
+  '/v1/dlp/detectors': dlpDetectors,
+  [`/v1/dlp/detectors/${keywordListPath}`]: keywordList,
+  '/v1/dlp/approval-requests': approvalQueue,
+  [`/v1/dlp/approval-requests/${queueRequestId}`]: queueRequest,
+  [`/v1/dlp/approval-requests/${pendingRequestId}`]: pendingRequest,
+  [`/v1/dlp/approval-requests/${rejectedRequestId}`]: rejectedRequest,
+  ...Object.fromEntries(
+    (
+      [
+        [warned, warnedDlp],
+        [approvalNeeded, approvalNeededDlp],
+        [pending, pendingDlp],
+        [blocked, blockedDlp],
+        [rejected, rejectedDlp],
+      ] as const
+    ).flatMap(([item, dlp]) => [
+      [`/v1/transfers/${item.id}`, item],
+      [`/v1/transfers/${item.id}/dlp`, dlp],
+      [`/v1/transfers/${item.id}/recipients`, unsentRecipients],
+    ]),
+  ),
 };
 
 async function mockApi(page: Page): Promise<void> {
@@ -81,11 +155,26 @@ const memberPages = [
   ['expired transfer, read-only', `/transfers/${expiredId}`],
   ['admin users', '/admin/users'],
   ['admin tenant policy', '/admin/policy'],
-  // M5's pages, hidden (#195): their routes show NotAvailableYet.
-  ['upload requests (not available yet)', '/upload-requests'],
-  ['new upload request (not available yet)', '/upload-requests/new'],
-  ['audit log (not available yet)', '/admin/audit'],
-  ['API keys (not available yet)', '/admin/api-keys'],
+  ['upload requests', '/upload-requests'],
+  ['new upload request', '/upload-requests/new'],
+  ['upload request detail', `/upload-requests/${uploadRequestId}`],
+  ['admin audit log', '/admin/audit'],
+  ['admin API keys', '/admin/api-keys'],
+  // DLP (#218 to #220): each section of the policy, each DLP state of a transfer, the approvals queue and a request.
+  ['DLP settings', '/admin/dlp'],
+  ['DLP rules', '/admin/dlp/rules'],
+  ['DLP new rule', '/admin/dlp/rules/new'],
+  ['DLP rule', `/admin/dlp/rules/${myNumberRuleId}`],
+  ['DLP keyword lists', '/admin/dlp/keywords'],
+  ['DLP new keyword list', '/admin/dlp/keywords/new'],
+  ['DLP keyword list', `/admin/dlp/keywords/${keywordListPath}`],
+  ['transfer awaiting confirmation, warned', `/transfers/${warnedId}`],
+  ['transfer awaiting confirmation, approval required', `/transfers/${approvalNeededId}`],
+  ['transfer pending approval', `/transfers/${pendingId}`],
+  ['transfer held by a DLP rule', `/transfers/${blockedId}`],
+  ['transfer held, approval rejected', `/transfers/${rejectedId}`],
+  ['approvals queue', '/approvals'],
+  ['approval request', `/approvals/${queueRequestId}`],
 ] as const;
 
 for (const [name, path] of memberPages) {
@@ -202,6 +291,146 @@ test('admin users: every confirmation dialog (#168)', async ({ page }) => {
     await page.keyboard.press('Escape');
     await expect(dialog).toBeHidden();
   }
+});
+
+// ---- M5 administration (#215, #216, #217) ----
+
+test('API keys: the create dialog, the secret shown once, and the revoke dialog, by keyboard (#215)', async ({ page }) => {
+  await page.route('**/v1/api-keys', (route) =>
+    route.request().method() === 'POST'
+      ? route.fulfill({ status: 201, json: apiKeyCreated() })
+      : route.fulfill({ status: 200, json: apiKeyPage }),
+  );
+  await page.goto('/admin/api-keys');
+  await expect(page.getByRole('cell', { name: 'CI pipeline', exact: true })).toBeVisible();
+
+  const create = page.getByRole('button', { name: text().admin.createApiKey }).first();
+  await create.focus();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog', { name: text().admin.createApiKey });
+  await expect(dialog.getByLabel(text().common.name)).toBeFocused();
+  // Sending it empty marks both fields in place.
+  await dialog.getByRole('button', { name: text().common.create }).click();
+  await expect(dialog.getByText(text().apiKeys.scopesRequired)).toBeVisible();
+  await expectNoWcagViolations(page, 'create API key dialog, with errors');
+
+  await dialog.getByLabel(text().common.name).fill('New integration');
+  await dialog.getByRole('checkbox', { name: /transfers:read/ }).check();
+  await dialog.getByRole('button', { name: text().common.create }).click();
+  const secret = page.getByRole('dialog', { name: text().apiKeys.createdTitle });
+  await expect(secret).toBeVisible();
+  await expect(secret.getByRole('textbox')).toBeFocused();
+  // Escape doesn't close it until the admin says the key is stored.
+  await page.keyboard.press('Escape');
+  await expect(secret).toBeVisible();
+  await expect(secret.getByRole('button', { name: text().apiKeys.done })).toBeDisabled();
+  await expectNoWcagViolations(page, 'API key secret');
+  await secret.getByRole('checkbox', { name: text().apiKeys.stored }).check();
+  await secret.getByRole('button', { name: text().apiKeys.done }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(create).toBeFocused();
+
+  const revoke = page.getByRole('button', { name: text().apiKeys.revokeKey.replace('{{name}}', 'CI pipeline') });
+  await revoke.focus();
+  await page.keyboard.press('Enter');
+  const revokeDialog = page.getByRole('dialog', { name: text().apiKeys.revokeTitle });
+  await expect(revokeDialog).toBeVisible();
+  await expectNoWcagViolations(page, 'revoke API key dialog');
+  await page.keyboard.press('Escape');
+  await expect(revoke).toBeFocused();
+});
+
+test('admin users: demoting an admin lists the API keys it revokes (#215)', async ({ page }) => {
+  await page.goto('/admin/users');
+  await page.getByRole('button', { name: text().admin.actionsFor.replace('{{email}}', 'admin@example.com') }).click();
+  await page.getByRole('menuitem', { name: text().admin.makeMember }).click();
+  const dialog = page.getByRole('dialog', { name: text().admin.confirm.role.title_member });
+  await expect(dialog.getByText('CI pipeline', { exact: false })).toBeVisible();
+  await expect(dialog.getByText('Old sync', { exact: false })).toHaveCount(0); // expired: nothing to revoke
+  await expectNoWcagViolations(page, 'demote dialog with keys');
+});
+
+test('audit log: filters, the actions list, paging and an event\'s details (#216)', async ({ page }) => {
+  await page.goto('/admin/audit');
+  await expect(page.getByRole('cell', { name: 'alice@example.com', exact: false })).toBeVisible();
+  await page.getByText(text().audit.actions_other.replace('{{count}}', '0')).click();
+  await page.getByRole('checkbox', { name: 'download.granted' }).check();
+  await page.getByLabel(text().audit.email).fill('alice@example.com');
+  await page.getByLabel(text().audit.ipAddress).fill('not an address');
+  await page.getByRole('button', { name: text().common.search }).click();
+  await expect(page.getByText(text().audit.invalid.sourceIp)).toBeVisible();
+  await expectNoWcagViolations(page, 'audit filters, with an error');
+
+  await page.getByLabel(text().audit.ipAddress).fill('198.51.100.5');
+  const searched = page.waitForRequest((request) => request.url().endsWith('/v1/audit/events/search') && request.method() === 'POST');
+  await page.getByRole('button', { name: text().common.search }).click();
+  const body = (await searched).postDataJSON() as { filter: Record<string, unknown> };
+  expect(body.filter).toEqual({ email: 'alice@example.com', actions: ['download.granted'], source_ip: '198.51.100.5' });
+  expect(page.url()).not.toContain('alice'); // T-47: never in the address
+
+  const details = page.getByRole('row').filter({ hasText: 'download.granted' }).getByRole('button');
+  await details.focus();
+  await page.keyboard.press('Enter');
+  const drawer = page.getByRole('dialog', { name: text().audit.eventTitle });
+  await expect(drawer.getByText('198.51.100.5')).toBeVisible();
+  await expect(drawer.getByText('recipient_id')).toBeVisible();
+  await expectNoWcagViolations(page, 'audit event details');
+  await page.keyboard.press('Escape');
+  await expect(details).toBeFocused();
+  await expect(page.getByRole('button', { name: text().audit.older })).toBeEnabled();
+});
+
+test('tenant policy: the domain lists and the suppression form (#217)', async ({ page }) => {
+  await page.route('**/v1/email-suppressions/clear', (route) => route.fulfill({ status: 204 }));
+  await page.goto('/admin/policy');
+  const allowed = page.getByRole('textbox', { name: text().domains.allowed });
+  await allowed.fill('not a domain');
+  await page.keyboard.press('Enter');
+  await expect(page.getByText(text().domains.problem.invalid)).toBeVisible();
+  await allowed.fill('Partner.Example');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('list', { name: text().domains.allowed }).getByText('partner.example')).toBeVisible();
+  await page.getByRole('textbox', { name: text().domains.blocked }).fill('partner.example');
+  await page.getByRole('button', { name: text().domains.addTo.replace('{{list}}', text().domains.blocked) }).click();
+  await expect(page.getByText(text().domains.overlap.replace('{{domains}}', 'partner.example'))).toBeVisible();
+  await expectNoWcagViolations(page, 'tenant policy, domain lists');
+
+  await page.getByLabel(text().suppression.email).fill('bounced@example.org');
+  await page.getByRole('button', { name: text().suppression.action }).click();
+  await expect(page.getByText(text().suppression.done.replace('{{email}}', 'bounced@example.org'))).toBeVisible();
+  await expectNoWcagViolations(page, 'suppression cleared');
+});
+
+test('transfers: the admin\'s tenant-wide list with the owner and a revoke dialog (#217)', async ({ page }) => {
+  await page.route(
+    (url) => url.pathname === '/v1/transfers' && url.searchParams.get('scope') === 'tenant',
+    (route) => route.fulfill({ status: 200, json: tenantTransferPage }),
+  );
+  await page.goto('/transfers');
+  const toggle = page.getByRole('checkbox', { name: text().tenantScope.allTransfers });
+  await toggle.check();
+  await expect(page.getByRole('columnheader', { name: text().tenantScope.owner })).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'member@example.com', exact: true })).toBeVisible();
+  await expectNoWcagViolations(page, 'tenant-wide transfers');
+  await page.getByRole('button', { name: new RegExp(`^${text().tenantScope.revoke}`) }).first().click();
+  await expect(page.getByRole('dialog', { name: text().delivery.revokeTitle })).toBeVisible();
+  await expectNoWcagViolations(page, 'tenant-wide revoke dialog');
+});
+
+test('upload requests: the admin\'s tenant-wide list with the owner and a revoke dialog (#217)', async ({ page }) => {
+  await page.route(
+    (url) => url.pathname === '/v1/upload-requests' && url.searchParams.get('scope') === 'tenant',
+    (route) => route.fulfill({ status: 200, json: tenantUploadRequestPage }),
+  );
+  await page.goto('/upload-requests');
+  const toggle = page.getByRole('checkbox', { name: text().tenantScope.allUploadRequests });
+  await toggle.check();
+  await expect(page.getByRole('columnheader', { name: text().tenantScope.owner })).toBeVisible();
+  await expect(page.getByRole('cell', { name: 'member@example.com', exact: true })).toBeVisible();
+  await expectNoWcagViolations(page, 'tenant-wide upload requests');
+  await page.getByRole('button', { name: new RegExp(`^${text().tenantScope.revoke}`) }).first().click();
+  await expect(page.getByRole('dialog', { name: text().requests.revokeTitle })).toBeVisible();
+  await expectNoWcagViolations(page, 'tenant-wide upload request revoke dialog');
 });
 
 test('sign-in callback that failed lands on the sign-in page with its error (#168)', async ({ page }) => {
@@ -343,9 +572,268 @@ test('a Japanese link opened in an English browser shows Japanese (FR-33)', asyn
   await expect(page.getByRole('heading', { level: 1, name: resources.ja.translation.recipient.verifyTitle })).toBeVisible();
 });
 
-// The uploader's link page is M5's: NotAvailableYet in the public layout (#195).
-test('uploader link (not available yet)', async ({ page }) => {
-  await page.goto('/u#fake-link-token');
-  await expect(page.getByRole('heading', { level: 1, name: text().notAvailable.title })).toBeVisible();
-  await expectNoWcagViolations(page, 'uploader link');
+// ---- the member's upload requests (#212, #213) and extend expiry (#214) ----
+
+test('new upload request, filled in', async ({ page }) => {
+  await page.goto('/upload-requests/new');
+  await page.getByLabel(text().requests.uploaderEmail).fill('supplier@example.com');
+  await page.getByLabel(text().requests.messageLabel).fill('The signed contract, please.');
+  await expectNoWcagViolations(page, 'new upload request, filled in');
+});
+
+test('upload request: received files with findings shown, then the unlock, revoke and delete dialogs, by keyboard', async ({ page }) => {
+  await page.goto(`/upload-requests/${uploadRequestId}`);
+  const table = page.getByRole('table', { name: text().requests.receivedCaption });
+  await expect(table.getByRole('rowheader', { name: 'contract.pdf' })).toBeVisible();
+  await expect(page.getByText(text().recipient.unscannableWarning)).toBeVisible();
+  await page.getByRole('button', { name: text().sender.showFindings.replace('{{name}}', 'staff-list.xlsx') }).click();
+  await expect(page.getByRole('region', { name: text().sender.findings })).toBeVisible();
+  await expectNoWcagViolations(page, 'received files with findings');
+
+  const unlock = page.getByRole('button', { name: text().requests.unlockFor.replace('{{email}}', 'supplier@example.com') });
+  await unlock.focus();
+  await page.keyboard.press('Enter');
+  const unlockDialog = page.getByRole('dialog', { name: text().requests.unlockTitle });
+  await expect(unlockDialog).toBeVisible();
+  await expect(unlockDialog.getByRole('button', { name: text().common.cancel })).toBeFocused();
+  await expectNoWcagViolations(page, 'unlock uploader dialog');
+  await page.keyboard.press('Escape');
+  await expect(unlockDialog).toBeHidden();
+  await expect(unlock).toBeFocused();
+
+  const revoke = page.getByRole('button', { name: text().requests.revoke });
+  await revoke.focus();
+  await page.keyboard.press('Enter');
+  const revokeDialog = page.getByRole('dialog', { name: text().requests.revokeTitle });
+  await expect(revokeDialog.getByText(text().requests.revokeBody)).toBeVisible();
+  await expectNoWcagViolations(page, 'revoke upload request dialog');
+  await page.keyboard.press('Escape');
+  await expect(revoke).toBeFocused();
+
+  const remove = page.getByRole('button', { name: text().requests.deleteFile.replace('{{name}}', 'setup.exe') });
+  await remove.focus();
+  await page.keyboard.press('Enter');
+  const deleteDialog = page.getByRole('dialog', { name: text().requests.deleteTitle });
+  await expect(deleteDialog).toBeVisible();
+  await expectNoWcagViolations(page, 'delete received file dialog');
+  await page.keyboard.press('Escape');
+  await expect(remove).toBeFocused();
+});
+
+test('upload request: a revocation not yet confirmed (503) says it stands and offers a retry (#212)', async ({ page }) => {
+  await page.route(`**/v1/upload-requests/${uploadRequestId}/revoke`, (route) =>
+    route.fulfill({ status: 503, json: problemOf(503, 'service_unavailable') }),
+  );
+  await page.goto(`/upload-requests/${uploadRequestId}`);
+  await page.getByRole('button', { name: text().requests.revoke }).click();
+  await page.getByRole('dialog').getByRole('button', { name: text().delivery.revokeConfirm }).click();
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(page.getByText(text().requests.revokeUnconfirmed)).toBeVisible();
+  await expect(page.getByRole('button', { name: text().delivery.revokeRetry })).toBeVisible();
+  await expectNoWcagViolations(page, 'upload request revocation unconfirmed');
+});
+
+test('transfer detail: the extend expiry dialog (#214)', async ({ page }) => {
+  await page.route(`**/v1/transfers/${transferId}`, (route) => route.fulfill({ status: 200, json: extendableTransfer() }));
+  await page.goto(`/transfers/${transferId}`);
+  const extend = page.getByRole('button', { name: text().extend.button });
+  await extend.focus();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog', { name: text().extend.title });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel(text().extend.newExpiry)).toBeFocused();
+  await expectNoWcagViolations(page, 'extend expiry dialog');
+  await page.keyboard.press('Escape');
+  await expect(extend).toBeFocused();
+});
+
+// ---- the uploader's link page (#212, #213) ----
+
+const UPLOAD_LINK = '/u#test-only-token-aaaaaaaaaaaaaaaa';
+
+test('uploader: the code step, in the link\'s language', async ({ page }) => {
+  await answerLinks(page, { 'POST /v1/links/resolve': { status: 200, json: uploaderResolution(language()) } });
+  await page.goto(UPLOAD_LINK);
+  await expect(page).toHaveURL(/\/u$/);
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.verifyTitle })).toBeFocused();
+  await expect(page.getByText(text().uploader.verifyIntro)).toBeVisible();
+  await expectNoWcagViolations(page, 'uploader code step');
+});
+
+test('uploader: the request and the files, each state in plain words', async ({ page }) => {
+  await answerLinks(page, {
+    'POST /v1/links/resolve': { status: 200, json: uploaderResolution(language(), 'verified') },
+    'GET /v1/session': { status: 200, json: uploaderSession(language()) },
+    'GET /v1/session/files': { status: 200, json: uploaderFiles },
+  });
+  await page.goto(UPLOAD_LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().uploader.title })).toBeFocused();
+  await expect(page.getByText(text().uploader.status.blocked)).toBeVisible();
+  await expect(page.getByText(text().uploader.status.unscannable)).toBeVisible();
+  await expect(page.getByText(text().uploader.resumeHint)).toBeVisible();
+  await expectNoWcagViolations(page, 'uploader files');
+});
+
+test('uploader: a revoked request says so', async ({ page }) => {
+  await answerLinks(page, {
+    'POST /v1/links/resolve': { status: 200, json: uploaderResolution(language(), 'verified') },
+    'GET /v1/session': { status: 200, json: uploaderSession(language()) },
+    'GET /v1/session/files': { status: 410, json: problemOf(410, 'link_revoked') },
+  });
+  await page.goto(UPLOAD_LINK);
+  await expect(page.getByRole('heading', { level: 1, name: text().recipient.revokedTitle })).toBeFocused();
+  await expect(page.getByText(text().uploader.revokedBody)).toBeVisible();
+  await expectNoWcagViolations(page, 'uploader link revoked');
+});
+
+// ---- DLP (#218 to #220): every dialog and error state, by keyboard where it matters ----
+
+/** A template's `{{name}}`s filled in, as i18next does. */
+const fill = (template: string, values: Record<string, string | number>) =>
+  template.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, name: string) => String(values[name]));
+
+test('DLP settings: a domain added, the confirmation, then a conflict with another admin (#218)', async ({ page }) => {
+  await page.route('**/v1/dlp/policy', (route) =>
+    route.request().method() === 'PATCH'
+      ? route.fulfill({ status: 409, json: problemOf(409, 'dlp_policy_conflict') })
+      : route.fulfill({ status: 200, json: dlpPolicy }),
+  );
+  await page.goto('/admin/dlp');
+  const t = text().dlpAdmin;
+  await page.getByLabel(t.addDomain).fill('Supplier.example, not a domain');
+  await page.getByRole('button', { name: t.add, exact: true }).click();
+  await expect(page.getByText(fill(t.domainInvalid, { value: ['not', 'a', 'domain'].join(text().common.listSeparator) }))).toBeVisible();
+  await expect(page.getByRole('button', { name: fill(t.removeDomain, { domain: 'supplier.example' }) })).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings, domain added');
+
+  await page.getByRole('button', { name: text().common.save }).click();
+  const dialog = page.getByRole('dialog', { name: t.confirmSettings });
+  await expect(dialog.getByText(fill(t.change.trust, { domains: 'supplier.example' }))).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings confirmation');
+  await dialog.getByRole('button', { name: text().common.save }).click();
+  await expect(dialog.getByRole('button', { name: t.reload })).toBeVisible();
+  await expectNoWcagViolations(page, 'DLP settings conflict');
+});
+
+test('DLP rules: turn off and delete confirmations, by keyboard (#218)', async ({ page }) => {
+  await page.goto('/admin/dlp/rules');
+  const t = text().dlpAdmin;
+  const turnOff = page.getByRole('button', { name: fill(t.turnOffNamed, { name: 'My Numbers' }) });
+  await turnOff.focus();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog', { name: t.confirmTurnOff });
+  await expect(dialog.getByText(fill(t.change.turnOff, { name: 'My Numbers' }))).toBeVisible();
+  await expectNoWcagViolations(page, 'turn off rule dialog');
+  await page.keyboard.press('Escape');
+  await expect(turnOff).toBeFocused();
+
+  await page.getByRole('button', { name: fill(t.deleteNamed, { name: 'My Numbers' }) }).click();
+  await expect(page.getByRole('dialog', { name: t.confirmDeleteRule })).toBeVisible();
+  await expectNoWcagViolations(page, 'delete rule dialog');
+});
+
+test('DLP rule form: what is missing, then the confirmation (#218)', async ({ page }) => {
+  await page.goto('/admin/dlp/rules/new');
+  const t = text().dlpAdmin;
+  await page.getByRole('button', { name: t.addRule }).click();
+  await expect(page.getByText(t.ruleProblem.name)).toBeVisible();
+  await expect(page.getByText(t.ruleProblem.detectors)).toBeVisible();
+  await expectNoWcagViolations(page, 'new rule, problems');
+
+  await page.getByLabel(text().common.name, { exact: true }).fill('Project names');
+  await page.getByRole('checkbox', { name: 'Project names' }).check();
+  await page.getByRole('radio', { name: new RegExp(escapeRegExp(text().dlpAction.require_approval)) }).check();
+  await page.getByRole('button', { name: t.addRule }).click();
+  const dialog = page.getByRole('dialog', { name: t.confirmAddRule });
+  await expect(dialog.getByText(fill(t.change.addRule, { name: 'Project names' }))).toBeVisible();
+  await expectNoWcagViolations(page, 'new rule confirmation');
+});
+
+test('DLP keyword lists: a list a rule uses can\'t be deleted (#218)', async ({ page }) => {
+  await page.route(`**/v1/dlp/detectors/${keywordListPath}`, (route) =>
+    route.request().method() === 'DELETE'
+      ? route.fulfill({ status: 409, json: problemOf(409, 'detector_in_use') })
+      : route.fulfill({ status: 200, json: keywordList }),
+  );
+  await page.goto('/admin/dlp/keywords');
+  const t = text().dlpAdmin;
+  await page.getByRole('button', { name: fill(t.deleteNamed, { name: 'Project names' }) }).click();
+  const dialog = page.getByRole('dialog', { name: t.confirmDeleteKeywordList });
+  await expectNoWcagViolations(page, 'delete keyword list dialog');
+  await dialog.getByRole('button', { name: text().common.delete }).click();
+  await expect(dialog.getByText(text().problems.detector_in_use)).toBeVisible();
+  await expectNoWcagViolations(page, 'keyword list in use');
+});
+
+test('DLP keyword list form: a term too long, then the confirmation (#218)', async ({ page }) => {
+  await page.goto(`/admin/dlp/keywords/${keywordListPath}`);
+  const t = text().dlpAdmin;
+  const terms = page.getByLabel(t.terms, { exact: true });
+  await expect(terms).toHaveValue('Bluebird\nKingfisher\n青い鳥');
+  await terms.fill(`Bluebird\n${'x'.repeat(101)}`);
+  await page.getByRole('button', { name: text().common.save }).click();
+  await expect(terms).toHaveAttribute('aria-invalid', 'true');
+  await expectNoWcagViolations(page, 'keyword list, term too long');
+  await terms.fill('Bluebird\nRedbird');
+  await page.getByRole('button', { name: text().common.save }).click();
+  await expect(page.getByRole('dialog', { name: t.confirmEditKeywordList })).toBeVisible();
+  await expectNoWcagViolations(page, 'keyword list confirmation');
+});
+
+test('transfer warned: the confirm dialog, by keyboard (#219)', async ({ page }) => {
+  await page.goto(`/transfers/${warnedId}`);
+  const t = text().dlp;
+  await expect(page.getByText('My Numbers').first()).toBeVisible();
+  const send = page.getByRole('button', { name: t.confirm.warning.button });
+  await send.focus();
+  await page.keyboard.press('Enter');
+  const dialog = page.getByRole('dialog', { name: t.confirm.warning.title });
+  await expect(dialog.getByLabel(t.justificationOptional)).toBeFocused();
+  await expectNoWcagViolations(page, 'confirm dialog');
+  await page.keyboard.press('Escape');
+  await expect(send).toBeFocused();
+});
+
+test('transfer needing approval: the request dialog asks for a reason (#220)', async ({ page }) => {
+  await page.goto(`/transfers/${approvalNeededId}`);
+  const t = text().dlp;
+  await page.getByRole('button', { name: t.confirm.approval.button }).click();
+  const dialog = page.getByRole('dialog', { name: t.confirm.approval.title });
+  await dialog.getByRole('button', { name: t.confirm.approval.action }).click();
+  await expect(dialog.getByLabel(t.justificationRequired)).toHaveAccessibleDescription(new RegExp(escapeRegExp(t.justificationProblem.required)));
+  await expectNoWcagViolations(page, 'request approval dialog, reason missing');
+});
+
+test('transfer held by a DLP rule: the remove and cancel dialogs (#219)', async ({ page }) => {
+  await page.goto(`/transfers/${blockedId}`);
+  const t = text().dlp;
+  await page.getByRole('button', { name: fill(t.removeFileNamed, { name: 'staff-list.xlsx' }) }).click();
+  await expect(page.getByRole('dialog', { name: t.removeTitle })).toBeVisible();
+  await expectNoWcagViolations(page, 'remove file dialog');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: text().sender.cancelTransfer }).click();
+  await expect(page.getByRole('dialog', { name: t.cancelTitle })).toBeVisible();
+  await expectNoWcagViolations(page, 'cancel transfer dialog');
+});
+
+test('approval request: approve with a sign-in too old, and reject without a comment (#220)', async ({ page }) => {
+  await page.route(`**/v1/dlp/approval-requests/${queueRequestId}/approve`, (route) =>
+    route.fulfill({ status: 401, json: problemOf(401, 'reauthentication_required') }),
+  );
+  await page.goto(`/approvals/${queueRequestId}`);
+  const t = text().approvals;
+  await page.getByRole('button', { name: t.approve.button, exact: true }).click();
+  const approve = page.getByRole('dialog', { name: t.approve.title });
+  await expect(approve.getByText(t.approve.stepUp)).toBeVisible();
+  await expectNoWcagViolations(page, 'approve dialog');
+  await approve.getByRole('button', { name: t.approve.action }).click();
+  await expect(approve.getByRole('button', { name: text().admin.signInAgain })).toBeVisible();
+  await expectNoWcagViolations(page, 'approve dialog, sign in again');
+  await page.keyboard.press('Escape');
+
+  await page.getByRole('button', { name: t.reject.button, exact: true }).click();
+  const reject = page.getByRole('dialog', { name: t.reject.title });
+  await reject.getByRole('button', { name: t.reject.action }).click();
+  await expect(reject.getByLabel(t.commentRequired)).toHaveAccessibleDescription(new RegExp(escapeRegExp(t.commentProblem.required)));
+  await expectNoWcagViolations(page, 'reject dialog, comment missing');
 });

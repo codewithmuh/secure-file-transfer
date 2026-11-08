@@ -1,5 +1,6 @@
 """The mail adapter: SES API v2 against botocore's Stubber, SMTP against a fake. No network."""
 
+import json
 import smtplib
 from collections.abc import Callable, Iterator
 from email.message import EmailMessage
@@ -418,3 +419,50 @@ def test_a_header_the_email_package_refuses_is_a_mail_error(
     assert_nothing_personal(str(caught.value))
     assert_nothing_personal(str(json_logs()))
     assert fake_smtp.opened == []
+
+
+# ---- releasing a cleared address at SES (#217, abuse 7.4) ----
+
+
+def test_ses_releases_an_address_from_the_tenants_list(
+    ses: tuple[SesMailer, Stubber], json_logs: Logs
+) -> None:
+    mailer, stubber = ses
+    stubber.add_response(
+        "delete_suppressed_destination", {}, {"EmailAddress": TO, "TenantName": str(TENANT_ID)}
+    )
+    mailer.release(TENANT_ID, TO)
+    # An address SES doesn't hold is released already.
+    stubber.add_client_error(
+        "delete_suppressed_destination",
+        service_error_code="NotFoundException",
+        service_message=f"{TO} not found",
+        http_status_code=404,
+    )
+    mailer.release(TENANT_ID, TO)
+    assert_nothing_personal(json.dumps(json_logs()))
+
+
+def test_ses_release_failures_name_a_kind_and_without_tenants_nothing_is_called(
+    ses: tuple[SesMailer, Stubber], json_logs: Logs
+) -> None:
+    mailer, stubber = ses
+    stubber.add_client_error(
+        "delete_suppressed_destination",
+        service_error_code="TooManyRequestsException",
+        service_message=f"slow down for {TO}",
+        http_status_code=429,
+    )
+    with pytest.raises(MailError) as caught:
+        mailer.release(TENANT_ID, TO)
+    assert caught.value.kind is MailErrorKind.THROTTLED
+    assert TO not in str(caught.value)
+    assert_nothing_personal(json.dumps(json_logs()))
+    mailer._name_tenants = False
+    mailer.release(TENANT_ID, TO)  # no tenant list to release from: no call (the Stubber checks)
+
+
+def test_smtp_has_no_list_to_release() -> None:
+    SmtpMailer(host="127.0.0.1", port=1, from_header=FROM, from_domain="sft.test").release(
+        TENANT_ID, TO
+    )

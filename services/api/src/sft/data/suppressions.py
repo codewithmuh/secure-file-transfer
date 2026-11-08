@@ -15,7 +15,15 @@ stops another tenant's (NFR-12). An entry suppresses while `expires_at` is empty
 - **Re-keying.** An entry found under an older key moves to the active key's pseudonym when the
   worker next records the address, because it holds the address then (encryption and keys 6.5).
 
-Releasing an address from SES's own tenant list arrives with SES tenant management (ADR-0015).
+- **An entry is ended** by a tenant admin (`clearEmailSuppression`, #217): `end_entries` sets
+  `expires_at` to now on the tenant's live entries for the address, and the API writes
+  `email_suppression.cleared` in the same transaction. The API may update only those columns
+  (revision 0023). An ended entry stays as a marker, so a second bounce is still recognised.
+- **Releasing at SES** (ADR-0015, data model 2.5): SES keeps its own tenant-level list, which our
+  ending an entry doesn't touch, because we hold only a pseudonym. The first time the notification
+  worker sends to an address whose entry has ended since its last release (`release_due`), it
+  removes the address from the tenant's SES list first, then records `ses_released_at`
+  (`mark_released`), with its audit event.
 """
 
 from __future__ import annotations
@@ -119,5 +127,60 @@ async def rekey(session: AsyncSession, entry_id: UUID, *, pseudonym: str, key_id
         update(EmailSuppression)
         .where(EmailSuppression.id == entry_id, in_scope(EmailSuppression, session))
         .values(email_hmac=pseudonym, hmac_key_id=key_id, updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def end_entries(session: AsyncSession, pseudonyms: Collection[str]) -> list[UUID]:
+    """End the scope's tenant's live entries under any of `pseudonyms` now; their IDs, none if
+    the address wasn't suppressed. The caller writes the audit event."""
+    require_scope(session, ScopeKind.TENANT)
+    if not pseudonyms:
+        return []
+    rows = await session.scalars(
+        update(EmailSuppression)
+        .where(
+            EmailSuppression.email_hmac.in_(list(pseudonyms)),
+            or_(EmailSuppression.expires_at.is_(None), EmailSuppression.expires_at > func.now()),
+            in_scope(EmailSuppression, session),
+        )
+        .values(expires_at=func.now(), updated_at=func.now())
+        .returning(EmailSuppression.id)
+        .execution_options(synchronize_session=False)
+    )
+    return list(rows.all())
+
+
+async def release_due(session: AsyncSession, pseudonyms: Collection[str]) -> UUID | None:
+    """The scope's tenant's ended entry for the address, under any of `pseudonyms`, that SES may
+    still hold: ended, and not released since it last changed. None if there is nothing to
+    release (no entry, a live one, or released already)."""
+    require_scope(session, ScopeKind.TENANT)
+    if not pseudonyms:
+        return None
+    entry_id: UUID | None = await session.scalar(
+        select(EmailSuppression.id)
+        .where(
+            EmailSuppression.email_hmac.in_(list(pseudonyms)),
+            EmailSuppression.expires_at <= func.now(),
+            or_(
+                EmailSuppression.ses_released_at.is_(None),
+                EmailSuppression.ses_released_at < EmailSuppression.updated_at,
+            ),
+            in_scope(EmailSuppression, session),
+        )
+        .limit(1)
+    )
+    return entry_id
+
+
+async def mark_released(session: AsyncSession, entry_id: UUID) -> None:
+    """Record that SES no longer suppresses the entry's address for the tenant. `updated_at`
+    moves with it, so the entry needs no release again until it changes."""
+    require_scope(session, ScopeKind.TENANT)
+    await session.execute(
+        update(EmailSuppression)
+        .where(EmailSuppression.id == entry_id, in_scope(EmailSuppression, session))
+        .values(ses_released_at=func.now(), updated_at=func.now())
         .execution_options(synchronize_session=False)
     )

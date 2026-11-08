@@ -11,9 +11,9 @@ one line (`sft.api.rate_limits`); `EVERY_REQUEST` runs before routing, on every 
 number is a starting value, changed only through deploy config, for every tenant at once.
 
 This page carries the limits of the routes that exist now (groups A, B, C, D's request rates, F's
-request rates, G for `inviteUser` and `sendTransfer`, H and J), and group G's cross-tenant cap on
-link emails, which the notification worker applies (#178, abuse 7.2). Groups I and K join with
-their routes. Group D's byte caps and group E's concurrent streams are budgets and leases, not
+request rates, G for `inviteUser` and `sendTransfer`, H, I and J), and group G's cross-tenant cap on
+link emails, which the notification worker applies (#178, abuse 7.2). Group K joins with its
+routes. Group D's byte caps and group E's concurrent streams are budgets and leases, not
 rates: `sft.service.rate_limits.downloads` (#180). Group F's per-file part-URL count and the
 tenant's daily upload volume come with the upload follow-ups.
 """
@@ -199,6 +199,8 @@ C_SESSION = _limit(Group.LINK_SESSION, "session_requests", KeyType.LINK_SESSION,
 D_SUBJECT = _limit(Group.DOWNLOAD_GRANTS, "subject_grants", KeyType.SUBJECT, Rate(100, HOUR))
 D_IP = _limit(Group.DOWNLOAD_GRANTS, "ip_grants", KeyType.IP, Rate(300, HOUR))
 D_TENANT = _limit(Group.DOWNLOAD_GRANTS, "tenant_grants", KeyType.TENANT, Rate(2000, HOUR))
+D_ACCOUNT = _limit(Group.DOWNLOAD_GRANTS, "account_grants", KeyType.ACCOUNT, Rate(300, HOUR))
+"""A member's grant requests of received files, resumes included (#213)."""
 
 # ---- F. Uploads: declaring files, part URLs, listing parts, completing. ----
 F_CALLER = _limit(
@@ -231,9 +233,23 @@ H_FAILED_AUTH = _limit(
     Group.TENANT_API, "failed_auth", KeyType.IP, Quota(100, 5 * MINUTE, "failures", 15 * MINUTE)
 )
 
+# ---- I. Audit: searchAuditEvents, exportAuditEvents (#216). Fail open. ----
+I_SEARCHES = _limit(Group.AUDIT, "tenant_searches", KeyType.TENANT, Rate(60, MINUTE))
+I_TENANT_EXPORTS = _limit(Group.AUDIT, "tenant_exports", KeyType.TENANT, Quota(10, HOUR))
+I_KEY_EXPORTS = _limit(Group.AUDIT, "key_exports", KeyType.API_KEY, Quota(1, HOUR))
+"""One export an hour per API key (authn and authz 5.3); an admin's exports count only towards
+the tenant's 10. One export at a time per tenant is a lease, not a rate
+(`sft.service.audit_search.ExportLeases`)."""
+
 # ---- J. Key and tenant administration. ----
 J_API_KEYS = _limit(Group.ADMINISTRATION, "api_keys", KeyType.TENANT, Quota(20, DAY))
 J_TENANTS = _limit(Group.ADMINISTRATION, "tenants", KeyType.OPERATOR, Quota(30, HOUR))
+
+# K: data loss prevention (#218 onwards).
+K_POLICY_CHANGES = _limit(Group.DLP, "policy_changes", KeyType.TENANT, Quota(100, DAY))
+K_CONFIRMATIONS = _limit(Group.DLP, "confirmations", CALLER, Rate(30, MINUTE))
+K_FINDING_READS = _limit(Group.DLP, "finding_reads", CALLER, Rate(600, HOUR))
+K_APPROVAL_DECISIONS = _limit(Group.DLP, "approval_decisions", CALLER, Rate(120, HOUR))
 
 ALL = (
     *(A_IP, A_NOT_FOUND, A_FAILED_CODES, A_SUBJECT_GAP, A_SUBJECT_DAY),
@@ -241,11 +257,17 @@ ALL = (
     *(B_START, B_CALLBACK, B_INVITATION),
     C_SESSION,
     *(D_SUBJECT, D_IP, D_TENANT),
+    D_ACCOUNT,
     *(F_CALLER, F_IP),
     *(G_CALLER_EMAILS, G_TENANT_EMAILS, G_ADDRESS_EMAILS, G_ADDRESS_ALL_TENANTS),
     *(G_INVITES, G_ADDRESS_INVITES),
     *(H_CALLER, H_TENANT, H_FAILED_AUTH),
     *(J_API_KEYS, J_TENANTS),
+    *(I_SEARCHES, I_TENANT_EXPORTS, I_KEY_EXPORTS),
+    K_POLICY_CHANGES,
+    K_CONFIRMATIONS,
+    K_FINDING_READS,
+    K_APPROVAL_DECISIONS,
 )
 """Every limit above, for the tests that check the whole table."""
 
@@ -270,6 +292,11 @@ GRANT_REQUEST = (D_SUBJECT, D_IP)
 that counts a download, not a resume, is also charged the tenant's 2,000 an hour (`D_TENANT`)
 with the byte caps, all or none (`sft.service.rate_limits.downloads.grant_charges`)."""
 
+RECEIVED_GRANT_REQUEST = (D_ACCOUNT, D_IP, H_TENANT)
+"""`createReceivedFileDownload`, resumes included (#213): per member, then per IP, then the
+tenant's group H budget, which counts group D too. A new grant is also charged the tenant's
+2,000 an hour and its 500 GB a day (`sft.service.rate_limits.downloads.received_grant_charges`)."""
+
 SIGN_IN_START = (B_START,)
 SIGN_IN_CALLBACK = (B_CALLBACK,)
 INVITATION_SIGN_IN = (B_INVITATION,)
@@ -289,6 +316,10 @@ UPLOAD = (F_CALLER, F_IP, H_TENANT)
 link-session twins): group F's own budgets, then the tenant's group H budget, which counts group F
 too (abuse and rate limits 2.2)."""
 
+SESSION_UPLOAD = (F_CALLER, F_IP)
+"""The uploader's four upload operations (#213): group F per link session and per IP. An uploader
+spends none of the tenant's group H budget, as no link session does (2.2, H)."""
+
 LINK_EMAILS = (G_CALLER_EMAILS, G_TENANT_EMAILS)
 """`sendTransfer`, after `TENANT_OPERATION`, once the send passes its checks: the caller's, then
 the tenant's recipient emails, each recipient costing one, with `ADDRESS_LINK_EMAILS` between the
@@ -303,3 +334,23 @@ CREATE_TENANT = (J_TENANTS,)
 """`createTenant`, on the operator API."""
 CREATE_API_KEY = (J_API_KEYS,)
 """`createApiKey`, after `TENANT_OPERATION`."""
+AUDIT_SEARCH = (H_CALLER, I_SEARCHES, H_TENANT)
+"""`searchAuditEvents`: the caller's group H budget, the tenant's 60 searches a minute, then the
+tenant's group H budget, which counts group I too (abuse 2.2, H and I)."""
+KEY_EXPORT = (I_KEY_EXPORTS,)
+"""`exportAuditEvents` by an API key, in the service once the export may run: one an hour."""
+TENANT_EXPORT = (I_TENANT_EXPORTS,)
+"""`exportAuditEvents`, in the service after `KEY_EXPORT`: the tenant's 10 an hour."""
+DLP_POLICY_CHANGE = (K_POLICY_CHANGES,)
+"""`updateDlpPolicy` and the rule and detector writes, after `TENANT_OPERATION`: 100 changes a day
+per tenant, counted only for a change that is made, in its transaction (abuse 2.2, K)."""
+CONFIRM_TRANSFER = (K_CONFIRMATIONS,)
+"""`confirmTransfer`, with `TENANT_OPERATION`: 30 confirmations a minute per account (abuse 2.2,
+K). Keys are refused by the service; the API key's key is named only so the check has one."""
+TRANSFER_DLP_READ = (K_FINDING_READS,)
+"""`getTransferDlp`, with `TENANT_OPERATION`: 600 reads an hour per account or key (abuse 2.2,
+K, the cap on responses with finding details, applied to every read until DLP-8 adds details)."""
+APPROVAL_DECISION = (K_APPROVAL_DECISIONS,)
+"""`approveTransfer` (with `TENANT_OPERATION`) and `rejectTransfer` (with `SAFETY_ACTION` only, a
+safety action): 120 approval decisions an hour per approver (abuse 2.2, K), so a compromised
+approver session can't release a backlog in seconds (#220)."""

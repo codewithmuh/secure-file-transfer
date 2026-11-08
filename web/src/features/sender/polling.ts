@@ -42,6 +42,26 @@ export function shouldPoll(
 }
 
 /**
+ * How often the detail page asks for a transfer that waits for an approver (#220): an approval, a rejection or the
+ * request's expiry moves it at a person's pace.
+ */
+export const APPROVAL_POLL_INTERVAL_MS = 15_000;
+
+/**
+ * How often `getTransfer` is asked again: every few seconds while the service moves the transfer (`shouldPoll`), every
+ * 15 seconds while it is `pending_approval`, else not at all. `awaiting_confirmation` and `held` wait for the sender,
+ * so they aren't polled; a change made in another tab shows when this one has the focus again.
+ */
+export function pollInterval(
+  transfer: Pick<Transfer, 'state' | 'files'> | undefined,
+  uploading: ReadonlySet<string> = new Set(),
+): number | false {
+  if (shouldPoll(transfer, uploading)) return POLL_INTERVAL_MS;
+  if (transfer?.state === 'pending_approval') return APPROVAL_POLL_INTERVAL_MS;
+  return false;
+}
+
+/**
  * How often the detail page asks for the recipients' delivery while the transfer is `sent` (#199): slower than the
  * scans, since emails, verifications and downloads move at a person's pace.
  */

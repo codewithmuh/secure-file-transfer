@@ -16,6 +16,7 @@ Three ways in, by scope:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Final
@@ -125,6 +126,11 @@ class Policy:
     received_file_retention_days: int = DEFAULT_RETENTION_DAYS
     default_locale: str = DEFAULT_LOCALE
     updated_at: datetime | None = None
+    allowed_domains: tuple[str, ...] = ()
+    """FR-24 (#217, revision 0023): if not empty, recipients and uploaders must be in one of these
+    domains or their subdomains. Lower-case, in their ASCII (IDNA) form."""
+    blocked_domains: tuple[str, ...] = ()
+    """FR-24: recipients and uploaders can't be in these domains or their subdomains."""
 
 
 def _policy(row: TenantPolicy) -> Policy:
@@ -134,6 +140,8 @@ def _policy(row: TenantPolicy) -> Policy:
         received_file_retention_days=row.received_file_retention_days,
         default_locale=row.default_locale,
         updated_at=row.updated_at,
+        allowed_domains=tuple(row.allowed_domains or ()),
+        blocked_domains=tuple(row.blocked_domains or ()),
     )
 
 
@@ -167,6 +175,8 @@ async def update_policy(
     unscannable_policy: UnscannablePolicy | None = None,
     received_file_retention_days: int | None = None,
     default_locale: str | None = None,
+    allowed_domains: Sequence[str] | None = None,
+    blocked_domains: Sequence[str] | None = None,
 ) -> Policy:
     """Change the fields given (None leaves one as it is) and return the policy as it now is.
 
@@ -185,6 +195,8 @@ async def update_policy(
             ),
             ("received_file_retention_days", received_file_retention_days),
             ("default_locale", default_locale),
+            ("allowed_domains", None if allowed_domains is None else list(allowed_domains)),
+            ("blocked_domains", None if blocked_domains is None else list(blocked_domains)),
         )
         if value is not None
     }
@@ -233,3 +245,15 @@ async def sender(session: AsyncSession) -> Sender | None:
         )
     )
     return Sender(str(row[0]), row[1] == ACTIVE, str(locale or DEFAULT_LOCALE))
+
+
+async def received_file_retention_days(session: AsyncSession) -> int:
+    """How long the scope's tenant keeps a received file, in days (FR-13, FR-23): read when an
+    upload is accepted (#213), by the API and by reconciliation as `sft_jobs` (revision 0020)."""
+    require_scope(session, ScopeKind.TENANT)
+    days = await session.scalar(
+        select(TenantPolicy.received_file_retention_days).where(
+            TenantPolicy.tenant_id == tenant_of(session), in_scope(TenantPolicy, session)
+        )
+    )
+    return int(days or DEFAULT_RETENTION_DAYS)

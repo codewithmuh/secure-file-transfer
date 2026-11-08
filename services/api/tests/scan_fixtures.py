@@ -8,19 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import struct
+import tempfile
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 from sft.data.models import StorageClass
+from sft.dlp.engine import load_engine
+from sft.dlp.extract import extract
+from sft.dlp.limits import Limits
 from sft.dlp.protocol import (
     Decision,
     Error,
     FindingModel,
+    Request,
     Result,
     encode_frame,
+    finding_model,
     parse_request,
     result,
 )
@@ -137,8 +145,26 @@ class FakeClamd:
                 await asyncio.wait_for(self._server.wait_closed(), 1)
 
 
-Mode = Literal["result", "stop", "error", "malformed", "hang", "close", "slow", "stall"]
-"""`slow` reads the rest at `pace` seconds a chunk; `stall` asks for the rest and never reads it."""
+Mode = Literal["result", "stop", "error", "malformed", "hang", "close", "slow", "stall", "detect"]
+"""`slow` reads the rest at `pace` seconds a chunk; `stall` asks for the rest and never reads it;
+`detect` answers as the real inspector's child would, in process: extraction and the real
+detectors, with the tenant's detectors the request carried (#218)."""
+
+
+def detect(data: bytes, request: Request) -> Result:
+    """What the inspector's child answers for `data`, without its sandbox (sft.dlp.child)."""
+    engine = load_engine()
+    scanner = engine.new_scanner(request.detectors())
+    with tempfile.TemporaryDirectory() as scratch:
+        outcome = extract(
+            io.BytesIO(data), emit=scanner.feed, limits=Limits(), scratch_dir=Path(scratch)
+        )
+    return result(
+        engine_version=engine.version,
+        state=outcome.state,
+        reasons=list(outcome.reasons),
+        findings=[finding_model(f) for f in scanner.findings()],
+    )
 
 
 def finding(detector: str, high: int = 1, *, previews: int = 0) -> FindingModel:
@@ -164,6 +190,8 @@ class FakeInspector:
     """For `malformed`: the answer to send as is, past the schema. By default, an unknown
     detector."""
     received: list[bytes] = field(default_factory=list)
+    requests: list[Request] = field(default_factory=list)
+    """Each request frame, with the tenant's detectors it carried (#218)."""
     prefix: int = 64 * 1024
     pace: float = 0.05
     port: int = 0
@@ -173,6 +201,7 @@ class FakeInspector:
         try:
             (length,) = struct.unpack(">I", await reader.readexactly(4))
             request = parse_request(await reader.readexactly(length))
+            self.requests.append(request)
             data = await reader.readexactly(min(self.prefix, request.size))
             if self.mode == "hang":
                 await asyncio.sleep(3600)
@@ -220,6 +249,8 @@ class FakeInspector:
                 ]
                 payload = json.dumps(raw).encode()
                 writer.write(struct.pack(">I", len(payload)) + payload)
+            elif self.mode == "detect":
+                writer.write(encode_frame(detect(data, request)))
             else:
                 writer.write(encode_frame(self.answer))
             await writer.drain()

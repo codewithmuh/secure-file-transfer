@@ -28,7 +28,7 @@ import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
 import dlp_fixtures as fx
-from member_fixtures import seed_user
+from member_fixtures import ready_for_dlp, seed_user
 from pg import ScratchDatabase
 from scan_fixtures import FakeClamd, FakeInspector, FakeScanObjects, eicar
 from sft.core.ids import uuid7
@@ -92,7 +92,9 @@ def seeded(
 ) -> tuple[uuid.UUID, uuid.UUID]:
     tenant_id = uuid.uuid4()
     db.sql("INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant_id)
-    transfer_id, _ = seed_transfer(db, tenant_id, seed_user(db, tenant_id), state="submitted")
+    owner = seed_user(db, tenant_id)
+    ready_for_dlp(db, tenant_id, owner)  # the default policy, and example.test known (#219)
+    transfer_id, _ = seed_transfer(db, tenant_id, owner, state="submitted")
     file_id = seed_file(db, tenant_id, transfer_id, size=len(data))
     objects.put(f"tenants/{tenant_id}/files/{file_id}", "version-1", data)
     return tenant_id, file_id

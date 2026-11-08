@@ -10,6 +10,8 @@ import { formatDate } from '@/lib/formatters';
 import { errorMessage, failureOf, isAccessProblem } from '@/lib/problems';
 import { useDurationLabel } from '@/lib/useDurationLabel';
 import { AdminAccessNote } from './AdminAccessNote';
+import { DomainListEditor } from './DomainListEditor';
+import { overlapping } from './domains';
 import {
   changedFields,
   formOf,
@@ -20,11 +22,13 @@ import {
   type PolicyField,
   type PolicyForm,
 } from './policyForm';
+import { SuppressionClearForm } from './SuppressionClearForm';
 
 /**
  * The tenant policy (#197; FR-3, FR-13, FR-18, FR-23, FR-33), on the contract's fields: the longest expiry, what
  * happens to files that can't be scanned, how long received files are kept, and the default language of recipients'
- * emails and pages. Saving sends only what changed. The domain lists (FR-24) arrive with M5 and aren't shown.
+ * emails and pages; and the allowed and blocked recipient domains (#217, FR-24). Saving sends only what changed. Below
+ * the policy, a form clears a suppressed email address (#217, FR-7).
  */
 export function TenantPolicyPage() {
   const { t } = useTranslation();
@@ -43,6 +47,7 @@ export function TenantPolicyPage() {
         ) : (
           <PolicyEditor policy={policy.data} />
         )}
+        <SuppressionClearForm />
       </div>
     </PageShell>
   );
@@ -153,6 +158,32 @@ function PolicyEditor({ policy }: { policy: TenantPolicy }) {
             </p>
           )}
         </fieldset>
+      </Card>
+
+      <Card>
+        <CardTitle>{t('domains.title')}</CardTitle>
+        <p className="mt-2 text-sm text-gray-600">{t('domains.intro')}</p>
+        <div className="mt-4 space-y-6">
+          <DomainListEditor
+            label={t('domains.allowed')}
+            hint={t('domains.allowedHint')}
+            domains={form.allowed_domains}
+            onChange={(domains) => set('allowed_domains', domains)}
+            error={fieldError('allowed_domains')}
+          />
+          <DomainListEditor
+            label={t('domains.blocked')}
+            hint={t('domains.blockedHint')}
+            domains={form.blocked_domains}
+            onChange={(domains) => set('blocked_domains', domains)}
+            error={fieldError('blocked_domains')}
+          />
+          {overlapping(form.allowed_domains, form.blocked_domains).length > 0 && (
+            <Alert variant="warning" role="status">
+              {t('domains.overlap', { domains: overlapping(form.allowed_domains, form.blocked_domains).join(', ') })}
+            </Alert>
+          )}
+        </div>
       </Card>
 
       <Card>

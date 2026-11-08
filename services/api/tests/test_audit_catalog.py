@@ -208,3 +208,189 @@ def test_the_download_and_lifecycle_actions_are_catalogued(migrated_db: ScratchD
         assert f'"{action}"' in source or f'ACTION: Final = "{action}"' in source, action
         for table in tables:
             assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of extending a transfer's expiry and the first-download notice (#214), with the
+# audited tables whose changes each covers in its transaction. `download.granted` also covers the
+# transfer's `first_download_notified_at`, set in the grant's transaction; the worker's notice is
+# `email.sent`.
+EXTENSION_AND_NOTICE_ACTIONS = {
+    "transfer.expiry_extended": ("transfers", "link_sessions", "download_grants"),
+    "download.granted": ("transfers",),
+    "email.sent": (),
+}
+
+
+def test_the_extension_and_notice_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in EXTENSION_AND_NOTICE_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source or f'ACTION: Final = "{action}"' in source, action
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of upload requests and their uploaders (#212), with the audited tables whose
+# changes each covers in its transaction. The link steps' existing actions (`verification.*`,
+# `link_session.*`) and `email.sent` cover an uploader's codes, sessions and link email too.
+UPLOAD_REQUEST_ACTIONS = {
+    "upload_request.created": ("upload_requests",),
+    "upload_request.revoked": ("upload_requests", "link_sessions"),
+    "upload_request.expired": ("upload_requests", "link_sessions"),
+    "uploader.link_issued": ("upload_requests",),
+    "uploader.locked": ("upload_requests",),
+    "uploader.unlocked": ("upload_requests",),
+    "uploader.suppressed": ("upload_requests",),
+    "verification.code_created": ("verification_codes",),
+    "verification.attempted": ("verification_codes", "upload_requests"),
+    "link_session.started": ("link_sessions",),
+    "link_session.ended": ("link_sessions",),
+    "email.sent": ("upload_requests",),
+}
+
+
+def test_the_upload_request_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    assert audited["upload_requests"], "upload_requests changes without the audit trigger"
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in UPLOAD_REQUEST_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of received files (#213), with the audited tables whose changes each covers in
+# its transaction. The uploader's file events are the member's (`file.*`, actor type `uploader`);
+# a scan result also adds to its request's notice counts, a revocation or an expiry rejects the
+# request's open uploads, and the deletion job clears a deleted file's finding details.
+RECEIVED_FILE_ACTIONS = {
+    "file.added": ("files",),
+    "file.part_urls_issued": ("files",),
+    "file.completion_started": ("files",),
+    "file.upload_incomplete": ("files",),
+    "file.uploaded": ("files",),
+    "file.scanned": ("files", "dlp_findings", "upload_requests"),
+    "file.rejected": ("files",),
+    "file.removed": ("files",),
+    "file.deleted": ("files", "dlp_findings"),
+    "upload_request.revoked": ("upload_requests", "link_sessions", "files"),
+    "upload_request.expired": ("upload_requests", "link_sessions", "files"),
+    "upload_request.notice_sent": ("upload_requests",),
+    "download.granted": ("download_grants",),
+    "download.resumed": (),
+    "download.refused": (),
+}
+
+
+def test_the_received_file_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in RECEIVED_FILE_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of API keys, audit reads and the domain rules (#215, #216, #217), with the
+# audited tables whose changes each covers in its transaction.
+ADMINISTRATION_ACTIONS = {
+    "api_key.created": ("api_keys",),
+    "api_key.revoked": ("api_keys",),
+    "api_key.used": (),
+    "api_key.expiry_notice_queued": (),
+    "audit.searched": (),
+    "audit.exported": (),
+    "tenant_policy.updated": ("tenant_policies",),
+    "email_suppression.cleared": ("email_suppressions",),
+    "email_suppression.released": ("email_suppressions",),
+    "email.sent": (),
+}
+
+
+def test_the_administration_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in ADMINISTRATION_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source or f'ACTION: Final = "{action}"' in source, action
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of the DLP policy (#218), with the audited tables whose changes each covers in
+# its transaction; `retention.rows_deleted` covers the cleanup's deletions of retired revisions.
+DLP_POLICY_ACTIONS = {
+    "dlp_policy.updated": ("dlp_policies",),
+    "dlp_rule.created": ("dlp_rules", "dlp_policies"),
+    "dlp_rule.changed": ("dlp_rules", "dlp_policies"),
+    "dlp_rule.deleted": ("dlp_rules", "dlp_policies"),
+    "dlp_detector.created": ("dlp_detectors", "dlp_policies"),
+    "dlp_detector.changed": ("dlp_detectors", "dlp_policies"),
+    "dlp_detector.deleted": ("dlp_detectors", "dlp_policies"),
+    "tenant.created": ("dlp_policies", "dlp_rules"),
+    "retention.rows_deleted": ("dlp_rules", "dlp_detectors"),
+}
+
+
+def test_the_dlp_policy_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in DLP_POLICY_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of the DLP decision (#219), with the audited tables whose changes each covers
+# in its transaction: the decision and its rules with the transfer's state, the confirmation, the
+# known domains a send records, and the cleanup's deletions of known domains.
+DLP_DECISION_ACTIONS = {
+    "dlp.decided": ("dlp_decisions", "dlp_decision_rules", "transfers"),
+    "dlp.rule_matched": ("dlp_decision_rules",),
+    "transfer.awaiting_confirmation": ("transfers",),
+    "transfer.held": ("transfers",),
+    "transfer.confirmed": ("dlp_confirmations",),
+    "transfer.sent": ("transfers", "dlp_known_domains"),
+    "retention.rows_deleted": ("dlp_known_domains",),
+}
+
+
+def test_the_dlp_decision_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in DLP_DECISION_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of DLP approvals (#220), with the audited tables whose changes each covers in
+# its transaction: the request with its confirmation and the transfer's state; each approver's
+# decision with the request's end and the transfer's; the withdrawals and expiries; the approver
+# designation.
+DLP_APPROVAL_ACTIONS = {
+    "dlp_approval.requested": ("dlp_approval_requests", "dlp_confirmations", "transfers"),
+    "dlp_approval.approved": ("dlp_approval_decisions", "dlp_approval_requests"),
+    "dlp_approval.rejected": ("dlp_approval_decisions", "dlp_approval_requests", "transfers"),
+    "dlp_approval.expired": ("dlp_approval_requests", "transfers"),
+    "dlp_approval.withdrawn": ("dlp_approval_requests",),
+    "transfer.held": ("transfers",),
+    "transfer.sent": ("transfers", "dlp_known_domains"),
+    "transfer.awaiting_confirmation": ("transfers",),
+    "user.dlp_approver_changed": ("users",),
+}
+
+
+def test_the_dlp_approval_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in DLP_APPROVAL_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"

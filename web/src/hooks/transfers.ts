@@ -5,37 +5,47 @@
  */
 import { useInfiniteQuery, useQuery, type QueryClient } from '@tanstack/react-query';
 import { api, type Schema, type Transfer, type TransferState } from '@/api';
-import {
-  POLL_INTERVAL_MS,
-  RECIPIENT_POLL_INTERVAL_MS,
-  shouldPoll,
-  shouldPollRecipients,
-  useActiveUploads,
-} from '@/features/sender/polling';
+import { pollInterval, RECIPIENT_POLL_INTERVAL_MS, shouldPollRecipients, useActiveUploads } from '@/features/sender/polling';
 import type { ApiFile, PartUrl, UploadApi, UploadedParts } from '@/features/sender/upload';
 import { failureOf } from '@/lib/problems';
 
 export const queryKeys = {
   transfers: ['transfers'] as const,
-  transferList: (state: TransferState | null) => ['transfers', 'list', state ?? 'all'] as const,
+  transferList: (state: TransferState | null, scope: ListScope = 'own') => ['transfers', 'list', state ?? 'all', scope] as const,
   recentTransfers: ['transfers', 'recent'] as const,
   transfer: (id: string) => ['transfers', 'detail', id] as const,
   recipients: (id: string) => ['transfers', 'detail', id, 'recipients'] as const,
   inspection: (fileId: string) => ['files', fileId, 'inspection'] as const,
+  uploadRequests: ['upload-requests'] as const,
+  uploadRequestList: (state: string | null, scope: ListScope = 'own') => ['upload-requests', 'list', state ?? 'all', scope] as const,
+  recentUploadRequests: ['upload-requests', 'recent'] as const,
+  uploadRequest: (id: string) => ['upload-requests', 'detail', id] as const,
+  uploadRequestFiles: (id: string) => ['upload-requests', 'detail', id, 'files'] as const,
   tenantPolicy: ['tenant-policy'] as const,
   users: ['users'] as const,
   userList: (role: string | null, status: string | null) => ['users', 'list', role ?? 'all', status ?? 'all'] as const,
 };
 
-/** A page of the member's own transfers, newest first, with "load more" through the cursor (`listTransfers`). */
-export function useTransferList(state: TransferState | null, limit = 25) {
+/** `own` (the default) or, for an admin, `tenant`: every member's items (FR-20, UC-3; #217). */
+export type ListScope = 'own' | 'tenant';
+
+/**
+ * A page of transfers, newest first, with "load more" through the cursor (`listTransfers`): the member's own, or with
+ * `scope=tenant` every transfer of the tenant (an admin only; a member gets `403`).
+ */
+export function useTransferList(state: TransferState | null, limit = 25, scope: ListScope = 'own') {
   return useInfiniteQuery({
-    queryKey: queryKeys.transferList(state),
+    queryKey: queryKeys.transferList(state, scope),
     initialPageParam: null as string | null,
     queryFn: async ({ pageParam, signal }) =>
       (
         await api.get('/transfers', {
-          query: { limit, ...(state ? { state: [state] } : {}), ...(pageParam ? { cursor: pageParam } : {}) },
+          query: {
+            limit,
+            ...(scope === 'tenant' ? { scope } : {}),
+            ...(state ? { state: [state] } : {}),
+            ...(pageParam ? { cursor: pageParam } : {}),
+          },
           signal,
         })
       ).data,
@@ -52,13 +62,12 @@ export function useRecentTransfers() {
 }
 
 /** One transfer, polled every few seconds while it or a file is still moving (`shouldPoll`): on the service, or in
- * this tab's uploads. */
+ * this tab's uploads; and every 15 seconds while it waits for an approver (`pollInterval`). */
 export function useTransfer(id: string) {
   return useQuery({
     queryKey: queryKeys.transfer(id),
     queryFn: async ({ signal }) => (await api.get('/transfers/{transfer_id}', { path: { transfer_id: id }, signal })).data,
-    refetchInterval: (query) =>
-      shouldPoll(query.state.data, useActiveUploads.getState().ids) ? POLL_INTERVAL_MS : false,
+    refetchInterval: (query) => pollInterval(query.state.data, useActiveUploads.getState().ids),
     staleTime: 0,
   });
 }
@@ -135,6 +144,26 @@ export async function revokeTransfer(transferId: string): Promise<Transfer> {
   return (await api.post('/transfers/{transfer_id}/revoke', { path: { transfer_id: transferId } })).data;
 }
 
+export type ExpiryExtension = Schema<'ExpiryExtension'>;
+
+/**
+ * `extendTransferExpiry` (#214, FR-9): moves `expires_at` later, with an `Idempotency-Key` kept for the attempt. The
+ * current time again returns the transfer unchanged, so a retry is safe either way.
+ */
+export async function extendTransferExpiry(
+  transferId: string,
+  body: ExpiryExtension,
+  idempotencyKey: string,
+): Promise<Transfer> {
+  return (
+    await api.post('/transfers/{transfer_id}/extend', {
+      path: { transfer_id: transferId },
+      body,
+      headers: { 'Idempotency-Key': idempotencyKey },
+    })
+  ).data;
+}
+
 export type RecipientStatus = Schema<'RecipientStatus'>;
 
 /**
@@ -160,8 +189,8 @@ export async function unlockRecipient(transferId: string, recipientId: string): 
   }
 }
 
-/** The upload engine's calls for one file (`FileUpload`). */
-export const uploadApi: UploadApi = {
+/** The upload engine's calls for one file (`FileUpload`); a member can delete the file too. */
+export const uploadApi: Required<UploadApi> = {
   async listUploadedParts(fileId): Promise<UploadedParts> {
     return (await api.get('/files/{file_id}/parts', { path: { file_id: fileId } })).data;
   },

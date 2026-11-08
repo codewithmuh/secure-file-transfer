@@ -48,15 +48,12 @@ test('http://127.0.0.1:3000 goes to http://localhost:3000', async ({ page }) => 
   await expect(page).toHaveURL('http://localhost:3000/sign-in');
 });
 
-test('M5 pages are hidden: no navigation entry, and their URLs say not available yet', async ({ page }) => {
+test('M5 pages are live: each has its navigation entry', async ({ page }) => {
   await signIn(page, 'admin');
   const nav = page.getByRole('navigation');
   await expect(nav.getByRole('link', { name: 'Transfers' })).toBeVisible();
-  for (const name of ['Upload Requests', 'Audit Log', 'API Keys']) {
-    await expect(nav.getByRole('link', { name })).toHaveCount(0);
-  }
-  for (const path of ['/upload-requests', '/upload-requests/new', '/admin/audit', '/admin/api-keys', '/u']) {
-    await page.goto(path);
-    await expect(page.getByRole('heading', { level: 1, name: 'Not available yet' })).toBeVisible();
+  // Upload requests (#212), the audit log (#216), API keys (#215) and the DLP policy (#218).
+  for (const name of ['Upload Requests', 'Audit Log', 'API Keys', 'Data loss prevention']) {
+    await expect(nav.getByRole('link', { name })).toBeVisible();
   }
 });

@@ -369,13 +369,17 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
 | Member | `dev.member@example.com` / `local-only-member-password` | http://localhost:3000 |
 | Admin | `dev.admin@example.com` / `local-only-admin-password` | http://localhost:3000 |
 | Recipient | no sign-in: the link and the code arrive in Mailpit | http://localhost:8025 |
+| Uploader | no sign-in: the upload link and the code arrive in Mailpit | http://localhost:8025 |
 | Keycloak console | `admin` / `local-only-admin` | http://localhost:8180/admin |
 
 1. **Send.** Sign in as the member, "New transfer": add a recipient (any address; Mailpit catches everything), pick
    files, send. The detail page shows each file going `Scanning`, then `Clean` and `Inspected`. To see the scanner and
    DLP work: an EICAR test file becomes `Infected` and holds the transfer; a text file with a synthetic My Number shows
    the `jp_my_number` detector ("My Number (Individual Number)"), and "Show findings" lists where. Write the EICAR file
-   yourself, never into the repository: `make web-e2e` builds both at run time (`web/e2e/support/stack.ts`).
+   yourself, never into the repository: `make web-e2e` builds both at run time (`web/e2e/support/stack.ts`). The
+   default DLP policy (#219) warns on a recipient domain the tenant hasn't sent to in 365 days and on My Numbers, so a
+   first send waits as `Awaiting confirmation`: "Send anyway" sends it, and a rule that needs approval asks for a
+   reason and goes to an approver's queue ("Approvals", #220).
 2. **Resume an upload.** Cut the network mid-upload: the page retries each part and, when the network is back,
    carries on from the parts S3 already holds. Reload mid-upload, open the draft from "Transfers", choose the same file
    again: only the missing parts go.
@@ -385,17 +389,28 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
    file; the member's detail page shows that recipient verified, with the download and its time. A reload forgets the
    link (it is kept in memory only): open it from the email again, and the page carries on without a new code. Twenty
    wrong codes lock the recipient (five a code, one code every 30 seconds); the member's "Unlock and send a new link"
-   emails a new link, and the old one stops working. "Revoke transfer" stops new downloads at once.
-4. **Administer.** Sign in as the admin (the sign-in always asks for the password, so switching users needs no
+   emails a new link, and the old one stops working. "Revoke transfer" stops new downloads at once. Tick "Email me when
+   the files are first downloaded" when sending, and the first download puts one notice in Mailpit (#214); "Extend
+   expiry" on the detail page offers later times up to 30 days, or the tenant's maximum, after sending.
+4. **Ask for files** (#212, #213). As the member, "Upload requests", "New upload request": any uploader address, their
+   language, how long it stays open and a message. Mailpit gets the upload request email in that language, with a
+   `/u#` link. Open it in a private window: "Email me a code", read the code in Mailpit, verify, and the page shows who
+   asks, the message, the expiry and the limits; choose files and they upload, each shown `Received`, `Blocked by the
+   company's policy` (an EICAR file) or `Couldn't be scanned`. The member's request page lists what arrived, with
+   "Download", "Delete", findings and the day each file is deleted; Mailpit gets the "files arrived" notice. Revoking
+   the request ends the uploader's page.
+5. **Administer.** Sign in as the admin (the sign-in always asks for the password, so switching users needs no
    cleanup): "Users" to invite (the invitation, with a temporary password, arrives in Mailpit; sign in with it in a
    private window and choose a password), change a role or the DLP approver flag, sign someone out everywhere, reset a
    sign-in (a new invitation arrives) or deactivate; "Tenant policy" for the longest expiry (the member's form follows
-   it), unscannable files, the retention of received files and the default language.
-5. **Expiry.** `make e2e`'s clock hook and job commands (#181, #182) expire and delete a transfer on demand:
+   it), unscannable files, the retention of received files, the default language, the allowed and blocked recipient
+   domains and clearing a suppressed address (#217); "Audit log" to search and export (#216); "API keys" to create, use
+   and revoke a key (#215); "Data loss prevention" for the DLP settings, rules and keyword lists (#218). The admin's
+   "Show every … in the organization" switch on "Transfers" and "Upload requests" lists and revokes other members'.
+6. **Expiry.** `make e2e`'s clock hook and job commands (#181, #182) expire and delete a transfer on demand:
    `CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry`. Its link then shows "This link has expired", and the member's
    list shows it `Expired`.
-6. **Automated.** `make web-a11y` (axe on every page, dialog and link state, no backend), then `make web-e2e` (every
+7. **Automated.** `make web-a11y` (axe on every page, dialog and link state, no backend), then `make web-e2e` (every
    browser flow and the M3 journey in both languages, against the seeded stack).
 
-Not available locally yet, and hidden in the app (their URLs say so): upload requests, the audit log, API keys and the
-DLP policy (M5); SSO, passkeys and step-up prompts beyond "Sign in again" (M6).
+Not available locally yet: SSO, passkeys and step-up prompts beyond "Sign in again" (M6).

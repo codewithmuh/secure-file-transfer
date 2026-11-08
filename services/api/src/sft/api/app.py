@@ -3,8 +3,10 @@
 Each feature registers its own routes: member sign-in, sign-out and `GET /me` (#113, auth.py),
 the member routes (#112, members.py), transfers and their files (#114, #174 to #176,
 transfers.py), the tenant policy (#174, tenant_policy.py), recipients' status and unlock (#178,
-#179, recipients.py), the link steps and link sessions (#179, links.py) and downloads (#180,
-downloads.py).
+#179, recipients.py), the link steps and link sessions (#179, links.py), downloads (#180,
+downloads.py), upload requests (#212, upload_requests.py), API keys (#215, api_keys.py), audit
+search and export (#216, audit.py), the DLP policy (#218, dlp.py) and DLP approvals (#220,
+approvals.py).
 Probes and metrics live on the internal port (sft.runtime.internal). The interactive docs and the
 OpenAPI document aren't served either: ADR-0002 keeps them off the public load balancer, and CI
 builds the document from `create_app().openapi()`.
@@ -43,7 +45,21 @@ from fastapi import FastAPI
 from fastapi.telemetry import TelemetryConfig
 from prometheus_client import CollectorRegistry
 
-from sft.api import auth, downloads, links, members, recipients, tenant_policy, transfers
+from sft.api import (
+    api_keys,
+    audit,
+    auth,
+    dlp,
+    downloads,
+    links,
+    members,
+    received,
+    recipients,
+    tenant_policy,
+    transfers,
+    upload_requests,
+)
+from sft.api import approvals as approval_routes
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
@@ -58,6 +74,7 @@ from sft.runtime.content import S3Content
 from sft.runtime.s3 import S3Objects
 from sft.runtime.secrets import Keyrings
 from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
+from sft.service.audit_search import ExportLeases
 from sft.service.csrf import CsrfKeyring
 from sft.service.downloads import DownloadMetrics, DownloadServices
 from sft.service.links import LinkMetrics, LinkServices
@@ -154,6 +171,8 @@ def _lifespan(
             recheck_seconds=settings.download_recheck_seconds,
             clock=app.state.clock,
         )
+        # Audit exports (#216): one at a time per tenant, a lease in the counter store.
+        app.state.export_leases = ExportLeases(store)
         app.state.keyrings = keyrings
         refresh = asyncio.create_task(keyrings.run())
         try:
@@ -203,6 +222,8 @@ def create_app(
     app.state.web_origin = None if settings is None else settings.web_origin
     # The user pool's connection, whose identities a sign-in reset deletes (#197).
     app.state.pool_provider = None if settings is None else settings.oidc_provider_name
+    # The environment of the API keys this API makes and takes (#215).
+    app.state.api_key_environment = None if settings is None else settings.api_key_environment
     register_error_handlers(app)  # every error is a problem document (docs/api/README.md 3)
     install_rate_limits(app)
     auth.register(app, settings)  # sign-in, sign-out, GET /me and CORS (#113)
@@ -212,4 +233,10 @@ def create_app(
     recipients.register(app)  # recipients' status and unlock (#178, #179)
     links.register(app)  # the link steps and link sessions (#179)
     downloads.register(app)  # download grants and streamed content (#180)
+    upload_requests.register(app)  # upload requests, revoke and unlock (#212)
+    received.register(app)  # uploaders' uploads, received files and their downloads (#213)
+    api_keys.register(app)  # API keys, and the record of every key's use (#215)
+    audit.register(app)  # audit search and export (#216)
+    dlp.register(app)  # the DLP policy, rules and detectors (#218)
+    approval_routes.register(app)  # DLP approval requests and decisions (#220)
     return app

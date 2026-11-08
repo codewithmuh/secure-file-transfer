@@ -15,7 +15,7 @@ import httpx2 as httpx
 import pytest
 from fastapi import FastAPI
 
-from member_fixtures import RecordingLimiter, app_for, seed_user, session_caller
+from member_fixtures import RecordingLimiter, app_for, ready_for_dlp, seed_user, session_caller
 from object_fixtures import FakeObjects
 from pg import ScratchDatabase
 from sft.data.database import Database
@@ -82,6 +82,9 @@ def add_tenant(
     for name, role in names:
         user_id = seed_user(db, tenant_id, role=role.value)
         callers[name] = session_caller(tenant_id, user_id, role)
+    first = next(iter(callers.values())).user_id
+    assert first is not None
+    ready_for_dlp(db, tenant_id, first)  # the default policy, and example.test known (#219)
     return tenant_id, callers
 
 

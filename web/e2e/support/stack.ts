@@ -237,3 +237,29 @@ export async function sha256(bytes: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
+
+/** The transfer's state on its detail page: the badge under "Status", not "Sent" as the label of the sent time. */
+export function transferStatus(page: Page, state: keyof (typeof resources)['en']['translation']['transferState'], lang: Language = 'en') {
+  const label = resources[lang].translation.transferState[state];
+  return page.locator('dd').filter({ hasText: new RegExp(`^${escapeRegExp(label)}$`) });
+}
+
+/**
+ * Waits on a transfer's page until it is sent, confirming a DLP warning on the way (#219): the default policy warns
+ * about My Numbers and about a recipient domain the tenant hasn't sent to in 365 days, so a first send to a domain
+ * waits for the sender's confirmation.
+ */
+export async function sendPastWarning(page: Page, lang: Language = 'en', justification?: string): Promise<void> {
+  const t = resources[lang].translation;
+  const sent = transferStatus(page, 'sent', lang);
+  const waiting = transferStatus(page, 'awaiting_confirmation', lang);
+  await expect(sent.or(waiting)).toBeVisible({ timeout: 180_000 });
+  if (await waiting.isVisible()) {
+    await page.getByRole('button', { name: t.dlp.confirm.warning.button }).click();
+    const dialog = page.getByRole('dialog', { name: t.dlp.confirm.warning.title });
+    if (justification) await dialog.getByLabel(t.dlp.justificationOptional).fill(justification);
+    await dialog.getByRole('button', { name: t.dlp.confirm.warning.action, exact: true }).click();
+    await expect(dialog).toBeHidden();
+  }
+  await expect(sent).toBeVisible({ timeout: 60_000 });
+}

@@ -142,6 +142,12 @@ LOOKUP_COLUMNS = {
             "revoked_at",
         )
     ),
+    # lookup_link_subject and lookup_link_subject_sessions (revision 0019, #212): an upload
+    # request's link by its token hash, and the upload request of a link session.
+    *(("upload_requests", column, "SELECT") for column in ("id", "tenant_id", "link_token_hash")),
+    ("link_sessions", "upload_request_id", "SELECT"),
+    # lookup_api_key (revision 0021, #215): a key's ID and tenant by its hash.
+    *(("api_keys", column, "SELECT") for column in ("id", "tenant_id", "key_hash")),
 }
 LOOKUP_GRANTS = {(table, privilege) for table, _, privilege in LOOKUP_COLUMNS}
 

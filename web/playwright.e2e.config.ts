@@ -5,10 +5,10 @@ import { defineConfig, devices } from '@playwright/test';
  * the API, Keycloak, Mailpit and the S3 stand-in, as a person reaches them. `make web-e2e` runs them in the Playwright
  * image pinned in the Makefile, so no browser is installed on the host.
  *
- * - `en`: every flow (`*.e2e.ts`): #195's sign-in, #196's uploads, #197's admin pages, #199's lockout and unlock, and
- *   #200's M3 journey in English.
- * - `ja`: the M3 journey in Japanese (`journey.e2e.ts`), with a Japanese browser and Japanese recipients. The other
- *   flows name English labels, so they run in `en` only.
+ * - `en`: every flow (`*.e2e.ts`): #195's sign-in, #196's uploads, #197's admin pages, #199's lockout and unlock,
+ *   #200's M3 journey and the DLP flows of #218 to #220, in English.
+ * - `ja`: the M3 journey and the DLP flows in Japanese (`journey.e2e.ts`, `dlp.e2e.ts`), with a Japanese browser. The
+ *   other flows name English labels, so they run in `en` only.
  *
  * Chromium only (#200, web/README.md "Browser journey"). Flows sign in through Keycloak and change the stack's data
  * (they create transfers and users, and the journey moves the jobs' clock), so they run one at a time, in order.
@@ -35,6 +35,6 @@ export default defineConfig({
   },
   projects: [
     { name: 'en', use: { locale: 'en-US' } },
-    { name: 'ja', use: { locale: 'ja-JP' }, testMatch: 'journey.e2e.ts' },
+    { name: 'ja', use: { locale: 'ja-JP' }, testMatch: ['journey.e2e.ts', 'dlp.e2e.ts'] },
   ],
 });

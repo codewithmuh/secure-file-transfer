@@ -307,6 +307,27 @@ def file_state(member: Member, file_id: str) -> dict[str, Any]:
     return dict(response.json())
 
 
+def confirm_warning(member: Member, transfer_id: str) -> None:
+    """The DLP decision (#219): the default policy warns on a My Number and on a new recipient
+    domain, so the member reviews the decision and confirms it, as the web app does."""
+
+    def probe() -> bool | None:
+        state = member.request("GET", f"/v1/transfers/{transfer_id}").json()["state"]
+        assert state not in ("held", "draft", "sent"), state
+        return True if state == "awaiting_confirmation" else None
+
+    wait_for(f"transfer {transfer_id} to await confirmation", probe)
+    dlp = member.request("GET", f"/v1/transfers/{transfer_id}/dlp")
+    assert dlp.status_code == 200, dlp.text
+    decision = dlp.json()["decision"]
+    assert decision["outcome"] == "warn"
+    assert {r["condition"] for r in decision["matched_rules"]} >= {"content", "new_domain"}
+    confirmed = member.request(
+        "POST", f"/v1/transfers/{transfer_id}/confirm", json={"decision_id": decision["id"]}
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+
 def sent_transfer(member: Member, transfer_id: str) -> None:
     def probe() -> bool | None:
         state = member.request("GET", f"/v1/transfers/{transfer_id}").json()["state"]
@@ -428,7 +449,8 @@ def test_the_m2_journey() -> None:
             f["detector"]
             for f in member.request("GET", f"/v1/files/{file_ids[0]}/inspection").json()["findings"]
         }
-        sent_transfer(member, transfer_id)  # findings don't gate sending before DLP-4
+        confirm_warning(member, transfer_id)  # the DLP decision warns (#219)
+        sent_transfer(member, transfer_id)
 
     with step(4, "emails a link to each recipient"):
         tokens = {address: link_token(inbox, address) for address in (first, second)}

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -19,13 +20,15 @@ from datetime import timedelta
 import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
-from member_fixtures import seed_user
+from dlp_fixtures import docx
+from member_fixtures import client, ready_for_dlp, seed_dlp_policy, seed_user, session_caller
 from pg import ScratchDatabase
 from scan_fixtures import FakeClamd, FakeInspector, FakeScanObjects, eicar, finding
 from sft.core.ids import uuid7
 from sft.core.settings import ScanSettings
 from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database
+from sft.data.models import Role
 from sft.data.outbox import OutboxMessage, Queue
 from sft.data.roles import SCAN
 from sft.dlp.protocol import result
@@ -104,6 +107,7 @@ async def rig(migrated_db: ScratchDatabase) -> AsyncIterator[Rig]:
         "INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant_id
     )
     owner = seed_user(migrated_db, tenant_id)
+    ready_for_dlp(migrated_db, tenant_id, owner)  # the default policy, example.test known (#219)
     clamd, inspector = FakeClamd(), FakeInspector()
     await clamd.start()
     await inspector.start()
@@ -207,7 +211,10 @@ async def test_unscannable_follows_the_policy_at_scan_time(
         "encrypted",
         allowed,
     )
-    assert transfer_row(rig.db, transfer_id)["state"] == ("sent" if allowed else "held")
+    # Shareable when allowed, so the DLP decision runs: the default policy warns on a file that
+    # couldn't be fully inspected (`encrypted`, detectors 6), so the sender confirms (#219).
+    expected = "awaiting_confirmation" if allowed else "held"
+    assert transfer_row(rig.db, transfer_id)["state"] == expected
     # A later change of policy never changes a scanned file (data model 3.1).
     rig.db.sql(
         "UPDATE tenant_policies SET unscannable_policy = 'block' WHERE tenant_id = :t",
@@ -340,7 +347,7 @@ async def test_without_the_counter_store_the_cap_is_skipped(rig: Rig) -> None:
 # ---- the inspection in the same pass (#176) ----
 
 
-async def test_findings_are_recorded_with_the_scan_and_dont_gate_sending(rig: Rig) -> None:
+async def test_findings_are_recorded_with_the_scan_and_gate_sending(rig: Rig) -> None:
     transfer_id, _ = seed_transfer(rig.db, rig.tenant_id, rig.owner, state="submitted")
     file_id = rig.scanning_file(transfer_id)
     rig.inspector.answer = result(
@@ -355,7 +362,8 @@ async def test_findings_are_recorded_with_the_scan_and_dont_gate_sending(rig: Ri
         ("jp_my_number", 0, 0, 2, None),
     ]
     assert rig.file(file_id)["version"] == "2.banks-x"
-    assert transfer_row(rig.db, transfer_id)["state"] == "sent"  # no DLP gate before DLP-4
+    # The default policy warns on a My Number: the sender confirms first (#219).
+    assert transfer_row(rig.db, transfer_id)["state"] == "awaiting_confirmation"
     [(details,)] = rig.db.sql("SELECT details FROM audit_events WHERE target_id = :id", id=file_id)
     assert details["jp_my_number_high"] == 2
     assert details["findings"] == 2
@@ -445,7 +453,8 @@ async def test_a_partial_file_is_shareable_and_keeps_its_findings(rig: Rig) -> N
     found = rig.file(file_id)
     assert (found["inspection"], found["reasons"]) == ("partial", ["limit_exceeded"])
     assert rig.findings(file_id) == [("payment_card", 0, 0, 4, None)]
-    assert transfer_row(rig.db, transfer_id)["state"] == "sent"
+    # Shareable, so decided: payment cards and `limit_exceeded` warn by default (#219).
+    assert transfer_row(rig.db, transfer_id)["state"] == "awaiting_confirmation"
     assert rig.metric("dlp_inspection_results_total", state="partial", reason="limit_exceeded") == 1
 
 
@@ -564,3 +573,178 @@ def test_the_worker_waits_out_a_long_poll() -> None:
     )
     queues = scan_queues(settings)
     assert queues._client.meta.config.read_timeout > LONG_POLL_SECONDS
+
+
+# ---- received files (#213) ----
+
+
+def seed_request(rig: Rig) -> uuid.UUID:
+    request_id = uuid7()
+    rig.db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, expires_at, delivery_state) VALUES (:id, :tenant, :owner, "
+        "'open', 'up@example.test', 'up@example.test', 'en', now() + interval '7 days', 'sent')",
+        id=request_id,
+        tenant=rig.tenant_id,
+        owner=rig.owner,
+    )
+    return request_id
+
+
+def received_scanning(rig: Rig, request_id: uuid.UUID, data: bytes) -> uuid.UUID:
+    """A received file reaching `scanning`, as `completeSessionUpload` leaves it."""
+    file_id = uuid7()
+    rig.db.sql(
+        "INSERT INTO files (id, tenant_id, upload_request_id, display_name_ct, content_type, "
+        "declared_size, actual_size, storage_class, storage_key, s3_upload_id, s3_version_id, "
+        "part_size, part_count, state, scan_deadline, retention_until, delete_after) VALUES "
+        "(:id, :tenant, :request, '\\x0061', 'text/plain', :size, :size, 'standard', "
+        "'tenants/' || :tenant || '/files/' || :id, 'upload-' || :id, 'v1', 5242880, 1, "
+        "'scanning', now() + interval '2 hours', now() + interval '30 days', "
+        "now() + interval '30 days')",
+        id=file_id,
+        tenant=rig.tenant_id,
+        request=request_id,
+        size=len(data),
+    )
+    rig.objects.put(rig.key(file_id), "v1", data)
+    return file_id
+
+
+def notice_row(rig: Rig, request_id: uuid.UUID) -> tuple[object, ...]:
+    [row] = rig.db.sql(
+        "SELECT arrived_since_notice, blocked_since_notice, notice_due_at IS NOT NULL "
+        "FROM upload_requests WHERE id = :id",
+        id=request_id,
+    )
+    return row
+
+
+async def test_received_files_are_scanned_and_counted_towards_one_delayed_notice(
+    rig: Rig,
+) -> None:
+    request_id = seed_request(rig)
+    clean = received_scanning(rig, request_id, DATA)
+    infected = received_scanning(rig, request_id, b"zip:" + eicar() + DATA)
+    for file_id in (clean, infected):
+        assert await rig.consumer.process(rig.delivery(file_id)) is Outcome.PROCESSED
+    assert rig.file(clean)["state"] == "clean"
+    assert rig.file(infected)["state"] == "infected"
+    assert rig.objects.tags[(rig.key(clean), "v1")]["scan"] == "clean"
+    assert rig.objects.tags[(rig.key(infected), "v1")]["scan"] == "infected"
+    # One notice for both, delayed by the window, deduped on the request (architecture 4.3).
+    assert notice_row(rig, request_id) == (1, 1, True)
+    assert rig.db.sql(
+        "SELECT delay_seconds FROM outbox WHERE topic = 'upload_request.files_settled' "
+        "AND payload->>'upload_request_id' = :id",
+        id=str(request_id),
+    ) == [(300,)]
+    # No transfer to evaluate; the result names the request.
+    [(details,)] = rig.db.sql(
+        "SELECT details FROM audit_events WHERE target_id = :id AND action = 'file.scanned'",
+        id=clean,
+    )
+    assert details["upload_request_id"] == str(request_id)
+    assert "transfer_id" not in details
+    # A second delivery of a message changes nothing more.
+    assert await rig.consumer.process(rig.delivery(clean)) is Outcome.PROCESSED
+    assert notice_row(rig, request_id) == (1, 1, True)
+
+
+async def test_an_overdue_received_scan_fails_and_counts_as_blocked(
+    rig: Rig, migrated_db: ScratchDatabase
+) -> None:
+    from sft.data.roles import JOBS
+    from sft.workers.scan_sweep import sweep
+
+    request_id = seed_request(rig)
+    file_id = received_scanning(rig, request_id, DATA)
+    rig.db.sql(
+        "UPDATE files SET scan_deadline = now() - interval '1 minute' WHERE id = :id", id=file_id
+    )
+    database = Database.connect(migrated_db.url(JOBS), pool_size=1)
+    try:
+        assert await sweep(database, ScanMetrics.create(CollectorRegistry())) >= 1
+    finally:
+        await database.dispose()
+    assert rig.file(file_id)["state"] == "scan_failed"
+    assert notice_row(rig, request_id) == (0, 1, True)
+
+
+# ---- the tenant's own detectors (#218; FR-38, ADR-0022, architecture 4.6) ----
+
+
+async def test_a_japanese_keyword_list_matches_its_forms_and_the_file_records_the_policy(
+    rig: Rig,
+) -> None:
+    # The keyword list is saved first, through the API, then a file is inspected: its detectors
+    # travel with it, and the file records the policy version that ran (FR-38, NFR-25).
+    admin = seed_user(rig.db, rig.tenant_id, role="admin")
+    seed_dlp_policy(rig.db, rig.tenant_id, admin)
+    caller = session_caller(rig.tenant_id, admin, Role.ADMIN)
+    async with client(rig.db, lambda: caller) as http:
+        created = await http.post(
+            "/v1/dlp/detectors",
+            json={
+                "name": "社内プロジェクト",
+                "kind": "keywords",
+                "keywords": ["機密プロジェクト", "ORION計画", "顧客台帳"],
+            },
+        )
+        assert created.status_code == 201, created.text
+    detector = created.json()["id"]
+    transfer_id, _ = seed_transfer(rig.db, rig.tenant_id, rig.owner, state="submitted")
+    # Half-width katakana, full-width Latin letters, and a line break between CJK characters in
+    # a paragraph, as a PDF text layer or a Word line break has them (detectors 3).
+    document = docx(
+        ["機密ﾌﾟﾛｼﾞｪｸﾄ の資料。", "ＯＲＩＯＮ計画 について。", "顧客\n台帳 を添付します。"]
+    )
+    file_id = rig.scanning_file(transfer_id, document)
+    rig.inspector.mode = "detect"
+    assert await rig.consumer.process(rig.delivery(file_id)) is Outcome.PROCESSED
+    [request] = rig.inspector.requests
+    [spec] = request.tenant_detectors
+    assert f"custom:{spec.id}" == detector
+    assert spec.kind == "keywords"
+    found = {row[0]: row[1:4] for row in rig.findings(file_id)}
+    assert found[detector] == (0, 0, 3)  # each of the three terms, in its other form
+    [(state, policy_version)] = rig.db.sql(
+        "SELECT inspection_state, inspection_policy_version FROM files WHERE id = :id",
+        id=file_id,
+    )
+    assert (state, policy_version) == ("inspected", 2)
+    # The sender sees the keyword list by its admins' name, never its terms (#218).
+    owner = session_caller(rig.tenant_id, rig.owner, Role.MEMBER)
+    async with client(rig.db, lambda: owner) as http:
+        inspection = (await http.get(f"/v1/files/{file_id}/inspection")).json()
+    [mine] = [f for f in inspection["findings"] if f["detector"] == detector]
+    assert mine["detector_name"] == "社内プロジェクト"
+    assert "ORION" not in json.dumps(inspection, ensure_ascii=False)
+
+
+async def test_a_disabled_or_deleted_detector_doesnt_travel_and_no_policy_records_none(
+    rig: Rig,
+) -> None:
+    # A tenant without a policy (made before revision 0024's data migration): its second file
+    # still scanning, so no DLP decision is due yet, which such a tenant couldn't make (#219).
+    rig.db.sql("DELETE FROM dlp_rules WHERE tenant_id = :t", t=rig.tenant_id)
+    rig.db.sql("DELETE FROM dlp_policies WHERE tenant_id = :t", t=rig.tenant_id)
+    transfer_id, _ = seed_transfer(rig.db, rig.tenant_id, rig.owner, state="submitted")
+    first = rig.scanning_file(transfer_id)
+    second = rig.scanning_file(transfer_id)
+    assert await rig.consumer.process(rig.delivery(first)) is Outcome.PROCESSED
+    assert rig.inspector.requests[-1].tenant_detectors == []
+    assert rig.db.sql("SELECT inspection_policy_version FROM files WHERE id = :id", id=first) == [
+        (None,)
+    ]  # a tenant without a policy (made before revision 0024's data migration)
+    admin = seed_user(rig.db, rig.tenant_id, role="admin")
+    seed_dlp_policy(rig.db, rig.tenant_id, admin)
+    caller = session_caller(rig.tenant_id, admin, Role.ADMIN)
+    async with client(rig.db, lambda: caller) as http:
+        body = {"name": "Off", "kind": "keywords", "keywords": ["quarterly"], "enabled": False}
+        assert (await http.post("/v1/dlp/detectors", json=body)).status_code == 201
+    assert await rig.consumer.process(rig.delivery(second)) is Outcome.PROCESSED
+    assert rig.inspector.requests[-1].tenant_detectors == []
+    assert rig.db.sql("SELECT inspection_policy_version FROM files WHERE id = :id", id=second) == [
+        (2,)
+    ]

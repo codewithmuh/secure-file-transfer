@@ -44,9 +44,9 @@ type Phase = 'form' | 'uploading' | 'sending' | 'failed';
 const LOCALES: readonly Locale[] = ['en', 'ja'];
 
 /**
- * Create, upload and send a transfer (#196; FR-1 to FR-5). The member fills in the recipients (each with the language
- * of their emails and pages), the expiry within the tenant's `max_expiry`, an optional download limit and message,
- * and picks files. "Send" then creates the draft (`createTransfer`), adds each file (`addTransferFile`), uploads its
+ * Create, upload and send a transfer (#196; FR-1 to FR-5, FR-8). The member fills in the recipients (each with the
+ * language of their emails and pages), the expiry within the tenant's `max_expiry`, an optional download limit and
+ * message, whether to be emailed on the first download (#214), and picks files. "Send" then creates the draft (`createTransfer`), adds each file (`addTransferFile`), uploads its
  * parts (`FileUpload`) and sends it (`sendTransfer`) once every file is complete, then opens the transfer. Each create
  * call has an `Idempotency-Key` kept for its attempt, so "Try again" after a lost answer replays it. If the page is
  * reloaded mid-upload, the draft's detail page picks the upload up again.
@@ -72,6 +72,7 @@ export function CreateTransferPage() {
   const [message, setMessage] = useState('');
   const [expiresIn, setExpiresIn] = useState<string | null>(null);
   const [downloadLimit, setDownloadLimit] = useState('');
+  const [notifyFirstDownload, setNotifyFirstDownload] = useState(false);
   const [phase, setPhase] = useState<Phase>('form');
   const [transferId, setTransferId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -176,6 +177,7 @@ export function CreateTransferPage() {
           recipients: recipients.map(({ email, locale: recipientLocale }) => ({ email, locale: recipientLocale })),
           expires_in: expiry,
           download_limit: limit,
+          notify_on_first_download: notifyFirstDownload,
           ...(message.trim() ? { message } : {}),
         };
         // An unchanged retry replays its key; an edited form is a new attempt with a new key.
@@ -450,6 +452,25 @@ export function CreateTransferPage() {
                 error={limit === undefined ? t('sender.downloadLimitInvalid') : fieldError('download_limit')}
                 helperText={t('sender.downloadLimitHint')}
               />
+              {/* FR-8 (#214): one email to the member on the transfer's first download. */}
+              <div className="flex items-start gap-3">
+                <input
+                  id="notify-first-download"
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 rounded border-gray-400 text-brand-600 focus:ring-brand-500"
+                  checked={notifyFirstDownload}
+                  onChange={(event) => setNotifyFirstDownload(event.target.checked)}
+                  aria-describedby="notify-first-download-hint"
+                />
+                <div>
+                  <label htmlFor="notify-first-download" className="text-sm font-medium text-gray-700">
+                    {t('sender.notifyFirstDownload')}
+                  </label>
+                  <p id="notify-first-download-hint" className="text-sm text-gray-500">
+                    {t('sender.notifyFirstDownloadHint')}
+                  </p>
+                </div>
+              </div>
             </fieldset>
           </Card>
 

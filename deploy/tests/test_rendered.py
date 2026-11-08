@@ -641,6 +641,11 @@ def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_
             "EMAIL_HMAC_KEYRING": f"{ref}/email-hmac",
             "CODE_HMAC_KEYRING": f"{ref}/code-hmac",
         }  # never K_link: only the notification worker derives links (data model 2.2)
+        # The environment of the API keys it makes and takes (#215, authn-authz 5.1).
+        assert (
+            api["API_KEY_ENVIRONMENT"]
+            == {"dev": "dev", "staging": "stg", "prod": "prd"}[env]
+        )
         assert {k: v for k, v in notifier.items() if k.endswith("_KEYRING")} == {
             "EMAIL_HMAC_KEYRING": f"{ref}/email-hmac",
             "LINK_HMAC_KEYRING": f"{ref}/link-hmac",

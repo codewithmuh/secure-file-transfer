@@ -59,6 +59,8 @@ class EmailType(enum.StrEnum):
     DLP_APPROVAL_EXPIRED = "dlp_approval_expired"
     DLP_NO_ELIGIBLE_APPROVER = "dlp_no_eligible_approver"
     DLP_POLICY_CHANGED = "dlp_policy_changed"
+    API_KEY_EXPIRING = "api_key_expiring"
+    API_KEY_FIRST_EXPORT = "api_key_first_export"
 
 
 class PolicyChange(enum.StrEnum):
@@ -108,6 +110,9 @@ class Links:
 
     def dlp_policy(self) -> str:
         return f"{self.origin}/admin/dlp"
+
+    def api_keys(self) -> str:
+        return f"{self.origin}/admin/api-keys"
 
 
 # ---- formatting ----
@@ -503,6 +508,47 @@ class DlpPolicyChanged(Email):
         }
 
 
+# API keys (#215, #216; authn-authz 5.2, 5.3): to the tenant's own people. A key is named by its
+# prefix only, never its name (an admin's free text) or any of its secret.
+
+_KEY_PREFIX = re.compile(r"sft_(dev|stg|prd)_[0-9A-Za-z]{8}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ApiKeyExpiring(Email):
+    """To the key's owner and every tenant admin, 14 and 3 days before the key expires."""
+
+    TYPE = EmailType.API_KEY_EXPIRING
+    key_prefix: str
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check("key_prefix", bool(_KEY_PREFIX.fullmatch(self.key_prefix)))
+
+    def _context(self, links: Links, locale: Locale) -> dict[str, object]:
+        return {
+            "key_prefix": self.key_prefix,
+            "expires_at": format_time(self.expires_at, locale),
+            "api_keys_url": links.api_keys(),
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class ApiKeyFirstExport(Email):
+    """To every tenant admin, the first time a key exports the audit log (authn-authz 5.3)."""
+
+    TYPE = EmailType.API_KEY_FIRST_EXPORT
+    key_prefix: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check("key_prefix", bool(_KEY_PREFIX.fullmatch(self.key_prefix)))
+
+    def _context(self, links: Links, locale: Locale) -> dict[str, object]:
+        return {"key_prefix": self.key_prefix, "api_keys_url": links.api_keys()}
+
+
 EMAILS: dict[EmailType, type[Email]] = {
     cls.TYPE: cls
     for cls in (
@@ -526,6 +572,8 @@ EMAILS: dict[EmailType, type[Email]] = {
         DlpApprovalExpired,
         DlpNoEligibleApprover,
         DlpPolicyChanged,
+        ApiKeyExpiring,
+        ApiKeyFirstExport,
     )
 }
 """Every email type and its class; a test checks it covers `EmailType`."""

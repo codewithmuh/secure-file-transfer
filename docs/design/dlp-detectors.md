@@ -223,6 +223,14 @@ happened; both arrive with those issues. The inspector's CPU and time limits (AD
 past them the file is `partial` with `limit_exceeded`. `testDlpDetectors` lets an admin try a detector on sample
 text before saving it (FR-56).
 
+**As built (#218).** Keyword lists only: `createDlpDetector` refuses `kind: pattern` with `422 validation_failed` until
+#221. A list is checked when it is saved, with `sft.dlp.detect.validate` and then compiled with the tenant's other live,
+enabled lists as the inspector compiles them (`TenantDetectors`), so a list or a set the inspector would refuse is
+refused at save time, with a pointer to the term. Its terms are stored as given and sealed with M2's stand-in until
+DLP-8. A change writes the detector's next revision, and a deletion retires it, refused with `409 detector_in_use`
+while a live rule names it. Findings name it `custom:<id>` and show its name; built-in detectors are listed with
+names and descriptions in English and Japanese (`listDlpDetectors`).
+
 ## 6. The default policy
 
 Every new tenant starts in enforce mode with this policy (FR-40). Every rule warns or records: nothing is held for
@@ -242,6 +250,25 @@ the rule does.
 
 A typical tightening, once approvers exist: My Numbers to any untrusted recipient need approval; credentials and
 private keys to untrusted recipients are blocked; personal data in bulk needs approval above 500.
+
+**As built (#218).** The policy is written by the database function `dlp_default_policy` (revision 0024): for every
+existing tenant by the migration, for a new tenant by `createTenant` in its transaction, at version 1, in enforce mode,
+with a 72-hour approval timeout and no trusted domains. Each rule is for sent files, threshold 1 unless the table says
+otherwise, at `medium` confidence unless it says `high`, and is named in the tenant's default language:
+
+| Rule (English) | Japanese |
+|---|---|
+| Credentials and private keys | 認証情報と秘密鍵 |
+| My Numbers | マイナンバー |
+| Payment cards | クレジットカード番号 |
+| Personal data in bulk | 大量の個人情報 |
+| Files that couldn't be fully inspected | 完全には検査できなかったファイル |
+| Images and files without text | 画像とテキストのないファイル |
+| Corporate Numbers and confidentiality labels | 法人番号と機密表示 |
+| New recipient domain | 新しい宛先ドメイン |
+
+The decision of #219 applies these rules to every transfer once its files are shareable, with the `new_domain`
+condition (FR-46): a recipient domain the tenant hasn't sent to in 365 days (`dlp_known_domains`).
 
 ## 7. Masking and location hints
 

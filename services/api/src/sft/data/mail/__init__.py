@@ -89,6 +89,11 @@ class Mailer(Protocol):
 
     def send(self, email: OutgoingEmail) -> str: ...
 
+    def release(self, tenant_id: UUID, address: str) -> None:
+        """Remove `address` from the tenant's suppression list at the provider, if it is there
+        (#217, abuse 7.4). Never logs or raises the address."""
+        ...
+
 
 def mailer_from_settings(settings: MailSettings) -> Mailer:
     """The adapter that `MAIL_BACKEND` names."""

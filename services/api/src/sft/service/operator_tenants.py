@@ -39,7 +39,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from sft.core.errors import Conflict, NotFound, ServiceUnavailable
 from sft.core.ids import uuid7
-from sft.data import audit, member_sessions, tenants
+from sft.data import audit, dlp_policy, member_sessions, tenants
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, Tenant, User
@@ -129,7 +129,8 @@ async def create_tenant(
     *,
     limiter: RateLimiter,
 ) -> CreatedTenant:
-    """`createTenant`: the tenant, its policy and its first admin's invitation, in one commit.
+    """`createTenant`: the tenant, its policy, its first admin's invitation and its default DLP
+    policy, in one commit.
 
     The invitation writes its own audit event and its email's outbox message (`MEMBER_INVITED`).
     The operator's limit (abuse and rate limits 2.2, J: 30 new tenants an hour) counts only a
@@ -166,6 +167,11 @@ async def create_tenant(
             )
         except UserExistsError:  # pragma: no cover - the tenant was made in this transaction
             raise Conflict("user_exists") from None
+        # The default DLP policy of detectors 6 at version 1, its rules made by the first admin
+        # and named in the tenant's language (#218). The tenant's event above covers it.
+        await dlp_policy.insert_default_policy(
+            session, created_by=first_admin.id, locale=new.default_locale
+        )
         await limiter.check(CREATE_TENANT, operator.rate_limit_keys())
     recorded = await _platform_event(
         database, operator, "tenant.created", origin, tenant_id, retry_safe=False

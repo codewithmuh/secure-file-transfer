@@ -23,6 +23,7 @@ import {
   type MenuItem,
 } from '@/components/ui';
 import type { User } from '@/api';
+import { adminKeys, useAllApiKeys } from '@/hooks/admin';
 import { queryKeys } from '@/hooks/transfers';
 import {
   deactivateUser,
@@ -39,6 +40,7 @@ import { IdempotencyKeys, mayHaveHappened } from '@/lib/idempotency';
 import { errorMessage, failureOf, fieldErrors, isAccessProblem, problemCode } from '@/lib/problems';
 import { isPlainAddress } from '@/features/sender/limits';
 import { AdminAccessNote } from './AdminAccessNote';
+import { activeKeysOf } from './apiKeys';
 import { userActions } from './userActions';
 
 const statusVariant: Record<UserStatus, 'success' | 'default' | 'info'> = {
@@ -58,7 +60,8 @@ type Pending =
 /**
  * The tenant's members and admins (#197; FR-22): the list with role and status filters, invitations, role and DLP
  * approver changes, a forced sign-out, a sign-in reset and deactivation, each from the row's action menu. A change that
- * ends the user's sessions asks first. `sso_fallback` is shown read-only: SSO arrives with M6.
+ * ends the user's sessions asks first. `sso_fallback` is shown read-only: SSO arrives with M6. A DLP approver change is
+ * emailed to every admin (#220), and the page says so.
  */
 export function UserManagementPage() {
   const { t, i18n } = useTranslation();
@@ -146,6 +149,8 @@ export function UserManagementPage() {
           />
         </div>
       </div>
+
+      <p className="text-sm text-gray-600">{t('admin.approverNote')}</p>
 
       {error !== null && (isAccessProblem(error) ? <AdminAccessNote error={error} /> : <Alert>{errorMessage(error, t)}</Alert>)}
 
@@ -313,10 +318,19 @@ function InviteDialog({ open, onClose, onInvited }: { open: boolean; onClose: ()
   );
 }
 
+/** Deactivating or demoting an admin revokes the API keys they own (authn-authz 5.2), so the dialog lists them first. */
+function revokesKeys(pending: Pending | null): boolean {
+  if (!pending || pending.user.role !== 'admin') return false;
+  return pending.kind === 'deactivate' || (pending.kind === 'role' && pending.role === 'member');
+}
+
 function ConfirmDialog({ pending, onClose, onDone }: { pending: Pending | null; onClose: () => void; onDone: () => void }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  const listsKeys = revokesKeys(pending);
+  const keys = useAllApiKeys(listsKeys);
   if (!pending) return null;
   const { user } = pending;
 
@@ -334,6 +348,7 @@ function ConfirmDialog({ pending, onClose, onDone }: { pending: Pending | null; 
       else if (pending.kind === 'signOut') await signOutUser(user.id);
       else await resetUserSignIn(user.id); // reset, or resend: the same operation (#197)
       toast('success', t(`admin.confirm.${pending.kind}.done`, { email: user.email }));
+      if (listsKeys) void queryClient.invalidateQueries({ queryKey: adminKeys.apiKeys });
       onDone();
       close();
     } catch (failure) {
@@ -353,7 +368,7 @@ function ConfirmDialog({ pending, onClose, onDone }: { pending: Pending | null; 
   return (
     <Dialog open onClose={close} title={title}>
       <p className="text-sm text-gray-700">{body}</p>
-      {pending.kind === 'deactivate' && user.role === 'admin' && <p className="mt-3 text-sm text-gray-600">{t('admin.confirm.deactivate.noKeys')}</p>}
+      {listsKeys && <OwnedKeys userId={user.id} keys={keys} />}
       {error !== null && (
         <div className="mt-4">
           {isAccessProblem(error) ? (
@@ -372,5 +387,38 @@ function ConfirmDialog({ pending, onClose, onDone }: { pending: Pending | null; 
         </Button>
       </div>
     </Dialog>
+  );
+}
+
+/** The API keys a user owns that still work, which the change revokes (authn-authz 5.2). */
+function OwnedKeys({ userId, keys }: { userId: string; keys: ReturnType<typeof useAllApiKeys> }) {
+  const { t, i18n } = useTranslation();
+  if (keys.isPending) {
+    return (
+      <p className="mt-3 text-sm text-gray-600" role="status">
+        {t('apiKeys.ownedLoading')}
+      </p>
+    );
+  }
+  // An admin acting as a member (no passkey) can't list keys: the confirmation still works, and says so.
+  if (keys.isError) return <p className="mt-3 text-sm text-gray-600">{t('apiKeys.ownedUnknown')}</p>;
+  const owned = activeKeysOf(keys.data, userId);
+  if (owned.length === 0) return <p className="mt-3 text-sm text-gray-600">{t('admin.confirm.deactivate.noKeys')}</p>;
+  return (
+    <div className="mt-3 space-y-2">
+      <p className="text-sm font-medium text-gray-800">{t('apiKeys.ownedRevoked', { count: owned.length })}</p>
+      <ul className="list-disc space-y-1 pl-5 text-sm text-gray-700">
+        {owned.map((key) => (
+          <li key={key.id}>
+            {key.name} (<code className="text-xs">{key.key_prefix}…</code>,{' '}
+            {key.last_used_at
+              ? t('apiKeys.lastUsedOn', { date: formatDate(key.last_used_at, i18n.language) })
+              : t('apiKeys.neverUsed')}
+            )
+          </li>
+        ))}
+      </ul>
+      <p className="text-sm text-gray-600">{t('apiKeys.ownedMove')}</p>
+    </div>
   );
 }

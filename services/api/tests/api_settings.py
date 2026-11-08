@@ -38,6 +38,7 @@ API_ENV: dict[str, str] = {
     "S3_FILES_KMS_KEY_ID": "alias/sft-test-files",
     "AUDIT_ARCHIVE_TOKYO_BUCKET": "sft-test-audit-archive",
     "CODE_HMAC_KEYRING": CODE_HMAC_KEYRING,
+    "API_KEY_ENVIRONMENT": "dev",
 }
 """As environment variables, for tests that read the environment."""
 

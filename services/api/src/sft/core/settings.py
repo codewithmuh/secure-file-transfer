@@ -417,6 +417,20 @@ class Settings(ServerSettings, ClockSettings):
         "sign part URLs; every other S3 call keeps S3_ENDPOINT_URL. Needs S3_ENDPOINT_URL. In AWS "
         "neither is set and S3 signs its own host.",
     )
+    # Tenant API keys (#215, authn and authz 5.1): the environment in every key this API makes
+    # and takes. Required everywhere but the test suite, so a deploy can't make keys of the wrong
+    # environment; the local stack uses `dev` (a local key's hash exists only in its database).
+    api_key_environment: Literal["dev", "stg", "prd"] | None = Field(
+        default=None,
+        description="dev, stg or prd: the `sft_<env>_` of API keys. Required unless "
+        "ENVIRONMENT=test.",
+    )
+
+    @model_validator(mode="after")
+    def _api_keys_need_their_environment(self) -> Self:
+        if self.api_key_environment is None and self.environment != "test":
+            raise ValueError("api_key_environment (API_KEY_ENVIRONMENT) is required: dev, stg, prd")
+        return self
 
     @model_validator(mode="after")
     def _presign_endpoint_needs_the_stand_in(self) -> Self:

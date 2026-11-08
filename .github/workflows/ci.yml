@@ -372,6 +372,7 @@ jobs:
             --env S3_FILES_BUCKET=sft-ci-files --env S3_LARGE_FILES_BUCKET=sft-ci-large-files \
             --env S3_FILES_KMS_KEY_ID=00000000-0000-4000-8000-000000000001 \
             --env AUDIT_ARCHIVE_TOKYO_BUCKET=sft-ci-audit-archive \
+            --env API_KEY_ENVIRONMENT=dev \
             --env 'CODE_HMAC_KEYRING=[{"id":"ci","state":"active","key":"enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno="}]' \
             --publish "127.0.0.1:9000:${PORT}" --publish "127.0.0.1:9001:${INTERNAL_PORT}" "$IMAGE"
           for _ in $(seq 1 30); do

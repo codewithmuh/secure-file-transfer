@@ -12,20 +12,34 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
 
 - **Expiry** (`expire_transfers`): a `submitted`, `awaiting_confirmation`, `pending_approval`,
   `held` or `sent` transfer past `expires_at` becomes `expired`, with `ended_at`, `delete_after`
-  on every file and `transfer.expired` (FR-21). The API already answers its link `410
+  on every file and `transfer.expired` (FR-21); its pending approval request, if any, expires
+  with it (`dlp_approval.expired`, #220). The API already answers its link `410
   link_expired` from `expires_at` (architecture 4.2).
+- **Upload requests** (`expire_upload_requests`, #212): an `open` request past `expires_at`
+  becomes `expired`, with `ended_at`, every link session of its uploader ending in the same
+  transaction, its uploads still open rejected (#213, NFR-6), and `upload_request.expired` (data
+  model 3.3). The API already answers its link `410 link_expired` from `expires_at`. Received files
+  keep their own retention (FR-13): the request's expiry never shortens it.
+- **Approval requests** (`expire_approval_requests`, #220; data model 3.6): a pending request
+  past `expires_at` becomes `expired`, under its transfer's row lock, with `dlp_approval.expired`;
+  unless the transfer has expired itself, the transfer goes back to `awaiting_confirmation` and
+  its sender gets `dlp_approval_expired`, and may ask again, up to 3 requests in all.
 - **Drafts** (`cancel_stale_drafts`): a draft with no activity for 7 days is cancelled, its files
   due for deletion and an open upload rejected (data model 2.2).
 - **Deletion** (`delete_due_files`): a file past `delete_after`, not `completing` or `scanning`
   and not deleted yet. With no transaction open: abort every multipart upload still under its key,
   in every region, then delete every object version and delete marker of its key in the bucket
   pair its `storage_class` names, in every region, and list again to confirm. Then, in one
-  transaction, the file becomes `deleted` with `deleted_at` and `file.deleted`, and the storage
-  reservation is released unless a rejection or removal released it already (data model 2.5).
-  Infected and rejected files are deleted the same way.
+  transaction, the file becomes `deleted` with `deleted_at` and `file.deleted`, its findings'
+  location hints and previews (`detail_ct`) are cleared, and the storage reservation is released
+  unless a rejection or removal released it already (data model 2.5, 6). Infected and rejected
+  files are deleted the same way, and so are received files (#213), at the `delete_after` their
+  retention set, or that the member's early delete moved forward (FR-13): `file.deleted` says
+  which (`trigger`).
 - **Reconciliation** (`reconcile`), every few minutes: an upload with no new part for 24 hours is
   rejected (its upload left to deletion); a file `completing` for 15 minutes runs completion's
-  phases 2 and 3 again, so it is finished or rejected; the scan sweep (#175,
+  phases 2 and 3 again, so it is finished or rejected, under its transfer's or, for a received
+  file, its upload request's row lock (#213); the scan sweep (#175,
   `sft.workers.scan_sweep`); and a grant whose
   `archived_at` is still empty a minute after creation gets its committed record written again,
   then `archived_at`.
@@ -37,9 +51,14 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
   The report (NFR-8) counts what it removed, and files still not deleted 7 days after their
   trigger.
 - **Cleanup** (`clean_up`), daily: expired verification codes, link sessions (their grants go
-  with them) and grants are deleted, each batch with one `retention.rows_deleted` event. A grant
-  whose committed record isn't confirmed, and its session, are never deleted: reconciliation
-  retries the record, and `lifecycle_unarchived_grants` shows how many wait.
+  with them) and grants are deleted, each batch with one `retention.rows_deleted` event; so are
+  retired DLP rule revisions no decision refers to (#219), retired detector revisions that a later
+  revision replaced, or that no live rule and no finding names (#218), and known recipient domains
+  365 days after `last_sent_at` (#219; the event counts rows, never names a domain). It also asks
+  for the API key expiry emails due, 14 and 3 days before a key expires
+  (`sft.service.api_keys.queue_expiry_notices`, #215). A grant whose committed record isn't
+  confirmed, and its session, are never deleted: reconciliation retries the record, and
+  `lifecycle_unarchived_grants` shows how many wait.
 
 Metrics, for NFR-8 and the jobs (`JobMetrics`): items done per job and result, the age of the
 oldest file whose deletion is due and not done (`lifecycle_deletion_lag_seconds`), the files past
@@ -60,24 +79,50 @@ from uuid import UUID
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sft.data import audit, codes, downloads, files, link_sessions, transfers, usage
+from sft.data import (
+    audit,
+    codes,
+    dlp_approvals,
+    dlp_decisions,
+    dlp_policy,
+    downloads,
+    files,
+    findings,
+    link_sessions,
+    transfers,
+    upload_requests,
+    usage,
+)
 from sft.data.access import NotFoundError
 from sft.data.audit import Actor, Target
 from sft.data.database import Database
 from sft.data.files import JobFile
 from sft.data.models import (
     ActorType,
+    ApprovalState,
     FileState,
     StorageClass,
     TransferState,
+    UploadRequestState,
 )
+from sft.data.outbox import DLP_APPROVAL_EXPIRED, enqueue
 from sft.data.scope import Scope
-from sft.service import scan_timing
+from sft.service import api_keys, scan_timing
 from sft.service.audit_archive import AuditArchive
+from sft.service.dlp_decision import KNOWN_FOR
 from sft.service.downloads import committed_record
-from sft.service.evaluation import evaluate
+from sft.service.evaluation import APPROVAL_REQUEST, evaluate
 from sft.service.objects import ObjectStore, ObjectStoreError, StorageCleaner
-from sft.service.uploads import Assembled, Gone, Missing, RejectReason, assemble, to_scanning
+from sft.service.uploads import (
+    Assembled,
+    Gone,
+    Missing,
+    RejectReason,
+    assemble,
+    owner_details,
+    reject_request_uploads,
+    to_scanning,
+)
 
 log = logging.getLogger(__name__)
 
@@ -119,12 +164,30 @@ class Reason(StrEnum):
     DRAFT_ABANDONED = "draft_abandoned"
 
 
+class DeletionTrigger(StrEnum):
+    """What made a received file due for deletion, in its `file.deleted` (#213, FR-13)."""
+
+    RETENTION = "retention"
+    EARLY_DELETE = "early_delete"
+    REJECTED = "rejected"
+
+
+class ExpiryReason(StrEnum):
+    """Why a pending approval request expired, in `dlp_approval.expired` (data model 3.6)."""
+
+    APPROVAL_TIMEOUT = "approval_timeout"
+    TRANSFER_EXPIRED = "transfer_expired"
+
+
 class Table(StrEnum):
     """The tables the daily cleanup deletes from, in `retention.rows_deleted`."""
 
     VERIFICATION_CODES = "verification_codes"
     LINK_SESSIONS = "link_sessions"
     DOWNLOAD_GRANTS = "download_grants"
+    DLP_RULES = "dlp_rules"
+    DLP_DETECTORS = "dlp_detectors"
+    DLP_KNOWN_DOMAINS = "dlp_known_domains"
 
 
 @dataclass(frozen=True)
@@ -228,7 +291,7 @@ async def _reject(
         action="file.rejected",
         actor=SYSTEM,
         target=Target(FILE, file.id),
-        details=_details(actor, transfer_id=file.transfer_id, reason=reason),
+        details=_details(actor, **owner_details(file), reason=reason),
     )
     return True
 
@@ -258,6 +321,8 @@ async def expire_transfers(jobs: Jobs) -> int:
                 ended_at=now,
                 hold_reason=None,
             )
+            if locked.state is TransferState.PENDING_APPROVAL:
+                await _expire_pending_request(session, locked.id, now)
             for file in await files.due_now(session, locked.id, now=now):
                 await _reject(
                     session, file, RejectReason.TRANSFER_NOT_OPEN, SystemActor.EXPIRY_JOB, now
@@ -274,6 +339,133 @@ async def expire_transfers(jobs: Jobs) -> int:
     expired = await _batches(find, act)
     jobs.metrics.count(Job.EXPIRY, "expired", expired)
     jobs.done("transfers_expired", expired)
+    return expired
+
+
+async def expire_upload_requests(jobs: Jobs) -> int:
+    """Upload requests past `expires_at` (module docstring)."""
+    database, now = jobs.database, jobs.now()
+
+    async def find() -> list[upload_requests.Due]:
+        async with database.transaction(Scope.system()) as session:
+            return await upload_requests.due_for_expiry(session, now=now, limit=BATCH)
+
+    async def act(item: upload_requests.Due) -> bool:
+        async with database.transaction(Scope.tenant(item.tenant_id)) as session:
+            locked = await upload_requests.lock_for_expiry(session, item.request_id)
+            if locked.state is not UploadRequestState.OPEN or locked.expires_at > now:
+                return False  # another run, or a revocation, came first
+            await upload_requests.change_state(
+                session,
+                locked.id,
+                from_states=(UploadRequestState.OPEN,),
+                to=UploadRequestState.EXPIRED,
+                ended_at=now,
+            )
+            sessions = await link_sessions.revoke_for_upload_request(session, locked.id)
+            rejected = await reject_request_uploads(
+                session,
+                locked.id,
+                actor=SYSTEM,
+                details=_details(SystemActor.EXPIRY_JOB),
+                now=now,
+            )
+            await audit.record(
+                session,
+                action="upload_request.expired",
+                actor=SYSTEM,
+                target=Target(upload_requests.TARGET, locked.id),
+                details=_details(
+                    SystemActor.EXPIRY_JOB, link_sessions_ended=sessions, uploads_rejected=rejected
+                ),
+            )
+        return True
+
+    expired = await _batches(find, act)
+    jobs.metrics.count(Job.EXPIRY, "upload_requests_expired", expired)
+    jobs.done("upload_requests_expired", expired)
+    return expired
+
+
+async def _expire_pending_request(session: AsyncSession, transfer_id: UUID, now: datetime) -> None:
+    """The pending approval request of a transfer that expires expires with it (data model 3.6);
+    the transfer's own expiry tells the sender nothing more."""
+    request_id = await dlp_approvals.end_pending(
+        session, transfer_id, to=ApprovalState.EXPIRED, ended_at=now
+    )
+    if request_id is not None:
+        await audit.record(
+            session,
+            action="dlp_approval.expired",
+            actor=SYSTEM,
+            target=Target(APPROVAL_REQUEST, request_id),
+            details=_details(
+                SystemActor.EXPIRY_JOB,
+                transfer_id=transfer_id,
+                reason=ExpiryReason.TRANSFER_EXPIRED,
+                returned=False,
+            ),
+        )
+
+
+async def expire_approval_requests(jobs: Jobs) -> int:
+    """Approval requests past `expires_at` (module docstring)."""
+    database, now = jobs.database, jobs.now()
+
+    async def find() -> list[dlp_approvals.Due]:
+        async with database.transaction(Scope.system()) as session:
+            return await dlp_approvals.due_for_expiry(session, now=now, limit=BATCH)
+
+    async def act(item: dlp_approvals.Due) -> bool:
+        async with database.transaction(Scope.tenant(item.tenant_id)) as session:
+            locked = await transfers.lock_for_evaluation(session, item.transfer_id)
+            ended = await dlp_approvals.end_request(
+                session, item.request_id, to=ApprovalState.EXPIRED, ended_at=now, due_by=now
+            )
+            if not ended:
+                return False  # another run, an approver or a withdrawal came first
+            transfer_expired = locked.expires_at is not None and locked.expires_at <= now
+            returned = locked.state is TransferState.PENDING_APPROVAL and not transfer_expired
+            await audit.record(
+                session,
+                action="dlp_approval.expired",
+                actor=SYSTEM,
+                target=Target(APPROVAL_REQUEST, item.request_id),
+                details=_details(
+                    SystemActor.EXPIRY_JOB,
+                    transfer_id=locked.id,
+                    reason=ExpiryReason.APPROVAL_TIMEOUT,
+                    returned=returned,
+                ),
+            )
+            if returned:
+                # Back to the sender, under the same decision: they may ask again (FR-43).
+                await transfers.change_state(
+                    session,
+                    locked.id,
+                    from_states=(TransferState.PENDING_APPROVAL,),
+                    to=TransferState.AWAITING_CONFIRMATION,
+                )
+                await audit.record(
+                    session,
+                    action="transfer.awaiting_confirmation",
+                    actor=SYSTEM,
+                    target=Target(TRANSFER, locked.id),
+                    details=_details(
+                        SystemActor.EXPIRY_JOB,
+                        from_state=locked.state,
+                        decision_id=locked.dlp_decision_id,
+                        approval_request_id=item.request_id,
+                    ),
+                )
+                await enqueue(
+                    session, DLP_APPROVAL_EXPIRED, {"approval_request_id": item.request_id}
+                )
+        return True
+
+    expired = await _batches(find, act)
+    jobs.metrics.count(Job.EXPIRY, "approval_expired", expired)
+    jobs.done("approval_requests_expired", expired)
     return expired
 
 
@@ -379,6 +571,11 @@ async def delete_due_files(jobs: Jobs) -> int:
                 return False  # another run came first, or it is completing or scanning again
             if file.state is not FileState.REJECTED and file.removed_at is None:
                 await usage.release_storage(session, file.declared_size)
+            # Location hints and previews go with the contents; the counts stay (data model 6).
+            await findings.clear_details(session, file.id)
+            trigger: dict[str, audit.Detail] = {}
+            if file.upload_request_id is not None:
+                trigger["trigger"] = _deletion_trigger(file)
             await audit.record(
                 session,
                 action="file.deleted",
@@ -386,10 +583,11 @@ async def delete_due_files(jobs: Jobs) -> int:
                 target=Target(FILE, file.id),
                 details=_details(
                     SystemActor.DELETION_JOB,
-                    transfer_id=file.transfer_id,
+                    **owner_details(file),
                     from_state=file.state,
                     versions_deleted=deleted,
                     uploads_aborted=aborted,
+                    **trigger,
                 ),
             )
         return True
@@ -399,6 +597,14 @@ async def delete_due_files(jobs: Jobs) -> int:
     jobs.done("files_deleted", deleted)
     await measure_lag(jobs)
     return deleted
+
+
+def _deletion_trigger(file: JobFile) -> DeletionTrigger:
+    if file.removed_at is not None:
+        return DeletionTrigger.EARLY_DELETE
+    if file.state is FileState.REJECTED:
+        return DeletionTrigger.REJECTED
+    return DeletionTrigger.RETENTION
 
 
 async def measure_lag(jobs: Jobs) -> None:
@@ -425,20 +631,43 @@ async def reject_abandoned_uploads(jobs: Jobs) -> int:
     async def act(item: files.Due) -> bool:
         async with database.transaction(Scope.tenant(item.tenant_id)) as session:
             file = await files.job_file(session, item.file_id)
-            await transfers.lock_for_evaluation(session, file.transfer_id)
+            await _lock_owner(session, file)
             file = await files.job_file(session, item.file_id)
             if file.state is not FileState.UPLOADING:
                 return False
             rejected = await _reject(
                 session, file, RejectReason.UPLOAD_ABANDONED, SystemActor.RECONCILIATION_JOB, now
             )
-            await _evaluate(session, file.transfer_id, now)
+            if file.transfer_id is not None:
+                await _evaluate(session, file.transfer_id, now)
         return rejected
 
     rejected = await _batches(find, act)
     jobs.metrics.count(Job.RECONCILIATION, "upload_abandoned", rejected)
     jobs.done("uploads_rejected", rejected)
     return rejected
+
+
+async def _lock_owner(session: AsyncSession, file: JobFile) -> None:
+    """The row lock a file's change is made under: its transfer's, or its upload request's."""
+    if file.upload_request_id is not None:
+        await upload_requests.lock_for_expiry(session, file.upload_request_id)
+    elif file.transfer_id is not None:
+        await transfers.lock_for_evaluation(session, file.transfer_id)
+
+
+async def _owner_open(session: AsyncSession, file: JobFile, now: datetime) -> RejectReason | None:
+    """Lock the file's owner; None while it takes the file, else why it doesn't: a transfer no
+    longer a draft, a request revoked or expired (#213)."""
+    if file.upload_request_id is not None:
+        request = await upload_requests.lock_for_expiry(session, file.upload_request_id)
+        if request.state is UploadRequestState.OPEN and request.expires_at > now:
+            return None
+        return RejectReason.REQUEST_NOT_OPEN
+    if file.transfer_id is None:  # pragma: no cover - the owner check holds exactly one
+        return RejectReason.TRANSFER_NOT_OPEN
+    locked = await transfers.lock_for_evaluation(session, file.transfer_id)
+    return None if locked.state is TransferState.DRAFT else RejectReason.TRANSFER_NOT_OPEN
 
 
 async def _evaluate(session: AsyncSession, transfer_id: UUID, now: datetime) -> None:
@@ -475,26 +704,27 @@ async def finish_stuck_completions(jobs: Jobs) -> int:
             log.warning("a stuck completion couldn't reach S3", extra={"code": exc.code})
             return False
         async with database.transaction(Scope.tenant(item.tenant_id)) as session:
-            locked = await transfers.lock_for_evaluation(session, file.transfer_id)
+            closed = await _owner_open(session, file, now)
             file = await files.job_file(session, item.file_id)
             if file.state is not FileState.COMPLETING:
                 return False
             target = Target(FILE, file.id)
             if (
-                locked.state is not TransferState.DRAFT
+                closed is not None
                 or file.removed_at is not None
                 or not isinstance(outcome, Assembled | Missing)
                 or (isinstance(outcome, Assembled) and outcome.size != file.declared_size)
             ):
                 reason = RejectReason.SIZE_MISMATCH
-                if locked.state is not TransferState.DRAFT:
-                    reason = RejectReason.TRANSFER_NOT_OPEN
+                if closed is not None:
+                    reason = closed
                 elif file.removed_at is not None:
                     reason = RejectReason.REMOVED
                 elif isinstance(outcome, Gone):
                     reason = RejectReason.UPLOAD_GONE
                 await _reject(session, file, reason, actor, now)
-                await _evaluate(session, file.transfer_id, now)
+                if file.transfer_id is not None:
+                    await _evaluate(session, file.transfer_id, now)
                 jobs.metrics.count(Job.RECONCILIATION, "completion_rejected")
                 return True
             if isinstance(outcome, Missing):
@@ -504,7 +734,7 @@ async def finish_stuck_completions(jobs: Jobs) -> int:
                     action="file.upload_incomplete",
                     actor=SYSTEM,
                     target=target,
-                    details=_details(actor, transfer_id=file.transfer_id),
+                    details=_details(actor, **owner_details(file)),
                 )
                 jobs.metrics.count(Job.RECONCILIATION, "completion_incomplete")
                 return True
@@ -628,8 +858,23 @@ async def audit_storage(jobs: Jobs) -> dict[str, int]:
 # ---- the daily cleanup ----
 
 
+async def _tenants_with_stale_domains(
+    session: AsyncSession, *, before: datetime, limit: int
+) -> list[UUID]:
+    return await dlp_decisions.tenants_with_stale_domains(
+        session, before=before - KNOWN_FOR, limit=limit
+    )
+
+
+async def _delete_stale_domains(session: AsyncSession, *, before: datetime, limit: int) -> int:
+    """Known recipient domains 365 days after `last_sent_at` (FR-46, data model 6)."""
+    return await dlp_decisions.delete_stale_domains(session, before=before - KNOWN_FOR, limit=limit)
+
+
 async def clean_up(jobs: Jobs) -> dict[str, int]:
-    """Expired codes, link sessions and grants are deleted (data model 6)."""
+    """Expired codes, link sessions and grants are deleted, retired DLP rule and detector
+    revisions nothing needs, and known recipient domains not sent to for 365 days (data model
+    6)."""
     database, now = jobs.database, jobs.now()
     kinds: tuple[
         tuple[
@@ -642,6 +887,17 @@ async def clean_up(jobs: Jobs) -> dict[str, int]:
         (Table.VERIFICATION_CODES, codes.tenants_with_expired, codes.delete_expired),
         (Table.DOWNLOAD_GRANTS, downloads.tenants_with_expired, downloads.delete_expired),
         (Table.LINK_SESSIONS, link_sessions.tenants_with_expired, link_sessions.delete_expired),
+        (
+            Table.DLP_RULES,
+            dlp_policy.tenants_with_retired_rules,
+            dlp_policy.delete_retired_rules,
+        ),
+        (
+            Table.DLP_DETECTORS,
+            dlp_policy.tenants_with_retired_detectors,
+            dlp_policy.delete_retired_detectors,
+        ),
+        (Table.DLP_KNOWN_DOMAINS, _tenants_with_stale_domains, _delete_stale_domains),
     )
     for table, tenants_of, delete in kinds:
         total = 0
@@ -650,6 +906,7 @@ async def clean_up(jobs: Jobs) -> dict[str, int]:
                 tenant_ids = await tenants_of(session, before=now, limit=BATCH)
             if not tenant_ids:
                 break
+            before_pass = total
             for tenant_id in tenant_ids:
                 async with database.transaction(Scope.tenant(tenant_id)) as session:
                     deleted = await delete(session, before=now, limit=BATCH)
@@ -661,8 +918,14 @@ async def clean_up(jobs: Jobs) -> dict[str, int]:
                             details=_details(SystemActor.CLEANUP_JOB, table=table, rows=deleted),
                         )
                 total += deleted
+            if total == before_pass:
+                break  # what the find saw, the tenant's scope keeps: never loop on it
         jobs.metrics.count(Job.CLEANUP, f"{table.value}_deleted", total)
         jobs.done(f"{table.value}_deleted", total)
+    # API keys close to expiry: their 14- and 3-day emails (#215, authn and authz 5.2).
+    notices = await api_keys.queue_expiry_notices(database, now=now)
+    jobs.metrics.count(Job.CLEANUP, "api_key_notices_queued", notices)
+    jobs.done("api_key_notices_queued", notices)
     # Grants waiting for their committed record, and their sessions, stay; the report says how
     # many, so a growing number shows (NFR-15).
     await measure_unarchived(jobs)
@@ -674,6 +937,8 @@ RUNS: Final[dict[Job, Callable[[Jobs], Awaitable[object]]]] = {}
 
 async def _expiry(jobs: Jobs) -> object:
     await expire_transfers(jobs)
+    await expire_upload_requests(jobs)
+    await expire_approval_requests(jobs)
     await cancel_stale_drafts(jobs)
     return jobs.report
 

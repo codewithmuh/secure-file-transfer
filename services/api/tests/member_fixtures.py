@@ -76,12 +76,56 @@ def seed_user(
 def seed_tenant(db: ScratchDatabase) -> Tenant:
     tenant_id = uuid.uuid4()
     db.sql("INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant_id)
-    return Tenant(
+    tenant = Tenant(
         id=tenant_id,
         admin=seed_user(db, tenant_id, role="admin"),
         member=seed_user(db, tenant_id),
         target=seed_user(db, tenant_id),
     )
+    seed_dlp_policy(db, tenant_id, tenant.admin)
+    know_domains(db, tenant_id)
+    return tenant
+
+
+def seed_dlp_policy(
+    db: ScratchDatabase, tenant_id: uuid.UUID, created_by: uuid.UUID, locale: str = "en"
+) -> None:
+    """The default DLP policy, as createTenant writes it (#218, revision 0024)."""
+    db.sql(
+        "SELECT dlp_default_policy(:tenant, :created_by, :locale)",
+        tenant=tenant_id,
+        created_by=created_by,
+        locale=locale,
+    )
+
+
+KNOWN_DOMAINS = ("example.test",)
+"""The domain the tests' recipients are at (`partner@example.test`), which the tenants of tests
+not about DLP have sent to before."""
+
+
+def know_domains(
+    db: ScratchDatabase, tenant_id: uuid.UUID, domains: Sequence[str] = KNOWN_DOMAINS
+) -> None:
+    """The tenant sent to `domains` a day ago (`dlp_known_domains`, #219), so the default
+    policy's new-domain rule (detectors 6) doesn't warn about them. Tests about DLP use other
+    domains, or none of these."""
+    for domain in domains:
+        db.sql(
+            "INSERT INTO dlp_known_domains (tenant_id, domain, first_sent_at, last_sent_at) "
+            "VALUES (:tenant, :domain, now() - interval '1 day', now() - interval '1 day') "
+            "ON CONFLICT DO NOTHING",
+            tenant=tenant_id,
+            domain=domain,
+        )
+
+
+def ready_for_dlp(db: ScratchDatabase, tenant_id: uuid.UUID, created_by: uuid.UUID) -> None:
+    """The default DLP policy every tenant has (#218), and the tests' recipient domain known
+    (#219), for a test tenant made without `seed_tenant`: its transfers are decided as the
+    default policy decides, and a transfer to `example.test` with no finding is sent."""
+    seed_dlp_policy(db, tenant_id, created_by)
+    know_domains(db, tenant_id)
 
 
 def session_caller(
@@ -144,6 +188,7 @@ def app_for(
     app.state.objects = objects or FakeObjects()
     app.state.upload_policy = policy or UploadPolicy()
     app.state.audit_archive = archive or fake_archive()
+    app.state.api_key_environment = "dev"  # the keys the tests make (#215)
     recording = limiter or RecordingLimiter()
 
     def resolve() -> Caller:

@@ -1,15 +1,19 @@
-"""Link sessions: a verified browser's session for one recipient (data model 2.4; authn and authz
-4.3; #179).
+"""Link sessions: a verified browser's session for one recipient or one upload request (data model
+2.4; authn and authz 4.3; #179, #212).
 
 A session token is 256 random bits (`new_token`). The browser holds the tokens of up to 10 link
 sessions in the HttpOnly `__Host-sft_link` cookie; the database holds only each one's SHA-256.
 
 - `lookup` is the credential lookup (data model 4.2): in lookup scope, the sessions of one
-  cookie's tokens, each with its tenant, its recipient and whether it is live, across tenants.
-  Each request then continues in that session's tenant (or resource) scope.
-- Lifetime: 24 hours at most and never past the transfer's expiry (`create`), 1 hour idle.
+  cookie's tokens, each with its tenant, its subject (a recipient or an upload request,
+  `lookup_link_subject_sessions`, revision 0019) and whether it is live, across tenants. Each
+  request then continues in that session's tenant (or resource) scope.
+- Lifetime: 24 hours at most and never past the transfer's or request's expiry (`create`,
+  `create_for`), 1 hour idle. An
+  extension of the transfer's expiry lets open sessions run on to it (`extend_for_transfer`, #214).
   `last_seen_at` moves at most once a minute (`TOUCH_INTERVAL`). Times are the database's.
-- Revocation sets `revoked_at` (`revoke`, `revoke_for_recipient`). The audit trigger requires an
+- Revocation sets `revoked_at` (`revoke`, `revoke_for_transfer`, `revoke_for_upload_request`,
+  which the request's revocation and its expiry run, #212). The audit trigger requires an
   audit event in the same transaction for every creation and revocation; the caller writes it.
 """
 
@@ -29,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sft.core.ids import uuid7
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import DownloadGrant, LinkSession, TransferRecipient
-from sft.data.scope import ScopeKind
+from sft.data.scope import ScopeKind, Subject, SubjectKind
 
 LIFETIME: Final = timedelta(hours=24)
 IDLE_TIMEOUT: Final = timedelta(hours=1)
@@ -54,10 +58,16 @@ class FoundLinkSession:
 
     session_id: UUID
     tenant_id: UUID
-    recipient_id: UUID
+    subject: Subject
+    """The recipient or upload request it was verified for."""
     live: bool
     token: str
     """The cookie's token that found it, which the caller already holds."""
+
+    @property
+    def recipient_id(self) -> UUID | None:
+        """The recipient of a recipient's session; None for an uploader's."""
+        return self.subject.id if self.subject.kind is SubjectKind.RECIPIENT else None
 
 
 async def lookup(session: AsyncSession, tokens: Sequence[str]) -> list[FoundLinkSession]:
@@ -72,14 +82,17 @@ async def lookup(session: AsyncSession, tokens: Sequence[str]) -> list[FoundLink
         row = (
             await session.execute(
                 text(
-                    "SELECT session_id, owner_tenant_id, recipient_id, live "
-                    "FROM lookup_link_sessions(:hashes)"
+                    "SELECT session_id, owner_tenant_id, recipient_id, upload_request_id, live "
+                    "FROM lookup_link_subject_sessions(:hashes)"
                 ),
                 {"hashes": [token_hash(token)]},
             )
         ).first()
         if row is not None:
-            found.append(FoundLinkSession(row[0], row[1], row[2], bool(row[3]), token))
+            subject = (
+                Subject.recipient(row[2]) if row[2] is not None else Subject.upload_request(row[3])
+            )
+            found.append(FoundLinkSession(row[0], row[1], subject, bool(row[4]), token))
     return sorted(found, key=lambda s: s.session_id)
 
 
@@ -88,7 +101,20 @@ async def create(
 ) -> tuple[str, LinkSession]:
     """A new session for the recipient, in the scope's tenant: 24 hours, or until `ends_by` (the
     transfer's expiry) if that is sooner. Its token and its row."""
+    return await create_for(session, Subject.recipient(recipient_id), ends_by=ends_by)
+
+
+async def create_for(
+    session: AsyncSession, subject: Subject, *, ends_by: datetime | None
+) -> tuple[str, LinkSession]:
+    """A new session for the recipient or upload request, in the scope's tenant: 24 hours, or
+    until `ends_by` (the transfer's or request's expiry) if that is sooner. Its token and row."""
     require_scope(session, ScopeKind.TENANT)
+    owner = (
+        {"upload_request_id": subject.id}
+        if subject.kind is SubjectKind.UPLOAD_REQUEST
+        else {"recipient_id": subject.id}
+    )
     token = new_token()
     expires = func.now() + LIFETIME
     if ends_by is not None:
@@ -98,7 +124,7 @@ async def create(
         insert(LinkSession).values(
             id=session_id,
             tenant_id=tenant_of(session),
-            recipient_id=recipient_id,
+            **owner,
             session_hash=token_hash(token),
             expires_at=expires,
         )
@@ -114,7 +140,8 @@ async def create(
 @dataclass(frozen=True, slots=True)
 class LiveLinkSession:
     session_id: UUID
-    recipient_id: UUID
+    recipient_id: UUID | None
+    """None for an uploader's session."""
     expires_at: datetime
 
 
@@ -202,6 +229,55 @@ async def revoke_for_transfer(session: AsyncSession, transfer_id: UUID) -> int:
     return len(result.all())
 
 
+async def revoke_for_upload_request(session: AsyncSession, request_id: UUID) -> int:
+    """End every open session of the request's uploader, in the revocation's or the expiry's
+    transaction (data model 2.4, #212); how many were open. That change's audit event covers
+    them. The expiry job runs it too, as `sft_jobs`, which may read and set only what this names
+    (revision 0019)."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        update(LinkSession)
+        .where(
+            LinkSession.upload_request_id == request_id,
+            LinkSession.revoked_at.is_(None),
+            in_scope(LinkSession, session),
+        )
+        .values(revoked_at=func.now())
+        .returning(LinkSession.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
+async def extend_for_transfer(session: AsyncSession, transfer_id: UUID, ends_by: datetime) -> int:
+    """Let the open sessions of the transfer's recipients run to `ends_by`, the transfer's new
+    expiry, in the extension's transaction (#214): each to 24 hours after it was created or
+    `ends_by`, whichever is sooner, so a session never outlives either. A session that has ended
+    (revoked, past its expiry) stays ended; none is shortened. How many moved; the extension's
+    audit event covers them."""
+    require_scope(session, ScopeKind.TENANT)
+    longest = func.least(LinkSession.created_at + LIFETIME, ends_by)
+    result = await session.execute(
+        update(LinkSession)
+        .where(
+            LinkSession.recipient_id.in_(
+                select(TransferRecipient.id).where(
+                    TransferRecipient.transfer_id == transfer_id,
+                    in_scope(TransferRecipient, session),
+                )
+            ),
+            LinkSession.revoked_at.is_(None),
+            LinkSession.expires_at > func.now(),
+            LinkSession.expires_at < longest,
+            in_scope(LinkSession, session),
+        )
+        .values(expires_at=longest)
+        .returning(LinkSession.id)
+        .execution_options(synchronize_session=False)
+    )
+    return len(result.all())
+
+
 # ---- the daily cleanup (sft_jobs, data model 6) ----
 
 
@@ -267,13 +343,16 @@ __all__ = [
     "FoundLinkSession",
     "LiveLinkSession",
     "create",
+    "create_for",
     "delete_expired",
+    "extend_for_transfer",
     "get_live",
     "live_for_recipient",
     "lookup",
     "new_token",
     "revoke",
     "revoke_for_transfer",
+    "revoke_for_upload_request",
     "tenants_with_expired",
     "token_hash",
 ]

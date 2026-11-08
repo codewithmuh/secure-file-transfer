@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { FileState, TransferState } from '@/api';
-import { shouldPoll, useActiveUploads } from './polling';
+import { APPROVAL_POLL_INTERVAL_MS, POLL_INTERVAL_MS, pollInterval, shouldPoll, useActiveUploads } from './polling';
 
 const transfer = (state: TransferState, files: FileState[]) => ({
   state,
@@ -35,5 +35,22 @@ describe('shouldPoll: the detail page polls only while something moves (#196)', 
     expect(shouldPoll(transfer('draft', ['uploading']), useActiveUploads.getState().ids)).toBe(true);
     useActiveUploads.getState().stop('f0');
     expect(shouldPoll(transfer('draft', ['uploading']), useActiveUploads.getState().ids)).toBe(false);
+  });
+});
+
+describe('pollInterval: DLP states (#219, #220)', () => {
+  it('asks every 15 seconds while an approver decides', () => {
+    expect(pollInterval(transfer('pending_approval', ['clean']))).toBe(APPROVAL_POLL_INTERVAL_MS);
+  });
+
+  it('waits for the sender while a warning or a block is shown', () => {
+    expect(pollInterval(transfer('awaiting_confirmation', ['clean']))).toBe(false);
+    expect(pollInterval(transfer('held', ['clean']))).toBe(false);
+  });
+
+  it('keeps the quick poll while the service moves the transfer', () => {
+    expect(pollInterval(transfer('submitted', ['clean']))).toBe(POLL_INTERVAL_MS);
+    expect(pollInterval(transfer('pending_approval', ['scanning']))).toBe(POLL_INTERVAL_MS);
+    expect(pollInterval(undefined)).toBe(false);
   });
 });

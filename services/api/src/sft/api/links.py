@@ -242,10 +242,15 @@ async def create_link_session(
     openapi_extra=_SESSION_PARAMETER,
 )
 async def get_link_session_route(
-    response: Response, link: LinkDep, database: DatabaseDep, services: ServicesDep
+    request: Request,
+    response: Response,
+    link: LinkDep,
+    database: DatabaseDep,
+    services: ServicesDep,
 ) -> LinkSession:
-    """The verified recipient's transfer, and the session's CSRF token (FR-14, FR-15)."""
-    view = await links.get_session(database, services, link)
+    """The verified recipient's transfer or uploader's request, and the session's CSRF token
+    (FR-14, FR-15)."""
+    view = await links.get_session(database, services, link, now=now_of(request))
     response.headers.update(NO_STORE)
     return LinkSession.of(view)
 

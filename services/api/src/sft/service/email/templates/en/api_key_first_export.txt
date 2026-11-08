@@ -1,0 +1,10 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}An API key exported the audit log of {{ tenant_name }}{% endblock %}
+{% block body %}
+The API key {{ key_prefix }}… exported the audit log of {{ tenant_name }} for the first time. This email goes out once per key.
+
+If you expected it, there is nothing to do. If not, revoke the key now: a revoked key stops working at once.
+
+View the API keys:
+{{ api_keys_url }}
+{% endblock %}

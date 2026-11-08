@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
@@ -12,9 +13,22 @@ from alembic.script import ScriptDirectory
 from pg import ScratchDatabase
 from sft.data.audit_required import require_audit_sql
 from sft.data.database import sync_engine
-from sft.data.migrate import alembic_config, compatible_with, include_name
+from sft.data.migrate import alembic_config, become_owner, compatible_with, include_name
 from sft.data.models import (
+    ApiKeyRevokedReason,
+    ApiKeyScope,
+    ApprovalDecisionKind,
+    ApprovalState,
     Base,
+    DeliveryState,
+    DlpAction,
+    DlpCondition,
+    DlpConfidence,
+    DlpDetectorKind,
+    DlpDirection,
+    DlpMode,
+    DlpOutcome,
+    DlpRecipientScope,
     FileState,
     InspectionReason,
     InspectionState,
@@ -23,6 +37,7 @@ from sft.data.models import (
     ScanEngine,
     SessionRevokedReason,
     TransferState,
+    UploadRequestState,
     UserStatus,
     sql_values,
 )
@@ -35,6 +50,7 @@ from sft.data.rls import (
     tenant_keys_sql,
     tenant_rls_sql,
 )
+from sft.data.roles import MIGRATE
 
 SCRIPTS = ScriptDirectory.from_config(alembic_config())
 
@@ -646,3 +662,537 @@ def test_the_invitation_backlog_revision_keeps_the_sql_the_helpers_wrote_for_it(
     # Read only: the worker writes nothing in the system scope.
     assert "INSERT" not in module.RLS[0]
     assert "UPDATE" not in module.RLS[0]
+
+
+def test_the_upload_requests_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("LOOKUP_LINK_SUBJECT_BODY", "0019")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("upload_requests"),
+        *(
+            tenant_foreign_key_sql("upload_requests", column, "users")
+            for column in ("created_by", "revoked_by", "unlocked_by")
+        ),
+    ]
+    assert [statement for _, _, statement in module.OWNER_KEYS] == [
+        tenant_foreign_key_sql(table, "upload_request_id", "upload_requests", on_delete="CASCADE")
+        for table in ("verification_codes", "link_sessions")
+    ]
+    enable, api, _, _, policy = tenant_rls_sql(
+        "upload_requests",
+        grants={"sft_api": "SELECT, INSERT, UPDATE", "sft_notify": "SELECT", "sft_jobs": "SELECT"},
+    )
+    assert list(module.RLS) == [
+        enable,
+        api,
+        grant_sql("upload_requests", "sft_notify", "SELECT", columns=_columns(module.NOTIFY_READ)),
+        grant_sql("upload_requests", "sft_notify", "UPDATE", columns=_columns(module.NOTIFY_WRITE)),
+        grant_sql("upload_requests", "sft_jobs", "SELECT", columns=_columns(module.JOBS_READ)),
+        grant_sql("upload_requests", "sft_jobs", "UPDATE", columns=_columns(module.JOBS_WRITE)),
+        policy,
+        policy_sql(
+            "jobs_find",
+            "upload_requests",
+            roles=["sft_jobs"],
+            command="SELECT",
+            using="app_scope() = 'system'",
+        ),
+        grant_sql("verification_codes", "sft_notify", "SELECT", columns=["upload_request_id"]),
+        grant_sql("link_sessions", "sft_jobs", "SELECT", columns=["upload_request_id"]),
+        grant_sql("link_sessions", "sft_jobs", "UPDATE", columns=["revoked_at"]),
+    ]
+    # The worker never reads the message; the jobs never read an address or the message.
+    assert "message_ct" not in _columns(module.NOTIFY_READ)
+    assert not {"message_ct", "uploader_email", "email_normalized"} & set(
+        _columns(module.JOBS_READ)
+    )
+    assert list(module.LOOKUPS) == [
+        *lookup_read_sql("upload_requests", ["id", "tenant_id", "link_token_hash"]),
+        lookup_read_sql("link_sessions", ["upload_request_id"])[0],
+        *lookup_function_sql(
+            "lookup_link_subject(p_token_hash bytea)",
+            returns="TABLE (recipient_id uuid, upload_request_id uuid, owner_tenant_id uuid)",
+            body=module.LOOKUP_LINK_SUBJECT_BODY,
+        ),
+        *lookup_function_sql(
+            "lookup_link_subject_sessions(p_session_hashes bytea[])",
+            returns="TABLE (session_id uuid, owner_tenant_id uuid, recipient_id uuid, "
+            "upload_request_id uuid, live boolean)",
+            body=module.LOOKUP_LINK_SUBJECT_SESSIONS_BODY,
+        ),
+    ]
+    # 0013's function, the same but for recipients only, replaced as its owner.
+    old: Any = _module("LOOKUP_LINK_SESSIONS", "0013")
+    [create] = [s for s in module.RECIPIENTS_ONLY if s.startswith("CREATE OR REPLACE")]
+    assert create == lookup_function_sql(
+        "lookup_link_sessions(p_session_hashes bytea[])",
+        returns="TABLE (session_id uuid, owner_tenant_id uuid, recipient_id uuid, live boolean)",
+        body=f"{old.LOOKUP_LINK_SESSIONS_BODY} AND recipient_id IS NOT NULL",
+    )[0].replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION")
+    assert module.RECIPIENTS_ONLY[-1] == "REVOKE CREATE ON SCHEMA public FROM sft_lookup"
+    assert list(module.AUDIT) == [require_audit_sql("upload_requests")]
+
+
+def test_the_upload_request_checks_list_the_states_of_the_code() -> None:
+    module: Any = _module("LOOKUP_LINK_SUBJECT_BODY", "0019")
+    assert f"({module.STATES})" == sql_values(UploadRequestState)
+    assert f"({module.DELIVERY_STATES})" == sql_values(DeliveryState)
+
+
+def test_an_upload_request_owns_codes_and_sessions_with_valid_checks_and_indexes(
+    migrated_db: ScratchDatabase,
+) -> None:
+    rows = migrated_db.sql(
+        "SELECT conname, convalidated FROM pg_constraint WHERE conname IN "
+        "('verification_codes_owner_check', 'link_sessions_owner_check', "
+        "'verification_codes_tenant_id_upload_request_id_fkey', "
+        "'link_sessions_tenant_id_upload_request_id_fkey')"
+    )
+    assert len(rows) == 4
+    assert all(valid is True for _, valid in rows)
+    [(definition,)] = migrated_db.sql(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'upload_requests_expires_at_idx'"
+    )
+    assert "WHERE (state = 'open'::text)" in str(definition)
+    [(unique,)] = migrated_db.sql(
+        "SELECT indexdef FROM pg_indexes WHERE indexname = 'upload_requests_link_token_hash_key'"
+    )
+    assert "CREATE UNIQUE INDEX" in str(unique)
+    # The revision handed CREATE back: only the owner keeps it on public (CVE-2018-1058).
+    [(can_create,)] = migrated_db.sql(
+        "SELECT has_schema_privilege('sft_lookup', 'public', 'CREATE')"
+    )
+    assert can_create is False
+
+
+def test_the_received_files_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("JOBS_FINDING_WRITE", "0020")
+    assert [statement for _, _, statement in module.OWNER_KEYS] == [
+        tenant_foreign_key_sql(
+            "files", "upload_request_id", "upload_requests", on_delete="CASCADE"
+        ),
+        tenant_foreign_key_sql("download_grants", "user_id", "users", on_delete="CASCADE"),
+        tenant_foreign_key_sql(
+            "download_grants", "member_session_id", "member_sessions", on_delete="CASCADE"
+        ),
+    ]
+    isolation = "ALTER POLICY tenant_isolation ON {} TO {}"
+    assert list(module.RLS) == [
+        grant_sql("files", "sft_scan", "SELECT", columns=["upload_request_id"]),
+        grant_sql("upload_requests", "sft_scan", "SELECT", columns=_columns(module.SCAN_READ)),
+        grant_sql("upload_requests", "sft_scan", "UPDATE", columns=_columns(module.SCAN_WRITE)),
+        isolation.format("upload_requests", "sft_api, sft_notify, sft_jobs, sft_scan"),
+        grant_sql("upload_requests", "sft_notify", "SELECT", columns=_columns(module.NOTICE)),
+        grant_sql("upload_requests", "sft_notify", "UPDATE", columns=_columns(module.NOTICE)),
+        grant_sql("upload_requests", "sft_jobs", "SELECT", columns=_columns(module.NOTICE)),
+        grant_sql("upload_requests", "sft_jobs", "UPDATE", columns=_columns(module.NOTICE)),
+        grant_sql("files", "sft_jobs", "SELECT", columns=_columns(module.JOBS_FILE_READ)),
+        grant_sql("files", "sft_jobs", "UPDATE", columns=_columns(module.JOBS_FILE_WRITE)),
+        grant_sql(
+            "tenant_policies", "sft_jobs", "SELECT", columns=_columns(module.JOBS_POLICY_READ)
+        ),
+        isolation.format(
+            "tenant_policies", "sft_operator, sft_api, sft_scan, sft_notify, sft_jobs"
+        ),
+        grant_sql(
+            "download_grants", "sft_jobs", "SELECT", columns=_columns(module.JOBS_GRANT_READ)
+        ),
+        grant_sql("dlp_findings", "sft_jobs", "SELECT", columns=_columns(module.JOBS_FINDING_READ)),
+        grant_sql(
+            "dlp_findings", "sft_jobs", "UPDATE", columns=_columns(module.JOBS_FINDING_WRITE)
+        ),
+        isolation.format("dlp_findings", "sft_api, sft_scan, sft_jobs"),
+    ]
+    # The scan worker and the jobs read no name, message, address or finding detail; the
+    # notification worker reads no message here either.
+    for listed in (module.SCAN_READ, module.JOBS_FILE_READ, module.JOBS_FINDING_READ):
+        assert not {"display_name_ct", "message_ct", "uploader_email", "detail_ct"} & set(
+            _columns(listed)
+        )
+
+
+def test_received_files_have_one_owner_with_valid_checks_keys_and_indexes(
+    migrated_db: ScratchDatabase,
+) -> None:
+    names = (
+        "files_owner_check",
+        "files_retention_until_check",
+        "files_dlp_blocked_check",
+        "files_tenant_id_upload_request_id_fkey",
+        "download_grants_owner_check",
+        "download_grants_tenant_id_user_id_fkey",
+        "download_grants_tenant_id_member_session_id_fkey",
+        "upload_requests_notice_counts_check",
+    )
+    rows = dict(
+        migrated_db.sql(
+            "SELECT conname, convalidated FROM pg_constraint WHERE conname = ANY(:names)",
+            names=list(names),
+        )
+    )
+    assert set(rows) == set(names)
+    assert all(valid is True for valid in rows.values())
+    indexes = {
+        name
+        for (name,) in migrated_db.sql(
+            "SELECT indexname FROM pg_indexes WHERE indexname IN "
+            "('files_tenant_id_upload_request_id_idx', 'download_grants_user_id_idx', "
+            "'download_grants_member_session_id_idx')"
+        )
+    }
+    assert len(indexes) == 3
+    nullable = dict(
+        migrated_db.sql(
+            "SELECT table_name || '.' || column_name, is_nullable FROM information_schema.columns "
+            "WHERE (table_name, column_name) IN (('files', 'transfer_id'), "
+            "('download_grants', 'recipient_id'), ('download_grants', 'link_session_id'))"
+        )
+    )
+    assert set(nullable.values()) == {"YES"}
+
+
+def test_the_api_keys_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("LOOKUP_API_KEY", "0021")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("api_keys"),
+        tenant_foreign_key_sql("api_keys", "created_by", "users"),
+    ]
+    find = "app_scope() = 'system'"
+    assert list(module.RLS) == [
+        *tenant_rls_sql("api_keys", grants={"sft_api": "SELECT, INSERT, UPDATE"}),
+        grant_sql("api_keys", "sft_jobs", "SELECT", columns=_columns(module.JOBS_READ)),
+        grant_sql("api_keys", "sft_jobs", "UPDATE", columns=["expiry_notice"]),
+        policy_sql("jobs_find", "api_keys", roles=["sft_jobs"], command="SELECT", using=find),
+        grant_sql("api_keys", "sft_notify", "SELECT", columns=_columns(module.NOTIFY_READ)),
+        "ALTER POLICY tenant_isolation ON api_keys TO sft_api, sft_jobs, sft_notify",
+    ]
+    assert list(module.LOOKUP_API_KEY) == [
+        *lookup_read_sql("api_keys", ["id", "tenant_id", "key_hash"]),
+        *lookup_function_sql(
+            "lookup_api_key(p_key_hash bytea)",
+            returns="TABLE (api_key_id uuid, owner_tenant_id uuid)",
+            body=module.LOOKUP_API_KEY_BODY,
+        ),
+    ]
+    assert (
+        require_audit_sql("api_keys", commands=("INSERT", "UPDATE"), update_of=("revoked_at",))
+        == module.AUDIT
+    )
+    # The jobs and the notification worker never read a key's hash or its name.
+    for listed in (module.JOBS_READ, module.NOTIFY_READ):
+        assert "key_hash" not in _columns(listed)
+        assert "name" not in _columns(listed)
+
+
+def test_the_api_key_checks_list_the_scopes_and_reasons_of_the_code() -> None:
+    module: Any = _module("LOOKUP_API_KEY", "0021")
+    assert sql_values(ApiKeyScope)[1:-1] == module.SCOPES
+    source = Path(str(SCRIPTS.get_revision("0021").path)).read_text()
+    assert f"revoked_reason IN {sql_values(ApiKeyRevokedReason)}" in source
+
+
+def test_the_domain_rules_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("RLS", "0023")
+    assert list(module.RLS) == [
+        grant_sql("email_suppressions", "sft_api", "UPDATE", columns=["expires_at", "updated_at"])
+    ]
+
+
+def test_the_email_search_finds_recipients_by_an_index(migrated_db: ScratchDatabase) -> None:
+    [(valid,)] = migrated_db.sql(
+        "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "WHERE c.relname = 'transfer_recipients_tenant_id_email_normalized_idx'"
+    )
+    assert valid is True
+
+
+def test_the_dlp_policy_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("DEFAULT_RULES", "0024")
+    assert list(module.KEYS) == [
+        tenant_keys_sql("dlp_policies")[0],
+        tenant_foreign_key_sql("dlp_policies", "updated_by", "users"),
+        tenant_keys_sql("dlp_rules")[0],
+        tenant_foreign_key_sql("dlp_rules", "created_by", "users"),
+        tenant_keys_sql("dlp_detectors")[0],
+        tenant_foreign_key_sql("dlp_detectors", "created_by", "users"),
+    ]
+
+    def jobs_find(table: str) -> str:
+        return policy_sql(
+            "jobs_find", table, roles=["sft_jobs"], command="SELECT", using="app_scope() = 'system'"
+        )
+
+    readers = {"sft_scan": "SELECT"}
+    assert list(module.RLS) == [
+        *tenant_rls_sql(
+            "dlp_policies",
+            grants={
+                "sft_api": "SELECT, INSERT, UPDATE",
+                "sft_operator": "INSERT",
+                **readers,
+                "sft_jobs": "SELECT",
+            },
+        ),
+        grant_sql("dlp_policies", "sft_operator", "SELECT", columns=["tenant_id"]),
+        *tenant_rls_sql(
+            "dlp_rules",
+            grants={
+                "sft_api": "SELECT, INSERT",
+                "sft_operator": "INSERT",
+                **readers,
+                "sft_jobs": "SELECT, DELETE",
+            },
+        ),
+        grant_sql("dlp_rules", "sft_api", "UPDATE", columns=["retired_at"]),
+        jobs_find("dlp_rules"),
+        *tenant_rls_sql(
+            "dlp_detectors",
+            grants={"sft_api": "SELECT, INSERT", **readers, "sft_jobs": "SELECT, DELETE"},
+        ),
+        grant_sql("dlp_detectors", "sft_api", "UPDATE", columns=["retired_at"]),
+        jobs_find("dlp_detectors"),
+        grant_sql("dlp_findings", "sft_jobs", "SELECT", columns=["tenant_id", "detector"]),
+        jobs_find("dlp_findings"),
+        "ALTER POLICY tenant_isolation ON dlp_findings TO sft_api, sft_scan, sft_jobs",
+    ]
+    assert list(module.AUDIT) == [
+        require_audit_sql(table) for table in ("dlp_policies", "dlp_rules", "dlp_detectors")
+    ]
+    # The API changes a revision's `retired_at` only: rules and detectors are never edited.
+    assert "UPDATE ON dlp_rules" not in " ".join(module.RLS)
+    # The checks list the values of the code.
+    for listed, values in (
+        (module.MODES, DlpMode),
+        (module.DIRECTIONS, DlpDirection),
+        (module.CONDITIONS, DlpCondition),
+        (module.CONFIDENCES, DlpConfidence),
+        (module.SCOPES, DlpRecipientScope),
+        (module.ACTIONS, DlpAction),
+        (module.REASONS, InspectionReason),
+        (module.KINDS, DlpDetectorKind),
+    ):
+        assert f"({listed})" == sql_values(values)
+
+
+def _upgrade(db: ScratchDatabase, revision: str) -> None:
+    engine = sync_engine(db.url(MIGRATE))
+    try:
+        with engine.connect() as connection:
+            become_owner(connection)
+            command.upgrade(alembic_config(connection), revision)
+    finally:
+        engine.dispose()
+
+
+def test_the_dlp_policy_revision_gives_every_tenant_the_default_policy(
+    empty_db: ScratchDatabase,
+) -> None:
+    _upgrade(empty_db, "0017")
+    japanese, empty = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+    for tenant in (japanese, empty):
+        empty_db.sql(
+            "INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant
+        )
+    empty_db.sql(
+        "INSERT INTO tenant_policies (tenant_id, default_locale) VALUES (:t, 'ja')", t=japanese
+    )
+    member, admin = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+    for user, role in ((member, "member"), (admin, "admin")):
+        empty_db.sql(
+            "INSERT INTO users (id, tenant_id, email, email_normalized, role, status) "
+            "VALUES (:id, :t, :email, :email, :role, 'active')",
+            id=user,
+            t=japanese,
+            email=f"{role}@example.test",
+            role=role,
+        )
+    _upgrade(empty_db, "head")
+    policies = empty_db.sql(
+        "SELECT tenant_id::text, version, mode, approval_timeout = interval '72 hours' "
+        "FROM dlp_policies ORDER BY 1"
+    )
+    assert policies == [(japanese, 1, "enforce", True), (empty, 1, "enforce", True)]
+    rules = empty_db.sql(
+        "SELECT tenant_id::text, name, created_by::text, revision FROM dlp_rules "
+        "ORDER BY tenant_id, id"
+    )
+    assert len(rules) == 16
+    by_tenant = {t: [r for r in rules if r[0] == t] for t in (japanese, empty)}
+    assert [r[1] for r in by_tenant[japanese]][:2] == ["認証情報と秘密鍵", "マイナンバー"]
+    assert [r[1] for r in by_tenant[empty]][-1] == "New recipient domain"
+    # The earliest admin, else the earliest user, else no one, made the rules.
+    assert {r[2] for r in by_tenant[japanese]} == {admin}
+    assert {r[2] for r in by_tenant[empty]} == {None}
+    assert {r[3] for r in rules} == {1}
+
+
+def test_the_dlp_decision_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("DECISION_KEY", "0025")
+    assert list(module.KEYS) == [
+        *tenant_keys_sql("dlp_decisions"),
+        tenant_foreign_key_sql("dlp_decisions", "transfer_id", "transfers", on_delete="CASCADE"),
+        tenant_foreign_key_sql("dlp_decisions", "file_id", "files", on_delete="CASCADE"),
+        tenant_keys_sql("dlp_decision_rules")[0],
+        tenant_foreign_key_sql(
+            "dlp_decision_rules", "decision_id", "dlp_decisions", on_delete="CASCADE"
+        ),
+        # By hand: the revision's key is (tenant_id, id, revision), and no ON DELETE, so a rule
+        # revision a decision applied stays.
+        "ALTER TABLE dlp_decision_rules ADD CONSTRAINT "
+        "dlp_decision_rules_tenant_id_rule_id_rule_revision_fkey "
+        "FOREIGN KEY (tenant_id, rule_id, rule_revision) "
+        "REFERENCES dlp_rules (tenant_id, id, revision)",
+        *tenant_keys_sql("dlp_confirmations"),
+        tenant_foreign_key_sql(
+            "dlp_confirmations", "transfer_id", "transfers", on_delete="CASCADE"
+        ),
+        tenant_foreign_key_sql(
+            "dlp_confirmations", "decision_id", "dlp_decisions", on_delete="CASCADE"
+        ),
+        tenant_foreign_key_sql("dlp_confirmations", "confirmed_by", "users"),
+        tenant_keys_sql("dlp_known_domains")[0],
+    ]
+    assert (
+        tenant_foreign_key_sql("transfers", "dlp_decision_id", "dlp_decisions")
+        == module.DECISION_KEY
+    )
+
+    def jobs_find(table: str) -> str:
+        return policy_sql(
+            "jobs_find", table, roles=["sft_jobs"], command="SELECT", using="app_scope() = 'system'"
+        )
+
+    deciders = {"sft_api": "SELECT, INSERT", "sft_scan": "INSERT", "sft_jobs": "INSERT"}
+    assert list(module.RLS) == [
+        *tenant_rls_sql("dlp_decisions", grants=deciders),
+        *tenant_rls_sql("dlp_decision_rules", grants=deciders),
+        grant_sql(
+            "dlp_decision_rules",
+            "sft_jobs",
+            "SELECT",
+            columns=["tenant_id", "rule_id", "rule_revision"],
+        ),
+        jobs_find("dlp_decision_rules"),
+        *tenant_rls_sql("dlp_confirmations", grants={"sft_api": "SELECT, INSERT"}),
+        *tenant_rls_sql(
+            "dlp_known_domains",
+            grants={
+                "sft_api": "SELECT, INSERT, UPDATE",
+                "sft_scan": "SELECT, INSERT, UPDATE",
+                "sft_jobs": "SELECT, INSERT, UPDATE, DELETE",
+            },
+        ),
+        jobs_find("dlp_known_domains"),
+        grant_sql("transfers", "sft_scan", "SELECT, UPDATE", columns=["dlp_decision_id"]),
+        grant_sql("transfer_recipients", "sft_scan", "SELECT", columns=["domain"]),
+        grant_sql("transfers", "sft_jobs", "SELECT, UPDATE", columns=["dlp_decision_id"]),
+        grant_sql("transfer_recipients", "sft_jobs", "SELECT", columns=["domain"]),
+        grant_sql(
+            "dlp_findings",
+            "sft_scan",
+            "SELECT",
+            columns=["tenant_id", "file_id", "detector", "count_low", "count_medium", "count_high"],
+        ),
+        grant_sql(
+            "dlp_findings",
+            "sft_jobs",
+            "SELECT",
+            columns=["file_id", "count_low", "count_medium", "count_high"],
+        ),
+    ]
+    assert list(module.AUDIT) == [
+        require_audit_sql(table)
+        for table in (
+            "dlp_decisions",
+            "dlp_decision_rules",
+            "dlp_confirmations",
+            "dlp_known_domains",
+        )
+    ]
+    # The evaluation's roles never read a finding's details, nor an address.
+    assert "detail_ct" not in " ".join(module.RLS)
+    assert "email" not in " ".join(module.RLS)
+    for listed, values in (
+        (module.MODES, DlpMode),
+        (module.OUTCOMES, DlpOutcome),
+        (module.ACTIONS, DlpAction),
+    ):
+        assert f"({listed})" == sql_values(values)
+
+
+def test_the_dlp_approval_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    module: Any = _module("REQUEST_JOBS_COLUMNS", "0026")
+    requests, decisions = "dlp_approval_requests", "dlp_approval_decisions"
+    assert list(module.KEYS) == [
+        *tenant_keys_sql(requests),
+        tenant_foreign_key_sql(requests, "transfer_id", "transfers", on_delete="CASCADE"),
+        tenant_foreign_key_sql(requests, "decision_id", "dlp_decisions", on_delete="CASCADE"),
+        tenant_foreign_key_sql(
+            requests, "confirmation_id", "dlp_confirmations", on_delete="CASCADE"
+        ),
+        tenant_foreign_key_sql(requests, "requested_by", "users"),
+        tenant_keys_sql(decisions)[0],
+        tenant_foreign_key_sql(decisions, "approval_request_id", requests, on_delete="CASCADE"),
+        tenant_foreign_key_sql(decisions, "approver_id", "users"),
+    ]
+    assert list(module.RLS) == [
+        *tenant_rls_sql(requests, grants={"sft_api": "SELECT, INSERT"}),
+        grant_sql(requests, "sft_api", "UPDATE", columns=["state", "ended_at"]),
+        grant_sql(requests, "sft_jobs", "SELECT", columns=_columns(module.REQUEST_JOBS_COLUMNS)),
+        grant_sql(requests, "sft_jobs", "UPDATE", columns=["state", "ended_at"]),
+        grant_sql(
+            requests, "sft_notify", "SELECT", columns=_columns(module.REQUEST_NOTIFY_COLUMNS)
+        ),
+        f"ALTER POLICY tenant_isolation ON {requests} TO sft_api, sft_jobs, sft_notify",
+        policy_sql(
+            "jobs_find",
+            requests,
+            roles=["sft_jobs"],
+            command="SELECT",
+            using="app_scope() = 'system'",
+        ),
+        *tenant_rls_sql(decisions, grants={"sft_api": "SELECT, INSERT"}),
+    ]
+    assert list(module.AUDIT) == [require_audit_sql(requests), require_audit_sql(decisions)]
+    # The system roles read no justification, comment or decision, and sft_jobs never the sender.
+    assert _columns(module.REQUEST_JOBS_COLUMNS) == [
+        "id",
+        "tenant_id",
+        "transfer_id",
+        "state",
+        "expires_at",
+    ]
+    assert _columns(module.REQUEST_NOTIFY_COLUMNS) == ["id", "tenant_id", "transfer_id", "state"]
+    assert "comment" not in " ".join(module.RLS)
+    assert f"({module.STATES})" == sql_values(ApprovalState)
+    assert f"({module.DECISIONS})" == sql_values(ApprovalDecisionKind)
+
+
+def test_a_recipients_domain_is_set_on_insert(migrated_db: ScratchDatabase) -> None:
+    # Revision 0025's trigger: the evaluation's roles read the domain, never the address.
+    tenant = "55555555-5555-4555-8555-555555555555"
+    user = "66666666-6666-4666-8666-666666666666"
+    transfer = "77777777-7777-4777-8777-777777777777"
+    migrated_db.sql("INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant)
+    migrated_db.sql(
+        "INSERT INTO users (id, tenant_id, email, email_normalized, role, status) "
+        "VALUES (:id, :t, 'a@example.test', 'a@example.test', 'member', 'active')",
+        id=user,
+        t=tenant,
+    )
+    migrated_db.sql(
+        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in) "
+        "VALUES (:id, :t, :u, 'draft', interval '1 day')",
+        id=transfer,
+        t=tenant,
+        u=user,
+    )
+    migrated_db.sql(
+        "INSERT INTO transfer_recipients (id, tenant_id, transfer_id, email, email_normalized, "
+        "locale) VALUES (gen_random_uuid(), :t, :x, 'Bo@Sub.Partner.Example', "
+        "'bo@sub.partner.example', 'en')",
+        t=tenant,
+        x=transfer,
+    )
+    assert migrated_db.sql(
+        "SELECT domain FROM transfer_recipients WHERE transfer_id = :x", x=transfer
+    ) == [("sub.partner.example",)]

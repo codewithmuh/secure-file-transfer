@@ -17,7 +17,7 @@ import httpx2 as httpx
 import pytest
 from prometheus_client import CollectorRegistry
 
-from member_fixtures import EMAIL_KEYRING, app_for, seed_user, session_caller
+from member_fixtures import EMAIL_KEYRING, app_for, ready_for_dlp, seed_user, session_caller
 from pg import ScratchDatabase
 from sft.api.rate_limits import get_rate_limiter
 from sft.data.counters import CounterMetrics, CounterStore
@@ -34,7 +34,9 @@ pytestmark = pytest.mark.anyio
 def _tenant(db: ScratchDatabase) -> tuple[uuid.UUID, uuid.UUID]:
     tenant_id = uuid.uuid4()
     db.sql("INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant_id)
-    return tenant_id, seed_user(db, tenant_id)
+    user_id = seed_user(db, tenant_id)
+    ready_for_dlp(db, tenant_id, user_id)  # the default policy, and example.test known (#219)
+    return tenant_id, user_id
 
 
 @asynccontextmanager

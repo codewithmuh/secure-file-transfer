@@ -1,7 +1,7 @@
 """The request and response bodies of the transfer and upload operations, as the contract defines
 them (docs/api/openapi.yaml: `TransferCreate`, `Transfer`, `TransferPage`, `FileCreate`, `File`,
 `FileInspection`, `PartUrlRequest`, `PartUrlList`, `UploadedParts`, `TenantPolicy`,
-`TenantPolicyUpdate` and the schemas they use).
+`TenantPolicyUpdate`, `ExpiryExtension` and the schemas they use).
 
 The generated-spec check compares the schemas FastAPI builds from these with the contract (API
 README 11.1), so a field here is written to produce exactly the contract's schema. Two patterns
@@ -23,6 +23,7 @@ from uuid import UUID
 
 from pydantic import (
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -135,6 +136,14 @@ class TransferCreate(BaseModel):
     notify_on_first_download: bool = False
 
 
+class ExpiryExtension(BaseModel):
+    """`extendTransferExpiry`'s body (#214): the new expiry, with its offset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expires_at: AwareDatetime
+
+
 class FileCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -205,7 +214,7 @@ class File(BaseModel):
         file = cls(
             id=view.id,
             transfer_id=view.transfer_id,
-            upload_request_id=None,
+            upload_request_id=view.upload_request_id,
             display_name=view.display_name,
             content_type=view.content_type,
             declared_size=view.declared_size,
@@ -216,7 +225,7 @@ class File(BaseModel):
             inspection=FileInspectionSummary(
                 state=view.inspection_state.value,
                 reasons=[r.value for r in view.inspection_reasons],
-                dlp_blocked=False,  # received files only (FR-51), with upload requests
+                dlp_blocked=view.dlp_blocked,  # received files only (FR-51, #221)
                 detectors=list(view.detectors),
             ),
             scanned_at=view.scanned_at,
@@ -224,6 +233,8 @@ class File(BaseModel):
             scan_detail=None if view.scan_detail is None else view.scan_detail.value,
             created_at=view.created_at,
         )
+        if view.retention_until is not None:
+            file.retention_until = view.retention_until
         if view.state.value == "uploading":
             # Set only while uploading: routes answer with `response_model_exclude_unset`, so it is
             # left out otherwise, as the contract has it, rather than sent as null.
@@ -283,7 +294,14 @@ class Transfer(BaseModel):
             revoked_by=view.revoked_by,
             total_size=view.total_size,
             hold_reason=view.hold_reason,  # type: ignore[arg-type]
-            dlp=None,  # no DLP decision before DLP-5
+            dlp=None
+            if view.dlp is None
+            else TransferDlpSummary(
+                outcome=view.dlp.outcome,  # type: ignore[arg-type]
+                mode=view.dlp.mode,  # type: ignore[arg-type]
+                enforced=view.dlp.enforced,
+                approval_request_id=view.dlp.approval_request_id,
+            ),
             files=[File.of(f) for f in view.files],
             # Nobody is invited before the transfer is sent; `invited` is the state until then.
             recipients=[
@@ -368,7 +386,7 @@ class TransferSummary(BaseModel):
             file_count=view.file_count,
             recipient_count=view.recipient_count,
             total_size=view.total_size,
-            dlp_outcome=None,  # no DLP decision before DLP-4
+            dlp_outcome=view.dlp_outcome,  # type: ignore[arg-type]
         )
 
 
@@ -495,8 +513,8 @@ class TenantPolicyOut(BaseModel):
             max_expiry=_duration(policy.max_expiry),
             unscannable_policy=policy.unscannable_policy,
             received_file_retention_days=policy.received_file_retention_days,
-            allowed_domains=[],  # FR-24, M5
-            blocked_domains=[],
+            allowed_domains=list(policy.allowed_domains),  # FR-24 (#217)
+            blocked_domains=list(policy.blocked_domains),
             default_locale=policy.default_locale,  # type: ignore[arg-type]
             # A tenant made before revision 0005 has no row, so no change time: now stands in.
             updated_at=policy.updated_at or now,

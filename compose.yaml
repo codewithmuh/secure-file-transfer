@@ -70,6 +70,8 @@ services:
       # The local stack (#182): the only environment, with test, where the clock's test hook may be
       # set. It stays 0 here; the journey test moves the lifecycle jobs' clock, never the API's.
       ENVIRONMENT: local
+      # API keys (#215): local keys are `sft_dev_…`, and their hashes exist only in this database.
+      API_KEY_ENVIRONMENT: dev
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain

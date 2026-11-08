@@ -540,6 +540,49 @@ the request stops new uploads but keeps received files. The member's grant belon
 content URL needs that session's cookie. An uploader's files count against the requesting tenant's daily upload volume
 and storage quota ([ABUSE] 6.1).
 
+**As built (#212).** Steps 1 to 4: `createUploadRequest` checks the expiry against the tenant's policy, the address
+against the suppression list and group G's email caps (shared with `sendTransfer`), then writes the `open` request,
+`upload_request.created` and an `upload_request.link_due` outbox message in one transaction. The notification worker
+derives the uploader's link from the request's ID (data model 2.2), emails `upload_request` in the request's locale
+with a `/u#<token>` link, and records `sent`. The uploader verifies exactly as a recipient does (4.2, steps 1 to 11):
+the link lookup finds an upload request as well as a recipient (`lookup_link_subject`), the code goes to the stored
+address, 20 failed attempts lock the uploader and notify the member and the admins, and the link session is bound to
+that one request, whose resource scope reaches nothing of any transfer (T-20). `getLinkSession` shows the request's
+message, the requester, the expiry and the limits of FR-11. Revoking the request ends its link sessions in the same
+transaction (4.4), and the expiry job records `expired` and ends them too (4.5); the API answers `410` from
+`expires_at` before the job runs.
+
+**As built (#213).** Step 5: the uploader's `addSessionUploadFile`, `requestSessionUploadPartUrls`,
+`listSessionUploadedParts` and `completeSessionUpload` work as a member's upload (4.1), with the request in the
+transfer's place: the request is always the link session's own, every file is found through it, and the calls act in
+the request's tenant scope, under its row lock where they check limits (100 declarations, 50 counted files, 20 GB) or
+complete. Completion runs the three phases, so a revocation or expiry that lands during phase 2 wins at phase 3
+(`410`), and a revocation also rejects every open upload in its own transaction, so no part sent afterwards is ever
+assembled (NFR-6). An accepted file gets `retention_until` and `delete_after` from that moment, the tenant's
+`received_file_retention_days` ahead (FR-13); the request's own expiry never shortens it. Steps 6 and 7: the scan
+worker's pass is the same as for a transfer's file; the result, in the transaction that records it, counts towards the
+request's next notice instead of a transfer's evaluation.
+
+**One notice per request per 5 minutes** (the decision #213 left open). One `files_arrived` per file would flood a
+member who receives 50, so the notices are batched: `upload_requests` holds the files that became shareable and those
+that were blocked since the last notice, and when it is due. The scan result that finds no notice due makes one due in
+5 minutes and writes one `upload_request.files_settled` outbox message, delayed by that window; every other result in
+the window only adds to the counts. The request is the dedup key, and a single conditional `UPDATE` under the row's
+lock decides, so two results at once make one notice. Step 8: the notification worker reads the counts under the same
+lock and sends `files_arrived` (shareable) and `files_blocked_member` (blocked) to the owner, in the tenant's
+language, and `files_blocked_uploader` to the uploader, in the request's, with no file name, finding or scan detail.
+Once they are out it takes off the counts it sent (`upload_request.notice_sent`); files that settled meanwhile make
+the next notice due, with its own delayed message. Counts only, never names: the request page shows the files. A
+notice whose message was lost (a suspended tenant's) is made due again by the next result once it is 15 minutes
+overdue.
+
+Step 9: `createReceivedFileDownload` grants the request's owner, through a member session only, one shareable file,
+in the order of 4.2 (intent record, then the grant under the request's row lock, then the committed record), with
+no download counted; a tenant admin gets `403`, another member `404`. Its content URL,
+`/v1/files/{fid}/downloads/{gid}/content`, needs the cookie of the member session that made the grant; its 30-second
+re-checks read that session as a request does, so a long download keeps it from ending for idleness. The member's
+early delete (`deleteFile`) removes the file at once and moves its `delete_after` to now (4.5).
+
 ### 4.4 Revoke (UC-3)
 
 ```mermaid
@@ -614,6 +657,13 @@ expire noncurrent object versions after 7 days and abort multipart uploads still
 nets behind the job. The job records expiry for deletion; the API already refuses an expired link (4.2). A rejected
 file is due at once (`delete_after = now()`, 4.1); the job skips files still `completing` or `scanning`.
 
+**Received files (#213).** A received file is due at its `retention_until`, set when its upload was accepted, or at
+once when its owner deletes it early (FR-13); the same deletion job removes every version in both regions and clears
+its findings' location hints and previews in the transaction that marks it deleted, and `file.deleted` says which
+(`trigger`). An upload request's expiry rejects its open uploads but never moves a received file's retention.
+Reconciliation finishes or rejects a received file left `completing` under its request's row lock, as it does a
+transfer's under the transfer's.
+
 ### 4.6 Data loss prevention (UC-7, FR-36 to FR-56)
 
 [ADR-0022](adr/0022-dlp-inspection-engine.md) decides the engine and its sandbox, the
@@ -656,6 +706,12 @@ sequenceDiagram
   reason `too_large` when the worker records GuardDuty's result.
 - **The inspector holds nothing.** No credentials, no network out, a fresh process per file and its scratch deleted
   after each file. The tenant's keyword lists and patterns travel with the file and are forgotten with it.
+- **The tenant's detectors, as built (#218).** In the transaction that reads the file, the worker reads the tenant's
+  live, enabled detectors and the DLP policy version (`sft.data.dlp_policy.scan_detectors`), opens each definition
+  (M2's unencrypted stand-in until DLP-8, so no key is unwrapped yet) and sends them in the request frame. The file
+  records that version in `inspection_policy_version`, and a tenant detector's findings are `custom:<id>`. The API
+  checks a keyword list with the detector library when it is saved, alone and with the tenant's other lists, so the
+  inspector never gets a set it can't compile.
 - **Findings, never values** (FR-53). The worker writes the detector and the counts at each confidence in plain
   columns, and the location hints and masked previews encrypted with the tenant's DLP data key
   ([KEYS] 3.3). Its database role may insert findings but not read their details back. An infected file's findings are
@@ -666,11 +722,6 @@ sequenceDiagram
 - **The message.** The API runs the same detectors on a transfer's message when the transfer is created, in process,
   because it is at most 2,000 characters of text and needs no parser (FR-50).
 
-**Until DLP-4 (M5) there is no decision.** DLP-3 (#176) records each file's inspection, reasons and findings with its
-scan, and `getFileInspection` and `File.inspection` show them, but no rule acts on them yet: when every counted file is
-shareable, the evaluation sends the transfer (#174). No `dlp_decisions` row is written, and no transfer is
-`awaiting_confirmation` or held for `dlp_blocked`. An inspection that `failed` still blocks its file, because that is a
-shareability rule (FR-16, FR-47), not a DLP decision.
 
 **The decision.** When the evaluation finds every counted file shareable (4.1), it decides under the same row lock
 (data model 3.2):
@@ -690,6 +741,29 @@ shareability rule (FR-16, FR-47), not a DLP decision.
 
 A decision stands for the files it saw. A later policy change doesn't revisit it, the rule the scan already follows
 for unscannable files (data model 3.1); removing a file runs the evaluation again and makes a new decision.
+
+**As built (#219).** `sft.service.dlp_decision` decides and `sft.service.evaluation` applies the outcome, under the
+transfer's row lock, as the API (`sft_api`), the scan worker (`sft_scan`) or a job (`sft_jobs`); each role reads only
+the policy and its rules, the recipients' domains (`transfer_recipients.domain`, set by a trigger; never an address)
+and the findings' counts (never their details), and writes the decision (data model 2.7).
+
+- Step 1: domains are compared lowercase and IDNA-normalised, a subdomain of a trusted domain is trusted, and a domain
+  is new when `dlp_known_domains` has no send to it in 365 days. SSO domains don't count yet: `sso_domains` arrives with
+  M6. Step 2: the message (FR-50) and the sender's 24 hours (FR-49) join with #221; a `not_inspected` rule counts files
+  and a `new_domain` rule domains, and a rule scoped to untrusted recipients is tested only when one is (its new
+  domains are theirs). The policy and its rules are read in one statement, so the version recorded names the rules
+  applied. A tenant without a policy, which can't happen, fails closed: nothing is sent.
+- `dlp.decided` records the decision (IDs, enums and counts) and one `dlp.rule_matched` event per matched rule, since
+  audit details hold no lists; neither names a rule, a domain or a value. `transfer.awaiting_confirmation`,
+  `transfer.held` (`dlp_blocked`), `transfer.confirmed` (the decision and whether a justification was given) and
+  `transfer.sent` follow. The sender's `dlp_confirmation_needed` and `transfer_held` emails name nothing.
+- A decision stands: an evaluation that isn't a file removal (a scan worker's retry, say) changes nothing for a transfer
+  awaiting confirmation or held by a rule. A file removal from `awaiting_confirmation` sets it back to `submitted` first.
+- `getTransferDlp` and `confirmTransfer` are `sft.service.transfer_dlp`; a required approval's confirmation makes an
+  approval request (#220, below). Monitor mode, refused by the policy API until #221, already sends everything with
+  `enforced: false`.
+- Moving to `sent` records each recipient domain in `dlp_known_domains`; the daily cleanup deletes a domain 365 days
+  after `last_sent_at`.
 
 **Confirmation and approval.**
 
@@ -746,6 +820,29 @@ sequenceDiagram
 - **Emails** (FR-33, [ABUSE] 7). The sender, the approvers and, for policy changes, the tenant admins get notices in
   English or Japanese that say a transfer waits and link to the web app. They hold no file names, messages, findings or
   approve links: decisions are made only in the web app, signed in.
+
+**As built (#220).** `sft.service.approval_requests` makes a request from `confirmTransfer`, `sft.service.approvals`
+serves `listApprovalRequests`, `getApprovalRequest`, `approveTransfer` and `rejectTransfer` (`sft.api.approvals`),
+and the `expiry` job expires requests (`sft.service.lifecycle`); data model 3.2 and 3.6 give the order of the checks.
+
+- **Eligible approvers** are read from `users` on each request and each decision, never from the session, under the
+  transfer's row lock: an approver whose designation was taken away a moment ago can't decide. Self-approval is
+  checked against the transfer's `created_by`, which for a key's transfer is the key's owner (T-100).
+- **No eligible approver.** The refusal rolls the confirmation back, then a transaction of its own writes the outbox
+  message that emails every active admin `dlp_no_eligible_approver`, and a failed `dlp_approval.requested`.
+- **Who reads what.** `getApprovalRequest`: approvers every request of the tenant, the sender their own (with the
+  decisions and comments), an admin acting as one every request, anyone else 404. `getTransferDlp`: an active
+  approver reads it for a transfer that has an approval request, so one who has decided still sees the decision.
+  `TransferDlp.approval_request` and `Transfer.dlp.approval_request_id` are the transfer's latest request, in
+  whatever state. `listApprovalRequests` defaults to the queue for an approver (pending, not their own transfers) and
+  to their own requests for anyone else; the queue needs the designation and `scope=tenant` the admin role.
+- **Rate limits.** Both decisions count against the approver's 120 an hour (group K); `rejectTransfer` counts against
+  nothing else but the caller's own limit, as a safety action.
+- **Emails** come from the outbox: `dlp_approval.requested` (each eligible approver, while the request is pending),
+  `dlp_approval.decided` and `dlp_approval.expired` (the sender), `dlp_approval.no_eligible_approver` (the admins), and
+  `dlp_policy.changed.approvers_changed` (the admins, when `updateUser` changes a designation). The hourly digest
+  past 20 requests an hour and the 10-minute coalescing of policy notices ([ABUSE] 7.1) aren't built yet.
+- Finding details for approvers (location hints, masked previews) come with DLP-8; two-approver rules with #221.
 
 **Recipient domain checks at send time.** `createTransfer` checks FR-24's allowed and blocked domains, and
 `sendTransfer` checks them again against the policy in force, so a domain blocked since the draft was made is refused

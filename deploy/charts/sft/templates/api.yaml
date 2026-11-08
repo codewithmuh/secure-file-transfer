@@ -29,6 +29,7 @@ External Secrets Secret.
   "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
   "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr
   "ENVIRONMENT" .Values.environment
+  "API_KEY_ENVIRONMENT" (get (dict "dev" "dev" "staging" "stg" "prod" "prd") .Values.environment)
   "SCAN_SMALL_POOL_MAX_BYTES" (toString .Values.scanSmallPoolMaxBytes)
   "CSRF_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "csrf-hmac"))
   "EMAIL_HMAC_KEYRING" (include "sft.keyringRef" (dict "root" $ "name" "email-hmac"))

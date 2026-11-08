@@ -11,6 +11,7 @@ import {
   payload,
   readBytes,
   runJob,
+  sendPastWarning,
   sha256,
   signIn,
   unique,
@@ -199,12 +200,14 @@ test('the M3 journey through the browser, steps 1 to 9', async ({ page: member, 
     await member.unrouteAll({ behavior: 'ignoreErrors' });
   });
 
-  await step(4, 'sends; the detail page shows clean and inspected, and the My Number finding on demand', async () => {
+  await step(4, 'sends past the My Number warning; the detail page shows clean and inspected, and the finding on demand', async () => {
+    // The default policy warns about the My Number (DLP-4, #219): the member confirms it, then it is sent. Once sent,
+    // the DLP panel (which lists the files too) is gone, so each file's row is the Files card's.
+    await sendPastWarning(member, lang);
     for (const name of [plain, staff]) {
       await expect(fileRow(member, name).getByText(t.fileState.clean, { exact: true })).toBeVisible({ timeout: 180_000 });
       await expect(fileRow(member, name).getByText(t.inspectionState.inspected, { exact: true })).toBeVisible();
     }
-    await expect(member.getByText(t.transferState.sent, { exact: true }).first()).toBeVisible({ timeout: 120_000 });
     await fileRow(member, staff).getByRole('button', { name: fill(t.sender.showFindings, { name: staff }) }).click();
     const findings = member.getByRole('region', { name: t.sender.findings });
     await expect(findings.getByRole('cell', { name: t.detectors.jp_my_number })).toBeVisible();
@@ -344,7 +347,7 @@ test('the M3 journey through the browser, steps 1 to 9', async ({ page: member, 
     await member.getByRole('button', { name: t.sender.send }).click();
     await expect(member).toHaveURL(/\/transfers\/[0-9a-f-]{36}$/, { timeout: 120_000 });
     const expiringId = new URL(member.url()).pathname.split('/').pop() ?? '';
-    await expect(member.getByText(t.transferState.sent, { exact: true }).first()).toBeVisible({ timeout: 180_000 });
+    await sendPastWarning(member, lang);
 
     const expiring = await newPage(browser, lang, 'expiring-recipient');
     const email = await linkEmail(request, later);

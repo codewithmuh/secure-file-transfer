@@ -55,6 +55,9 @@ class SmtpMailer:
         message.add_alternative(email.html, subtype="html", cte="quoted-printable")
         return message
 
+    def release(self, tenant_id: uuid.UUID, address: str) -> None:
+        """Nothing to release: the local mail catcher keeps no suppression list."""
+
     def send(self, email: OutgoingEmail) -> str:
         try:
             message = self.message(email)

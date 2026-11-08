@@ -1,19 +1,29 @@
 import type { TenantPolicy, TenantPolicyUpdate } from '@/hooks/users';
 import { fieldErrors, type ApiFailure } from '@/lib/problems';
 import { normalizeDuration } from '@/lib/durations';
+import { sameDomains } from './domains';
 
 /**
- * The tenant policy form (#197; FR-3, FR-13, FR-18, FR-23, FR-33). `allowed_domains` and `blocked_domains` (FR-24)
- * arrive with M5 and are not shown, so the form never sends them.
+ * The tenant policy form (#197; FR-3, FR-13, FR-18, FR-23, FR-33), with the allowed and blocked recipient domains
+ * (#217, FR-24): each list is sent whole, and only when it changed.
  */
 export interface PolicyForm {
   max_expiry: string;
   unscannable_policy: TenantPolicy['unscannable_policy'];
   received_file_retention_days: string;
   default_locale: TenantPolicy['default_locale'];
+  allowed_domains: string[];
+  blocked_domains: string[];
 }
 
-export const POLICY_FIELDS = ['max_expiry', 'unscannable_policy', 'received_file_retention_days', 'default_locale'] as const;
+export const POLICY_FIELDS = [
+  'max_expiry',
+  'unscannable_policy',
+  'received_file_retention_days',
+  'default_locale',
+  'allowed_domains',
+  'blocked_domains',
+] as const;
 export type PolicyField = (typeof POLICY_FIELDS)[number];
 
 export const MIN_RETENTION_DAYS = 1;
@@ -25,6 +35,8 @@ export function formOf(policy: TenantPolicy): PolicyForm {
     unscannable_policy: policy.unscannable_policy,
     received_file_retention_days: String(policy.received_file_retention_days),
     default_locale: policy.default_locale,
+    allowed_domains: [...policy.allowed_domains],
+    blocked_domains: [...policy.blocked_domains],
   };
 }
 
@@ -48,15 +60,21 @@ export function changedFields(original: TenantPolicy, form: PolicyForm): TenantP
   if (form.unscannable_policy !== original.unscannable_policy) body.unscannable_policy = form.unscannable_policy;
   if (days !== original.received_file_retention_days) body.received_file_retention_days = days;
   if (form.default_locale !== original.default_locale) body.default_locale = form.default_locale;
+  if (!sameDomains(form.allowed_domains, original.allowed_domains)) body.allowed_domains = form.allowed_domains;
+  if (!sameDomains(form.blocked_domains, original.blocked_domains)) body.blocked_domains = form.blocked_domains;
   return body;
 }
 
-/** `422 validation_failed`: each issue on the input its pointer names (`#/max_expiry`), the rest on the form. */
+/**
+ * `422 validation_failed`: each issue on the input its pointer names (`#/max_expiry`; a domain's `#/allowed_domains/3`
+ * on its list), the rest on the form.
+ */
 export function policyFieldErrors(failure: ApiFailure): { fields: Partial<Record<PolicyField, string>>; other: string[] } {
   const fields: Partial<Record<PolicyField, string>> = {};
   const other: string[] = [];
-  for (const [field, detail] of Object.entries(fieldErrors(failure))) {
-    if ((POLICY_FIELDS as readonly string[]).includes(field)) fields[field as PolicyField] = detail;
+  for (const [pointer, detail] of Object.entries(fieldErrors(failure))) {
+    const field = pointer.split('/', 1)[0] as string;
+    if ((POLICY_FIELDS as readonly string[]).includes(field)) fields[field as PolicyField] ??= detail;
     else other.push(detail);
   }
   return { fields, other };

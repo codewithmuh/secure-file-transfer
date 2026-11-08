@@ -1,0 +1,10 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}APIキーが{{ tenant_name }}の監査ログをエクスポートしました{% endblock %}
+{% block body %}
+APIキー {{ key_prefix }}… が、{{ tenant_name }}の監査ログを初めてエクスポートしました。このメールはキーごとに一度だけ送られます。
+
+心当たりがあれば、対応は不要です。心当たりがない場合は、すぐにこのキーを無効にしてください。無効にしたキーはただちに使えなくなります。
+
+APIキーを見る：
+{{ api_keys_url }}
+{% endblock %}

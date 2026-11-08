@@ -4,6 +4,7 @@ One case per data-access function, and later per endpoint (delivery plan 2, poin
 is `isolation.py`; the README's "The isolation suite" says how to add a case.
 """
 
+import contextlib
 import hashlib
 import secrets
 import uuid
@@ -14,22 +15,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Seeded, Tenants
 from sft.data import (
+    api_keys,
     audit,
+    audit_reads,
     codes,
+    dlp_approvals,
+    dlp_decisions,
+    dlp_policy,
     downloads,
     files,
     findings,
     idempotency,
     link_sessions,
+    link_subjects,
     member_sessions,
     recipients,
     suppressions,
     transfers,
+    upload_requests,
     usage,
 )
 from sft.data import tenants as tenant_data
-from sft.data.access import in_scope
+from sft.data.access import NotFoundError, ScopeNotAllowedError, in_scope
 from sft.data.audit import Actor
+from sft.data.dlp_policy import DetectorFields, RuleFields, detector_ref
 from sft.data.identities import (
     delete_identities,
     find_connection,
@@ -47,6 +56,9 @@ from sft.data.member_sessions import (
 )
 from sft.data.models import (
     ActorType,
+    ApiKeyRevokedReason,
+    ApprovalDecisionKind,
+    ApprovalState,
     DeliveryState,
     FileState,
     InspectionState,
@@ -56,6 +68,7 @@ from sft.data.models import (
     ScanEngine,
     SuppressionReason,
     TransferState,
+    UploadRequestState,
 )
 from sft.data.operator_sessions import (
     create_operator_session,
@@ -873,9 +886,33 @@ async def revoke_another_tenants_sessions_by_transfer(
     return await link_sessions.revoke_for_transfer(session, tenants.theirs.rows["transfer"])
 
 
+# ---- extending the expiry and the first-download notice (#214) ----
+
+
+@cases.add(scopes=API_TENANT)
+async def extend_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows["transfer"]
+    later = datetime.now(UTC) + timedelta(days=3)
+    moved = (
+        await transfers.extend_expiry(session, theirs, later),
+        await link_sessions.extend_for_transfer(session, theirs, later),
+        await downloads.extend_for_transfer(session, theirs),
+    )
+    await audit.record(session, action="transfer.expiry_extended", actor=Actor(ActorType.SYSTEM))
+    return moved
+
+
+@cases.add(scopes=GRANT_USERS, subject=mine_as_recipient)
+async def claim_another_tenants_first_download(session: AsyncSession, tenants: Tenants) -> object:
+    claimed = await transfers.claim_first_download_notice(session, tenants.theirs.rows["transfer"])
+    await audit.record(session, action="download.granted", actor=Actor(ActorType.SYSTEM))
+    return claimed
+
+
 # ---- the lifecycle jobs (#181) ----
 
 FAR = datetime.now(UTC) + timedelta(days=36500)
+PAST = datetime.now(UTC) - timedelta(days=36500)
 
 
 @cases.add(scopes={JOBS: [SYSTEM, TENANT]})
@@ -938,6 +975,833 @@ async def delete_another_tenants_expired_rows(session: AsyncSession, tenants: Te
     )
     await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
     return deleted
+
+
+# ---- upload requests (#212) ----
+
+
+def mine_as_uploader(mine: Seeded) -> Subject:
+    return Subject.upload_request(mine.rows["upload_request"])
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_another_tenants_upload_link_and_session(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # Lookup scope reads across tenants by design: IDs and a status only.
+    theirs = tenants.theirs.rows
+    return (
+        await link_subjects.find_by_token(session, str(theirs["upload_link_token"])),
+        await link_subjects.find_by_token(session, str(theirs["link_token"])),
+        await link_sessions.lookup(session, [str(theirs["upload_session_token"])]),
+    )
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]}, subject=mine_as_uploader)
+async def read_another_tenants_upload_request(session: AsyncSession, tenants: Tenants) -> object:
+    return await upload_requests.get_request(session, tenants.theirs.rows["upload_request"])
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]}, subject=mine_as_uploader)
+async def read_another_tenants_uploader_link(session: AsyncSession, tenants: Tenants) -> object:
+    return await upload_requests.link_view(session, tenants.theirs.rows["upload_request"])
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]}, subject=mine_as_uploader)
+async def read_and_end_another_tenants_uploader_session(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows["upload_session"]
+    live = await link_sessions.get_live(session, theirs)
+    ended = await link_sessions.revoke(session, theirs)
+    await audit.record(session, action="link_session.ended", actor=Actor(ActorType.SYSTEM))
+    return live, ended
+
+
+@cases.add(scopes=API_TENANT)
+async def list_and_count_another_tenants_upload_requests(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await upload_requests.list_requests(
+            session, created_by=None, limit=100, now=datetime.now(UTC)
+        ),
+        await upload_requests.live_session_ids(session, [theirs["upload_request"]]),
+        await codes.newest_for(session, Subject.upload_request(theirs["upload_request"])),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def create_an_upload_request_for_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # The tenant is the scope's; their user isn't one of its users (a foreign key refusal).
+    made = await upload_requests.insert_request(
+        session,
+        request_id=uuid.uuid4(),
+        created_by=tenants.theirs.rows["user"],
+        email="x@example.test",
+        locale="en",
+        message_ct=None,
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+    await audit.record(session, action="upload_request.created", actor=Actor(ActorType.SYSTEM))
+    return made
+
+
+@cases.add(scopes=API_TENANT)
+async def revoke_and_unlock_another_tenants_upload_request(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows["upload_request"]
+    changed = (
+        await upload_requests.change_state(
+            session,
+            theirs,
+            from_states=(UploadRequestState.OPEN,),
+            to=UploadRequestState.REVOKED,
+            ended_at=datetime.now(UTC),
+        ),
+        await link_sessions.revoke_for_upload_request(session, theirs),
+    )
+    await upload_requests.unlock(session, theirs, by=tenants.mine.rows["user"])
+    await audit.record(session, action="upload_request.revoked", actor=Actor(ActorType.SYSTEM))
+    return changed
+
+
+@cases.add(scopes=API_TENANT)
+async def check_a_code_of_another_tenants_uploader(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    locked = await upload_requests.lock_unlocked(session, theirs["upload_request"])
+    taken = await codes.take_attempt(session, theirs["upload_code"])
+    await codes.consume(session, theirs["upload_code"])
+    await audit.record(session, action="verification.attempted", actor=Actor(ActorType.SYSTEM))
+    return locked, taken, await upload_requests.count_failure(session, theirs["upload_request"])
+
+
+@cases.add(scopes=API_TENANT)
+async def start_a_session_for_another_tenants_uploader(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    subject = Subject.upload_request(tenants.theirs.rows["upload_request"])
+    made = await link_sessions.create_for(session, subject, ends_by=None)
+    await audit.record(session, action="link_session.started", actor=Actor(ActorType.SYSTEM))
+    return made
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def notify_another_tenants_uploader(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows["upload_request"]
+    found = await upload_requests.link_target(session, theirs, lock=True)
+    issued = await upload_requests.issue_link(
+        session,
+        theirs,
+        key_id="iso",
+        issued_at=datetime.now(UTC),
+        hashed=hashlib.sha256(b"u").digest(),
+        replace=True,
+    )
+    await upload_requests.set_delivery(session, theirs, DeliveryState.SENT, notified=True)
+    made = await codes.create_for(
+        session,
+        Subject.upload_request(theirs),
+        code_id=uuid.uuid4(),
+        code_hmac=hashlib.sha256(b"c").digest(),
+        key_id="iso",
+    )
+    await audit.record(session, action="uploader.link_issued", actor=Actor(ActorType.SYSTEM))
+    return found, issued, made
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_upload_requests_due_for_expiry(session: AsyncSession, tenants: Tenants) -> object:
+    # The find step reads across tenants in system scope, by design; tenant scope is refused.
+    return await upload_requests.due_for_expiry(session, now=FAR, limit=10)
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def expire_another_tenants_upload_request(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows["upload_request"]
+    expired = await upload_requests.change_state(
+        session,
+        theirs,
+        from_states=(UploadRequestState.OPEN,),
+        to=UploadRequestState.EXPIRED,
+        ended_at=FAR,
+    )
+    ended = await link_sessions.revoke_for_upload_request(session, theirs)
+    await audit.record(session, action="upload_request.expired", actor=Actor(ActorType.SYSTEM))
+    return expired, ended, await upload_requests.lock_for_expiry(session, theirs)
+
+
+# ---- received files (#213) ----
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE]}, subject=mine_as_uploader)
+async def read_another_tenants_received_files(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    found = []
+    for call in (
+        files.get_request_file(session, theirs["upload_request"], theirs["received_file"]),
+        files.get_file(session, theirs["received_file"]),
+    ):
+        try:
+            found.append(await call)
+        except NotFoundError:
+            found.append(None)
+    return (
+        found,
+        await files.list_request_files(session, theirs["upload_request"]),
+        await files.request_totals(session, theirs["upload_request"]),
+        await files.received_counts(session, [theirs["upload_request"]]),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def declare_a_file_on_another_tenants_request(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    file_id = uuid.uuid4()
+    made = await files.insert_file(
+        session,
+        file_id=file_id,
+        upload_request_id=tenants.theirs.rows["upload_request"],
+        display_name_ct=b"x",
+        content_type="text/plain",
+        declared_size=10,
+        storage_class="standard",
+        s3_upload_id="iso",
+        part_size=5242880,
+        part_count=1,
+    )
+    await audit.record(session, action="file.added", actor=Actor(ActorType.SYSTEM))
+    return made
+
+
+@cases.add(scopes=API_TENANT)
+async def delete_another_tenants_received_file_early(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    removed = await files.remove_received_file(session, tenants.theirs.rows["received_file"])
+    await audit.record(session, action="file.removed", actor=Actor(ActorType.SYSTEM))
+    return removed
+
+
+@cases.add(scopes={API: [TENANT], JOBS: [TENANT]})
+async def reject_another_tenants_open_request_uploads(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    found = await files.open_request_uploads(session, theirs["upload_request"])
+    rejected = await files.reject_open(session, theirs["received_upload"], now=FAR)
+    await audit.record(session, action="file.rejected", actor=Actor(ActorType.SYSTEM))
+    return found, rejected
+
+
+@cases.add(scopes={API: [TENANT], JOBS: [TENANT]})
+async def accept_another_tenants_received_upload_with_retention(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    days = await tenant_data.received_file_retention_days(session)
+    marked = await files.mark_scanning(
+        session,
+        tenants.theirs.rows["received_upload"],
+        actual_size=10,
+        s3_version_id="iso",
+        scan_deadline=FAR,
+        retention_days=days,
+    )
+    await audit.record(session, action="file.uploaded", actor=Actor(ActorType.SYSTEM))
+    return days, marked
+
+
+@cases.add(scopes={API: [TENANT], SCAN: [TENANT], JOBS: [TENANT]})
+async def count_another_tenants_received_file_for_its_notice(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows["upload_request"]
+    noted = await upload_requests.note_settled(session, theirs, shareable=True)
+    blocked = await upload_requests.note_settled(session, theirs, shareable=False)
+    await audit.record(session, action="file.scanned", actor=Actor(ActorType.SYSTEM))
+    return noted, blocked
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def send_another_tenants_received_file_notice(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows["upload_request"]
+    found = await upload_requests.notice(session, theirs, lock=True)
+    more = await upload_requests.settle_notice(session, theirs, arrived=1, blocked=0)
+    await audit.record(session, action="upload_request.notice_sent", actor=Actor(ActorType.SYSTEM))
+    return found, more
+
+
+@cases.add(scopes=API_TENANT)
+async def grant_another_tenants_received_file(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    try:
+        found: object = await downloads.get_grant(session, theirs["member_grant"])
+    except NotFoundError:
+        found = None
+    made = await downloads.insert_member_grant(
+        session,
+        grant_id=uuid.uuid4(),
+        file_id=theirs["received_file"],
+        s3_version_id="iso",
+        user_id=theirs["user"],
+        member_session_id=theirs["session"],
+        size=10,
+        ends_by=FAR,
+    )
+    await audit.record(session, action="download.granted", actor=Actor(ActorType.SYSTEM))
+    return found, made
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def clear_another_tenants_finding_details(session: AsyncSession, tenants: Tenants) -> object:
+    await findings.clear_details(session, tenants.theirs.rows["scanning_file"])
+    await audit.record(session, action="file.deleted", actor=Actor(ActorType.SYSTEM))
+    return None
+
+
+# ---- API keys, audit reads, domain rules and suppression clearing (#215, #216, #217) ----
+
+
+@cases.add(scopes={API: [TENANT, LOOKUP]})
+async def look_up_and_use_another_tenants_key(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    key_hash = hashlib.sha256(str(theirs["api_key_token"]).encode()).digest()
+    try:
+        found = await api_keys.lookup_key(session, key_hash)
+    except ScopeNotAllowedError:
+        found = None
+    try:
+        live = await api_keys.live_key(session, theirs["api_key"])
+    except ScopeNotAllowedError:
+        live = None
+    # The lookup finds their key's ID and tenant by design (data model 4.2); the tenant scope
+    # that follows is the key's own tenant's, never the caller's, so nothing else of theirs.
+    return None if found is None else (found.key_id, found.tenant_id), live
+
+
+@cases.add(scopes={API: [TENANT]})
+async def read_and_revoke_another_tenants_keys(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    found = (
+        await api_keys.get_key(session, theirs["api_key"], for_update=True),
+        await api_keys.list_keys(session, limit=10),
+        await api_keys.count_active(session),
+        await api_keys.revoke_key(session, theirs["api_key"], reason=ApiKeyRevokedReason.ADMIN),
+        await api_keys.revoke_owner_keys(
+            session, theirs["user"], reason=ApiKeyRevokedReason.OWNER_DEACTIVATED
+        ),
+        await api_keys.owner_keys(
+            session, theirs["user"], reason=ApiKeyRevokedReason.OWNER_DEACTIVATED
+        ),
+        await api_keys.mark_first_export(session, theirs["api_key"]),
+        await api_keys.notice_key(session, theirs["api_key"]),
+    )
+    await audit.record(session, action="api_key.revoked", actor=ADMIN)
+    return found
+
+
+@cases.add(scopes={API: [TENANT]})
+async def create_a_key_for_another_tenants_user(session: AsyncSession, tenants: Tenants) -> object:
+    # The tenant is the scope's; their user is no user of it, so the composite key refuses.
+    key = await api_keys.insert_key(
+        session,
+        key_id=uuid.uuid4(),
+        created_by=tenants.theirs.rows["user"],
+        name="isolation",
+        key_prefix="sft_dev_Isolatn1",
+        key_hash=secrets.token_bytes(32),
+        scopes=["transfers:read"],
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+    await audit.record(session, action="api_key.created", actor=ADMIN)
+    return key.id
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_and_mark_expiring_keys(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    found: object = None
+    with contextlib.suppress(ScopeNotAllowedError):  # system scope only
+        found = await api_keys.expiring(
+            session, now=datetime.now(UTC), within=timedelta(days=14), limit=10
+        )
+    try:
+        marked = await api_keys.mark_notice(session, theirs["api_key"], stage=14, before=None)
+    except ScopeNotAllowedError:
+        marked = None
+    return found, marked
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def read_another_tenants_key_for_an_email(session: AsyncSession, tenants: Tenants) -> object:
+    return await api_keys.notice_key(session, tenants.theirs.rows["api_key"])
+
+
+@cases.add(scopes=API_TENANT)
+async def search_another_tenants_audit_log(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    filters = (
+        audit_reads.EventFilter(),
+        audit_reads.EventFilter(target_id=theirs.rows["transfer"]),
+        audit_reads.EventFilter(target_type="transfer", target_id=theirs.rows["transfer"]),
+        audit_reads.EventFilter(actor_id=theirs.rows["user"]),
+        audit_reads.EventFilter(people=frozenset({theirs.rows["user"], theirs.rows["recipient"]})),
+    )
+    now = datetime.now(UTC)
+    found: list[object] = []
+    for events in filters:
+        rows = await audit_reads.read_events(session, events, after=None, until=now, limit=100)
+        found.append(rows)
+        found.append(await audit_reads.count_events(session, events, until=now, cap=100))
+        found.append(await audit_reads.actor_emails(session, rows))
+    found.append(await audit_reads.people_with_email(session, f"{theirs.marker}@example.test"))
+    found.append(await audit_reads.people_with_email(session, f"{theirs.marker}@recipient.test"))
+    return found
+
+
+@cases.add(scopes=API_TENANT)
+async def clear_another_tenants_suppression(session: AsyncSession, tenants: Tenants) -> object:
+    ended = await suppressions.end_entries(session, [f"eiso:{tenants.theirs.marker}"])
+    await audit.record(session, action="email_suppression.cleared", actor=ADMIN)
+    return ended
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def release_another_tenants_suppression(session: AsyncSession, tenants: Tenants) -> object:
+    due = await suppressions.release_due(session, [f"eiso:{tenants.theirs.marker}"])
+    await suppressions.mark_released(session, tenants.theirs.rows["suppression"])
+    await audit.record(session, action="email_suppression.released", actor=Actor(ActorType.SYSTEM))
+    return due
+
+
+@cases.add(scopes=API_TENANT)
+async def set_the_scopes_own_domain_rules(session: AsyncSession, tenants: Tenants) -> object:
+    policy = await tenant_data.update_policy(
+        session, allowed_domains=["example.com"], blocked_domains=["bad.example.com"]
+    )
+    await audit.record(session, action="tenant_policy.updated", actor=ADMIN)
+    return policy
+
+
+# ---- the DLP policy, rules and detectors (#218, revision 0024) ----
+
+# The roles that read the policy in a tenant's scope, and roles that must be refused.
+DLP_READERS = {API: [TENANT, RESOURCE], SCAN: [TENANT], JOBS: [TENANT], NOTIFY: [TENANT]}
+DLP_WRITERS = {API: [TENANT], OPERATOR: [TENANT], SCAN: [TENANT], JOBS: [TENANT]}
+
+
+def _rule_fields(marker: str) -> RuleFields:
+    return RuleFields(
+        name=marker,
+        direction="sent",
+        condition="new_domain",
+        detectors=(),
+        min_confidence="medium",
+        threshold=1,
+        reasons=(),
+        include_sender_24h=False,
+        recipient_scope="any",
+        action="warn",
+        approvals_required=1,
+        enabled=True,
+    )
+
+
+@cases.add(scopes=DLP_READERS)
+async def read_another_tenants_dlp_policy(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await dlp_policy.get_policy(session),
+        await dlp_policy.list_live_rules(session),
+        await dlp_policy.get_live_rule(session, theirs["dlp_rule"]),
+        await dlp_policy.count_live_rules(session),
+        await dlp_policy.live_rules_using(session, detector_ref(theirs["dlp_detector"])),
+        await dlp_policy.list_live_detectors(session),
+        await dlp_policy.get_live_detector(session, theirs["dlp_detector"]),
+        await dlp_policy.scan_detectors(session),
+        await dlp_policy.detector_names(
+            session, [theirs["dlp_detector"], theirs["dlp_deleted_detector"]]
+        ),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_approvers_and_admins(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    return (
+        await dlp_policy.get_policy(session, lock=True),
+        await dlp_policy.count_active_approvers(session),
+        await dlp_policy.active_admin_ids(session),
+    )
+
+
+@cases.add(scopes=DLP_WRITERS)
+async def raise_the_dlp_version_as_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    policy = await dlp_policy.raise_version(session, updated_by=tenants.theirs.rows["user"])
+    await audit.record(session, action="dlp_policy.updated", actor=ADMIN)
+    return policy
+
+
+@cases.add(scopes=DLP_WRITERS)
+async def raise_the_dlp_version_of_no_other_tenant(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    policy = await dlp_policy.raise_version(
+        session, updated_by=None, trusted_domains=["mine.example"]
+    )
+    await audit.record(session, action="dlp_policy.updated", actor=ADMIN)
+    return policy
+
+
+@cases.add(scopes=DLP_WRITERS)
+async def retire_another_tenants_rule_and_detector(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    found = (
+        await dlp_policy.retire_rule(session, theirs["dlp_rule"], 2),
+        await dlp_policy.retire_detector(session, theirs["dlp_detector"], 2),
+    )
+    await audit.record(session, action="dlp_rule.deleted", actor=ADMIN)
+    return found
+
+
+@cases.add(scopes=DLP_WRITERS)
+async def write_a_rule_made_by_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    rule = await dlp_policy.insert_rule(
+        session,
+        uuid.uuid4(),
+        1,
+        _rule_fields(tenants.mine.marker),
+        created_by=tenants.theirs.rows["user"],
+    )
+    await audit.record(session, action="dlp_rule.created", actor=ADMIN)
+    return rule
+
+
+@cases.add(scopes=DLP_WRITERS)
+async def write_a_detector_made_by_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    detector = await dlp_policy.insert_detector(
+        session,
+        uuid.uuid4(),
+        1,
+        DetectorFields(
+            name=tenants.mine.marker, kind="keywords", definition_ct=b"\x00{}", enabled=True
+        ),
+        created_by=tenants.theirs.rows["user"],
+    )
+    await audit.record(session, action="dlp_detector.created", actor=ADMIN)
+    return detector
+
+
+@cases.add(scopes={OPERATOR: [TENANT], API: [TENANT]})
+async def write_a_default_policy_naming_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # Mine has its policy already: the function writes nothing, and names no one of theirs.
+    await dlp_policy.insert_default_policy(
+        session, created_by=tenants.theirs.rows["user"], locale="ja"
+    )
+    await audit.record(session, action="tenant.created", actor=ADMIN)
+    return None
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_retired_dlp_revisions(session: AsyncSession, tenants: Tenants) -> object:
+    # The cleanup's find steps read across tenants in system scope, by design; in tenant scope
+    # the data layer refuses them before any row.
+    return (
+        await dlp_policy.tenants_with_retired_rules(session, before=FAR, limit=10),
+        await dlp_policy.tenants_with_retired_detectors(session, before=FAR, limit=10),
+    )
+
+
+@cases.add(scopes={JOBS: [TENANT], API: [TENANT], SCAN: [TENANT]})
+async def delete_another_tenants_retired_revisions(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    deleted = (
+        await dlp_policy.delete_retired_rules(session, before=FAR, limit=10),
+        await dlp_policy.delete_retired_detectors(session, before=FAR, limit=10),
+    )
+    await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
+    return deleted
+
+
+# ---- the DLP decision (#219, revision 0025) ----
+
+DECISION_READERS = {API: [TENANT], SCAN: [TENANT], JOBS: [TENANT]}
+
+
+@cases.add(scopes=DECISION_READERS)
+async def read_another_tenants_decision_inputs(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    return (
+        await dlp_decisions.decision_policy(session),
+        await transfers.recipient_domains(session, theirs.rows["transfer"]),
+        await findings.counts_by_file(session, [theirs.rows["scanning_file"]]),
+        await dlp_decisions.known_since(
+            session, [f"{theirs.marker}.example", f"old-{theirs.marker}.example"], since=PAST
+        ),
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_decision(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs
+    return (
+        await dlp_decisions.get_decision(session, theirs.rows["dlp_decision"]),
+        await dlp_decisions.decision_summary(session, theirs.rows["dlp_decision"]),
+        await dlp_decisions.known_before(session, [f"{theirs.marker}.example"], at=FAR),
+    )
+
+
+@cases.add(scopes=DECISION_READERS)
+async def decide_on_another_tenants_transfer(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    await dlp_decisions.insert_decision(
+        session,
+        decision_id=uuid.uuid4(),
+        transfer_id=theirs["transfer"],
+        policy_version=1,
+        mode="enforce",
+        outcome="warn",
+        enforced=True,
+        untrusted_recipients=0,
+        new_domains=0,
+        rules=[dlp_decisions.MatchedRule(theirs["dlp_rule"], 2, "warn", 1)],
+    )
+    await audit.record(session, action="dlp.decided", actor=Actor(ActorType.SYSTEM))
+    return None
+
+
+@cases.add(scopes=DECISION_READERS)
+async def apply_another_tenants_rule_to_my_transfer(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    await dlp_decisions.insert_decision(
+        session,
+        decision_id=uuid.uuid4(),
+        transfer_id=tenants.mine.rows["transfer"],
+        policy_version=1,
+        mode="enforce",
+        outcome="warn",
+        enforced=True,
+        untrusted_recipients=0,
+        new_domains=0,
+        rules=[dlp_decisions.MatchedRule(tenants.theirs.rows["dlp_rule"], 2, "warn", 1)],
+    )
+    await audit.record(session, action="dlp.decided", actor=Actor(ActorType.SYSTEM))
+    return None
+
+
+@cases.add(scopes=DECISION_READERS)
+async def point_another_tenants_transfer_at_a_decision(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    changed = (
+        await transfers.change_state(
+            session,
+            tenants.theirs.rows["transfer"],
+            from_states=(TransferState.DRAFT,),
+            to=TransferState.DRAFT,
+            dlp_decision_id=tenants.mine.rows["dlp_decision"],
+        ),
+        await transfers.change_state(
+            session,
+            tenants.mine.rows["transfer"],
+            from_states=(TransferState.DRAFT,),
+            to=TransferState.DRAFT,
+            dlp_decision_id=tenants.theirs.rows["dlp_decision"],
+        ),
+    )
+    await audit.record(session, action="dlp.decided", actor=Actor(ActorType.SYSTEM))
+    return changed
+
+
+@cases.add(scopes=API_TENANT)
+async def confirm_another_tenants_decision(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    await dlp_decisions.insert_confirmation(
+        session,
+        confirmation_id=uuid.uuid4(),
+        transfer_id=tenants.mine.rows["transfer"],
+        decision_id=theirs["dlp_decision"],
+        confirmed_by=theirs["user"],
+        justification_ct=tenants.mine.marker.encode(),
+    )
+    await audit.record(session, action="transfer.confirmed", actor=ADMIN)
+    return None
+
+
+@cases.add(scopes=DECISION_READERS)
+async def record_a_domain_another_tenant_knows(session: AsyncSession, tenants: Tenants) -> object:
+    # Theirs is untouched: the upsert writes the scope's tenant's row, never their `last_sent_at`.
+    recorded = await dlp_decisions.record_known_domains(
+        session, [f"{tenants.theirs.marker}.example", f"{tenants.mine.marker}.example"]
+    )
+    await audit.record(session, action="transfer.sent", actor=Actor(ActorType.SYSTEM))
+    return recorded
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_stale_known_domains(session: AsyncSession, tenants: Tenants) -> object:
+    # The cleanup's find step reads across tenants in system scope, by design; in tenant scope
+    # the data layer refuses it before any row.
+    return await dlp_decisions.tenants_with_stale_domains(session, before=FAR, limit=10)
+
+
+@cases.add(scopes={JOBS: [TENANT], API: [TENANT], SCAN: [TENANT]})
+async def delete_another_tenants_known_domains(session: AsyncSession, tenants: Tenants) -> object:
+    deleted = await dlp_decisions.delete_stale_domains(session, before=FAR, limit=10)
+    await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
+    return deleted
+
+
+# ---- DLP approvals (#220, revision 0026) ----
+
+APPROVAL_ENDERS = {API: [TENANT], JOBS: [TENANT]}
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_approval_requests(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await dlp_approvals.count_requests(session, theirs["transfer"]),
+        await dlp_approvals.get_request(session, theirs["dlp_approval_request"]),
+        await dlp_approvals.latest_request(session, theirs["transfer"]),
+        await dlp_approvals.list_requests(session, now=FAR, limit=10),
+        await dlp_approvals.list_requests(
+            session, now=PAST, sent_by=theirs["user"], states=[ApprovalState.PENDING], limit=10
+        ),
+        await dlp_approvals.list_requests(
+            session, now=FAR, not_sent_by=theirs["user"], states=[ApprovalState.EXPIRED], limit=10
+        ),
+        await dlp_approvals.approvals(session, [theirs["dlp_approval_request"]]),
+        await dlp_approvals.rule_names(session, [theirs["dlp_decision"]]),
+        await dlp_approvals.approvals_required(session, theirs["dlp_decision"]),
+        await dlp_approvals.justification(session, theirs["dlp_confirmation"]),
+        await dlp_approvals.list_decisions(session, theirs["dlp_approval_request"]),
+        await dlp_approvals.eligible_approvers(session, sender=theirs["user"]),
+    )
+
+
+async def _request_approval_naming(
+    session: AsyncSession,
+    mine: dict[str, uuid.UUID],
+    decision: uuid.UUID,
+    confirmation: uuid.UUID,
+    user: uuid.UUID,
+) -> object:
+    # Each transfer holds one pending request (the seed's), and the index allowing one pending
+    # request per transfer answers before a foreign key would: mine is withdrawn first, and their
+    # transfer, which keeps its pending request, isn't named.
+    await dlp_approvals.end_pending(
+        session, mine["transfer"], to=ApprovalState.WITHDRAWN, ended_at=datetime.now(UTC)
+    )
+    await dlp_approvals.insert_request(
+        session,
+        request_id=uuid.uuid4(),
+        transfer_id=mine["transfer"],
+        decision_id=decision,
+        confirmation_id=confirmation,
+        requested_by=user,
+        approvals_required=1,
+        expires_at=FAR,
+    )
+    await audit.record(session, action="dlp_approval.requested", actor=ADMIN)
+    return None
+
+
+@cases.add(scopes=API_TENANT)
+async def request_approval_under_another_tenants_decision(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    mine, theirs = tenants.mine.rows, tenants.theirs.rows
+    return await _request_approval_naming(
+        session, mine, theirs["dlp_decision"], mine["dlp_confirmation"], mine["user"]
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def request_approval_with_another_tenants_confirmation_and_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    mine, theirs = tenants.mine.rows, tenants.theirs.rows
+    return await _request_approval_naming(
+        session, mine, mine["dlp_decision"], theirs["dlp_confirmation"], theirs["user"]
+    )
+
+
+@cases.add(scopes=APPROVAL_ENDERS)
+async def end_another_tenants_approval_request(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    ended = (
+        await dlp_approvals.end_request(
+            session, theirs["dlp_approval_request"], to=ApprovalState.EXPIRED, ended_at=FAR
+        ),
+        await dlp_approvals.end_request(
+            session,
+            theirs["dlp_approval_request"],
+            to=ApprovalState.EXPIRED,
+            ended_at=FAR,
+            due_by=FAR,
+        ),
+        await dlp_approvals.end_pending(
+            session, theirs["transfer"], to=ApprovalState.WITHDRAWN, ended_at=FAR
+        ),
+    )
+    await audit.record(session, action="dlp_approval.expired", actor=Actor(ActorType.SYSTEM))
+    return ended
+
+
+@cases.add(scopes=API_TENANT)
+async def decide_another_tenants_approval_request(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    mine, theirs = tenants.mine.rows, tenants.theirs.rows
+    for request, approver in (
+        (theirs["dlp_approval_request"], mine["user"]),
+        (mine["dlp_approval_request"], theirs["user"]),
+    ):
+        await dlp_approvals.insert_decision(
+            session,
+            decision_id=uuid.uuid4(),
+            request_id=request,
+            approver_id=approver,
+            decision=ApprovalDecisionKind.REJECT,
+            comment_ct=tenants.mine.marker.encode(),
+        )
+    await audit.record(session, action="dlp_approval.rejected", actor=ADMIN)
+    return None
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_expired_approval_requests(session: AsyncSession, tenants: Tenants) -> object:
+    # The expiry job's find reads across tenants in system scope, by design; in tenant scope the
+    # data layer refuses it before any row.
+    return await dlp_approvals.due_for_expiry(session, now=FAR, limit=10)
+
+
+@cases.add(scopes={NOTIFY: [TENANT], API: [TENANT]})
+async def read_another_tenants_approval_notice(session: AsyncSession, tenants: Tenants) -> object:
+    return await dlp_approvals.notice(session, tenants.theirs.rows["dlp_approval_request"])
 
 
 test_isolation = cases.test()

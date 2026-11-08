@@ -30,6 +30,7 @@ from sft.service.permissions import (
     permission_for,
 )
 from sft.service.rate_limits.limits import KeyType
+from test_authorization_matrix import API_KEY_SCOPES
 from tools.contract_check import CONTRACT, METHODS, load_contract
 
 DOCS = Path(__file__).resolve().parents[3] / "docs"
@@ -191,9 +192,32 @@ def test_step_up_operations_need_a_recent_sign_in() -> None:
 def test_api_keys_need_one_of_the_scopes() -> None:
     key = Caller(CallerKind.API_KEY, tenant_id=uuid.uuid4(), credential_id=uuid.uuid4())
     with refused(Unauthenticated, "authentication_required"):
-        authorize(key, "listUsers", now=NOW)  # no credential the operation accepts
+        authorize(key, "createTenant", now=NOW)  # no credential the operation accepts
     with refused(Forbidden, "permission_denied"):
         authorize(key, "listTransfers", now=NOW)
+
+
+def test_api_keys_are_refused_with_403_on_every_operation_for_web_sessions_only() -> None:
+    # A key is a credential the member routes read (#215), so its refusal there is 403 (T-55).
+    key = Caller(
+        CallerKind.API_KEY,
+        tenant_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        credential_id=uuid.uuid4(),
+        scopes=frozenset(API_KEY_SCOPES),
+    )
+    web_only = [
+        operation
+        for permission in REGISTRY
+        if permission.api_key is None
+        and (permission.member, permission.admin) != (Reach.NONE, Reach.NONE)
+        for operation in permission.operations
+    ]
+    assert {"listUsers", "createApiKey", "revokeApiKey", "clearEmailSuppression"} <= set(web_only)
+    assert {"getCurrentMember", "unlockRecipient", "createReceivedFileDownload"} <= set(web_only)
+    for operation in web_only:
+        with refused(Forbidden, "permission_denied"):
+            authorize(key, operation, now=NOW)
     reader = Caller(CallerKind.API_KEY, scopes=frozenset({"transfers:read"}))
     assert authorize(reader, "listTransfers", now=NOW) is Reach.TENANT
     writer = Caller(CallerKind.API_KEY, scopes=frozenset({"transfers:write"}))
@@ -222,9 +246,12 @@ def test_operators_and_system_actors() -> None:
 
 
 def test_a_401_to_a_bearer_credential_carries_the_challenge() -> None:
-    for kind in (CallerKind.API_KEY, CallerKind.OPERATOR):
+    for kind, operation in (
+        (CallerKind.API_KEY, "createTenant"),
+        (CallerKind.OPERATOR, "listUsers"),
+    ):
         with pytest.raises(Unauthenticated) as caught:
-            authorize(Caller(kind, credential_id=uuid.uuid4()), "listUsers", now=NOW)
+            authorize(Caller(kind, credential_id=uuid.uuid4()), operation, now=NOW)
         assert caught.value.bearer
     with pytest.raises(Unauthenticated) as cookie:
         authorize(None, "listUsers", now=NOW)

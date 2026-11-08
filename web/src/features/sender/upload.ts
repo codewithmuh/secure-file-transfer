@@ -14,9 +14,11 @@
  * - **No credentials to storage.** Parts go through their own axios instance: no base URL, `withCredentials: false`,
  *   no default `Content-Type`, and none of the app's interceptors, so no cookie, CSRF token or link session ever
  *   reaches S3.
- * - **Cancel.** `cancel` stops every part in flight and removes the file (`deleteFile`).
+ * - **Cancel.** `cancel` stops every part in flight and removes the file (`deleteFile`), when the caller can.
  *
- * The engine knows nothing of React: the page passes the API calls in and reads progress from `onChange`.
+ * The engine knows nothing of React: the page passes the API calls in and reads progress from `onChange`. A member's
+ * transfer passes the member operations (`uploadApi`); an uploader's page passes the link session's (#213,
+ * `sessionUploadApi`), whose completion answers a `SessionFile` and which has no delete.
  */
 import axios, { type AxiosInstance } from 'axios';
 import type { Schema } from '@/api';
@@ -37,12 +39,15 @@ export const MAX_WAIT_MS = 30_000;
 /** A URL this close to its `expires_at` is asked for again rather than used. */
 export const URL_MARGIN_MS = 30_000;
 
-/** The API calls the engine makes, for one file. */
-export interface UploadApi {
+/**
+ * The API calls the engine makes, for one file. `Completed` is what `completeUpload` answers: a `File` for a member,
+ * a `SessionFile` for an uploader. `deleteFile` is left out where the caller can't delete (an uploader, #213).
+ */
+export interface UploadApi<Completed = ApiFile> {
   listUploadedParts(fileId: string): Promise<UploadedParts>;
   requestPartUrls(fileId: string, partNumbers: number[]): Promise<PartUrl[]>;
-  completeUpload(fileId: string): Promise<ApiFile>;
-  deleteFile(fileId: string): Promise<void>;
+  completeUpload(fileId: string): Promise<Completed>;
+  deleteFile?(fileId: string): Promise<void>;
 }
 
 export interface Part {
@@ -99,10 +104,10 @@ export interface UploadProgress {
   error: unknown;
 }
 
-export interface FileUploadOptions {
+export interface FileUploadOptions<Completed = ApiFile> {
   fileId: string;
   blob: Blob;
-  api: UploadApi;
+  api: UploadApi<Completed>;
   storage?: AxiosInstance;
   concurrency?: number;
   attempts?: number;
@@ -138,10 +143,10 @@ function statusOf(error: unknown): number | null {
 }
 
 /** One file's upload. `start` runs it to `completeUpload`; `resume` runs it again after a failure; `cancel` ends it. */
-export class FileUpload {
+export class FileUpload<Completed = ApiFile> {
   readonly fileId: string;
   private readonly blob: Blob;
-  private readonly api: UploadApi;
+  private readonly api: UploadApi<Completed>;
   private readonly storage: AxiosInstance;
   private readonly concurrency: number;
   private readonly attempts: number;
@@ -150,7 +155,7 @@ export class FileUpload {
   private readonly onChange?: (progress: UploadProgress) => void;
 
   private controller = new AbortController();
-  private running: Promise<ApiFile | null> | null = null;
+  private running: Promise<Completed | null> | null = null;
   private held = new Set<number>();
   private inFlight = new Map<number, number>();
   private urls = new Map<number, PartUrl>();
@@ -158,7 +163,7 @@ export class FileUpload {
   private parts: Part[] = [];
   private progress: UploadProgress;
 
-  constructor(options: FileUploadOptions) {
+  constructor(options: FileUploadOptions<Completed>) {
     this.fileId = options.fileId;
     this.blob = options.blob;
     this.api = options.api;
@@ -176,7 +181,7 @@ export class FileUpload {
   }
 
   /** Uploads every missing part and completes the file. Resolves with the completed file, or `null` if cancelled. */
-  start(): Promise<ApiFile | null> {
+  start(): Promise<Completed | null> {
     if (!this.running) {
       this.running = this.run().finally(() => {
         this.running = null;
@@ -186,7 +191,7 @@ export class FileUpload {
   }
 
   /** After a failure: start again from the parts S3 holds. */
-  resume(): Promise<ApiFile | null> {
+  resume(): Promise<Completed | null> {
     if (this.progress.status === 'cancelled' || this.progress.status === 'done') return Promise.resolve(null);
     return this.start();
   }
@@ -203,13 +208,13 @@ export class FileUpload {
     this.update({ status: 'failed', error: 'paused' });
   }
 
-  /** Stops every part in flight and removes the file from its transfer (`deleteFile`). */
+  /** Stops every part in flight and removes the file from its transfer (`deleteFile`), when the API offers that. */
   async cancel(): Promise<void> {
     if (this.progress.status === 'cancelled' || this.progress.status === 'done') return;
     this.controller.abort();
     this.update({ status: 'cancelled' });
     await this.running?.catch(() => null);
-    await this.api.deleteFile(this.fileId);
+    await this.api.deleteFile?.(this.fileId);
   }
 
   private update(change: Partial<UploadProgress>): void {
@@ -219,7 +224,7 @@ export class FileUpload {
     this.onChange?.(this.progress);
   }
 
-  private async run(): Promise<ApiFile | null> {
+  private async run(): Promise<Completed | null> {
     if (this.controller.signal.aborted) return null;
     this.update({ status: 'uploading', error: null });
     try {

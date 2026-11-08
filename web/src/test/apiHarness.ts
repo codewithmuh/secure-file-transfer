@@ -85,6 +85,7 @@ export const member = {
   email: 'aiko@example.co.jp',
   name: 'aiko@example.co.jp',
   role: 'member' as const,
+  dlpApprover: false,
   tenantId: '0190c0de-0000-7000-8000-0000000000aa',
   tenantName: 'Example KK',
 };

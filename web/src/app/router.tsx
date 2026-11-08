@@ -1,16 +1,32 @@
 import { createBrowserRouter } from 'react-router';
 import { AppLayout, PublicLayout } from '@/components/layout';
-import { NotAvailableYet } from '@/components/NotAvailableYet';
 import { ProtectedRoute, SignInPage, SignInCallbackPage } from '@/features/auth';
-import { DashboardPage, TransferListPage, CreateTransferPage, TransferDetailPage } from '@/features/sender';
+import {
+  DashboardPage,
+  TransferListPage,
+  CreateTransferPage,
+  TransferDetailPage,
+  UploadRequestListPage,
+  CreateUploadRequestPage,
+  UploadRequestDetailPage,
+} from '@/features/sender';
 import { RecipientPage } from '@/features/recipient';
-import { UserManagementPage, TenantPolicyPage } from '@/features/admin';
+import { UploaderPage } from '@/features/uploader';
+import { UserManagementPage, TenantPolicyPage, ApiKeysPage } from '@/features/admin';
+import { ApprovalQueuePage, ApprovalRequestPage } from '@/features/approvals';
+import { AuditLogPage } from '@/features/audit';
+import {
+  DlpAdminPage,
+  KeywordListEditor,
+  KeywordListsSection,
+  RuleEditor,
+  RulesSection,
+  SettingsSection,
+} from '@/features/dlp';
 
 /**
- * The routes. M5's pages (upload requests and the uploader's `/u`, the audit log, API keys and the DLP policy) are
- * hidden (#195's decision): no navigation entry, and their routes show `NotAvailableYet`, so an old bookmark or a typed
- * URL gets a clear answer. Their components stay in the repository, unrouted and unimported, as M5's starting point;
- * M5 routes each again as its operations land.
+ * The routes. Every M5 page is live: upload requests and the uploader's `/u` (#212, #213), the audit log (#216), API
+ * keys (#215), the DLP policy (#218) and approvals (#220).
  */
 export const router = createBrowserRouter([
   { path: '/sign-in', element: <SignInPage /> },
@@ -20,7 +36,7 @@ export const router = createBrowserRouter([
     element: <PublicLayout />,
     children: [
       { path: '/t', element: <RecipientPage /> },
-      { path: '/u', element: <NotAvailableYet /> },
+      { path: '/u', element: <UploaderPage /> },
     ],
   },
 
@@ -35,7 +51,12 @@ export const router = createBrowserRouter([
       { path: '/transfers', element: <TransferListPage /> },
       { path: '/transfers/new', element: <CreateTransferPage /> },
       { path: '/transfers/:id', element: <TransferDetailPage /> },
-      { path: '/upload-requests/*', element: <NotAvailableYet /> },
+      { path: '/upload-requests', element: <UploadRequestListPage /> },
+      { path: '/upload-requests/new', element: <CreateUploadRequestPage /> },
+      { path: '/upload-requests/:id', element: <UploadRequestDetailPage /> },
+      // Approvers see their queue, admins every request; a sender may open their own request's page.
+      { path: '/approvals', element: <ApprovalQueuePage /> },
+      { path: '/approvals/:id', element: <ApprovalRequestPage /> },
       {
         path: '/admin/users',
         element: <ProtectedRoute requiredRole="admin"><UserManagementPage /></ProtectedRoute>,
@@ -44,9 +65,27 @@ export const router = createBrowserRouter([
         path: '/admin/policy',
         element: <ProtectedRoute requiredRole="admin"><TenantPolicyPage /></ProtectedRoute>,
       },
-      { path: '/admin/audit/*', element: <NotAvailableYet /> },
-      { path: '/admin/api-keys/*', element: <NotAvailableYet /> },
-      { path: '/admin/dlp/*', element: <NotAvailableYet /> },
+      {
+        path: '/admin/audit',
+        element: <ProtectedRoute requiredRole="admin"><AuditLogPage /></ProtectedRoute>,
+      },
+      {
+        path: '/admin/api-keys',
+        element: <ProtectedRoute requiredRole="admin"><ApiKeysPage /></ProtectedRoute>,
+      },
+      {
+        path: '/admin/dlp',
+        element: <ProtectedRoute requiredRole="admin"><DlpAdminPage /></ProtectedRoute>,
+        children: [
+          { index: true, element: <SettingsSection /> },
+          { path: 'rules', element: <RulesSection /> },
+          { path: 'rules/new', element: <RuleEditor /> },
+          { path: 'rules/:ruleId', element: <RuleEditor /> },
+          { path: 'keywords', element: <KeywordListsSection /> },
+          { path: 'keywords/new', element: <KeywordListEditor /> },
+          { path: 'keywords/:detectorId', element: <KeywordListEditor /> },
+        ],
+      },
     ],
   },
 ]);

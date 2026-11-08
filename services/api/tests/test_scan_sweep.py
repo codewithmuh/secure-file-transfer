@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from prometheus_client import CollectorRegistry
 
-from member_fixtures import seed_user
+from member_fixtures import ready_for_dlp, seed_user
 from pg import ScratchDatabase
 from sft.data.database import Database
 from sft.data.outbox import Queue
@@ -65,6 +65,7 @@ async def test_the_sweep_fails_overdue_scans_and_holds_their_transfers(
         "INSERT INTO tenants (id, name, status) VALUES (:id, 'T', 'active')", id=tenant_id
     )
     owner = seed_user(migrated_db, tenant_id)
+    ready_for_dlp(migrated_db, tenant_id, owner)  # the default policy, example.test known (#219)
     transfer_id, _ = seed_transfer(migrated_db, tenant_id, owner, state="submitted")
     overdue = seed_file(migrated_db, tenant_id, transfer_id, deadline=-timedelta(minutes=1))
     in_time = seed_file(migrated_db, tenant_id, transfer_id, deadline=timedelta(hours=1))

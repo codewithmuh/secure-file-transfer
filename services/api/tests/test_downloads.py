@@ -827,3 +827,99 @@ async def test_the_grant_flow_reads_the_injected_clock(w: World) -> None:
         origin=Origin(), now=datetime.now(UTC),
     )  # fmt: skip
     assert resumed.grant_id == view.grant_id
+
+
+# ---- the first-download notice (#214, FR-8) ----
+
+
+def notices(w: World, transfer_id: uuid.UUID) -> int:
+    [(found,)] = w.db.sql(
+        "SELECT count(*) FROM outbox WHERE topic = 'transfer.first_download' "
+        "AND payload->>'transfer_id' = :id",
+        id=str(transfer_id),
+    )
+    return int(str(found))
+
+
+async def two_recipients_download_three_files(
+    w: World, *, notify: bool
+) -> tuple[uuid.UUID, list[uuid.UUID], list[tuple[Browser, dict[str, Any], str]]]:
+    """A transfer to two recipients with three files; between them they download each file, and
+    one file twice. The grants, each with its browser and session."""
+    first, second = unique(), unique()
+    transfer_id, _, file_ids, _ = shared(w, first, second, files=3)
+    w.db.sql(
+        "UPDATE transfers SET notify_on_first_download = :notify WHERE id = :id",
+        notify=notify,
+        id=transfer_id,
+    )
+    one, two = await w.browser(), await w.browser()
+    _, one_session = await w.verify(one, first)
+    _, two_session = await w.verify(two, second)
+    grants = []
+    for browser, session, file_id in (
+        (one, one_session, file_ids[0]),
+        (two, two_session, file_ids[1]),
+        (one, one_session, file_ids[2]),
+        (two, two_session, file_ids[0]),
+    ):
+        response = await grant(browser, session, file_id)
+        assert response.status_code == 200, response.text
+        grants.append((browser, session, response.json()["grant_id"]))
+    return transfer_id, file_ids, grants
+
+
+async def test_the_first_download_of_a_transfer_emails_its_member_once(w: World) -> None:
+    w.db.sql(
+        "INSERT INTO tenant_policies (tenant_id, default_locale) VALUES (:t, 'ja')", t=w.tenant.id
+    )
+    transfer_id, file_ids, grants = await two_recipients_download_three_files(w, notify=True)
+    assert notices(w, transfer_id) == 1
+    [(notified,)] = w.db.sql(
+        "SELECT first_download_notified_at IS NOT NULL FROM transfers WHERE id = :id",
+        id=transfer_id,
+    )
+    assert notified is True
+    await w.links()
+    [email] = w.sent.of_type("first_download")
+    [(owner,)] = w.db.sql("SELECT email FROM users WHERE id = :id", id=w.tenant.target)
+    assert email.to == owner
+    assert not email.subject.isascii(), "in the member's language, the tenant's default"
+    assert f"/transfers/{transfer_id}" in email.text
+    assert all(str(file_id) not in email.text for file_id in file_ids)
+    assert actions(w, transfer_id).count("email.sent") == 1
+
+    # A resume, and another counted download of a file already downloaded, send nothing more.
+    browser, session, grant_id = grants[0]
+    resumed = await grant(browser, session, file_ids[0], {"resume_grant_id": grant_id})
+    assert resumed.status_code == 200, resumed.text
+    assert (await grant(browser, session, file_ids[0])).status_code == 200
+    await w.links()
+    assert notices(w, transfer_id) == 1
+    assert len(w.sent.of_type("first_download")) == 1
+
+
+async def test_without_the_flag_no_first_download_email_is_sent(w: World) -> None:
+    transfer_id, _, _ = await two_recipients_download_three_files(w, notify=False)
+    await w.links()
+    assert notices(w, transfer_id) == 0
+    assert w.sent.of_type("first_download") == []
+    [(notified,)] = w.db.sql(
+        "SELECT first_download_notified_at FROM transfers WHERE id = :id", id=transfer_id
+    )
+    assert notified is None
+
+
+async def test_a_refused_grant_writes_no_first_download_notice(w: World) -> None:
+    address = unique()
+    transfer_id, _, [file_id], _ = shared(w, address)
+    w.db.sql("UPDATE transfers SET notify_on_first_download = true WHERE id = :id", id=transfer_id)
+    browser = await w.browser()
+    _, session = await w.verify(browser, address)
+    w.store.fail = {Region.OSAKA}  # the intent record fails: nothing is counted
+    response = await grant(browser, session, file_id)
+    assert response.status_code == 503, response.text
+    assert notices(w, transfer_id) == 0
+    w.store.fail = set()
+    assert (await grant(browser, session, file_id)).status_code == 200
+    assert notices(w, transfer_id) == 1

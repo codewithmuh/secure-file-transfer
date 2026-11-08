@@ -78,6 +78,9 @@ E_SESSION = StreamCap("session_streams", KeyType.LINK_SESSION, 6)
 E_IP = StreamCap("ip_streams", KeyType.IP, 20)
 E_TENANT = StreamCap("tenant_streams", KeyType.TENANT, 200)
 STREAM_CAPS: Final = (E_SESSION, E_IP, E_TENANT)
+E_ACCOUNT = StreamCap("account_streams", KeyType.ACCOUNT, 6)
+"""A member's streams of received files (#213): 6, as a link session's."""
+MEMBER_STREAM_CAPS: Final = (E_ACCOUNT, E_IP, E_TENANT)
 
 
 def units(size: int) -> int:
@@ -95,6 +98,13 @@ def grant_charges(keys: Mapping[KeyType, KeyValue], size: int) -> list[Charge]:
         Charge(D_SUBJECT_BYTES, keys, cost),
         Charge(D_TENANT_BYTES, keys, cost),
     ]
+
+
+def received_grant_charges(keys: Mapping[KeyType, KeyValue], size: int) -> list[Charge]:
+    """What a member's new grant of a received file costs (#213): one of the tenant's grants an
+    hour and the file's size against the tenant's bytes of the day, shared with recipients. No
+    per-member byte cap: the received files are the member's own company's."""
+    return [Charge(D_TENANT, keys), Charge(D_TENANT_BYTES, keys, units(size))]
 
 
 @dataclass
@@ -119,6 +129,7 @@ class StreamSlot:
     stream_id: UUID
     keys: tuple[str, ...]
     released: bool = False
+    caps: tuple[StreamCap, ...] = STREAM_CAPS
 
     async def renew(self) -> None:
         await self.limits._renew(self)
@@ -153,17 +164,24 @@ class DownloadLimits:
 
     # ---- concurrent streams ----
 
-    async def open_stream(self, keys: Mapping[KeyType, str], stream_id: UUID) -> StreamSlot:
-        """A place for one stream under the pod's cap and every stream cap, or `503` or `429`."""
+    async def open_stream(
+        self,
+        keys: Mapping[KeyType, str],
+        stream_id: UUID,
+        *,
+        caps: tuple[StreamCap, ...] = STREAM_CAPS,
+    ) -> StreamSlot:
+        """A place for one stream under the pod's cap and every stream cap, or `503` or `429`.
+        A member's stream of a received file passes `MEMBER_STREAM_CAPS` (#213)."""
         if self.active >= self.pod_streams:
             raise PodFull()
         slot = StreamSlot(
-            self, stream_id, tuple(cap.store_key(keys[cap.key]) for cap in STREAM_CAPS)
+            self, stream_id, tuple(cap.store_key(keys[cap.key]) for cap in caps), caps=caps
         )
         held: list[str] = []
         now_ms = int(self._clock() * 1000)
         try:
-            for cap, key in zip(STREAM_CAPS, slot.keys, strict=True):
+            for cap, key in zip(caps, slot.keys, strict=True):
                 taken = await self._store.acquire_lease(
                     key, str(stream_id), now_ms=now_ms, ttl_ms=STREAM_LEASE_MS, cap=cap.cap
                 )
@@ -174,7 +192,7 @@ class DownloadLimits:
                 held.append(key)
         except CounterStoreUnavailableError:
             log.warning("counter store unavailable: stream caps count per pod")
-            for cap, key in zip(STREAM_CAPS, slot.keys, strict=True):
+            for cap, key in zip(caps, slot.keys, strict=True):
                 if len(self._local.streams.get(key, set())) >= max(1, cap.cap // FALLBACK_DIVISOR):
                     self._stream_refused(cap)
             for key in slot.keys:
@@ -190,7 +208,7 @@ class DownloadLimits:
     async def _renew(self, slot: StreamSlot) -> None:
         now_ms = int(self._clock() * 1000)
         try:
-            for cap, key in zip(STREAM_CAPS, slot.keys, strict=True):
+            for cap, key in zip(slot.caps, slot.keys, strict=True):
                 # A renewal is never refused: the stream holds its place already, and a renewal
                 # past an expired lease puts it back, even over the cap for a moment.
                 await self._store.acquire_lease(

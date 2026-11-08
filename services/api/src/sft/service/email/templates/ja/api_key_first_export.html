@@ -1,0 +1,7 @@
+{% extends "ja/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">APIキー <strong>{{ key_prefix }}…</strong> が、{{ tenant_name }}の監査ログを初めてエクスポートしました。このメールはキーごとに一度だけ送られます。</p>
+<p style="margin:0 0 16px;">心当たりがあれば、対応は不要です。心当たりがない場合は、すぐにこのキーを無効にしてください。無効にしたキーはただちに使えなくなります。</p>
+{{ button(api_keys_url, 'APIキーを見る', 'ボタンが使えない場合は、次のアドレスをブラウザに貼り付けてください。') }}
+{% endblock %}

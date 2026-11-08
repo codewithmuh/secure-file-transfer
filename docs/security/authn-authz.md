@@ -516,8 +516,8 @@ own.
   leaked link is cut off; a recipient who mistyped just gets a new email.
 - Lockouts and unlocks are security-critical audit records.
 - **API keys can't unlock** (API contract). A lockout signals a possible attack, so a person decides.
-- **As built (#179).** An API key gets `403 permission_denied` on `unlockRecipient` (the contract's answer), not the
-  `401` a key gets on other operations for web sessions only. A local admin without a passkey gets
+- **As built (#179).** An API key gets `403 permission_denied` on `unlockRecipient` (the contract's answer), as it
+  does on every other operation for web sessions only since #215 (5.4). A local admin without a passkey gets
   `403 passkey_required` on another member's recipient. Unlocking a recipient who isn't locked returns them unchanged
   and sends nothing, and writes the last unlock's archive record if it is still missing.
 
@@ -568,6 +568,41 @@ gitleaks rule in this repository matches the format, and the format suits GitHub
 - No operator API and no `/session` routes.
 - Accepted only in `Authorization: Bearer`, never in a query string or a body.
 - Rate limits per key and per tenant (#24).
+
+### 5.4 As built (#215, #216)
+
+- **Format.** `sft.service.api_keys` makes the key: the secret is 43 characters drawn one by one from the base62
+  alphabet `0-9A-Za-z` by the operating system's generator, and the check is the CRC-32 of `sft_<env>_<secret>` in 6
+  base62 digits, most significant first. `parse_key` refuses a malformed key, another environment's or one whose check
+  fails before any database query. `.gitleaks.toml` adds the rule `sft-api-key` to gitleaks' default rules; its test
+  builds keys at run time, so no key-shaped string is in the repository.
+- **Environment.** `API_KEY_ENVIRONMENT` (`dev`, `stg` or `prd`) is required everywhere but the test suite. The chart
+  maps dev, staging and prod to it; the local stack uses `dev`, and a local key is useless elsewhere because its hash
+  exists only in that database.
+- **Lookup.** `lookup_api_key(p_key_hash bytea)` returns the key's ID and tenant only (7.1). The tenant's scope then
+  checks that the key isn't revoked or expired, that its owner is an active admin and that the tenant is active. Any
+  failure is `401 credentials_invalid` with the `invalid_token` challenge and counts as a failed authentication (abuse
+  2.2, H). A session cookie with a key is `401 credentials_invalid`.
+- **Web-only operations.** A live key is a credential the member routes read, so the registry answers it
+  `403 permission_denied` on every operation whose row gives keys a dash: user, policy, key and suppression
+  administration, unlocks, received-file downloads, DLP decisions, `getCurrentMember` and `signOut` (T-55). The
+  `/session` routes read only the link cookie and still answer a bearer `401`.
+- **Every use** writes one `api_key.used` event, with the operation ID and the answer's status and nothing of the body,
+  in a short transaction of its own after the handler and before the answer starts (`sft.api.api_keys.RecordKeyUse`).
+  If it can't be written, the answer is `503` instead (NFR-15). A write's own changes committed before that with their
+  own events, which name the key as the actor, so nothing it did is unaudited. `last_used_at` moves at most once an
+  hour, in the lookup's transaction.
+- **Owners.** Deactivating or demoting an admin revokes every key they own in that transaction, one security-critical
+  `api_key.revoked` each (`reason`: `owner_deactivated` or `owner_demoted`), archived with the change's own record; a
+  retry completes the records. `revokeApiKey` records `reason: admin`.
+- **Limits.** 25 active keys per tenant under a transaction-scoped advisory lock (`422 validation_failed`); group J's 20
+  a day, charged once the key can be made (`429`). A creation's expiry is in the future and at most 365 days ahead.
+- **Expiry emails.** The daily cleanup job queues `api_key.expiring` 14 and 3 days before a key expires, once per notice
+  (`api_keys.expiry_notice`); the notification worker emails `api_key_expiring` to the owner and every active admin,
+  naming the key by its prefix only, unless it was revoked meanwhile.
+- **Audit exports by keys** (5.3, #216): one an hour per key (group I), at most 100,000 events
+  (`422 export_too_large`, counted before anything is charged), and the first export of each key queues
+  `api_key_first_export` to the tenant's admins (`api_keys.first_exported_at`).
 
 ## 6. Authorization model
 

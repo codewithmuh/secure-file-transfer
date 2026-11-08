@@ -1,5 +1,6 @@
 """The transfer and file operations of the contract: `createTransfer`, `listTransfers`,
-`getTransfer`, `sendTransfer` and `cancelTransfer` (#114, #174), `revokeTransfer` (#180);
+`getTransfer`, `sendTransfer` and `cancelTransfer` (#114, #174), `revokeTransfer` (#180),
+`extendTransferExpiry` (#214);
 `addTransferFile`, `requestUploadPartUrls`, `listUploadedParts`, `completeUpload`, `getFile` and
 `deleteFile` (#114, #175); and `getFileInspection` (#176). Architecture 4.1, 4.4;
 docs/api/openapi.yaml, tags "Transfers", "Files" and "Data loss prevention".
@@ -21,9 +22,10 @@ IP's upload budgets, and the tenant's group H budget, which counts groups D to K
 `getFileInspection` is group K, which has no limit of its own for a response without finding details
 (all of them, until DLP-8), so it counts against the caller's and the tenant's group H budgets.
 
-`createTransfer` and `addTransferFile` take `Idempotency-Key` (`sft.api.idempotency`, API README 5):
-a retry with the same key and body gets the first `201`, its `Location` and the resource as it is
-now, and creates nothing again.
+`createTransfer`, `addTransferFile` and `extendTransferExpiry` take `Idempotency-Key`
+(`sft.api.idempotency`, API README 5): a retry with the same key and body gets the first answer
+(a `201` with its `Location`, or the extension's `200`) and the resource as it is now, and changes
+nothing again.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from sft.api.errors import problem_responses
 from sft.api.idempotency import IdempotencyDep
 from sft.api.rate_limits import get_rate_limiter, rate_limit
 from sft.api.transfer_schemas import (
+    ExpiryExtension,
     File,
     FileCreate,
     FileInspection,
@@ -62,7 +65,15 @@ from sft.api.transfer_schemas import (
 from sft.core.pseudonyms import EmailKeyring
 from sft.data.database import Database
 from sft.data.models import TransferState
-from sft.service import file_reads, revocation, sending, transfers, uploads
+from sft.service import (
+    extension,
+    file_reads,
+    received,
+    revocation,
+    sending,
+    transfers,
+    uploads,
+)
 from sft.service.audit_archive import AuditArchive
 from sft.service.caller import Caller
 from sft.service.objects import ObjectStore
@@ -262,8 +273,9 @@ async def complete_upload(
 async def delete_file(
     file_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep
 ) -> Response:
-    """Remove a file from a draft transfer (FR-5, data model 3.2)."""
-    await uploads.delete_file(database, caller, file_id, origin=origin_of(request), now=_now())
+    """Remove a file from a transfer that wasn't sent (FR-5, data model 3.2), or delete a received
+    file before its retention ends (FR-13, #213)."""
+    await received.delete_file(database, caller, file_id, origin=origin_of(request), now=_now())
     return Response(status_code=204)
 
 
@@ -388,6 +400,39 @@ async def revoke_transfer(
         database, archive, caller, transfer_id, origin=origin_of(request), now=now_of(request)
     )
     return Transfer.of(view)
+
+
+@router.post(
+    "/transfers/{transfer_id}/extend",
+    operation_id="extendTransferExpiry",
+    response_model=Transfer,
+    response_model_exclude_unset=True,
+    summary="Extend a transfer's expiry",
+    tags=["Transfers"],
+    dependencies=[TENANT_LIMITS],
+    responses=problem_responses(400, 401, 403, 404, 409, 422, 429),
+)
+async def extend_transfer_expiry(
+    transfer_id: UUID,
+    body: ExpiryExtension,
+    request: Request,
+    response: Response,
+    caller: CallerDep,
+    database: DatabaseDep,
+    idempotency: IdempotencyDep,
+) -> Transfer:
+    """Move `expires_at` later, within the lifetime caps; the same time is a no-op (FR-9, FR-3)."""
+    outcome = await extension.extend_expiry(
+        database,
+        caller,
+        transfer_id,
+        body.expires_at,
+        origin=origin_of(request),
+        now=now_of(request),
+        idempotency=idempotency,
+    )
+    response.status_code = outcome.status
+    return Transfer.of(outcome.value)
 
 
 @router.get(

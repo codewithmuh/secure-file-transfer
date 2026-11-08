@@ -105,12 +105,12 @@ aren't drawn.
 | Table | Key columns | Notes |
 |---|---|---|
 | `tenants` | `id`, `name`, `status` (active, suspended), `recovery_contact`, `sso_required`, `sso_mfa_confirmed_by`, `sso_mfa_confirmed_at` | Created by a platform operator (FR-34), with a second contact besides the first admin, through which operator-assisted recovery confirms a request (`recoverTenantAdmin`, authentication and authorization 2.5). A tenant that uses SSO has an `idp_connections` row and its proven domains in `sso_domains` (FR-26). `sso_required` lets its members sign in only through the identity provider, except its fallback admins. `sso_mfa_confirmed_by` and `sso_mfa_confirmed_at` record the tenant admin's confirmation that their identity provider enforces MFA, which is also audited. Suspending a tenant ends every session of the tenant (2.4). |
-| `tenant_policies` | `tenant_id` (PK), `max_expiry`, `unscannable_policy` (block, allow_with_warning), `received_file_retention_days` (1–90, default 30), `allowed_domains`, `blocked_domains`, `default_locale` (en, ja) | One row per tenant (FR-23, FR-24, FR-33). |
+| `tenant_policies` | `tenant_id` (PK), `max_expiry`, `unscannable_policy` (block, allow_with_warning), `received_file_retention_days` (1–90, default 30), `allowed_domains`, `blocked_domains`, `default_locale` (en, ja) | One row per tenant (FR-23, FR-24, FR-33). As built (revision 0023, #217): `allowed_domains` and `blocked_domains` are `text[]`, at most 500 each, empty by default, of lower-case domains in their IDNA (ASCII) form; each covers its subdomains, and blocked wins over allowed (`sft.service.domain_rules`). |
 | `users` | `id`, `tenant_id`, `email`, `email_normalized`, `role` (admin, member), `status` (invited, active, deactivated), `sso_fallback`, `dlp_approver`, `invitation_token_hash`, `invitation_expires_at` | Unique on `(tenant_id, email_normalized)` (FR-22, FR-25). `dlp_approver` marks a member or admin a tenant admin named as a DLP approver (FR-43, 2.7). `invitation_token_hash` (unique) is the SHA-256 of the one-time invitation link that binds an SSO identity to this user: 256 random bits, valid 7 days, replaced by a new invitation and cleared when it is used (authentication and authorization 2.5). `sso_fallback` marks the at most two admins of an SSO tenant who keep a local sign-in. Deactivating a user clears `dlp_approver` and `sso_fallback`, so a deactivated user is never an approver or a fallback admin. |
 | `idp_connections` | `id`, `tenant_id` (empty for the platform's own pools), `kind` (local, oidc, saml), `provider_name`, `issuer`, `status` (active, inactive) | One row for each of the platform's own user pools for local members (FR-25): Tokyo, and the Osaka standby in staging and prod (authentication and authorization 2.3). One row for each tenant's SSO provider (FR-26), written by the operator API (`configureTenantSso`). The provider exists in both pools under the same name, so one row and one identity serve either pool. `provider_name` is unique: the pool's ID, or the name the operator CLI gives a tenant's provider. `issuer` is recorded for checks and display, but it is not unique and never used to find a connection, because issuer strings repeat across tenants (a copied SAML entity ID, a shared multi-tenant issuer). |
 | `sso_domains` | `domain` (PK, lowercase), `tenant_id`, `idp_connection_id`, `verified_at` | Email domains a tenant has proven with a DNS TXT record (authentication and authorization 2.5). The primary key means a domain belongs to one tenant at most. "Continue with SSO" finds the tenant's connection through it. |
 | `user_identities` | `id`, `tenant_id`, `user_id`, `idp_connection_id`, `subject`, `expires_at` | Unique on `(idp_connection_id, subject)`: a subject is only unique within the connection it came through. Sign-in finds the connection from how the sign-in arrived (the pool that issued the token, and for SSO the provider it names), then the identity. Through a tenant's connection it accepts only an identity whose user is in that tenant, so one tenant's identity provider can never sign anyone in to another tenant (FR-26, NFR-12). Rows are written in two places only: by the notification worker, from the `sub` Cognito returns when it creates a local member, and by the invitation flow, which binds an SSO subject to the invited user (authentication and authorization 2.4). An email claim never finds or binds a user. A member can hold one local identity per pool, so one in Tokyo and one in Osaka after a failover. A sign-in reset deletes the member's local identities in the API transaction. `expires_at` is set only on the temporary local sign-in that operator-assisted recovery gives an SSO tenant's admin, for 72 hours. |
-| `api_keys` | `id`, `tenant_id`, `created_by`, `name`, `key_prefix`, `key_hash`, `scopes`, `expires_at`, `revoked_at`, `last_used_at` | The full key is shown once, at creation. `key_prefix` is the environment's prefix (`sft_dev_`, `sft_stg_`, `sft_prd_`) plus the first 8 characters of the secret, so a tenant admin can recognise a key without seeing it (authentication and authorization 5.1). Deactivating or demoting the owner revokes their keys in the same transaction. `last_used_at` is updated at most once an hour, not on every call (FR-32). |
+| `api_keys` | `id`, `tenant_id`, `created_by`, `name`, `key_prefix`, `key_hash`, `scopes`, `expires_at`, `revoked_at`, `last_used_at` | The full key is shown once, at creation. `key_prefix` is the environment's prefix (`sft_dev_`, `sft_stg_`, `sft_prd_`) plus the first 8 characters of the secret, so a tenant admin can recognise a key without seeing it (authentication and authorization 5.1). Deactivating or demoting the owner revokes their keys in the same transaction. `last_used_at` is updated at most once an hour, not on every call (FR-32). As built (revisions 0021, 0022, #215, #216): `scopes` is a `text[]` of 1 to 5 contract scopes; `expires_at` at most 365 days after `created_at`; `revoked_reason` (admin, owner_deactivated, owner_demoted) with `revoked_at`; `expiry_notice` (14 or 3), the last expiry email the daily job asked for; `first_exported_at`, the key's first audit export, which emails the admins once. `sft_api` reads and writes keys in tenant scope and finds one by its hash only through `lookup_api_key`; `sft_jobs` reads IDs, times and the notice, `sft_notify` the owner, prefix and expiry, never the hash or name. The audit trigger watches inserts and `revoked_at`. |
 | `tenant_data_keys` | `tenant_id`, `key_version`, `wrapped_key`, `created_at`, `retired_at` | Primary key `(tenant_id, key_version)`. The tenant's 256-bit data key for field encryption, as KMS returned it wrapped under the fields key with the encryption context `purpose` and `tenant_id` (encryption and keys 3.2). Each year a new version takes over new writes, and `retired_at` is set on the one it replaces, which from then on only decrypts. A version is deleted once no row uses it (section 6). |
 
 **Field encryption** (encryption and keys 3.2). `files.display_name_ct`, `transfers.message_ct` and
@@ -131,7 +131,7 @@ version, the key version, the nonce, and the ciphertext with its tag; the additi
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `transfers` | `id`, `tenant_id`, `created_by`, `state`, `hold_reason` (file_blocked, dlp_blocked, approval_rejected; set only while `held`), `dlp_decision_id`, `message_ct`, `data_key_version`, `expires_in` (an interval, 1 hour to 30 days), `expires_at` (empty while a draft), `download_limit` (null for no limit, or 1–100), `notify_on_first_download`, `last_activity_at`, `submitted_at`, `sent_at`, `ended_at`, `revoked_by`, `purge_after` | States in section 3.2. `dlp_decision_id` is the transfer's current DLP decision (2.7). `expires_at` is the authority for expiry; the API compares it with the current time on every call (architecture 4.2). `ended_at` is set when the transfer is revoked, expires or is cancelled. `message_ct` is the encrypted message (2.1). |
+| `transfers` | `id`, `tenant_id`, `created_by`, `state`, `hold_reason` (file_blocked, dlp_blocked, approval_rejected; set only while `held`), `dlp_decision_id`, `message_ct`, `data_key_version`, `expires_in` (an interval, 1 hour to 30 days), `expires_at` (empty while a draft), `download_limit` (null for no limit, or 1–100), `notify_on_first_download`, `first_download_notified_at`, `last_activity_at`, `submitted_at`, `sent_at`, `ended_at`, `revoked_by`, `purge_after` | States in section 3.2. `dlp_decision_id` is the transfer's current DLP decision (2.7). `expires_at` is the authority for expiry; the API compares it with the current time on every call (architecture 4.2). `ended_at` is set when the transfer is revoked, expires or is cancelled. `message_ct` is the encrypted message (2.1). `first_download_notified_at` is set once, by the first counted download, when `notify_on_first_download` is set (as built, #214). |
 | `transfer_recipients` | `id`, `tenant_id`, `transfer_id`, `email`, `email_normalized`, `locale`, `link_token_hash`, `link_key_id`, `link_issued_at`, `delivery_state`, `notified_at`, `first_verified_at`, `last_verified_at`, `failed_attempts`, `locked_at`, `unlocked_by` | One row per recipient per transfer. Unique on `(tenant_id, transfer_id, email_normalized)`, so a request that lists the same address twice is rejected. `link_token_hash` is unique. `delivery_state` and `notified_at` follow the link email (below); `first_verified_at` and `last_verified_at` are set when a link session is created (2.4). Together they are the recipient's status (FR-7). |
 | `upload_requests` | `id`, `tenant_id`, `created_by`, `state`, `uploader_email`, `email_normalized`, `locale`, `message_ct`, `data_key_version`, `expires_at`, `link_token_hash`, `link_key_id`, `link_issued_at`, `delivery_state`, `notified_at`, `failed_attempts`, `locked_at`, `unlocked_by`, `ended_at`, `revoked_by`, `purge_after` | One uploader per request (FR-10). States in section 3.3. |
 
@@ -195,6 +195,43 @@ recipient `bounced` (`email.rejected`). The cap is read before the send and spen
 notice to several people records each email as it goes, so a redelivery sends only the unsent ones. `sft_notify`
 reads only the columns that needs, never a ciphertext column, and may write outbox messages.
 
+**As built (#214, revision 0018).** `transfers.first_download_notified_at` (nullable) records when the member's
+first-download notice (FR-8) was written. The transaction that counts a download (2.3) runs, after the counter's
+conditional update and under the transfer's row lock, one more conditional update:
+`SET first_download_notified_at = now() WHERE notify_on_first_download AND first_download_notified_at IS NULL`. Only
+the transaction that sets it writes the `transfer.first_download` outbox message, so a transfer's member is told once,
+whichever recipient and file came first; a resume, a retry and every later download find it set, and a refused or
+rolled-back grant sets nothing. A column on `transfers` rather than the counters' `first_downloaded_at`: those are per
+recipient and file, so finding the transfer's first would read all its counters on every grant, and a column also
+records that the notice was written. It runs in the recipient's resource scope, which reaches their own transfer; `download.granted` covers the change, and
+no grant is new (`sft_api` already updates `transfers`). The notification worker sends `first_download` to the owner,
+in the tenant's default language like every member notice, with no file name, and records `email.sent`; a member who
+is no longer active gets nothing.
+
+**As built (#212, revision 0019).** `upload_requests` has every column of the table above, `message_ct` sealed by
+`sft.service.fields` and `purge_after` empty until the purge job exists. Its checks: the states of 3.3, `ended_at` set
+exactly when the request isn't `open`, `revoked_by` only on a revoked request, the link columns set together or not at
+all (as for recipients), `failed_attempts` 0 to 20, `email_normalized = lower(uploader_email)`. `link_token_hash` is
+unique, `(tenant_id, email_normalized)` serves audit search by address, and a partial index on `expires_at WHERE state
+= 'open'` the expiry job (section 5). Composite foreign keys tie `created_by`, `revoked_by` and `unlocked_by` to users
+of the same tenant. `createUploadRequest` writes the row `open` and `queued` with `upload_request.created` and one
+`upload_request.link_due` outbox message, in one transaction; the expiry is a time, 1 hour to 30 days (within
+`max_expiry`) from the API's now, accepting a client clock up to 5 minutes off (a time up to 5 minutes short of an hour
+is kept, one up to 5 minutes past the maximum is cut to it). The notification worker answers the message as it answers
+`recipient.link_due`: the suppression list (`suppressed`, `uploader.suppressed`), the cross-tenant cap, the link
+derived from the request's ID and issued once (`uploader.link_issued`), the `upload_request` email in the request's
+locale with a `/u#<token>` link, then `sent`, `notified_at` and `email.sent`. `sft_notify` reads the request's address,
+locale, link, status, owner, state and expiry, never `message_ct`; `sft_jobs` reads its ID, tenant, state and expiry
+and writes `state`, `ended_at` and the sessions' `revoked_at`. An unlock writes the same message again.
+
+**Extending the expiry (#214, FR-9).** `extendTransferExpiry` moves `expires_at` under the row lock, never earlier and
+never more than 30 days, or the tenant's current `max_expiry` if shorter, after `submitted_at`. In the same transaction
+the open link sessions of its recipients run on to the new time, each still at most 24 hours after it was created
+(2.4), and their live download grants with them, each still at most 24 hours after it was made and never past its
+session (2.3); an ended session or grant stays ended and none is shortened. `transfer.expiry_extended` records the
+old and the new time. The expiry job re-reads `expires_at` under the lock, so it finds an extended transfer no longer
+due.
+
 ### 2.3 Files, download counts and grants
 
 | Table | Key columns | Notes |
@@ -251,10 +288,10 @@ lost this way can let that recipient download the file once more than the limit 
 which grant it was.
 
 A grant allows `byte_budget` (3 × `actual_size`) and at most 20 content requests until `expires_at`: 24 hours after
-creation, never past its session's or the transfer's expiry. The content operations (`getSessionDownloadContent`,
-`getReceivedFileDownloadContent`) are authorised by the grant ID plus a session cookie that holds the grant's session
-(authentication and authorization 4.3). Each content request is admitted with one statement, which also makes it the
-grant's only active stream:
+creation, never past its session's or the transfer's expiry (an extension moves both on with the transfer, 2.2). The
+content operations (`getSessionDownloadContent`, `getReceivedFileDownloadContent`) are authorised by the grant ID plus
+a session cookie that holds the grant's session (authentication and authorization 4.3). Each content request is
+admitted with one statement, which also makes it the grant's only active stream:
 
 ```sql
 UPDATE download_grants
@@ -310,6 +347,23 @@ Step 3 re-checks, under the transfer's row lock, the transfer, the session and t
 takes the grant's end from that read of the session, so a revocation or an ended session in between answers `410` or
 `401 session_expired` and counts nothing.
 
+**As built (#213, revision 0020).** `files.upload_request_id` has its composite foreign key, cascading, and
+`transfer_id` is nullable, with `files_owner_check` (exactly one is set), both added `NOT VALID` and validated, and
+`files (tenant_id, upload_request_id)` indexed. `retention_until` and `dlp_blocked` (false until #221) are allowed on
+received files only, each by a check. A received file's `retention_until` and `delete_after` are set together when its
+upload is accepted, the moment `completeSessionUpload` (or reconciliation) moves it to `scanning`, from the tenant's
+`received_file_retention_days` then (the decision #213 left open: FR-13's "from each file's upload" is the
+acceptance); the member's early delete sets `removed_at` and moves `delete_after` to now. The request's limits are
+counted in PostgreSQL under its row lock: 100 declarations, rejected and removed files included; 50 files that aren't
+`rejected` or removed, and 20 GB of their declared sizes. `download_grants` has the member's pair, `user_id` and
+`member_session_id`, each through a composite foreign key that cascades, so a member session's grants go with it;
+`recipient_id` and `link_session_id` are nullable, and `download_grants_owner_check` requires exactly one complete
+pair. A member's grant counts nothing (received files have no limit), lasts 24 hours and never past its member
+session, and is re-checked under the request's row lock, which an early delete takes too. Its committed record names
+the member and the member session. `upload_requests` holds the batched notice of architecture 4.3: `notice_due_at`,
+`arrived_since_notice` and `blocked_since_notice`, which the scan worker and the jobs add to and the notification
+worker takes off.
+
 ### 2.4 Verification and sessions
 
 `verification_codes` and `link_sessions` belong to either a recipient or an uploader. Like `files`, each has two
@@ -319,7 +373,7 @@ constraint that exactly one is set. That keeps database-enforced isolation and l
 | Table | Key columns | Notes |
 |---|---|---|
 | `verification_codes` | `id`, `tenant_id`, `recipient_id` or `upload_request_id`, `code_hmac`, `hmac_key_id`, `expires_at` (≤ 10 min), `attempts`, `superseded_at`, `consumed_at` | Created by the notification worker, which emails the code (architecture 4.2). `code_hmac` is `HMAC-SHA-256(K_code, "code/v1/" + id + "/" + code)` under the `code-hmac` keyring, and `hmac_key_id` names the key version (encryption and keys 6.2). Creating a code sets `superseded_at` on every older live code for the same subject, so only the newest code can ever match. |
-| `link_sessions` | `id`, `tenant_id`, `recipient_id` or `upload_request_id`, `session_hash`, `expires_at` (≤ 24 h), `last_seen_at`, `revoked_at` | A verified browser session (FR-15). It also ends after 1 hour without activity: `last_seen_at` is written at most once a minute, and a running download stream counts as activity. A browser can hold up to 10, one per subject, in one cookie (authentication and authorization 4.3). Revoking a transfer or request sets `revoked_at` on its sessions in the same transaction. There is no CSRF column: CSRF tokens are derived from the session token (authentication and authorization 3.4). |
+| `link_sessions` | `id`, `tenant_id`, `recipient_id` or `upload_request_id`, `session_hash`, `expires_at` (≤ 24 h), `last_seen_at`, `revoked_at` | A verified browser session (FR-15). It also ends after 1 hour without activity: `last_seen_at` is written at most once a minute, and a running download stream counts as activity. A browser can hold up to 10, one per subject, in one cookie (authentication and authorization 4.3). Revoking a transfer or request sets `revoked_at` on its sessions in the same transaction; extending a transfer's expiry moves its open sessions on to the new time, within their 24 hours (2.2, #214). There is no CSRF column: CSRF tokens are derived from the session token (authentication and authorization 3.4). |
 | `member_sessions` | `id`, `tenant_id`, `user_id`, `identity_id`, `session_hash`, `auth_time`, `auth_method` (passkey, password_totp, local, sso), `last_seen_at`, `expires_at` (12 h from sign-in), `revoked_at`, `revoked_reason`, `created_ip`, `user_agent` | Web app sessions for members and admins, kept in PostgreSQL so revocation is transactional and survives a failover (authentication and authorization 3.2). `session_hash` is unique. A request is refused once the session is revoked or expired, `last_seen_at` is 30 minutes old (it is written at most once a minute, and a running download stream counts as activity, as for link sessions, 2.3), or the user or tenant is inactive. The role is read from `users` on every request, never copied here. `auth_method` comes from the ID token's `amr` claim, and a local admin acts with the admin role only in a `passkey` session (authentication and authorization 3.3). A user has at most 10 live sessions; an 11th ends the oldest. A role change, a deactivation and the tenant's suspension revoke the sessions they affect in the same transaction, with `revoked_reason` saying which; `sft_operator` may only revoke them, in the suspended tenant's scope. There is no CSRF column. |
 
 Sign-in and step-up always create a new member session. A role change, deactivation, sign-in reset, forced sign-out
@@ -366,6 +420,23 @@ record if it is still missing; once the API has seen it confirmed in both region
 under a `code-hmac` key the API no longer holds can't be checked: it answers `422 code_expired` (ask for a new code,
 encryption and keys 6.5), audited as `unknown_key`, and adds nothing to `failed_attempts`.
 
+**As built (#212, revision 0019).** Both tables gained `upload_request_id`, a composite foreign key to
+`upload_requests` that cascades, and the check `num_nonnulls(recipient_id, upload_request_id) = 1`; `recipient_id`
+became nullable. The check and the keys were added `NOT VALID` and validated afterwards, and the indexes of section 5
+(`verification_codes (upload_request_id, created_at DESC)`, `link_sessions (upload_request_id)`) built concurrently.
+The link lookups gained two functions: `lookup_link_subject` finds a recipient or an upload request by
+`link_token_hash`, `lookup_link_subject_sessions` returns each session with its recipient or upload request. The two
+functions of revision 0013 keep their signatures for the code of the previous release; `lookup_link_sessions` was
+replaced, same signature, to return recipients' sessions only, so that code never meets an uploader's. An uploader's
+link steps run the same five steps on the `upload_requests` row (lock, attempt, compare, session, count) and write the
+same audit actions with actor type `uploader`; the 20th failure writes `uploader.locked` (security-critical, archived
+before the answer) and an `upload_request.uploader_locked` outbox notice, which the worker sends to the owner and the
+active admins as `recipient_locked` in its upload-request variant (no template of its own). An uploader's request has
+no verification columns: the access state `verified` is a live link session. `unlockUploader` clears the lock and the
+whole link, sets `queued`, writes `uploader.unlocked` (security-critical) and `upload_request.link_due`. An uploader's
+link session's resource scope reaches its own request, its own sessions and the member who asked (`users.reach`),
+nothing of a transfer; a recipient's reaches no upload request.
+
 ### 2.5 Audit and plumbing
 
 | Table | Key columns | Notes |
@@ -375,7 +446,7 @@ encryption and keys 6.5), audited as `unknown_key`, and adds nothing to `failed_
 | `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at`, `attempts`, `next_attempt_at`, `last_error` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `payload` maps names to UUIDs or lists of UUIDs and nothing else, so no token, code, address or file name can reach a queue (threat model T-49). `delay_seconds` (0 to 900) asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4); it counts from `created_at`, so the relay sends what is left of it and a late relay doesn't delay the message twice. A send SQS refuses adds one to `attempts`, records SQS's error code in `last_error` and moves `next_attempt_at` on (2 s doubling to 5 minutes), so one refused row can't hold up the rows behind it. The API, the operator API, the scan worker and the lifecycle jobs insert in their tenant's scope; only `sft_relay` reads and marks rows, in system scope (ADR-0013). |
 | `processed_messages` | `consumer`, `message_id`, `tenant_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work, in the message's tenant scope, first: a second copy handled at the same time waits on the first one's row and is skipped once it commits. `message_id` is text, because intake queues use their source's event ID. The consumers may only insert, with `ON CONFLICT DO NOTHING` and no conflict target, and learn of a duplicate from the row count, so none of them can read another consumer's records. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`, #185), `message_id` is a UUID derived (version 5) from the sending tenant, `mail.messageId`, the event type and the event's timestamp, not the SQS message ID, because SES can publish one event more than once. A bounce that names several recipients is one event, handled in one transaction. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. `caller_id` is a member's user (so a key survives a new sign-in), an API key or a link session. While a request runs, its transaction holds an advisory lock on the key, so a second request with it gets `409 idempotency_in_progress` instead of waiting. An expired row is overwritten by the next use of its key. `sft_api` reads and writes rows in the tenant's scope; the daily job (`sft_jobs`) finds the tenants with expired rows in system scope and deletes them in each tenant's. Not audited: the change it records is. |
-| `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
+| `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. As built (#217): clearing ends the tenant's live entries for the address (`sft_api` may update only `expires_at` and `updated_at`, revision 0023) and writes `email_suppression.cleared` with the entry as its target; "ended since its last release" is `expires_at <= now()` and `ses_released_at` empty or older than `updated_at`, so an entry that bounces again and ends again is released again. The release is SES's `DeleteSuppressedDestination` with the tenant's name, before a link or code email, recorded with `email_suppression.released`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
 | `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB) comes from deploy configuration and is the same for every tenant; v1 has no per-tenant overrides (section 10). |
 
 **Fail-closed audit** (NFR-15, architecture 5.2). A change to an audited table can't commit without an audit event in
@@ -488,6 +559,72 @@ has `tenant_id`, composite foreign keys and row-level security like every other 
   with Tokyo leaves its transfer waiting, never sent without one. A rejection lost the same way leaves the transfer
   waiting for a new decision.
 
+**As built (#218, revision 0024).** `dlp_policies`, `dlp_rules` and `dlp_detectors` exist; the decision tables arrive
+with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` with DLP-8.
+
+- `dlp_rules` and `dlp_detectors` have the primary key `(id, revision)`, the unique key `(tenant_id, id, revision)`
+  that a decision's rule refers to, a partial unique index on `id` for the live revision, and the partial indexes of
+  section 5. `created_by` is a composite foreign key to `users`; a default rule's is the tenant's first admin, and
+  empty only for a tenant that had no user when revision 0024 ran (the API shows the nil UUID then).
+- The checks: `mode`, `direction`, `condition` (`content`, `not_inspected`, `new_domain`), `min_confidence`,
+  `recipient_scope` and `action` list their values; `threshold` 1 to 100,000; `reasons` the six inspection reasons;
+  at most 64 detectors; `approvals_required` 1 or 2, and 2 only with `require_approval`; a `received` rule allows and
+  records or blocks only, with a `content` or `not_inspected` condition and scope `any`; a `content` rule names a
+  detector and a `not_inspected` rule a reason. `trusted_domains` holds at most 500 lowercase domains, and
+  `approval_timeout` is 1 hour to 7 days (default 72 hours).
+- `definition_ct` is the definition as JSON, sealed with M2's stand-in (`sft.service.dlp_definitions`), **not yet
+  encrypted**; `dlp_key_version` stays empty until DLP-8 changes that one module.
+- **The default policy** is the database function `dlp_default_policy(tenant, created_by, locale)`: the policy at
+  version 1 and the eight rules of detectors 6, named in the tenant's default language (English or Japanese). It does
+  nothing for a tenant that has a policy. Revision 0024 runs it for every existing tenant, `createTenant` in the
+  transaction that makes the tenant, and the local seed for its tenant.
+- **Grants.** `sft_api` reads and writes the three tables but may change only `retired_at` of a revision;
+  `sft_operator` inserts a new tenant's policy and rules; `sft_scan` and `sft_jobs` read them (the scan worker's
+  detectors and version, the decision of #219); `sft_jobs` deletes retired revisions, finding them across tenants in
+  system scope, and reads `dlp_findings (tenant_id, detector)` to know which detectors findings still name.
+- Until #221: monitor mode, `received` rules, two approvers, the 24-hour window and patterns are refused with
+  `422 validation_failed` by the API, not by a check, so #221 needs no migration for them.
+
+**As built (#219, revision 0025).** `dlp_decisions`, `dlp_decision_rules`, `dlp_confirmations` and
+`dlp_known_domains` exist, with `transfers.dlp_decision_id`.
+
+- `dlp_decisions`: exactly one of `transfer_id` and `file_id` (a check), `enforced` true exactly in enforce mode,
+  `new_domains` the distinct new recipient domains. The key `(tenant_id, id)` is what the transfer, the decision's rules
+  and the confirmations refer to. A transfer's decisions, their rules and its confirmations go with it
+  (`ON DELETE CASCADE`), so the purge needs nothing more.
+- `dlp_decision_rules`: primary key `(decision_id, rule_id)`; its key to `dlp_rules (tenant_id, id, revision)` has no
+  `ON DELETE`, so the database itself keeps a revision a decision applied, and the daily cleanup skips it.
+- `dlp_confirmations`: `justification_ct` sealed with M2's stand-in (`sft.service.fields`, not yet encrypted), so
+  `data_key_version` stays empty until M6. No unique key per decision: #220's requests may follow an expired one.
+- `dlp_known_domains`: lowercase IDNA domains, `first_sent_at` and `last_sent_at`; written, in sorted order, by the
+  transaction that moves a transfer to `sent`, and deleted by the daily cleanup 365 days after `last_sent_at`.
+- `transfers.dlp_decision_id` was added as data model 7 says for a key on an existing table: indexed `CONCURRENTLY`,
+  the key `NOT VALID`, then validated. `transfer_recipients.domain`, the domain part of `email_normalized`, is set by
+  a trigger on insert, so the evaluation's system roles read a domain, never an address.
+- **Grants** (T-107): `sft_api`, `sft_scan` and `sft_jobs` insert decisions and their rules, set
+  `transfers.dlp_decision_id`, read `transfer_recipients.domain` and the findings' counts (never `detail_ct`), and read,
+  insert and update known domains; `sft_api` also reads decisions and inserts and reads confirmations; `sft_jobs` deletes
+  known domains and reads `dlp_decision_rules (tenant_id, rule_id, rule_revision)`, finding both across tenants in
+  system scope (`jobs_find`). All four tables have the audit trigger.
+
+**As built (#220, revision 0026).** `dlp_approval_requests` and `dlp_approval_decisions` exist.
+
+- `dlp_approval_requests`: `created_at` is the request time the API shows as `requested_at`; `approvals_required` 1
+  or 2 (the most any of the decision's approval rules asks); `state` the five states of 3.6, with `ended_at` set
+  exactly when it leaves `pending` (a check). The partial indexes of section 5, plus `(tenant_id, transfer_id)` (a
+  transfer's latest request and its count of 3), `(tenant_id, requested_by)` and the keys to the decision and the
+  confirmation. A request refers to its transfer, decision, confirmation (which holds the justification) and sender
+  by composite keys; it goes with its transfer (`ON DELETE CASCADE`).
+- `dlp_approval_decisions`: unique `(approval_request_id, approver_id)`; a check that a rejection has `comment_ct`;
+  `comment_ct` sealed with M2's stand-in (`sft.service.fields`, not yet encrypted), so `data_key_version` stays
+  empty until M6. It goes with its request.
+- **Grants.** `sft_api` reads and inserts both, and updates only a request's `state` and `ended_at`. `sft_jobs` reads
+  a request's `id`, `tenant_id`, `transfer_id`, `state` and `expires_at`, and updates `state` and `ended_at`, finding
+  due requests across tenants in system scope (`jobs_find`). `sft_notify` reads `id`, `tenant_id`, `transfer_id` and
+  `state`. No system role reads a justification, a comment or a decision. Both tables have the audit trigger.
+- Eligible approvers are read through `users (tenant_id) WHERE dlp_approver AND status = 'active'`, which revision
+  0004 made.
+
 ## 3. State machines
 
 State values use underscores, so the PRD's `scan-failed` is `scan_failed` here.
@@ -569,6 +706,10 @@ stateDiagram-v2
   while a file is being scanned, the scan worker records the result, and the next deletion run removes it. The deadline
   is longer than every attempt together, so no file stays in `scanning` for good, and none is deleted underneath a
   running scan.
+- **Received files** (#213) take the same states. Completion's row lock is the upload request's, "the owner still
+  open" means the request `open` and before its `expires_at`, and a rejection runs no evaluation. A revoked or expired
+  request rejects its files still `uploading` or `completing` in the same transaction (NFR-6). A scan result counts
+  towards the request's next notice (architecture 4.3) instead of a transfer's evaluation.
 
 ### 3.2 Transfer
 
@@ -625,10 +766,19 @@ counts the transfer's files that are not `rejected` and have no `removed_at`. On
 | Any counted file is still `uploading`, `completing` or `scanning` | `submitted`: no change for a submitted transfer, and a held one goes back. A later scan result or rejection runs the evaluation again. |
 | Every counted file is shareable | The DLP decision (architecture 4.6): a new `dlp_decisions` row with its matched rules, and its audit event. In monitor mode, or when no rule matched or every matched rule only allows and records, `sent` (below). A warning or a required approval gives `awaiting_confirmation`, with an outbox message to the member. A block gives `held` with `hold_reason = dlp_blocked`. |
 
-**As built before DLP-4 (#174).** The last row of the table has no DLP decision yet: a transfer whose counted files
-are all shareable is sent, findings or not, and no `dlp_decisions` row is written (architecture 4.6). The evaluation
-lives in `sft.service.evaluation`; the API runs it as its caller, the scan worker and the scan sweep as named system
-actors whose roles read only the columns it needs, never a ciphertext column or an address (revision 0009).
+**As built (#174, #219).** The evaluation lives in `sft.service.evaluation`, the DLP decision of its last row in
+`sft.service.dlp_decision` (architecture 4.6); the API runs it as its caller, the scan worker and the jobs as named
+system actors whose roles read only the columns it needs, never a ciphertext column or an address (revisions 0009,
+0025). The table applies as written, with these additions:
+
+- A file removal (`deleteFile`) from an `awaiting_confirmation` or `pending_approval` transfer sets it back to
+  `submitted` first, with `transfer.submitted`, withdrawing a pending approval request in the same transaction
+  (#220). Then the table decides again on the files left.
+- A transfer held by a DLP rule (`dlp_blocked`) or a rejected approval (`approval_rejected`), or awaiting
+  confirmation, stays as it is for every evaluation that isn't a file removal, such as a scan worker's retry: a
+  decision stands for the files it saw, and only a change to them makes a new one.
+- Back to `draft` also clears `dlp_decision_id`. `confirmTransfer` sends a warned transfer through the same "moving to
+  `sent`" as the evaluation (`sft.service.evaluation.send`), and so does an approval (#220, below).
 
 **Moving to `sent`**, from the evaluation, a confirmation or an approval: download counters are created, the
 recipients' `delivery_state` becomes `queued`, each recipient domain is recorded in `dlp_known_domains`, and an outbox
@@ -650,6 +800,24 @@ onwards.
 - The lifecycle job expires a request past its `expires_at`: the request becomes `expired`, and the transfer goes back
   to `awaiting_confirmation` with a notice to the sender, unless it has expired itself.
 
+**As built (#220).** `sft.service.approval_requests` makes a request and `sft.service.approvals` decides it, as
+written above, with these details:
+
+- `confirmTransfer` checks in this order: a justification (`422 justification_required`), fewer than 3 requests in
+  any state (`409 approval_limit_reached`), then enough eligible approvers (`409 no_eligible_approver`). The last
+  refusal rolls the confirmation's transaction back, and a second transaction writes the outbox message that emails
+  the admins and a failed `dlp_approval.requested`, so the refusal changes nothing else but the admins are told.
+  Repeating the confirmation of a `pending_approval` transfer's decision returns the transfer.
+- `approveTransfer` and `rejectTransfer` check, under the transfer's row lock: the caller is an active approver
+  (`403 permission_denied`), isn't the transfer's `created_by` (`403 self_approval_forbidden`), then that the request
+  is pending. The same decision again returns the request; a different one is `409 invalid_state`.
+- A pending request past `expires_at` shows as `expired` before the job records it, as a transfer does. The expiry
+  job (`expire_approval_requests`, after `expire_transfers`) expires it, writes `dlp_approval.expired` and, unless the
+  transfer has expired, moves the transfer back with `transfer.awaiting_confirmation` and the sender's notice. A
+  transfer that expires takes its pending request with it (`expired`, no notice).
+- Cancelling and revoking a `pending_approval` transfer withdraw its request in their transaction
+  (`dlp_approval.withdrawn`).
+
 A decision isn't recomputed when the DLP policy changes. Like `unscannable_allowed` (3.1), it holds for the files it
 saw; only a change to the counted files makes a new one.
 
@@ -670,6 +838,16 @@ stateDiagram-v2
 ```
 
 Closing a request stops new uploads only. Each received file keeps its own `retention_until` (FR-13).
+
+**As built (#212, revision 0019).** `revokeUploadRequest` locks the request, sets `revoked`, `ended_at` and
+`revoked_by`, ends every link session of its uploader and writes `upload_request.revoked` (security-critical) in one
+transaction; the `200` waits for both regions' archive, and a `503` keeps the revocation, which a retry confirms. The
+API shows a request `expired` from `expires_at`, before the job records it: its link and sessions answer `410
+link_expired`, and `revokeUploadRequest` and `unlockUploader` answer `409 upload_request_expired`. The expiry job finds
+open requests past `expires_at` across tenants, then in each request's tenant scope, under its row lock, records
+`expired` with `ended_at`, ends its uploader's link sessions and writes `upload_request.expired`. Both a revocation
+and the expiry also reject the request's uploads still `uploading` or `completing`, under the same lock, so none is
+ever assembled (#213, NFR-6); files already received keep their retention and stay downloadable.
 
 ### 3.4 Recipient or uploader access
 
@@ -721,6 +899,13 @@ stateDiagram-v2
 ```
 
 Every change of state sets `ended_at` and writes its audit event in the transaction that changes the transfer.
+
+**As built (#220).** The audit events are `dlp_approval.requested`, `.approved` (one per approver's approval, with
+the approvals so far), `.rejected`, `.expired` (with the reason, `approval_timeout` or `transfer_expired`) and
+`.withdrawn` (with the reason, `file_removed`, `cancelled` or `revoked`), targeted at the request. None holds the
+justification or a comment, only whether one was given. The withdrawals happen in the transaction of the removal,
+cancellation or revocation; an expiry in the expiry job's, under the transfer's row lock. The API shows a pending
+request past `expires_at` as `expired` at once.
 
 ## 4. Multi-tenancy model
 
@@ -886,7 +1071,7 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 | Sessions to close on revoke | `link_sessions (recipient_id)`, `link_sessions (upload_request_id)` |
 | Latest code for a subject | `verification_codes (recipient_id, created_at DESC)`, `verification_codes (upload_request_id, created_at DESC)` |
 | Download counters of a file (purge) | `download_counters (file_id)` |
-| Grants of a file, recipient or session (foreign key checks) | `download_grants (file_id)`, `download_grants (recipient_id)`, `download_grants (link_session_id)`, `download_grants (member_session_id)` |
+| Grants of a file, recipient, member or session (foreign key checks) | `download_grants (file_id)`, `download_grants (recipient_id)`, `download_grants (link_session_id)`, `download_grants (user_id)`, `download_grants (member_session_id)` |
 | Rows that use a data key version | `files (tenant_id, data_key_version)`, `transfers (tenant_id, data_key_version)`, `upload_requests (tenant_id, data_key_version)`, `dlp_confirmations (tenant_id, data_key_version)`, `dlp_approval_decisions (tenant_id, data_key_version)`; for DLP data keys `dlp_findings (tenant_id, dlp_key_version)`, `dlp_detectors (tenant_id, dlp_key_version)` |
 | Suppression lookup | unique `email_suppressions (tenant_id, email_hmac)` |
 | Break-glass reconciliation | unique `break_glass_grants (assignment_request_id)` |
@@ -947,8 +1132,8 @@ How the PRD's data lifecycle table and the architecture's operational retention 
 | DLP findings, decisions, confirmations, approval requests and approval decisions | Their transfer's or upload request's `purge_after` | Purge job, with the rest of the parent's child rows |
 | DLP finding details (`detail_ct`) | The file's `deleted_at` | Deletion job, in the transaction that marks the file deleted |
 | DLP approval requests past their expiry | `dlp_approval_requests.expires_at` while `pending` | Lifecycle job: the request expires and the transfer goes back to its sender (3.2) |
-| Replaced DLP rule and detector revisions | `retired_at` set, and no decision (rules) or live rule or finding (detectors) refers to the revision | Daily job |
-| Known recipient domains | `last_sent_at + 365 days` | Daily job |
+| Replaced DLP rule and detector revisions | `retired_at` set, and no decision (rules) or live rule or finding (detectors) refers to the revision | Daily job. As built (#218): a detector revision a later revision replaced goes at once, since the later one carries the detector's name on; the last revision of a deleted detector stays while a live rule or a finding names it (`custom:<id>`). As built (#219): a rule revision a decision applied stays; its foreign key keeps it too. |
+| Known recipient domains | `last_sent_at + 365 days` | Daily job. As built (#219), with `retention.rows_deleted` per batch, which counts rows and names no domain |
 | Retired DLP data key versions | No row's `dlp_key_version` uses the version any more | Purge job; the foreign key refuses the delete while a row still uses it |
 
 **Why `purge_after` is computed, not tracked.** After a transfer ends, no download or verification can happen, and its
@@ -974,7 +1159,16 @@ which routes by the same `SCAN_SMALL_POOL_MAX_BYTES`. `files.deleted_at` records
 unfinished upload it lists under the file's key, rather than the recorded upload ID alone, and lists the key again to
 confirm nothing is left before it marks the file. The reservation is released at deletion unless a rejection or removal
 released it. `sft_jobs` reads no name, message or grant byte count; the API's role still deletes nothing but its
-idempotency keys. The purge after 365 days, received files' retention and the clearing of DLP details are later issues.
+idempotency keys. The purge after 365 days is a later issue.
+
+**As built (#213, revision 0020).** Received files: the deletion job deletes a received file at its `delete_after`,
+which its upload's acceptance set to `retention_until` or the member's early delete moved to now, exactly as a
+transfer's file, and `file.deleted` names its request and why (`trigger`: `retention`, `early_delete` or `rejected`).
+In the transaction that marks any file deleted it also clears its findings' `detail_ct` and `dlp_key_version`, which
+`sft_jobs` may write but never read; the counts stay. An upload request's expiry rejects its open uploads and never
+moves a received file's retention. Reconciliation rejects an upload with no part for 24 hours and finishes a stuck
+completion under the request's row lock, writing `retention_until` from the tenant's policy, which `sft_jobs` may read;
+the storage audit compares every object with every file row, whichever its owner.
 
 **Jobs work in small transactions.** Every job deletes or purges in batches of at most 1,000 rows, one transaction per
 batch, and never has a transaction open while it calls S3. The deletion job, for example, deletes the objects first

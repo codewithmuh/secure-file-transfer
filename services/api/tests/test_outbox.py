@@ -19,6 +19,13 @@ from sft.data.audit import Actor, Target, record
 from sft.data.database import Database
 from sft.data.models import ActorType, Outbox, Tenant
 from sft.data.outbox import (
+    API_KEY_EXPIRING,
+    API_KEY_FIRST_EXPORT,
+    DLP_APPROVAL_DECIDED,
+    DLP_APPROVAL_EXPIRED,
+    DLP_APPROVAL_REQUESTED,
+    DLP_NO_ELIGIBLE_APPROVER,
+    DLP_POLICY_CHANGED,
     FILE_SCAN,
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
@@ -27,9 +34,15 @@ from sft.data.outbox import (
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
     TOPICS,
+    TRANSFER_AWAITING_CONFIRMATION,
+    TRANSFER_FIRST_DOWNLOAD,
     TRANSFER_HELD,
     TRANSFER_RETURNED_TO_DRAFT,
     TRANSFER_SENT,
+    UPLOAD_REQUEST_CODE_REQUESTED,
+    UPLOAD_REQUEST_FILES_SETTLED,
+    UPLOAD_REQUEST_LINK_DUE,
+    UPLOAD_REQUEST_UPLOADER_LOCKED,
     InvalidMessageError,
     OutboxMessage,
     Queue,
@@ -65,7 +78,7 @@ def test_the_service_names_each_topic_it_sends() -> None:
     # Each feature adds its topics, with the queue that carries them: invitations (#112), scans
     # (#114, #175), each to the pool of its size (ADR-0019), and the evaluation's notices (#174).
     # The notification worker's own messages (#178, #179): per-recipient links, codes, lockouts.
-    assert TOPICS == {
+    assert {
         "member.invited": MEMBER_INVITED,
         "member.sign_in_reset": MEMBER_SIGN_IN_RESET,
         "file.scan": FILE_SCAN,
@@ -76,13 +89,46 @@ def test_the_service_names_each_topic_it_sends() -> None:
         "recipient.link_due": RECIPIENT_LINK_DUE,
         "recipient.code_requested": RECIPIENT_CODE_REQUESTED,
         "recipient.locked": RECIPIENT_LOCKED,
-    }
+        "transfer.first_download": TRANSFER_FIRST_DOWNLOAD,  # the member's notice (#214)
+        # The uploader's link, codes and lockout notice (#212).
+        "upload_request.link_due": UPLOAD_REQUEST_LINK_DUE,
+        "upload_request.code_requested": UPLOAD_REQUEST_CODE_REQUESTED,
+        "upload_request.uploader_locked": UPLOAD_REQUEST_UPLOADER_LOCKED,
+        # The batched notice of received files (#213).
+        "upload_request.files_settled": UPLOAD_REQUEST_FILES_SETTLED,
+        "api_key.expiring": API_KEY_EXPIRING,
+        "api_key.first_export": API_KEY_FIRST_EXPORT,
+        # The admins' DLP policy notices, one topic per kind of change (#218).
+        **{topic.name: topic for topic in DLP_POLICY_CHANGED.values()},
+        # The sender's notice that a DLP rule warns or needs approval (#219).
+        "transfer.awaiting_confirmation": TRANSFER_AWAITING_CONFIRMATION,
+        # DLP approvals (#220): to the approvers, the sender and, when nobody can approve, admins.
+        "dlp_approval.requested": DLP_APPROVAL_REQUESTED,
+        "dlp_approval.decided": DLP_APPROVAL_DECIDED,
+        "dlp_approval.expired": DLP_APPROVAL_EXPIRED,
+        "dlp_approval.no_eligible_approver": DLP_NO_ELIGIBLE_APPROVER,
+    } == TOPICS
+    assert TRANSFER_AWAITING_CONFIRMATION.queue is Queue.NOTIFY
+    for topic in (
+        DLP_APPROVAL_REQUESTED,
+        DLP_APPROVAL_DECIDED,
+        DLP_APPROVAL_EXPIRED,
+        DLP_NO_ELIGIBLE_APPROVER,
+    ):
+        assert topic.queue is Queue.NOTIFY
     assert MEMBER_INVITED.queue is Queue.NOTIFY
     assert MEMBER_SIGN_IN_RESET.queue is Queue.NOTIFY  # a sign-in reset's new invitation (#197)
     assert FILE_SCAN.queue is Queue.SCAN_SMALL
     assert FILE_SCAN_LARGE.queue is Queue.SCAN_LARGE
     notices = (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT)
     for topic in (*notices, RECIPIENT_LINK_DUE, RECIPIENT_CODE_REQUESTED, RECIPIENT_LOCKED):
+        assert topic.queue is Queue.NOTIFY
+    assert TRANSFER_FIRST_DOWNLOAD.queue is Queue.NOTIFY
+    for topic in (
+        UPLOAD_REQUEST_LINK_DUE,
+        UPLOAD_REQUEST_CODE_REQUESTED,
+        UPLOAD_REQUEST_UPLOADER_LOCKED,
+    ):
         assert topic.queue is Queue.NOTIFY
 
 

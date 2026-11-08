@@ -1,10 +1,15 @@
 """Data access for `files` (data model 2.3, states in 3.1).
 
 Each state change is one conditional `UPDATE … WHERE state = …`, so a change applies only from the
-state the caller re-checked under the transfer's row lock, and returns the row as it now is, or
-None if the file was no longer in that state. Writes run in tenant scope only; reads also serve a
-recipient's link session later, through `File.reach`. State rules and permissions are the service
-layer's (`sft.service.uploads`).
+state the caller re-checked under the transfer's or upload request's row lock, and returns the row
+as it now is, or None if the file was no longer in that state. Writes run in tenant scope only;
+reads also serve a link session, through `File.reach`: a recipient's reaches its transfer's files,
+an uploader's its request's (#213). State rules and permissions are the service layer's
+(`sft.service.uploads`, `sft.service.received`).
+
+A file belongs to a transfer or, received through an upload request, to that request (exactly one,
+revision 0020). A received file's `retention_until` and `delete_after` are set when its upload is
+accepted (`mark_scanning` with `retention_days`, FR-13).
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from datetime import datetime
 from typing import Any, Final
 from uuid import UUID
 
-from sqlalchemy import Update, and_, func, insert, select, update
+from sqlalchemy import ColumnElement, Update, and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
@@ -40,7 +45,8 @@ async def insert_file(
     session: AsyncSession,
     *,
     file_id: UUID,
-    transfer_id: UUID,
+    transfer_id: UUID | None = None,
+    upload_request_id: UUID | None = None,
     display_name_ct: bytes,
     content_type: str,
     declared_size: int,
@@ -49,8 +55,11 @@ async def insert_file(
     part_size: int,
     part_count: int,
 ) -> File:
-    """A new `uploading` file of a transfer of the scope's tenant."""
+    """A new `uploading` file of a transfer, or of an upload request (#213), of the scope's
+    tenant: exactly one of `transfer_id` and `upload_request_id`."""
     require_scope(session, ScopeKind.TENANT)
+    if (transfer_id is None) == (upload_request_id is None):
+        raise ValueError("a file belongs to a transfer or an upload request")
     tenant_id = tenant_of(session)
     file: File | None = await session.scalar(
         insert(File)
@@ -58,6 +67,7 @@ async def insert_file(
             id=file_id,
             tenant_id=tenant_id,
             transfer_id=transfer_id,
+            upload_request_id=upload_request_id,
             display_name_ct=display_name_ct,
             content_type=content_type,
             declared_size=declared_size,
@@ -115,6 +125,106 @@ async def counted_totals(session: AsyncSession, transfer_id: UUID) -> tuple[int,
         )
     ).one()
     return int(row[0]), int(row[1])
+
+
+# ---- received files (#213) ----
+
+
+async def get_request_file(session: AsyncSession, request_id: UUID, file_id: UUID) -> File:
+    """A file of the upload request, removed or not, or `NotFoundError`: the uploader's calls find
+    their files only through their own request (`sft.service.received`)."""
+    file: File | None = await session.scalar(
+        select(File)
+        .where(
+            File.id == file_id,
+            File.upload_request_id == request_id,
+            in_scope(File, session),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if file is None:
+        raise NotFoundError("file")
+    return file
+
+
+async def list_request_files(session: AsyncSession, request_id: UUID) -> list[File]:
+    """The upload request's files that haven't been removed, oldest first."""
+    rows = await session.scalars(
+        select(File)
+        .where(
+            File.upload_request_id == request_id,
+            File.removed_at.is_(None),
+            in_scope(File, session),
+        )
+        .order_by(File.id)
+        .execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class RequestTotals:
+    """An upload request's files as FR-11 counts them."""
+
+    declared: int
+    """Every file ever declared, rejected and removed ones included: at most 100."""
+    counted: int
+    """Files that aren't `rejected` and weren't removed, `completing` ones included: at most 50."""
+    total: int
+    """The counted files' declared bytes: at most 20 GB."""
+
+
+def _counted() -> ColumnElement[bool]:
+    return and_(File.state != FileState.REJECTED.value, File.removed_at.is_(None))
+
+
+async def request_totals(session: AsyncSession, request_id: UUID) -> RequestTotals:
+    """The request's declarations, counted files and their bytes (FR-11, abuse 2.2 F)."""
+    counted = _counted()
+    row = (
+        await session.execute(
+            select(
+                func.count(),
+                func.count().filter(counted),
+                func.coalesce(func.sum(File.declared_size).filter(counted), 0),
+            ).where(File.upload_request_id == request_id, in_scope(File, session))
+        )
+    ).one()
+    return RequestTotals(int(row[0]), int(row[1]), int(row[2]))
+
+
+async def received_counts(
+    session: AsyncSession, request_ids: Sequence[UUID]
+) -> dict[UUID, tuple[int, int]]:
+    """For each request among `request_ids`, its counted files and their declared bytes; a
+    request with none is left out."""
+    if not request_ids:
+        return {}
+    rows = await session.execute(
+        select(File.upload_request_id, func.count(), func.coalesce(func.sum(File.declared_size), 0))
+        .where(File.upload_request_id.in_(request_ids), _counted(), in_scope(File, session))
+        .group_by(File.upload_request_id)
+    )
+    return {r[0]: (int(r[1]), int(r[2])) for r in rows if r[0] is not None}
+
+
+async def remove_received_file(session: AsyncSession, file_id: UUID) -> File | None:
+    """The member's early delete of a received file (FR-13): `removed_at`, and `delete_after`
+    moved forward to now, whatever its retention said; None if it was removed already."""
+    require_scope(session, ScopeKind.TENANT)
+    now = func.now()
+    statement = update(File).where(
+        File.id == file_id,
+        File.upload_request_id.is_not(None),
+        File.removed_at.is_(None),
+        in_scope(File, session),
+    )
+    return await _returning(
+        session,
+        statement.values(
+            removed_at=now, delete_after=func.least(func.coalesce(File.delete_after, now), now)
+        ),
+    )
 
 
 def _transition(session: AsyncSession, file_id: UUID, *states: FileState) -> Update:
@@ -227,13 +337,21 @@ class CountedFile:
     state: FileState
     unscannable_allowed: bool
     inspection_state: InspectionState
+    inspection_reasons: tuple[InspectionReason, ...] = ()
+    """Why content wasn't inspected: what a `not_inspected` rule tests (#219)."""
 
 
 async def counted_states(session: AsyncSession, transfer_id: UUID) -> list[CountedFile]:
     """The transfer's counted files: not `rejected` and not removed."""
     require_scope(session, ScopeKind.TENANT)
     rows = await session.execute(
-        select(File.id, File.state, File.unscannable_allowed, File.inspection_state)
+        select(
+            File.id,
+            File.state,
+            File.unscannable_allowed,
+            File.inspection_state,
+            File.inspection_reasons,
+        )
         .where(
             File.transfer_id == transfer_id,
             File.state != FileState.REJECTED.value,
@@ -244,7 +362,11 @@ async def counted_states(session: AsyncSession, transfer_id: UUID) -> list[Count
     )
     return [
         CountedFile(
-            r.id, FileState(r.state), r.unscannable_allowed, InspectionState(r.inspection_state)
+            r.id,
+            FileState(r.state),
+            r.unscannable_allowed,
+            InspectionState(r.inspection_state),
+            tuple(InspectionReason(reason) for reason in r.inspection_reasons),
         )
         for r in rows
     ]
@@ -255,7 +377,7 @@ class ScanTarget:
     """What the scan worker needs of a file: where its recorded version is, and its state."""
 
     id: UUID
-    transfer_id: UUID
+    transfer_id: UUID | None
     state: FileState
     storage_class: StorageClass
     storage_key: str
@@ -263,6 +385,8 @@ class ScanTarget:
     actual_size: int | None
     unscannable_allowed: bool
     inspection_state: InspectionState
+    upload_request_id: UUID | None = None
+    """A received file's request (#213): its notices, not a transfer's evaluation, follow."""
 
 
 async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
@@ -279,6 +403,7 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
                 File.actual_size,
                 File.unscannable_allowed,
                 File.inspection_state,
+                File.upload_request_id,
             ).where(File.id == file_id, in_scope(File, session))
         )
     ).first()
@@ -294,6 +419,7 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
         actual_size=row.actual_size,
         unscannable_allowed=row.unscannable_allowed,
         inspection_state=InspectionState(row.inspection_state),
+        upload_request_id=row.upload_request_id,
     )
 
 
@@ -309,11 +435,13 @@ async def record_scan(
     inspection_state: InspectionState,
     inspection_reasons: Sequence[InspectionReason] = (),
     inspection_engine_version: str | None = None,
+    inspection_policy_version: int | None = None,
     sha256: bytes | None = None,
 ) -> bool:
     """Record the scan's and the inspection's result together, only if the file is still
     `scanning` (data model 3.1, 3.5); False if it wasn't, and nothing changed. `sha256` is the
-    digest of the version the worker read in full, the downloads' `ETag` (#180)."""
+    digest of the version the worker read in full, the downloads' `ETag` (#180);
+    `inspection_policy_version` the DLP policy version whose detectors ran (#218)."""
     require_scope(session, ScopeKind.TENANT)
     result = await session.execute(
         update(File)
@@ -332,6 +460,7 @@ async def record_scan(
             inspection_state=inspection_state.value,
             inspection_reasons=[r.value for r in inspection_reasons],
             inspection_engine_version=inspection_engine_version,
+            inspection_policy_version=inspection_policy_version,
             **({} if sha256 is None else {"sha256": sha256}),
         )
         .returning(File.id)
@@ -363,34 +492,44 @@ async def overdue_scans(session: AsyncSession, *, limit: int) -> list[Overdue]:
     return [Overdue(r.tenant_id, r.id) for r in rows]
 
 
+@dataclass(frozen=True, slots=True)
+class Owner:
+    """A file's transfer, or the upload request it was received through (#213)."""
+
+    transfer_id: UUID | None
+    upload_request_id: UUID | None
+
+
 async def fail_overdue_scan(
     session: AsyncSession,
     file_id: UUID,
     *,
     detail: ScanDetail,
     inspection_state: InspectionState,
-) -> UUID | None:
+) -> Owner | None:
     """`scan_failed` for a file still `scanning` past its deadline, in its tenant's scope; its
-    transfer's ID, or None if a result came first and nothing changed."""
+    transfer or request, or None if a result came first and nothing changed."""
     require_scope(session, ScopeKind.TENANT)
-    transfer_id: UUID | None = await session.scalar(
-        update(File)
-        .where(
-            File.id == file_id,
-            File.state == FileState.SCANNING.value,
-            File.scan_deadline < func.now(),
-            in_scope(File, session),
+    row = (
+        await session.execute(
+            update(File)
+            .where(
+                File.id == file_id,
+                File.state == FileState.SCANNING.value,
+                File.scan_deadline < func.now(),
+                in_scope(File, session),
+            )
+            .values(
+                state=FileState.SCAN_FAILED.value,
+                scan_detail=detail.value,
+                scanned_at=func.now(),
+                inspection_state=inspection_state.value,
+            )
+            .returning(File.transfer_id, File.upload_request_id)
+            .execution_options(synchronize_session=False)
         )
-        .values(
-            state=FileState.SCAN_FAILED.value,
-            scan_detail=detail.value,
-            scanned_at=func.now(),
-            inspection_state=inspection_state.value,
-        )
-        .returning(File.transfer_id)
-        .execution_options(synchronize_session=False)
-    )
-    return transfer_id
+    ).first()
+    return None if row is None else Owner(row[0], row[1])
 
 
 # ---- the lifecycle jobs (sft_jobs, data model 6; #181) ----
@@ -509,7 +648,7 @@ class JobFile:
     """What the jobs need of one file, in its tenant's scope: never its name."""
 
     id: UUID
-    transfer_id: UUID
+    transfer_id: UUID | None
     state: FileState
     storage_class: StorageClass
     storage_key: str
@@ -520,30 +659,29 @@ class JobFile:
     removed_at: datetime | None
     delete_after: datetime | None
     deleted_at: datetime | None
+    upload_request_id: UUID | None = None
+    retention_until: datetime | None = None
 
 
-async def job_file(session: AsyncSession, file_id: UUID) -> JobFile:
-    require_scope(session, ScopeKind.TENANT)
-    row = (
-        await session.execute(
-            select(
-                File.id,
-                File.transfer_id,
-                File.state,
-                File.storage_class,
-                File.storage_key,
-                File.s3_upload_id,
-                File.declared_size,
-                File.part_size,
-                File.part_count,
-                File.removed_at,
-                File.delete_after,
-                File.deleted_at,
-            ).where(File.id == file_id, in_scope(File, session))
-        )
-    ).first()
-    if row is None:
-        raise NotFoundError("file")
+_JOB_COLUMNS: Final = (
+    File.id,
+    File.transfer_id,
+    File.state,
+    File.storage_class,
+    File.storage_key,
+    File.s3_upload_id,
+    File.declared_size,
+    File.part_size,
+    File.part_count,
+    File.removed_at,
+    File.delete_after,
+    File.deleted_at,
+    File.upload_request_id,
+    File.retention_until,
+)
+
+
+def _job_file(row: Any) -> JobFile:
     return JobFile(
         row.id,
         row.transfer_id,
@@ -557,7 +695,38 @@ async def job_file(session: AsyncSession, file_id: UUID) -> JobFile:
         row.removed_at,
         row.delete_after,
         row.deleted_at,
+        row.upload_request_id,
+        row.retention_until,
     )
+
+
+async def job_file(session: AsyncSession, file_id: UUID) -> JobFile:
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(*_JOB_COLUMNS).where(File.id == file_id, in_scope(File, session))
+        )
+    ).first()
+    if row is None:
+        raise NotFoundError("file")
+    return _job_file(row)
+
+
+async def open_request_uploads(session: AsyncSession, request_id: UUID) -> list[JobFile]:
+    """The request's files still `uploading` or `completing`: what a revocation or an expiry
+    rejects, so no part of them is ever assembled (NFR-6). The caller holds the request's row
+    lock."""
+    require_scope(session, ScopeKind.TENANT)
+    rows = await session.execute(
+        select(*_JOB_COLUMNS)
+        .where(
+            File.upload_request_id == request_id,
+            File.state.in_(OPEN_UPLOAD),
+            in_scope(File, session),
+        )
+        .order_by(File.id)
+    )
+    return [_job_file(row) for row in rows]
 
 
 async def _changed(session: AsyncSession, statement: Update) -> bool:
@@ -640,17 +809,23 @@ async def mark_scanning(
     actual_size: int,
     s3_version_id: str,
     scan_deadline: datetime,
+    retention_days: int | None = None,
 ) -> bool:
     """Phase 3: `completing` to `scanning`, with the size and version recorded at completion. The
     scan worker scans that version, and downloads serve only it (data model 2.3). False if the file
-    was no longer `completing` or was removed. Names its columns, so the jobs run it too."""
+    was no longer `completing` or was removed. Names its columns, so the jobs run it too.
+
+    A received file gets `retention_until`, `retention_days` from now, and `delete_after` with it:
+    its upload was accepted now (FR-13, #213)."""
     statement = _transition(session, file_id, FileState.COMPLETING).where(File.removed_at.is_(None))
-    return await _changed(
-        session,
-        statement.values(
-            state=FileState.SCANNING.value,
-            actual_size=actual_size,
-            s3_version_id=s3_version_id,
-            scan_deadline=scan_deadline,
-        ),
-    )
+    values: dict[str, Any] = {
+        "state": FileState.SCANNING.value,
+        "actual_size": actual_size,
+        "s3_version_id": s3_version_id,
+        "scan_deadline": scan_deadline,
+    }
+    if retention_days is not None:
+        until = func.now() + func.make_interval(0, 0, 0, retention_days)
+        values["retention_until"] = until
+        values["delete_after"] = until
+    return await _changed(session, statement.values(**values))

@@ -1,0 +1,7 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">The API key <strong>{{ key_prefix }}…</strong> of {{ tenant_name }} expires on {{ expires_at }}. After that, the automation that uses it stops working.</p>
+<p style="margin:0 0 16px;">To keep it working, a tenant admin creates a new key, switches the automation over to it, then revokes this one. You get this email because you own the key or are a tenant admin.</p>
+{{ button(api_keys_url, 'View the API keys', 'Or copy this address into your browser:') }}
+{% endblock %}

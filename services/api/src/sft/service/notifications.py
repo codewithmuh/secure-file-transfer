@@ -14,6 +14,37 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `recipient.locked`: `recipient_locked` to the transfer's owner and every active tenant admin.
 - `transfer.held`: `transfer_held` to the owner, while the transfer is still held: once per hold.
 - `transfer.returned_to_draft`: `transfer_returned_to_draft` to the owner, while it is a draft.
+- `transfer.first_download`: `first_download` to the owner, once per transfer (#214).
+- `upload_request.link_due`: as `recipient.link_due`, for an upload request's uploader (#212): the
+  suppression list, the cross-tenant cap, the link (derived from the request's ID, its hash
+  stored once, `uploader.link_issued`), then `upload_request` in the request's locale, then `sent`
+  and `notified_at`. Written by the request's creation and by an unlock.
+- `upload_request.code_requested`: a new code for the uploader, as for a recipient.
+- `upload_request.uploader_locked`: `recipient_locked`, in its upload-request variant (no
+  template of its own), to the request's owner and every active tenant admin.
+- `upload_request.files_settled` (#213, architecture 4.3): the request's batched notice, counts
+  only. `files_arrived` to the owner for the files that became shareable, `files_blocked_member`
+  to the owner and `files_blocked_uploader` to the uploader, in the request's locale, for the
+  blocked ones; the uploader's names no finding, scan detail or file. Each email is recorded on
+  its own (two go to the owner), and once they are out, the counts sent are taken off with
+  `upload_request.notice_sent`; files that settled meanwhile make the next notice due, with a new
+  delayed message. The request may have ended since: received files stay, so the notice goes out
+  whatever its state.
+- `transfer.awaiting_confirmation` (#219): `dlp_confirmation_needed` to the owner, while the
+  transfer still waits for them. A DLP block is `transfer.held` (`transfer_held` says a file or a
+  rule holds it), and neither email names a file, a rule or a finding.
+- `dlp_policy.changed.<kind>` (#218): `dlp_policy_changed`, naming that kind of change, to every
+  active admin of the tenant (FR-54). One topic per kind, since a payload carries IDs only; an
+  update of several settings at once sends one email per kind it changed. The coalescing of abuse
+  7.1 (one email per tenant every 10 minutes) isn't built yet: each change is its own notice. An
+  approver designation changed by `updateUser` is the kind `approvers_changed` (#220).
+- `dlp_approval.requested` (#220): `dlp_approval_requested` to each eligible approver (active,
+  with the designation, not the transfer's sender), while the request is still pending. No file
+  name, no approve link: decisions are made signed in (architecture 4.6). The hourly digest past
+  20 an hour (abuse 7.1) isn't built yet: each request is its own email.
+- `dlp_approval.decided`, `dlp_approval.expired` (#220): `dlp_approval_decided` (approved or
+  rejected; the comment stays in the web app) and `dlp_approval_expired` to the transfer's sender.
+- `dlp_approval.no_eligible_approver` (#220): `dlp_no_eligible_approver` to every active admin.
 - `member.invited`: with a user pool (`sft.service.user_pool`; Keycloak locally, #197), the
   member's pool user with a temporary password, its identity, then `member_invitation` with that
   password; an address that already signs in locally for another tenant gets
@@ -23,6 +54,15 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `member.sign_in_reset`: the same, after deleting the member's pool user: a new user, a new
   identity, a new invitation (authn and authz 2.5). The API already ended the sessions and deleted
   the old identities.
+- `api_key.expiring` (#215): `api_key_expiring` to the key's owner and every active tenant admin,
+  unless the key was revoked or has expired meanwhile. Names the key by its prefix only.
+- `api_key.first_export` (#216): `api_key_first_export` to every active tenant admin.
+
+**A cleared suppression** (#217, abuse 7.4): before a link or code email goes to an address whose
+suppression entry ended since its last release (an admin cleared it, or its 90 days passed), the
+worker removes the address from the tenant's SES list (`release`, outside any transaction, before
+the send), then records `ses_released_at` and `email_suppression.released` with the email. A
+release that fails sends nothing, and the message is delivered again.
 
 **Recorded after the send** (ADR-0013, consumer.py). An email can't share a transaction, so a
 message that sends one is handled in three steps: a short transaction checks that the message
@@ -82,38 +122,85 @@ from sft.core.errors import RateLimited
 from sft.core.hmac_keyrings import CodeKeyring, LinkKeyring
 from sft.core.ids import uuid7
 from sft.core.pseudonyms import EmailKeyring
-from sft.data import audit, codes, identities, recipients, suppressions, tenants, transfers, users
+from sft.data import (
+    api_keys,
+    audit,
+    codes,
+    dlp_approvals,
+    identities,
+    recipients,
+    suppressions,
+    tenants,
+    transfers,
+    upload_requests,
+    users,
+)
 from sft.data.audit import Actor, Target
 from sft.data.database import Database
 from sft.data.mail import MailError, MailErrorKind, OutgoingEmail
-from sft.data.models import ActorType, DeliveryState, Role, TransferState, UserStatus
+from sft.data.models import (
+    ActorType,
+    ApprovalState,
+    DeliveryState,
+    Role,
+    TransferState,
+    UploadRequestState,
+    UserStatus,
+)
 from sft.data.models import Outcome as AuditOutcome
 from sft.data.outbox import (
+    API_KEY_EXPIRING,
+    API_KEY_FIRST_EXPORT,
+    DLP_APPROVAL_DECIDED,
+    DLP_APPROVAL_EXPIRED,
+    DLP_APPROVAL_REQUESTED,
+    DLP_NO_ELIGIBLE_APPROVER,
+    DLP_POLICY_CHANGED,
     MAX_DELAY,
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
+    TRANSFER_AWAITING_CONFIRMATION,
+    TRANSFER_FIRST_DOWNLOAD,
     TRANSFER_HELD,
     TRANSFER_RETURNED_TO_DRAFT,
     TRANSFER_SENT,
+    UPLOAD_REQUEST_CODE_REQUESTED,
+    UPLOAD_REQUEST_FILES_SETTLED,
+    UPLOAD_REQUEST_LINK_DUE,
+    UPLOAD_REQUEST_UPLOADER_LOCKED,
     OutboxMessage,
     enqueue,
 )
 from sft.data.processed import record_processed, recorded_before
-from sft.data.scope import Scope
+from sft.data.scope import Scope, Subject
 from sft.service.email import EmailRenderer
 from sft.service.email.catalog import (
+    ApiKeyExpiring,
+    ApiKeyFirstExport,
+    DlpApprovalDecided,
+    DlpApprovalExpired,
+    DlpApprovalRequested,
+    DlpConfirmationNeeded,
+    DlpNoEligibleApprover,
+    DlpPolicyChanged,
     Email,
     EmailType,
+    FilesArrived,
+    FilesBlockedMember,
+    FilesBlockedUploader,
+    FirstDownload,
     InvitationAddressInUse,
     Locale,
     MemberInvitation,
+    PolicyChange,
     RecipientLocked,
     TransferHeld,
     TransferLink,
     TransferReturnedToDraft,
+    UploadRequest,
     VerificationCode,
 )
 from sft.service.rate_limits import Charge
@@ -147,6 +234,16 @@ class Done(StrEnum):
     DUPLICATE = "duplicate"
 
 
+class Addressed(Protocol):
+    """A link or code email's addressee: a recipient's or an uploader's link target."""
+
+    @property
+    def email(self) -> str: ...
+
+    @property
+    def email_normalized(self) -> str: ...
+
+
 class Limiter(Protocol):
     """What the worker needs of `sft.service.rate_limits.RateLimiter`."""
 
@@ -157,6 +254,8 @@ class Limiter(Protocol):
 
 Send = Callable[[OutgoingEmail], Awaitable[str]]
 """Hands one email to the provider (a `Mailer` in the worker's thread pool); its message ID."""
+Release = Callable[[UUID, str], Awaitable[None]]
+"""Removes an address from a tenant's suppression list at the provider (`Mailer.release`)."""
 
 
 @dataclass(frozen=True)
@@ -208,6 +307,9 @@ class _Plan:
     """The email type the tenant's audit log records, when it must not be the email's own: an
     address-in-use email is logged as an invitation, so the tenant learns nothing of another
     tenant (authn and authz 2.5, NFR-12)."""
+    part_by_type: bool = False
+    """With `per_email`, each email is recorded by its type too: a notice that sends one person
+    two emails (#213's to a request's owner) records each."""
 
 
 def _details(**more: audit.Detail) -> dict[str, audit.Detail]:
@@ -232,6 +334,7 @@ class Notifier:
         metrics: NotifyMetrics,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         pool: UserPool | None = None,
+        release: Release | None = None,
     ) -> None:
         self.database = database
         self.renderer = renderer
@@ -243,6 +346,7 @@ class Notifier:
         self.metrics = metrics
         self.clock = clock
         self.pool = pool
+        self.release = release
 
     async def handle(self, message: OutboxMessage) -> Done:
         """Do the message's work once (module docstring). Raises to have it delivered again."""
@@ -262,7 +366,20 @@ class Notifier:
             RECIPIENT_LOCKED.name: self._locked,
             TRANSFER_HELD.name: self._held,
             TRANSFER_RETURNED_TO_DRAFT.name: self._returned_to_draft,
+            TRANSFER_AWAITING_CONFIRMATION.name: self._awaiting_confirmation,
             MEMBER_INVITED.name: self._invited,
+            TRANSFER_FIRST_DOWNLOAD.name: self._first_download,
+            UPLOAD_REQUEST_LINK_DUE.name: self._uploader_link,
+            UPLOAD_REQUEST_CODE_REQUESTED.name: self._uploader_code,
+            UPLOAD_REQUEST_UPLOADER_LOCKED.name: self._uploader_locked,
+            UPLOAD_REQUEST_FILES_SETTLED.name: self._files_settled,
+            API_KEY_EXPIRING.name: self._key_expiring,
+            API_KEY_FIRST_EXPORT.name: self._key_first_export,
+            **{topic.name: self._policy_changed for topic in DLP_POLICY_CHANGED.values()},
+            DLP_APPROVAL_REQUESTED.name: self._approval_requested,
+            DLP_APPROVAL_DECIDED.name: self._approval_decided,
+            DLP_APPROVAL_EXPIRED.name: self._approval_decided,
+            DLP_NO_ELIGIBLE_APPROVER.name: self._no_eligible_approver,
         }.get(message.topic)
         if prepare is None:
             # Never deleted: after 5 receives it lands in the dead-letter queue, which alerts.
@@ -293,6 +410,8 @@ class Notifier:
             part = None
             if plan.per_email:
                 part = f"{message_id}:{self.emails.active(outgoing.to.lower())}"
+                if plan.part_by_type:
+                    part = f"{part}:{email.TYPE.value}"
             if part is not None:
                 async with self.database.transaction(scope) as session:
                     if await recorded_before(session, consumer=CONSUMER, message_id=part):
@@ -466,7 +585,38 @@ class Notifier:
                 # The cap filled meanwhile, from another worker: the email is out already.
                 log.info("link email sent as the cross-tenant cap filled")
 
-        return _Plan([(email, outgoing)], subject, delivered, bounced, charge)
+        plan = _Plan([(email, outgoing)], subject, delivered, bounced, charge)
+        return await self._released_first(session, plan, message.tenant_id, target)
+
+    async def _released_first(
+        self, session: AsyncSession, plan: _Plan, tenant_id: UUID, target: Addressed
+    ) -> _Plan:
+        """The plan, removing the address from the tenant's SES list before the send if its
+        suppression entry ended since the last release (module docstring)."""
+        entry_id = await suppressions.release_due(
+            session, self.emails.every_version(target.email_normalized)
+        )
+        if entry_id is None or self.release is None:
+            return plan
+        release, address = self.release, target.email
+
+        async def released() -> None:
+            await release(tenant_id, address)
+
+        async def recorded(session: AsyncSession) -> None:
+            await suppressions.mark_released(session, entry_id)
+            await audit.record(
+                session,
+                action="email_suppression.released",
+                actor=SYSTEM,
+                target=Target(suppressions.TARGET, entry_id),
+                details=_details(),
+            )
+
+        plan.before_send = released
+        plan.after = _both(recorded, plan.after)
+        plan.rejected = _both(recorded, plan.rejected)
+        return plan
 
     async def _token(self, session: AsyncSession, target: recipients.LinkTarget) -> str | None:
         """The recipient's link token: rebuilt from the row, or derived and stored now. None if
@@ -546,7 +696,8 @@ class Notifier:
             tenant_id=message.tenant_id,
             tags={"recipient_id": str(recipient_id)},
         )
-        return _Plan([(email, outgoing)], subject)
+        plan = _Plan([(email, outgoing)], subject)
+        return await self._released_first(session, plan, message.tenant_id, target)
 
     async def _locked(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         recipient_id = _id(message, "recipient_id")
@@ -564,6 +715,411 @@ class Notifier:
             per_email=True,
         )
 
+    # ---- uploaders (#212) ----
+
+    async def _live_request(
+        self, session: AsyncSession, request_id: UUID
+    ) -> upload_requests.LinkTarget | None:
+        """The request, locked, if it is open and hasn't expired and its uploader isn't locked
+        out."""
+        target = await upload_requests.link_target(session, request_id, lock=True)
+        if target is None or target.state is not UploadRequestState.OPEN:
+            return None
+        if target.expires_at <= self.clock() or target.locked_at is not None:
+            return None
+        return target
+
+    async def _uploader_link(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`upload_request` to the uploader, as `_link` sends a recipient theirs."""
+        request_id = _id(message, "upload_request_id")
+        target = await self._live_request(session, request_id)
+        sender = await tenants.sender(session)
+        if target is None or sender is None or not sender.active:
+            return _Plan()
+        if target.delivery_state is DeliveryState.SENT and target.notified_at is not None:
+            return _Plan()  # this link's email went out already (a stale copy)
+        subject = Target(upload_requests.TARGET, request_id)
+        if await self._suppressed(session, target.email_normalized):
+            await upload_requests.set_delivery(session, request_id, DeliveryState.SUPPRESSED)
+            await audit.record(
+                session,
+                action="uploader.suppressed",
+                actor=SYSTEM,
+                target=subject,
+                details=_details(),
+            )
+            return _Plan()
+        charges = [
+            Charge(
+                limit,
+                {KeyType.EMAIL: self.emails.for_limits(target.email_normalized, self.clock())},
+            )
+            for limit in CROSS_TENANT_LINK_EMAILS
+        ]
+        try:
+            await self.limiter.peek_all(charges)
+        except RateLimited as held:
+            delay = min(timedelta(seconds=held.retry_after), MAX_DELAY)
+            await enqueue(
+                session, UPLOAD_REQUEST_LINK_DUE, {"upload_request_id": request_id}, delay=delay
+            )
+            self.metrics.caps.labels("address_link_emails_all").inc()
+            log.info("link email held by the cross-tenant cap", extra={"delay": delay.seconds})
+            return _Plan()
+        token = await self._uploader_token(session, target)
+        if token is None:
+            return _Plan()
+        owner = await users.get_user(session, target.created_by)
+        if owner is None:  # pragma: no cover - a request's owner is a user of its tenant
+            return _Plan()
+        email = UploadRequest(
+            tenant_name=sender.name,
+            sender_email=owner.email,
+            token=token,
+            expires_at=target.expires_at,
+        )
+        outgoing = self.renderer.compose(
+            email,
+            Locale(target.locale),
+            to=target.email,
+            tenant_id=message.tenant_id,
+            tags={"upload_request_id": str(request_id)},
+        )
+
+        async def delivered(session: AsyncSession) -> None:
+            await upload_requests.set_delivery(
+                session, request_id, DeliveryState.SENT, notified=True
+            )
+
+        async def bounced(session: AsyncSession) -> None:
+            await upload_requests.set_delivery(session, request_id, DeliveryState.BOUNCED)
+
+        async def charge() -> None:
+            try:
+                await self.limiter.check_all(charges)
+            except RateLimited:
+                log.info("link email sent as the cross-tenant cap filled")
+
+        plan = _Plan([(email, outgoing)], subject, delivered, bounced, charge)
+        return await self._released_first(session, plan, message.tenant_id, target)
+
+    async def _uploader_token(
+        self, session: AsyncSession, target: upload_requests.LinkTarget
+    ) -> str | None:
+        """The uploader's link token, derived from the request's ID as `_token` derives a
+        recipient's (data model 2.2): rebuilt, or issued now and its hash stored once."""
+        if (
+            target.link_issued_at is not None
+            and target.link_key_id is not None
+            and self.link_keys.knows(target.link_key_id)
+        ):
+            return self.link_keys.token(target.link_key_id, target.id, target.link_issued_at)
+        replace = target.link_issued_at is not None
+        issued_at = self.clock()
+        key_id = self.link_keys.active_id
+        token = self.link_keys.token(key_id, target.id, issued_at)
+        issued = await upload_requests.issue_link(
+            session,
+            target.id,
+            key_id=key_id,
+            issued_at=issued_at,
+            hashed=recipients.token_hash(token),
+            replace=replace,
+        )
+        if not issued:
+            stored = await upload_requests.link_target(session, target.id)
+            if (
+                stored is None
+                or stored.link_issued_at is None
+                or stored.link_key_id is None
+                or not self.link_keys.knows(stored.link_key_id)
+            ):
+                return None
+            return self.link_keys.token(stored.link_key_id, stored.id, stored.link_issued_at)
+        await audit.record(
+            session,
+            action="uploader.link_issued",
+            actor=SYSTEM,
+            target=Target(upload_requests.TARGET, target.id),
+            details=_details(replaced=replace),
+        )
+        return token
+
+    async def _uploader_code(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`verification_code` to the uploader's stored address only, as for a recipient."""
+        request_id = _id(message, "upload_request_id")
+        target = await self._live_request(session, request_id)
+        sender = await tenants.sender(session)
+        if target is None or sender is None or not sender.active or target.link_issued_at is None:
+            return _Plan()
+        subject = Target(upload_requests.TARGET, request_id)
+        if await self._suppressed(session, target.email_normalized):
+            return _Plan()  # requestVerificationCode answered 422; suppressed since: no email
+        code = new_code()
+        code_id = uuid7()
+        key_id = self.code_keys.active_id
+        superseded = await codes.create_for(
+            session,
+            Subject.upload_request(request_id),
+            code_id=code_id,
+            code_hmac=self.code_keys.code_hmac(key_id, code_id, code),
+            key_id=key_id,
+        )
+        await audit.record(
+            session,
+            action="verification.code_created",
+            actor=SYSTEM,
+            target=subject,
+            details=_details(code_id=code_id, superseded=superseded),
+        )
+        email = VerificationCode(tenant_name=sender.name, code=code)
+        outgoing = self.renderer.compose(
+            email,
+            Locale(target.locale),
+            to=target.email,
+            tenant_id=message.tenant_id,
+            tags={"upload_request_id": str(request_id)},
+        )
+        plan = _Plan([(email, outgoing)], subject)
+        return await self._released_first(session, plan, message.tenant_id, target)
+
+    async def _uploader_locked(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """The lockout notice to the request's owner and every active admin: `recipient_locked`
+        in its upload-request variant, which names the request's page and no address."""
+        request_id = _id(message, "upload_request_id")
+        target = await upload_requests.link_target(session, request_id)
+        sender = await tenants.sender(session)
+        if target is None or sender is None or not sender.active or target.locked_at is None:
+            return _Plan()
+        email = RecipientLocked(
+            tenant_name=sender.name, subject_kind="upload_request", subject_id=request_id
+        )
+        to = await self._owner_and_admins(session, target.created_by)
+        return _Plan(
+            [self._to_member(email, sender, address, message.tenant_id) for address in to],
+            Target(upload_requests.TARGET, request_id),
+            per_email=True,
+        )
+
+    async def _files_settled(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """The request's batched notice of received files (module docstring, #213)."""
+        request_id = _id(message, "upload_request_id")
+        notice = await upload_requests.notice(session, request_id, lock=True)
+        sender = await tenants.sender(session)
+        if notice is None or (notice.arrived == 0 and notice.blocked == 0):
+            return _Plan()  # a stale copy: an earlier one sent these counts
+        if sender is None or not sender.active:
+            return _Plan()  # a suspended tenant's: kept, and told with the next notice
+        owner = await users.get_user(session, notice.created_by)
+        to_owner = owner is not None and owner.status == UserStatus.ACTIVE.value
+        emails: list[tuple[Email, OutgoingEmail]] = []
+        if to_owner and owner is not None and notice.arrived:
+            arrived = FilesArrived(
+                tenant_name=sender.name, upload_request_id=request_id, file_count=notice.arrived
+            )
+            emails.append(self._to_member(arrived, sender, owner.email, message.tenant_id))
+        if to_owner and owner is not None and notice.blocked:
+            blocked = FilesBlockedMember(
+                tenant_name=sender.name, upload_request_id=request_id, file_count=notice.blocked
+            )
+            emails.append(self._to_member(blocked, sender, owner.email, message.tenant_id))
+        if (
+            notice.blocked
+            and owner is not None
+            and not await self._suppressed(session, notice.email_normalized)
+        ):
+            # The uploader learns only that the company's policy didn't accept a file: no
+            # finding, no scan detail, no file name (FR-12, abuse 7.5).
+            uploader = FilesBlockedUploader(tenant_name=sender.name, sender_email=owner.email)
+            outgoing = self.renderer.compose(
+                uploader,
+                Locale(notice.locale),
+                to=notice.email,
+                tenant_id=message.tenant_id,
+                tags={"upload_request_id": str(request_id)},
+            )
+            emails.append((uploader, outgoing))
+        counts = (notice.arrived, notice.blocked)
+
+        async def settled(session: AsyncSession) -> None:
+            await self._settle(session, request_id, *counts)
+
+        if not emails:
+            # Nobody to tell (an owner deactivated, an uploader suppressed): the counts are
+            # taken off all the same, so the next notice holds only what follows.
+            await self._settle(session, request_id, *counts)
+            return _Plan()
+        return _Plan(
+            emails,
+            Target(upload_requests.TARGET, request_id),
+            after=settled,
+            rejected=settled,
+            per_email=True,
+            part_by_type=True,
+        )
+
+    async def _settle(
+        self, session: AsyncSession, request_id: UUID, arrived: int, blocked: int
+    ) -> None:
+        """Take the notice's counts off the request, with its audit event; files that settled
+        meanwhile make the next notice due, with its delayed message."""
+        more = await upload_requests.settle_notice(
+            session, request_id, arrived=arrived, blocked=blocked
+        )
+        if more:
+            await enqueue(
+                session,
+                UPLOAD_REQUEST_FILES_SETTLED,
+                {"upload_request_id": request_id},
+                delay=upload_requests.NOTICE_WINDOW,
+            )
+        await audit.record(
+            session,
+            action="upload_request.notice_sent",
+            actor=SYSTEM,
+            target=Target(upload_requests.TARGET, request_id),
+            details=_details(files_arrived=arrived, files_blocked=blocked, next_notice_due=more),
+        )
+
+    # ---- API keys (#215, #216) ----
+
+    async def _key_expiring(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        key_id = _id(message, "api_key_id")
+        key = await api_keys.notice_key(session, key_id)
+        sender = await tenants.sender(session)
+        if key is None or key.revoked or key.expires_at <= self.clock():
+            return _Plan()  # revoked or expired since the job asked: nothing to warn of
+        if sender is None or not sender.active:
+            return _Plan()
+        email = ApiKeyExpiring(
+            tenant_name=sender.name, key_prefix=key.key_prefix, expires_at=key.expires_at
+        )
+        to = await self._owner_and_admins(session, key.owner_id)
+        return _Plan(
+            [self._to_member(email, sender, address, message.tenant_id) for address in to],
+            Target(api_keys.TARGET, key_id),
+            per_email=True,
+        )
+
+    async def _key_first_export(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        key_id = _id(message, "api_key_id")
+        key = await api_keys.notice_key(session, key_id)
+        sender = await tenants.sender(session)
+        if key is None or sender is None or not sender.active:
+            return _Plan()
+        # Even for a key revoked since: the admins learn what it did while it was live.
+        email = ApiKeyFirstExport(tenant_name=sender.name, key_prefix=key.key_prefix)
+        to = await self._owner_and_admins(session, key.owner_id)
+        return _Plan(
+            [self._to_member(email, sender, address, message.tenant_id) for address in to],
+            Target(api_keys.TARGET, key_id),
+            per_email=True,
+        )
+
+    # ---- notices to the tenant's admins ----
+
+    async def _policy_changed(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`dlp_policy_changed` to every active admin, naming the kind of change: the topic's last
+        part (#218, FR-54). Never a keyword, a threshold or a domain: the email names kinds."""
+        change = PolicyChange(message.topic.rsplit(".", 1)[-1])
+        sender = await tenants.sender(session)
+        if sender is None or not sender.active:
+            return _Plan()
+        admins = await users.list_users(
+            session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
+        )
+        email = DlpPolicyChanged(tenant_name=sender.name, changes=(change,))
+        return _Plan(
+            [self._to_member(email, sender, admin.email, message.tenant_id) for admin in admins],
+            Target("dlp_policy", message.tenant_id),
+            per_email=True,
+        )
+
+    async def _no_eligible_approver(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`dlp_no_eligible_approver` to every active admin (#220): a sender's request was refused
+        because nobody but the sender could approve. Names no file, rule or finding."""
+        transfer_id = _id(message, "transfer_id")
+        sender = await tenants.sender(session)
+        if sender is None or not sender.active:
+            return _Plan()
+        admins = await users.list_users(
+            session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
+        )
+        email = DlpNoEligibleApprover(tenant_name=sender.name)
+        return _Plan(
+            [self._to_member(email, sender, admin.email, message.tenant_id) for admin in admins],
+            Target("transfer", transfer_id),
+            per_email=True,
+        )
+
+    # ---- DLP approvals (#220) ----
+
+    async def _approval_requested(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`dlp_approval_requested` to each eligible approver while the request is pending."""
+        request_id = _id(message, "approval_request_id")
+        request = await dlp_approvals.notice(session, request_id)
+        sender = await tenants.sender(session)
+        if request is None or request.state is not ApprovalState.PENDING:
+            return _Plan()  # decided, withdrawn or expired since: nothing to ask
+        if sender is None or not sender.active:
+            return _Plan()
+        transfer = await transfers.notice(session, request.transfer_id)
+        if transfer is None:
+            return _Plan()
+        email = DlpApprovalRequested(tenant_name=sender.name)
+        plans = []
+        after: UUID | None = None
+        while True:
+            page = await users.list_users(
+                session,
+                status=UserStatus.ACTIVE,
+                dlp_approver=True,
+                after=after,
+                limit=users.MAX_PAGE,
+            )
+            for user in page[: users.MAX_PAGE]:
+                if user.id != transfer.created_by:  # the sender never approves (T-100)
+                    plans.append(self._to_member(email, sender, user.email, message.tenant_id))
+            if len(page) <= users.MAX_PAGE:
+                break
+            after = page[users.MAX_PAGE - 1].id
+        return _Plan(plans, Target("dlp_approval_request", request_id), per_email=True)
+
+    async def _approval_decided(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`dlp_approval_decided` or `dlp_approval_expired` to the transfer's sender, by the
+        request's state: approved or rejected, or expired."""
+        request_id = _id(message, "approval_request_id")
+        request = await dlp_approvals.notice(session, request_id)
+        sender = await tenants.sender(session)
+        if request is None or sender is None or not sender.active:
+            return _Plan()
+        expected = (
+            (ApprovalState.EXPIRED,)
+            if message.topic == DLP_APPROVAL_EXPIRED.name
+            else (ApprovalState.APPROVED, ApprovalState.REJECTED)
+        )
+        if request.state not in expected:
+            return _Plan()
+        transfer = await transfers.notice(session, request.transfer_id)
+        if transfer is None:
+            return _Plan()
+        owner = await users.get_user(session, transfer.created_by)
+        if owner is None or owner.status != UserStatus.ACTIVE.value:
+            return _Plan()
+        email: Email
+        if request.state is ApprovalState.EXPIRED:
+            email = DlpApprovalExpired(tenant_name=sender.name, transfer_id=transfer.id)
+        else:
+            email = DlpApprovalDecided(
+                tenant_name=sender.name,
+                transfer_id=transfer.id,
+                decision="approved" if request.state is ApprovalState.APPROVED else "rejected",
+            )
+        return _Plan(
+            [self._to_member(email, sender, owner.email, message.tenant_id)],
+            Target("dlp_approval_request", request_id),
+        )
+
     # ---- notices to the member ----
 
     async def _held(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
@@ -572,12 +1128,18 @@ class Notifier:
     async def _returned_to_draft(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         return await self._notice(session, message, TransferState.DRAFT, TransferReturnedToDraft)
 
+    async def _awaiting_confirmation(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        # A DLP rule warns or needs approval (#219): the member reviews it in the web app.
+        return await self._notice(
+            session, message, TransferState.AWAITING_CONFIRMATION, DlpConfirmationNeeded
+        )
+
     async def _notice(
         self,
         session: AsyncSession,
         message: OutboxMessage,
         state: TransferState,
-        kind: type[TransferHeld] | type[TransferReturnedToDraft],
+        kind: type[TransferHeld] | type[TransferReturnedToDraft] | type[DlpConfirmationNeeded],
     ) -> _Plan:
         transfer_id = _id(message, "transfer_id")
         notice = await transfers.notice(session, transfer_id)
@@ -588,6 +1150,23 @@ class Notifier:
         if owner is None or owner.status != UserStatus.ACTIVE.value:
             return _Plan()
         email = kind(tenant_name=sender.name, transfer_id=transfer_id)
+        return _Plan(
+            [self._to_member(email, sender, owner.email, message.tenant_id)],
+            Target("transfer", transfer_id),
+        )
+
+    async def _first_download(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`first_download` to the member (FR-8, #214), with no file name. The download happened
+        whatever the transfer's state is now, so a revoked or expired transfer is still told."""
+        transfer_id = _id(message, "transfer_id")
+        notice = await transfers.notice(session, transfer_id)
+        sender = await tenants.sender(session)
+        if notice is None or sender is None or not sender.active:
+            return _Plan()
+        owner = await users.get_user(session, notice.created_by)
+        if owner is None or owner.status != UserStatus.ACTIVE.value:
+            return _Plan()
+        email = FirstDownload(tenant_name=sender.name, transfer_id=transfer_id)
         return _Plan(
             [self._to_member(email, sender, owner.email, message.tenant_id)],
             Target("transfer", transfer_id),
@@ -746,6 +1325,18 @@ class Notifier:
         return email, self.renderer.compose(
             email, Locale(sender.default_locale), to=address, tenant_id=tenant_id
         )
+
+
+def _both(
+    first: Callable[[AsyncSession], Awaitable[None]],
+    then: Callable[[AsyncSession], Awaitable[None]] | None,
+) -> Callable[[AsyncSession], Awaitable[None]]:
+    async def run(session: AsyncSession) -> None:
+        await first(session)
+        if then is not None:
+            await then(session)
+
+    return run
 
 
 def _id(message: OutboxMessage, key: str) -> UUID:

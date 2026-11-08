@@ -1,0 +1,10 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}のAPIキーの有効期限が近づいています{% endblock %}
+{% block body %}
+{{ tenant_name }}のAPIキー {{ key_prefix }}… は {{ expires_at }} に有効期限が切れます。期限が切れると、このキーを使う自動処理は動かなくなります。
+
+引き続き使うには、テナント管理者が新しいキーを作成し、自動処理をそのキーに切り替えてから、このキーを無効にしてください。このメールは、キーの所有者とテナント管理者に送られています。
+
+APIキーを見る：
+{{ api_keys_url }}
+{% endblock %}
