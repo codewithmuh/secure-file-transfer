@@ -1,0 +1,17 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}{% if none_left %}No DLP approver is left in {{ tenant_name }}{% else %}Only one DLP approver is left in {{ tenant_name }}{% endif %}{% endblock %}
+{% block body %}
+A member of {{ tenant_name }} who was a data loss prevention approver was
+deactivated, so they approve nothing any more.
+{% if none_left %}
+No approver is left: a transfer that needs approval can't be sent until an
+admin names an approver.
+{% else %}
+One approver is left, who can't approve their own transfers.
+{% endif %}
+The audit log shows who made the change, and when. Name more approvers in
+the DLP settings.
+
+Open the DLP settings:
+{{ dlp_policy_url }}
+{% endblock %}

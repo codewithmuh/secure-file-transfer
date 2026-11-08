@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  auditLink,
   detailRows,
   EMPTY_FILTER,
   exportFileName,
   filterBody,
   filterProblems,
+  formFromSearch,
   isIpAddress,
+  isoToLocal,
   KNOWN_ACTIONS,
   localToIso,
   MAX_ACTIONS,
@@ -75,6 +78,29 @@ describe('the audit filter (#216)', () => {
     expect(toggleAction(['a.b'], 'c.d')).toEqual(['a.b', 'c.d']);
     expect(toggleAction(['a.b', 'c.d'], 'a.b')).toEqual(['c.d']);
     for (const action of Object.values(KNOWN_ACTIONS).flat()) expect(action).toMatch(/^[a-z_]+\.[a-z_]+$/);
+    expect(KNOWN_ACTIONS.dlp).toContain('dlp.decided');
+  });
+});
+
+describe('a link that starts the audit log filtered (#222)', () => {
+  const from = new Date(2026, 9, 1).toISOString();
+  const to = new Date(2026, 9, 8, 12, 30, 15).toISOString();
+
+  it('carries actions and a time range, and the page starts with them, to the second', () => {
+    const link = auditLink({ actions: ['dlp.decided'], from, to });
+    expect(link.startsWith('/admin/audit?')).toBe(true);
+    const form = formFromSearch(new URLSearchParams(link.split('?')[1]));
+    expect(form).toEqual({ ...EMPTY_FILTER, actions: ['dlp.decided'], from: '2026-10-01T00:00:00', to: '2026-10-08T12:30:15' });
+    expect(filterBody(form ?? EMPTY_FILTER)).toEqual({ actions: ['dlp.decided'], occurred_after: from, occurred_before: to });
+    expect(auditLink({ actions: [] })).toBe('/admin/audit');
+  });
+
+  it('takes nothing else from the address: no email, IP or actor, no action that isn\'t a dotted code', () => {
+    const params = new URLSearchParams({ email: 'a@example.com', source_ip: '192.0.2.1', actor_id: 'x', action: 'DROP TABLE' });
+    expect(formFromSearch(params)).toBeNull();
+    params.append('action', 'transfer.sent');
+    expect(formFromSearch(params)).toEqual({ ...EMPTY_FILTER, actions: ['transfer.sent'] });
+    expect(isoToLocal('not a time')).toBe('');
   });
 });
 

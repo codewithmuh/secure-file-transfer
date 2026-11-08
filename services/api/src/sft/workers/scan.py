@@ -33,12 +33,15 @@ For each `file.scan` (small pool) or `file.scan_large` (large pool) message:
    findings, `custom:<id>` for a tenant's own detector, with the audit event and the message's
    `processed_messages` row, in one transaction, only while the file is still `scanning`
    (`sft.service.scans.record`). A duplicate does the work once; a result after `scan_failed`
-   changes nothing.
+   changes nothing. The same transaction makes a received file's DLP decision (FR-51, #221) and
+   counts the tenant patterns the inspector stopped for their budget
+   (`dlp.pattern_budget_exceeded`, #164).
 6. **Then the tag, then the evaluation.** After the commit, the `scan` tag is set on the version,
    keeping its other tags, and the transfer is evaluated under its row lock. If either fails, the
    message comes back, and step 1 finishes the job. A file received through an upload request
    (#213) has no transfer: its result counted towards the request's next notice in step 5's
-   transaction (`sft.service.scans.note_received`), and only the tag follows.
+   transaction (`sft.service.scans.note_received`), and only the tag follows: `dlp_blocked` for
+   one a DLP rule blocked, which the API's read condition refuses.
 
 While a message is in hand, the loop extends its visibility every half visibility timeout, so a
 long scan isn't handed to a second worker. Metrics (abuse 8.1): `scan_results_total{state,reason}`,
@@ -403,6 +406,7 @@ def _inspection_result(answer: Result, policy_version: int | None) -> Inspection
             for f in answer.findings
         ),
         policy_version=policy_version,
+        budget_exceeded=tuple(answer.budget_exceeded),
     )
 
 
@@ -658,7 +662,9 @@ class ScanConsumer(Consumer):
             target = await files.scan_target(session, file_id)
         if target.state is FileState.SCANNING or target.s3_version_id is None:
             return
-        value = scans.tag_value(target.state, target.unscannable_allowed, target.inspection_state)
+        value = scans.tag_value(
+            target.state, target.unscannable_allowed, target.inspection_state, target.dlp_blocked
+        )
         try:
             tags = await self.objects.object_tags(
                 target.storage_class, target.storage_key, target.s3_version_id

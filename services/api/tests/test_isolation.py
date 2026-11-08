@@ -22,6 +22,7 @@ from sft.data import (
     dlp_approvals,
     dlp_decisions,
     dlp_policy,
+    dlp_reports,
     downloads,
     files,
     findings,
@@ -29,6 +30,7 @@ from sft.data import (
     link_sessions,
     link_subjects,
     member_sessions,
+    notice_windows,
     recipients,
     suppressions,
     transfers,
@@ -60,8 +62,10 @@ from sft.data.models import (
     ApprovalDecisionKind,
     ApprovalState,
     DeliveryState,
+    DlpDirection,
     FileState,
     InspectionState,
+    NoticeKind,
     ProcessedMessage,
     Role,
     ScanDetail,
@@ -1241,6 +1245,17 @@ async def send_another_tenants_received_file_notice(
 
 
 @cases.add(scopes=API_TENANT)
+async def withdraw_another_tenants_received_file_from_its_notice(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # #229: the uploader's removal takes a file off its request's next notice.
+    theirs = tenants.theirs.rows["upload_request"]
+    withdrawn = await upload_requests.withdraw_arrival(session, theirs, settled_at=FAR)
+    await audit.record(session, action="file.removed", actor=Actor(ActorType.SYSTEM))
+    return withdrawn
+
+
+@cases.add(scopes=API_TENANT)
 async def grant_another_tenants_received_file(session: AsyncSession, tenants: Tenants) -> object:
     theirs = tenants.theirs.rows
     try:
@@ -1802,6 +1817,101 @@ async def find_expired_approval_requests(session: AsyncSession, tenants: Tenants
 @cases.add(scopes={NOTIFY: [TENANT], API: [TENANT]})
 async def read_another_tenants_approval_notice(session: AsyncSession, tenants: Tenants) -> object:
     return await dlp_approvals.notice(session, tenants.theirs.rows["dlp_approval_request"])
+
+
+# ---- notice windows (#230) ----
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def lock_and_save_another_tenants_notice_windows(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # `lock` makes the scope's own rows when missing; another tenant's never reach it.
+    # A digest window of their user can't be made in this scope: the user key refuses it.
+    theirs = tenants.theirs.rows["user"]
+    await notice_windows.save(
+        session, NoticeKind.DLP_APPROVAL_DIGEST, theirs, window_started_at=FAR, sent=0
+    )
+    await notice_windows.save(
+        session, NoticeKind.DLP_POLICY_CHANGED, None, window_started_at=FAR, sent=0
+    )
+    found = await notice_windows.lock(session, NoticeKind.DLP_POLICY_CHANGED, [None])
+    digests = await notice_windows.lock(session, NoticeKind.DLP_APPROVAL_DIGEST, [theirs])
+    return found, digests
+
+
+@cases.add(scopes=NOTIFY_TENANT)
+async def count_another_tenants_pending_approvals(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    return await notice_windows.pending_approvals(session, tenants.mine.rows["user"])
+
+
+# ---- DLP-6 and DLP-7 (#221, #222, revision 0027) ----
+
+
+@cases.add(scopes=API_TENANT)
+async def add_message_findings_to_another_tenants_transfer(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    found = [findings.Counts("payment_card", 0, 1, 0)]
+    return await findings.insert_message_findings(session, tenants.theirs.rows["transfer"], found)
+
+
+@cases.add(scopes=DECISION_READERS)
+async def read_another_tenants_message_and_sender_findings(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await findings.message_counts(session, theirs["transfer"]),
+        await findings.sender_recent_counts(
+            session, theirs["user"], since=PAST, other_than=tenants.mine.rows["transfer"]
+        ),
+    )
+
+
+@cases.add(scopes={SCAN: [TENANT]})
+async def block_another_tenants_received_file(session: AsyncSession, tenants: Tenants) -> object:
+    return await files.block_received(session, tenants.theirs.rows["received_file"])
+
+
+@cases.add(scopes={SCAN: [TENANT]})
+async def stop_another_tenants_pattern(session: AsyncSession, tenants: Tenants) -> object:
+    # The row is the scope's own tenant's, whatever detector ID it names.
+    await dlp_policy.record_pattern_stops(session, [tenants.theirs.rows["dlp_detector"]])
+    await audit.record(session, action="dlp.pattern_budget_exceeded", actor=Actor(ActorType.SYSTEM))
+    return None
+
+
+@cases.add(scopes=API_TENANT)
+async def read_another_tenants_pattern_stops(session: AsyncSession, tenants: Tenants) -> object:
+    return await dlp_policy.pattern_stops(session, tenants.theirs.rows["dlp_detector"])
+
+
+@cases.add(scopes={SCAN: [TENANT]})
+async def read_another_tenants_received_rules(session: AsyncSession, tenants: Tenants) -> object:
+    return await dlp_decisions.decision_policy(session, DlpDirection.RECEIVED)
+
+
+@cases.add(scopes=API_TENANT)
+async def report_another_tenants_decisions(session: AsyncSession, tenants: Tenants) -> object:
+    query = dlp_reports.DecisionQuery(since=PAST, until=FAR)
+    return (
+        await dlp_reports.list_decisions(session, query, before=None, limit=100),
+        await dlp_reports.list_decisions(
+            session,
+            dlp_reports.DecisionQuery(
+                since=PAST,
+                until=FAR,
+                rule_id=tenants.theirs.rows["dlp_rule"],
+                sender_id=tenants.theirs.rows["user"],
+            ),
+            before=None,
+            limit=100,
+        ),
+        await dlp_reports.report(session, since=PAST, until=FAR),
+    )
 
 
 test_isolation = cases.test()

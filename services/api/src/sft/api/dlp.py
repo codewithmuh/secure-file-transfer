@@ -1,9 +1,10 @@
 """The DLP policy operations of the contract (#218; docs/api/openapi.yaml, tag "Data loss
 prevention"): `getDlpPolicy`, `updateDlpPolicy`, `listDlpRules`, `createDlpRule`, `getDlpRule`,
 `updateDlpRule`, `deleteDlpRule`, `listDlpDetectors`, `createDlpDetector`, `getDlpDetector`,
-`updateDlpDetector` and `deleteDlpDetector`; a transfer's decision, `getTransferDlp` and
-`confirmTransfer` (#219, `sft.service.transfer_dlp`). The approval operations (#220) are
-`sft.api.approvals`, whose `rejectTransfer` mustn't count against the tenant's budget.
+`updateDlpDetector`, `deleteDlpDetector` and `testDlpDetectors` (#221); a transfer's decision,
+`getTransferDlp` and `confirmTransfer` (#219, `sft.service.transfer_dlp`). The approval
+operations (#220) are `sft.api.approvals`, whose `rejectTransfer` mustn't count against the
+tenant's budget.
 
 Routes only parse the request and shape the response; the service layer (`sft.service.dlp_policy`)
 checks the caller and applies the rules. Every route counts against the caller's and the tenant's
@@ -30,6 +31,8 @@ from sft.api.dlp_schemas import (
     DlpDetectorCreate,
     DlpDetectorList,
     DlpDetectorOut,
+    DlpDetectorTest,
+    DlpDetectorTestResult,
     DlpDetectorUpdate,
     DlpPolicyOut,
     DlpPolicyUpdate,
@@ -51,6 +54,7 @@ from sft.service.caller import Caller
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import (
     CONFIRM_TRANSFER,
+    DLP_DETECTOR_TEST,
     TENANT_OPERATION,
     TRANSFER_DLP_READ,
 )
@@ -64,6 +68,7 @@ LimiterDep = Annotated[RateLimiter, Depends(get_rate_limiter)]
 TENANT_LIMITS: Final = rate_limit(TENANT_OPERATION, caller=get_tenant_caller)
 DLP_READ_LIMITS: Final = rate_limit(TRANSFER_DLP_READ, caller=get_tenant_caller)
 CONFIRM_LIMITS: Final = rate_limit(CONFIRM_TRANSFER, caller=get_tenant_caller)
+TEST_LIMITS: Final = rate_limit(DLP_DETECTOR_TEST, caller=get_tenant_caller)
 DetectorIdPath = Annotated[str, Path(max_length=71, pattern=_DETECTOR_PATTERN)]
 
 router = APIRouter(prefix=PREFIX, tags=[TAG], dependencies=[TENANT_LIMITS])
@@ -339,6 +344,24 @@ async def delete_dlp_detector(
         database, caller, detector_id, limiter=limiter, origin=origin_of(request), now=_now()
     )
     return Response(status_code=204)
+
+
+@router.post(
+    "/dlp/detector-tests",
+    operation_id="testDlpDetectors",
+    response_model=DlpDetectorTestResult,
+    summary="Try detectors on sample text",
+    dependencies=[TEST_LIMITS],
+    responses=problem_responses(400, 401, 403, 413, 422, 429),
+)
+async def test_dlp_detectors(
+    body: DlpDetectorTest, request: Request, caller: CallerDep, database: DatabaseDep
+) -> DlpDetectorTestResult:
+    # The text is never logged or stored (FR-56): it goes to the service and no further.
+    result = await dlp_policy.test_dlp_detectors(
+        database, caller, body.test(), origin=origin_of(request), now=_now()
+    )
+    return DlpDetectorTestResult.of(result)
 
 
 # ---- a transfer's decision (#219) ----

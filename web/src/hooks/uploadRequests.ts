@@ -84,9 +84,13 @@ export async function unlockUploader(id: string): Promise<UnlockOutcome> {
   }
 }
 
-/** `createReceivedFileDownload`: a grant for one received file, whose `url` the browser then fetches. */
-export async function createReceivedFileDownload(fileId: string): Promise<DownloadAccess> {
-  return (await api.post('/files/{file_id}/downloads', { path: { file_id: fileId }, body: {} })).data;
+/**
+ * `createReceivedFileDownload`: a grant for one received file, whose `url` the browser then fetches. With
+ * `resumeGrantId`, the grant kept from an interrupted start comes back (#229, `receivedDownload.ts`).
+ */
+export async function createReceivedFileDownload(fileId: string, resumeGrantId?: string | null): Promise<DownloadAccess> {
+  const body = resumeGrantId ? { resume_grant_id: resumeGrantId } : {};
+  return (await api.post('/files/{file_id}/downloads', { path: { file_id: fileId }, body })).data;
 }
 
 /** `deleteFile` on a received file: deleted before its retention ends (FR-13). */

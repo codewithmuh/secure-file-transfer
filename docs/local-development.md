@@ -396,9 +396,10 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
    language, how long it stays open and a message. Mailpit gets the upload request email in that language, with a
    `/u#` link. Open it in a private window: "Email me a code", read the code in Mailpit, verify, and the page shows who
    asks, the message, the expiry and the limits; choose files and they upload, each shown `Received`, `Blocked by the
-   company's policy` (an EICAR file) or `Couldn't be scanned`. The member's request page lists what arrived, with
-   "Download", "Delete", findings and the day each file is deleted; Mailpit gets the "files arrived" notice. Revoking
-   the request ends the uploader's page.
+   company's policy` (an EICAR file), `Couldn't be scanned`, or `Accepted` for an unscannable file the tenant policy
+   allows; "Remove" takes a file back while the request is open (#229). The member's request page lists what
+   arrived, with "Download", "Delete", findings and the day each file is deleted; Mailpit gets the "files arrived"
+   notice. Revoking the request ends the uploader's page.
 5. **Administer.** Sign in as the admin (the sign-in always asks for the password, so switching users needs no
    cleanup): "Users" to invite (the invitation, with a temporary password, arrives in Mailpit; sign in with it in a
    private window and choose a password), change a role or the DLP approver flag, sign someone out everywhere, reset a

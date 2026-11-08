@@ -31,7 +31,7 @@ from sft.dlp.detect.builtin import (
     PHONE_NUMBER,
 )
 from sft.dlp.detect.credentials import CLOUD_CREDENTIAL
-from sft.dlp.detect.scanner import Scanner, inspect_text, new_scanner
+from sft.dlp.detect.scanner import Scanner, TrialMatch, inspect_text, new_scanner, try_detectors
 from sft.dlp.detect.tenant import DetectorError, validate
 from sft.dlp.units import (
     CUSTOM_PREFIX,
@@ -77,7 +77,9 @@ __all__ = [
     "Scanner",
     "TenantDetector",
     "TextUnit",
+    "TrialMatch",
     "inspect_text",
     "new_scanner",
+    "try_detectors",
     "validate",
 ]

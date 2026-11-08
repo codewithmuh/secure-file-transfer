@@ -1,7 +1,8 @@
 """SES's events from the `ses-events` queue (#185; ADR-0015; abuse 7.4; data model 2.5): which
 events are acted on, the suppression each writes in its own tenant only, the second bounce that
-suppresses for good, the link email's recipient left `bounced`, and a copy handled once. The
-consumer runs as `sft_notify` against PostgreSQL, through the consumer loop and a fake queue."""
+suppresses for good, the link email's recipient left `bounced`, an uploader's request left
+`bounced` and its address suppressed (#228), and a copy handled once. The consumer runs as
+`sft_notify` against PostgreSQL, through the consumer loop and a fake queue."""
 
 from __future__ import annotations
 
@@ -39,14 +40,18 @@ def ses_event(
     address: str = ADDRESS,
     bounce_type: str = "Permanent",
     recipient_id: uuid.UUID | None = None,
+    upload_request_id: uuid.UUID | None = None,
+    email_type: str = "transfer_link",
     message_id: str = "0106018f-ses-message",
     envelope: bool = True,
 ) -> str:
-    tags: dict[str, list[str]] = {"email_type": ["transfer_link"]}
+    tags: dict[str, list[str]] = {"email_type": [email_type]}
     if tenant_id is not None:
         tags["tenant_id"] = [str(tenant_id)]
     if recipient_id is not None:
         tags["recipient_id"] = [str(recipient_id)]
+    if upload_request_id is not None:
+        tags["upload_request_id"] = [str(upload_request_id)]
     event: dict[str, object] = {
         "eventType": kind,
         "mail": {"messageId": message_id, "timestamp": "2026-11-08T00:00:00Z", "tags": tags},
@@ -245,3 +250,106 @@ async def test_an_entry_under_an_older_key_moves_to_the_active_key(w: World) -> 
     # Found under the old key, so this is the second bounce: for good, under the active key.
     assert pseudonym == keyring.active(normalized)
     assert (reason, count, forever) == ("hard_bounce", 2, True)
+
+
+# ---- an uploader's emails (#228) ----
+
+
+def seed_request(db: ScratchDatabase, tenant: Tenant, *, state: str = "open") -> uuid.UUID:
+    """An upload request whose link email went out (`sent`), as the superuser."""
+    request_id = uuid.uuid4()
+    db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, expires_at, delivery_state, notified_at, ended_at) VALUES "
+        "(:id, :tenant, :owner, :state, :email, lower(:email), 'en', now() + interval '7 days', "
+        "'sent', now(), CASE WHEN :state = 'open' THEN NULL ELSE now() END)",
+        id=request_id,
+        tenant=tenant.id,
+        owner=tenant.member,
+        state=state,
+        email=ADDRESS,
+    )
+    return request_id
+
+
+def delivery(w: World, request_id: uuid.UUID) -> object:
+    [(state,)] = w.db.sql("SELECT delivery_state FROM upload_requests WHERE id = :r", r=request_id)
+    return state
+
+
+def request_events(w: World, request_id: uuid.UUID) -> list[tuple[object, ...]]:
+    return w.db.sql(
+        "SELECT action, outcome, details->>'email_type' FROM audit_events "
+        "WHERE target_type = 'upload_request' AND target_id = :r ORDER BY occurred_at",
+        r=request_id,
+    )
+
+
+def test_an_uploader_email_names_its_upload_request() -> None:
+    tenant, request_id = uuid.uuid4(), uuid.uuid4()
+    event = parse_event(ses_event("Bounce", tenant, upload_request_id=request_id))
+    assert event is not None
+    assert (event.upload_request_id, event.recipient_id) == (request_id, None)
+    assert event.as_message().payload == {"upload_request_id": request_id}
+    plain = parse_event(ses_event("Bounce", tenant))
+    assert plain is not None
+    assert plain.upload_request_id is None
+
+
+@pytest.mark.parametrize("email_type", ["upload_request", "verification_code"])
+async def test_a_hard_bounce_on_an_uploader_email_marks_the_request_bounced_and_suppresses(
+    w: World, email_type: str
+) -> None:
+    request_id = seed_request(w.db, w.tenant)
+    body = ses_event("Bounce", w.tenant.id, upload_request_id=request_id, email_type=email_type)
+    assert await w.deliver(body) == [Outcome.PROCESSED]
+    assert delivery(w, request_id) == "bounced"
+    assert request_events(w, request_id) == [("email.bounced", "failure", email_type)]
+    [(pseudonym, reason, _, forever)] = w.entries(w.tenant.id)
+    assert (pseudonym, reason, forever) == (
+        EMAIL_KEYRING.active(ADDRESS.lower()),
+        "hard_bounce",
+        False,
+    )
+
+
+async def test_a_bounce_after_the_request_ended_still_shows(w: World) -> None:
+    # The blocked-file notice can go out after a revocation: its bounce is shown all the same.
+    request_id = seed_request(w.db, w.tenant, state="revoked")
+    body = ses_event(
+        "Bounce", w.tenant.id, upload_request_id=request_id, email_type="files_blocked_uploader"
+    )
+    assert await w.deliver(body) == [Outcome.PROCESSED]
+    assert delivery(w, request_id) == "bounced"
+
+
+async def test_a_reject_of_an_uploader_email_marks_the_request_bounced(w: World) -> None:
+    request_id = seed_request(w.db, w.tenant)
+    body = ses_event(
+        "Reject", w.tenant.id, upload_request_id=request_id, email_type="upload_request"
+    )
+    assert await w.deliver(body) == [Outcome.PROCESSED]
+    assert delivery(w, request_id) == "bounced"
+    assert w.entries(w.tenant.id) == []  # a reject names nobody to suppress
+
+
+async def test_a_complaint_on_an_uploader_email_suppresses_for_good(w: World) -> None:
+    request_id = seed_request(w.db, w.tenant)
+    body = ses_event("Complaint", w.tenant.id, upload_request_id=request_id)
+    assert await w.deliver(body) == [Outcome.PROCESSED]
+    [(_, reason, _, forever)] = w.entries(w.tenant.id)
+    assert (reason, forever) == ("complaint", True)
+    # The email arrived: the request still reads `sent`, as a recipient's would.
+    assert delivery(w, request_id) == "sent"
+    assert request_events(w, request_id) == []
+
+
+async def test_a_tag_naming_another_tenants_request_changes_nothing_of_it(w: World) -> None:
+    other = seed_tenant(w.db)
+    theirs = seed_request(w.db, other)
+    body = ses_event("Bounce", w.tenant.id, upload_request_id=theirs)
+    assert await w.deliver(body) == [Outcome.PROCESSED]
+    assert delivery(w, theirs) == "sent"
+    assert request_events(w, theirs) == []
+    assert w.entries(other.id) == []
+    assert len(w.entries(w.tenant.id)) == 1  # the sending tenant's own list only

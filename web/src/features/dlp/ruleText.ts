@@ -32,3 +32,11 @@ export function conditionText(rule: RuleCondition, detectors: readonly DlpDetect
       return t('dlpAdmin.conditionNewDomain');
   }
 }
+
+/** The rule's options beyond its condition, as short notes (#221): the sender's last 24 hours, two approvers. */
+export function ruleOptionNotes(rule: Pick<DlpRule, 'include_sender_24h' | 'approvals_required' | 'action'>, t: TFunction): string[] {
+  const notes: string[] = [];
+  if (rule.include_sender_24h) notes.push(t('dlpAdmin.includes24h'));
+  if (rule.action === 'require_approval' && rule.approvals_required === 2) notes.push(t('dlpAdmin.twoApprovers'));
+  return notes;
+}

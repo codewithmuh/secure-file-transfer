@@ -151,19 +151,24 @@ class SessionFileOut(BaseModel):
     download_limit: int | None = Field(default=None, ge=1, le=100)
     downloads_used: Annotated[int, Field(ge=0)] | SkipJsonSchema[None] = None
     upload: UploadPlan | SkipJsonSchema[None] = None
+    blocked: bool | SkipJsonSchema[None] = None
 
     @classmethod
     def of(cls, file: SessionFile) -> SessionFileOut:
         if file.uploader:
             # An uploader's file (#213): its state, and its plan while uploading; no download
-            # count and no warning, which are a recipient's.
+            # count, which is a recipient's. An unscannable file the policy allowed carries the
+            # warning, which the uploader's page words as accepted (#229).
             mine = cls(
                 id=file.id,
                 display_name=file.display_name,
                 content_type=file.content_type,
                 size=file.size,
                 state=file.state.value,
+                blocked=file.blocked,
             )
+            if file.unscannable:
+                mine.warning = "unscannable"
             if file.state.value == "uploading":
                 mine.upload = UploadPlan(part_size=file.part_size, part_count=file.part_count)
             return mine

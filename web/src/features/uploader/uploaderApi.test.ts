@@ -8,12 +8,14 @@ import { createStorageClient, FileUpload } from '@/features/sender/upload';
 import {
   addSessionUploadFile,
   countedFiles,
+  deleteSessionUploadFile,
   IDLE_POLL_MS,
   limitsOf,
   resumableMatch,
   sessionUploadApi,
   uploaderFileProblem,
   uploaderFileStatus,
+  uploaderMayRemove,
   uploaderProblemText,
   uploaderStatusVariant,
   uploadsPollInterval,
@@ -194,7 +196,66 @@ describe('the uploader\'s upload through the M3 engine (#213)', () => {
     expect(JSON.parse(String(sent[1]?.data))).toEqual({ part_numbers: [2] });
   });
 
-  it('has no delete: cancelling only stops the parts, since an uploader can\'t delete a file', () => {
+  it('gives the engine no delete: cancelling only stops the parts, and the page removes a file itself', () => {
     expect('deleteFile' in sessionUploadApi).toBe(false);
+  });
+});
+
+describe('an allowed unscannable file, and taking a file back (#229)', () => {
+  it('words an unscannable file the company accepted as accepted, in both languages', () => {
+    expect(uploaderFileStatus('unscannable', 'unscannable')).toBe('accepted');
+    expect(uploaderFileStatus('unscannable')).toBe('unscannable');
+    expect(uploaderFileStatus('scan_failed', 'unscannable')).toBe('unscannable');
+    expect(uploaderStatusVariant.accepted).toBe('success');
+    for (const language of ['en', 'ja'] as const) {
+      const words = resources[language].translation.uploader;
+      expect(words.status.accepted).toBeTruthy();
+      expect(words.acceptedHint).toBeTruthy();
+      expect(words.status.accepted).not.toBe(words.status.unscannable);
+    }
+  });
+
+  it('offers removal for every file but a blocked or deleted one', () => {
+    const removable = FILE_STATES.filter((state) => uploaderMayRemove({ state }));
+    expect(removable).toEqual(['uploading', 'completing', 'scanning', 'clean', 'rejected']);
+    expect(uploaderMayRemove({ state: 'unscannable', warning: 'unscannable' })).toBe(true);
+    expect(uploaderMayRemove({ state: 'unscannable' })).toBe(false);
+  });
+
+  it('words any file the API marks blocked as "not accepted", with no reason, and never offers to remove it (#221, FR-51)', () => {
+    for (const state of ['clean', 'infected', 'scan_failed', 'unscannable'] as const) {
+      expect(uploaderFileStatus(state, undefined, true), state).toBe('notAccepted');
+      expect(uploaderMayRemove({ state, blocked: true }), state).toBe(false);
+    }
+    expect(uploaderFileStatus('unscannable', 'unscannable', true)).toBe('notAccepted');
+    expect(uploaderFileStatus('deleted', undefined, true)).toBe('removed');
+    expect(uploaderFileStatus('clean', undefined, false)).toBe('received');
+    expect(uploaderStatusVariant.notAccepted).toBe('danger');
+    for (const language of ['en', 'ja'] as const) {
+      const words = resources[language].translation.uploader;
+      expect(words.status.notAccepted).toBeTruthy();
+      expect(`${words.status.notAccepted} ${words.notAcceptedHint}`.toLowerCase()).not.toMatch(
+        /malware|virus|infected|data loss|dlp|my number|マルウェア|ウイルス|情報漏えい/,
+      );
+    }
+  });
+
+  it('removes the file through the link session, with its CSRF token', async () => {
+    const { sent } = await setUpApi((config) =>
+      config.method === 'delete' && config.url === `/session/files/${fileId}` ? { status: 204, data: '' } : problem(404, 'not_found'),
+    );
+    useAuthStore.getState().setLinkSession(sessionId, csrfToken('link'));
+    await deleteSessionUploadFile(fileId);
+    expect(sent).toHaveLength(1);
+    expect(header(sent[0], 'X-Link-Session')).toBe(sessionId);
+    expect(header(sent[0], 'X-CSRF-Token')).toBe(csrfToken('link'));
+  });
+
+  it('words a blocked file\'s refusal as the link pages do', async () => {
+    await setUpApi(() => problem(409, 'invalid_state'));
+    useAuthStore.getState().setLinkSession(sessionId, csrfToken('link'));
+    const error = await deleteSessionUploadFile(fileId).catch((caught: unknown) => caught);
+    await i18n.changeLanguage('en');
+    expect(uploaderProblemText(error, i18n.t)).toBeTruthy();
   });
 });

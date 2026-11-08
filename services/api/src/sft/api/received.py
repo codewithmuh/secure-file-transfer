@@ -2,7 +2,8 @@
 session", "Upload requests" and "Files").
 
 - **The uploader's**, on their link session: `addSessionUploadFile` (with `Idempotency-Key`),
-  `requestSessionUploadPartUrls`, `listSessionUploadedParts` and `completeSessionUpload`. As every
+  `requestSessionUploadPartUrls`, `listSessionUploadedParts`, `completeSessionUpload` and
+  `deleteSessionUploadFile` (#229, the uploader takes a file back). As every
   `/session` call, `X-Link-Session` names the session, the `__Host-sft_link` cookie must hold it,
   and an unsafe method passes the CSRF checks with that session's token
   (`sft.api.links.get_link_session`); a revoked or expired request is `410`. Group F per link
@@ -216,6 +217,27 @@ async def complete_session_upload(
     )
     response.headers.update(NO_STORE)
     return SessionFileOut.of(view)
+
+
+@router.delete(
+    "/session/files/{file_id}",
+    operation_id="deleteSessionUploadFile",
+    status_code=204,
+    response_class=Response,
+    summary="Remove an uploader's file",
+    tags=["Recipient session"],
+    dependencies=[UPLOAD_LIMITS],
+    responses=problem_responses(401, 403, 404, 409, 410, 429),
+    openapi_extra=_SESSION_PARAMETER,
+)
+async def delete_session_upload_file(
+    file_id: UUID, request: Request, link: LinkDep, database: DatabaseDep
+) -> Response:
+    """Take back a file declared or uploaded to an open request; it no longer counts (#229)."""
+    await received.delete_session_file(
+        database, link.caller, file_id, origin=origin_of(request), now=now_of(request)
+    )
+    return Response(status_code=204, headers=NO_STORE)
 
 
 # ---- the member's side ----

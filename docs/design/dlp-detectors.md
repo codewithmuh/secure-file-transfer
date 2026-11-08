@@ -223,13 +223,23 @@ happened; both arrive with those issues. The inspector's CPU and time limits (AD
 past them the file is `partial` with `limit_exceeded`. `testDlpDetectors` lets an admin try a detector on sample
 text before saving it (FR-56).
 
-**As built (#218).** Keyword lists only: `createDlpDetector` refuses `kind: pattern` with `422 validation_failed` until
+**As built (#218).** Keyword lists only: `createDlpDetector` refused `kind: pattern` with `422 validation_failed` until
 #221. A list is checked when it is saved, with `sft.dlp.detect.validate` and then compiled with the tenant's other live,
 enabled lists as the inspector compiles them (`TenantDetectors`), so a list or a set the inspector would refuse is
 refused at save time, with a pointer to the term. Its terms are stored as given and sealed with M2's stand-in until
 DLP-8. A change writes the detector's next revision, and a deletion retires it, refused with `409 detector_in_use`
 while a live rule names it. Findings name it `custom:<id>` and show its name; built-in detectors are listed with
 names and descriptions in English and Japanese (`listDlpDetectors`).
+
+**As built (#221, #164).** Patterns are accepted: `createDlpDetector` and `updateDlpDetector` take `kind: pattern`
+with `pattern`, `context_keywords`, `case_insensitive` (true unless sent) and `min_length`, checked by the library
+(`validate`, then compiled with the tenant's other live detectors); a refusal points at the field (`#/pattern`,
+`#/context_keywords/n`, `#/min_length`) and names the rule broken, never the expression. A tenant has at most 20 live
+patterns, enabled or not. The scan worker writes `dlp.pattern_budget_exceeded` once per file (the stopped patterns as
+`detector_a`, `detector_b`… since details hold no lists) and counts each stop in `dlp_pattern_stops`;
+`getDlpDetector` shows `budget_exceeded_files` and `budget_exceeded_last_at` for a pattern. `testDlpDetectors` feeds
+the sample text to the detectors line by line (`sft.dlp.detect.try_detectors`), so a match's line is its line in the
+text, and returns at most 100 matches with the previews of section 7; the draft's matches are named `draft`.
 
 ## 6. The default policy
 

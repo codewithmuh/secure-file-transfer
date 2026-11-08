@@ -9,10 +9,12 @@ import { createDlpDetector, invalidateDlp, updateDlpDetector, useDlpDetector, us
 import { IdempotencyKeys, mayHaveHappened } from '@/lib/idempotency';
 import { problemCode } from '@/lib/problems';
 import { ConfirmChange } from './ConfirmChange';
+import { DetectorTestPanel } from './DetectorTestPanel';
 import { LoadError, Loading } from './DlpAdminPage';
 import {
   DETECTOR_NAME_MAX,
   keywordCreateBody,
+  keywordDraft,
   keywordFormOf,
   keywordProblems,
   keywordUpdate,
@@ -24,9 +26,10 @@ import {
 import { useWrite } from './useWrite';
 
 /**
- * A keyword list's page (#218; FR-38, detectors 5): its name and its terms, one per line, 1 to 1,000 terms of 1 to
- * 100 characters. Terms match in any width and case, and Japanese terms without word boundaries. This is the only
- * page that shows the terms.
+ * A keyword list's page (#218, #221; FR-38, FR-56, detectors 5): its name and its terms, one per line, 1 to 1,000
+ * terms of 1 to 100 characters. Terms match in any width and case, and Japanese terms without word boundaries. This is
+ * the only page that shows the terms. Under the form, "Test on sample text" tries the unsaved list, or the saved one
+ * while nothing changed.
  */
 export function KeywordListEditor() {
   const { detectorId } = useParams<{ detectorId: string }>();
@@ -60,6 +63,9 @@ function KeywordFormView({ detector, policy }: { detector: DlpDetector | undefin
   const update = detector ? keywordUpdate(detector, form, version) : null;
   const createBody = detector ? null : keywordCreateBody(form, version);
   const nothingChanged = detector !== undefined && update !== null && update.changes.length === 0;
+  const draft = useMemo(() => keywordDraft(form), [form]);
+  const nameOf = (id: string) =>
+    id === 'draft' || id === detector?.id ? form.name.trim() || t('dlpAdmin.test.thisDraft') : id;
 
   const lines = useMemo(() => {
     const name = form.name.trim();
@@ -173,6 +179,10 @@ function KeywordFormView({ detector, policy }: { detector: DlpDetector | undefin
           {detector ? t('common.save') : t('dlpAdmin.addKeywordList')}
         </Button>
       </form>
+
+      <div className="mx-auto mt-6 max-w-2xl">
+        <DetectorTestPanel existingId={detector?.id ?? null} changed={!nothingChanged} draft={draft} nameOf={nameOf} />
+      </div>
 
       <ConfirmChange
         open={confirming}

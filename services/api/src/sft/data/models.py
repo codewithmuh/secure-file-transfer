@@ -682,6 +682,14 @@ class Transfer(TenantOwned, Base):
             use_alter=True,
         ),
         Index("transfers_tenant_id_dlp_decision_id_idx", "tenant_id", "dlp_decision_id"),
+        # A sender's transfers of the last 24 hours (FR-49, #221, revision 0027).
+        Index(
+            "transfers_tenant_id_created_by_sent_at_idx",
+            "tenant_id",
+            "created_by",
+            "sent_at",
+            postgresql_where=text("sent_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1020,7 +1028,8 @@ class EmailSuppression(TenantOwned, Base):
 class DlpFinding(TenantOwned, Base):
     """What one detector found in one file: counts at each confidence, never a value (data model
     2.7, FR-53). Written by the scan worker, which may not read `detail_ct` back (revision 0011).
-    A transfer's message gets `transfer_id` with FR-50; until then `file_id` is always set."""
+    A transfer's message has its findings under `transfer_id` instead (FR-50, revision 0027):
+    exactly one of the two is set."""
 
     __tablename__ = "dlp_findings"
     __table_args__ = (
@@ -1037,11 +1046,25 @@ class DlpFinding(TenantOwned, Base):
             name="counts",
         ),
         CheckConstraint("detail_ct IS NULL OR octet_length(detail_ct) > 0", name="detail_ct"),
+        # A transfer's message findings (#221, revision 0027).
+        ForeignKeyConstraint(
+            ["tenant_id", "transfer_id"],
+            ["transfers.tenant_id", "transfers.id"],
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("(file_id IS NULL) <> (transfer_id IS NULL)", name="subject"),
+        Index(
+            "dlp_findings_tenant_id_transfer_id_detector_key",
+            "tenant_id",
+            "transfer_id",
+            "detector",
+            unique=True,
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
     tenant_id: Mapped[uuid.UUID]
-    file_id: Mapped[uuid.UUID]
+    file_id: Mapped[uuid.UUID | None]
     detector: Mapped[str] = mapped_column(Text)
     count_low: Mapped[int]
     count_medium: Mapped[int]
@@ -1049,6 +1072,7 @@ class DlpFinding(TenantOwned, Base):
     detail_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
     dlp_key_version: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    transfer_id: Mapped[uuid.UUID | None]
 
 
 class VerificationCode(TenantOwned, Base):
@@ -1856,3 +1880,64 @@ class DlpApprovalDecision(TenantOwned, Base):
     comment_ct: Mapped[bytes | None] = mapped_column(LargeBinary)
     data_key_version: Mapped[int | None]
     decided_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class NoticeKind(StrEnum):
+    """The notices the notification worker coalesces or caps (#230, revision 0028)."""
+
+    DLP_POLICY_CHANGED = "dlp_policy_changed"
+    """The tenant's coalesced DLP policy notice: one email per admin every 10 minutes."""
+    DLP_APPROVAL_DIGEST = "dlp_approval_digest"
+    """One approver's request emails: 20 an hour, then one digest at the hour's end."""
+    DLP_NO_ELIGIBLE_APPROVER = "dlp_no_eligible_approver"
+    """The tenant's "no eligible approver" emails to its admins, capped."""
+
+
+class NoticeWindow(TenantOwned, Base):
+    """One tenant's window of a coalesced or capped notice, and for the digest one approver's
+    (#230, revision 0028; abuse 7.1). Written through `sft.data.notice_windows` by the
+    notification worker only; not audited (`NOT_AUDITED`)."""
+
+    __tablename__ = "notice_windows"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        ForeignKeyConstraint(["tenant_id", "user_id"], ["users.tenant_id", "users.id"]),
+        UniqueConstraint("tenant_id", "notice", "user_id", postgresql_nulls_not_distinct=True),
+        Index("notice_windows_tenant_id_user_id_idx", "tenant_id", "user_id"),
+        CheckConstraint(f"notice IN {sql_values(NoticeKind)}", name="notice"),
+        CheckConstraint("(notice = 'dlp_approval_digest') = (user_id IS NOT NULL)", name="user_id"),
+        CheckConstraint("sent >= 0", name="sent"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID]
+    notice: Mapped[str] = mapped_column(Text)
+    user_id: Mapped[uuid.UUID | None]
+    window_started_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    sent: Mapped[int] = mapped_column(server_default=text("0"))
+    changes: Mapped[list[str]] = mapped_column(ARRAY(Text), server_default=text("'{}'::text[]"))
+    """The kinds of DLP policy change waiting for the next notice."""
+    changed_at: Mapped[datetime | None]
+    """When the latest of `changes` was recorded."""
+    due_at: Mapped[datetime | None]
+    """When the coalesced notice or the digest is due; empty when none is."""
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class DlpPatternStop(TenantOwned, Base):
+    """How many files stopped one tenant pattern for spending its scan-time budget, and when it
+    last happened (#164, #221, revision 0027; detectors 5). The scan worker adds one with
+    `dlp.pattern_budget_exceeded`; `getDlpDetector` shows it."""
+
+    __tablename__ = "dlp_pattern_stops"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        PrimaryKeyConstraint("tenant_id", "detector_id"),
+        CheckConstraint("files_stopped >= 1", name="files_stopped"),
+    )
+
+    tenant_id: Mapped[uuid.UUID]
+    detector_id: Mapped[uuid.UUID]
+    files_stopped: Mapped[int]
+    last_stopped_at: Mapped[datetime]

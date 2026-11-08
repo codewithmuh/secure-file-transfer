@@ -79,7 +79,7 @@ from sft.data.models import (
     TransferState,
 )
 from sft.data.scope import Scope
-from sft.service import domain_rules, fields
+from sft.service import domain_rules, fields, message_inspection
 from sft.service.caller import Caller, CallerKind
 from sft.service.evaluation import is_shareable
 from sft.service.idempotency import IdempotentRequest, Outcome, once
@@ -142,7 +142,7 @@ class FileView:
     retention_until: datetime | None = None
     """When a received file is deleted (FR-13)."""
     dlp_blocked: bool = False
-    """A received file a DLP rule blocked (FR-51): false until #221."""
+    """A received file a DLP rule blocked (FR-51, #221)."""
 
     @property
     def shareable(self) -> bool:
@@ -479,6 +479,12 @@ async def create_transfer(
                 notify_on_first_download=request.notify_on_first_download,
             )
             await transfers.insert_recipients(session, transfer.id, recipients)
+            message_findings = 0
+            if request.message is not None:
+                # FR-50: the message is inspected now, with the files' detectors (#221).
+                message_findings = await message_inspection.inspect_message(
+                    session, tenant_id, transfer.id, request.message
+                )
             await audit.record(
                 session,
                 action="transfer.created",
@@ -491,6 +497,7 @@ async def create_transfer(
                     expires_in_seconds=int(expires_in.total_seconds()),
                     download_limit=request.download_limit,
                     has_message=request.message is not None,
+                    message_findings=message_findings,
                 ),
             )
             return await transfer_view(session, tenant_id, transfer, now)

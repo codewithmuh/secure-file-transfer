@@ -9,6 +9,7 @@ from sft.service.email.catalog import (
     DlpApprovalDecided,
     DlpApprovalExpired,
     DlpApprovalRequested,
+    DlpApproverDeactivated,
     DlpConfirmationNeeded,
     DlpNoEligibleApprover,
     DlpPolicyChanged,
@@ -74,6 +75,7 @@ SAMPLES: dict[EmailType, Email] = {
         DlpPolicyChanged(tenant_name=TENANT, changes=(PolicyChange.RULE_ADDED,)),
         ApiKeyExpiring(tenant_name=TENANT, key_prefix=KEY_PREFIX, expires_at=EXPIRES),
         ApiKeyFirstExport(tenant_name=TENANT, key_prefix=KEY_PREFIX),
+        DlpApproverDeactivated(tenant_name=TENANT, none_left=True),
     )
 }
 
@@ -89,6 +91,7 @@ VARIANTS: list[Email] = [
     DlpApprovalRequested(tenant_name=TENANT, request_count=21),
     DlpApprovalDecided(tenant_name=TENANT, transfer_id=TRANSFER_ID, decision="rejected"),
     DlpPolicyChanged(tenant_name=TENANT, changes=tuple(PolicyChange)),
+    DlpApproverDeactivated(tenant_name=TENANT, none_left=False),
 ]
 
 SECRETS: dict[str, EmailType] = {

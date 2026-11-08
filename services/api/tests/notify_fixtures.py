@@ -2,6 +2,9 @@
 `sft_notify`, a sender that records every email (or fails on demand), and `drain`, which hands
 every unhandled notify message in the outbox to the notifier, as the relay and SQS would.
 
+`elapse` moves the tenant's delayed messages and notice windows back, as time passing would, for
+the coalesced and digested notices (#230).
+
 Emails are read back by recipient: `Sent.links(address)` and `Sent.codes(address)` pull the link
 token and the code out of the text part, as a person would from their mailbox.
 """
@@ -12,6 +15,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from prometheus_client import CollectorRegistry
 
@@ -135,6 +139,24 @@ def pending(db: ScratchDatabase, tenant_id: uuid.UUID) -> list[OutboxMessage]:
         )
         for row in sorted(rows, key=lambda r: (r[3], str(r[0])))  # type: ignore[arg-type,return-value]
     ]
+
+
+def elapse(db: ScratchDatabase, tenant_id: uuid.UUID, by: timedelta) -> None:
+    """Time passes for the tenant's waiting messages and notice windows (#230): each delayed
+    message and each window's times move back `by`, so what was due later is due now."""
+    db.sql(
+        "UPDATE outbox SET created_at = created_at - CAST(:by AS interval) "
+        "WHERE tenant_id = :tenant AND published_at IS NULL",
+        tenant=tenant_id,
+        by=by,
+    )
+    db.sql(
+        "UPDATE notice_windows SET window_started_at = window_started_at - CAST(:by AS interval), "
+        "changed_at = changed_at - CAST(:by AS interval), due_at = due_at - CAST(:by AS interval) "
+        "WHERE tenant_id = :tenant",
+        tenant=tenant_id,
+        by=by,
+    )
 
 
 async def drain(notifier: Notifier, db: ScratchDatabase, tenant_id: uuid.UUID) -> list[Done]:

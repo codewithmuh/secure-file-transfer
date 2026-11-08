@@ -12,7 +12,7 @@ import { formatDate, formatFileSize } from '@/lib/formatters';
 import { errorMessage, problemCode } from '@/lib/problems';
 import { useAuthStore } from '@/stores/authStore';
 import { InspectionStateBadge } from '@/features/sender/StateBadges';
-import { FindingLine } from '@/features/sender/TransferDlpPanel';
+import { FindingLine, MessageFindings } from '@/features/sender/TransferDlpPanel';
 import { dlpActionVariant, isBuiltinDetector } from '@/features/sender/states';
 import { approvalStateVariant, cannotDecide, seesApprovals, shortId } from './approvals';
 import { ApproveDialog, RejectDialog } from './DecisionDialogs';
@@ -20,8 +20,8 @@ import { ApproveDialog, RejectDialog } from './DecisionDialogs';
 /**
  * An approval request (#220; FR-43, UC-7 steps 3 to 5): everything `getApprovalRequest` returns (the recipients with
  * their trust and new-domain flags, each file's name, size and inspection, the message, the matched rules, the
- * sender's justification and the decisions so far) and each file's findings as detector names and counts
- * (`getTransferDlp`). There is never a way to download the files. Approve and reject when `can_decide`; otherwise
+ * sender's justification and the decisions so far) and each file's and the message's findings as detector names and
+ * counts (`getTransferDlp`; the message's since #221, FR-50). There is never a way to download the files. Approve and reject when `can_decide`; otherwise
  * the page says why not.
  */
 export function ApprovalRequestPage() {
@@ -93,6 +93,14 @@ function RequestView({ request }: { request: ApprovalRequest }) {
           <p className="mt-1 whitespace-pre-wrap break-words text-sm text-gray-700">{request.justification}</p>
           <h3 className="mt-5 text-sm font-semibold text-gray-900">{t('sender.messageColumn')}</h3>
           <p className="mt-1 whitespace-pre-wrap break-words text-sm text-gray-700">{request.transfer.message ?? t('approvals.noMessage')}</p>
+          {dlp.data && (request.transfer.message || dlp.data.message_findings.length > 0) && (
+            <div className="mt-2">
+              <p className="text-sm font-medium text-gray-900">{t('dlp.messageFindings')}</p>
+              <div className="mt-1">
+                <MessageFindings findings={dlp.data.message_findings} />
+              </div>
+            </div>
+          )}
         </Card>
 
         <Card>

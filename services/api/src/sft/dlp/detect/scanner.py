@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import secrets
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 from sft.dlp.detect import bank_codes, builtin
@@ -143,3 +144,50 @@ def inspect_text(text: str, tenant: Sequence[TenantDetector] = ()) -> list[Findi
     scanner = _Scanner(tenant)
     scanner.feed(TextUnit(location="message", text=text))
     return scanner.findings()
+
+
+# ---- trying detectors on sample text (FR-56) ----
+
+
+@dataclass(frozen=True, slots=True)
+class TrialMatch:
+    """One match in sample text: the detector, its confidence, the line and the masked preview
+    findings would show ([DLP] 7). Never the matched value."""
+
+    detector: str
+    confidence: Confidence
+    line: int
+    preview: str
+
+
+class _Trial(_Scanner):
+    """A scanner that keeps each match, with its line, instead of counting distinct values."""
+
+    def __init__(self, tenant: Sequence[TenantDetector]) -> None:
+        super().__init__(tenant)
+        self.matches: list[TrialMatch] = []
+
+    def __repr__(self) -> str:
+        return f"<Trial matches={len(self.matches)}>"
+
+    def _record(self, hit: Hit, location: str) -> None:
+        self.matches.append(
+            TrialMatch(
+                hit.detector,
+                _LEVELS[hit.confidence],
+                int(location),
+                hit.preview[:MAX_PREVIEW_LENGTH],
+            )
+        )
+
+
+def try_detectors(text: str, tenant: Sequence[TenantDetector] = ()) -> list[TrialMatch]:
+    """Every match in `text`, line by line, of the built-in detectors and `tenant`'s, in the
+    order found: what `testDlpDetectors` shows an admin before they save a detector (FR-56). The
+    caller keeps only the detectors it was asked about. Raises DetectorError if a tenant detector
+    is invalid."""
+    trial = _Trial(tenant)
+    for number, line in enumerate(text.splitlines() or [text], start=1):
+        trial.feed(TextUnit(location=str(number), text=line))
+    trial.findings()  # credentials still waiting for a key ID count now
+    return trial.matches

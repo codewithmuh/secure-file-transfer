@@ -337,6 +337,8 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
     seed_dlp(db, tenant_id, marker, rows)
     seed_dlp_decisions(db, tenant_id, marker, rows)
     seed_dlp_approvals(db, tenant_id, marker, rows)
+    seed_notice_windows(db, tenant_id, rows)
+    seed_dlp_should(db, tenant_id, rows)
     return Seeded(tenant_id, marker, rows)
 
 
@@ -683,6 +685,57 @@ def seed_dlp_approvals(
         request=rows["dlp_approval_request"],
         user=rows["user"],
         marker=marker,
+    )
+
+
+def seed_notice_windows(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
+    """Notice windows (#230, revision 0028): the tenant's policy notice with a change waiting and
+    due, its capped "no eligible approver" window, and the seeded member's digest window, full and
+    due. Each row holds only IDs, kinds and times: the change is a kind, the marker isn't needed."""
+    for key, notice, user in (
+        ("notice_policy", "dlp_policy_changed", None),
+        ("notice_no_approver", "dlp_no_eligible_approver", None),
+        ("notice_digest", "dlp_approval_digest", rows["user"]),
+    ):
+        rows[key] = uuid.uuid4()
+        db.sql(
+            "INSERT INTO notice_windows (id, tenant_id, notice, user_id, sent, changes, "
+            "changed_at, due_at) VALUES (:id, :tenant, :notice, :user, 20, "
+            "CASE WHEN :notice = 'dlp_policy_changed' THEN ARRAY['rule_added'] "
+            "ELSE '{}'::text[] END, now(), now() + interval '5 minutes')",
+            id=rows[key],
+            tenant=tenant_id,
+            notice=notice,
+            user=user,
+        )
+
+
+def seed_dlp_should(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -> None:
+    """DLP-6 (#221, revision 0027): a finding of the draft transfer's message, a received file's
+    decision that blocked it, and a stop of the tenant's own detector for its budget."""
+    for key in ("message_finding", "received_decision"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO dlp_findings (id, tenant_id, transfer_id, detector, count_low, count_medium, "
+        "count_high) VALUES (:id, :tenant, :transfer, 'jp_my_number', 0, 0, 2)",
+        id=rows["message_finding"],
+        tenant=tenant_id,
+        transfer=rows["transfer"],
+    )
+    db.sql(
+        "INSERT INTO dlp_decisions (id, tenant_id, file_id, policy_version, mode, outcome, "
+        "enforced, untrusted_recipients, new_domains) VALUES (:id, :tenant, :file, 1, "
+        "'enforce', 'block', true, 0, 0)",
+        id=rows["received_decision"],
+        tenant=tenant_id,
+        file=rows["received_file"],
+    )
+    db.sql("UPDATE files SET dlp_blocked = true WHERE id = :file", file=rows["received_file"])
+    db.sql(
+        "INSERT INTO dlp_pattern_stops (tenant_id, detector_id, files_stopped, last_stopped_at) "
+        "VALUES (:tenant, :detector, 2, now())",
+        tenant=tenant_id,
+        detector=rows["dlp_detector"],
     )
 
 

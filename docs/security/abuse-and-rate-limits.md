@@ -272,8 +272,8 @@ over the last 2 minutes; a client that reads nothing at all is closed by the loa
 (5.7). During a counter store outage each cap counts in the pod, at a third.
 
 **F. Uploads:** `addTransferFile`, `addSessionUploadFile`, `requestUploadPartUrls`, `requestSessionUploadPartUrls`,
-`listUploadedParts`, `listSessionUploadedParts`, `completeUpload`, `completeSessionUpload`. Fail open to the per-pod
-limiter, except the PostgreSQL rows.
+`listUploadedParts`, `listSessionUploadedParts`, `completeUpload`, `completeSessionUpload`, `deleteSessionUploadFile`
+(#229). Fail open to the per-pod limiter, except the PostgreSQL rows.
 
 | Key | Limit | Enforced by | Over the limit |
 |---|---|---|---|
@@ -290,6 +290,11 @@ are PostgreSQL's, under the request's row lock: the 101st declaration and the 51
 `422 too_many_files`, a total past 20 GB `413 total_too_large`, and `completeSessionUpload` counts again in its first
 phase, so parallel completes can't pass either. Each declaration reserves the requesting tenant's storage quota. The
 per-file part-URL count and the tenant's daily volume are #165's, as for members.
+
+**As built for an uploader's removal (#229).** `deleteSessionUploadFile` is in the same group, per link session and IP.
+A removed file stops counting toward the 50 files and 20 GB and releases its storage reservation, but its declaration
+still counts toward the 100, so declaring and removing can't run without end. A blocked file can't be removed
+(`409 invalid_state`): it stays for the requesting company to review (AB-6).
 
 **G. Actions that send email:** `sendTransfer`, `createUploadRequest`, `inviteUser`. Fail open to the per-pod limiter.
 Section 7 explains each cap.
@@ -364,6 +369,11 @@ address, and only an STS request that AWS accepts gets a token (authn-authz 8.2)
 | Account | 120 approval decisions an hour | App | `429` |
 | Account | 600 responses with finding details an hour, each audited | App | `429` |
 | Tenant | 60 DLP report and decision-list reads a minute | App | `429` |
+
+As built (#221, #222): `testDlpDetectors` applies group H and `K.detector_tests`, 30 a minute per account; text over
+16,384 characters gets `413 request_too_large` from the service (the contract's schema names the limit, but a `422`
+would hide which one). `listDlpDecisions` and `getDlpReport` apply group H and `K.report_reads`, 60 a minute per
+tenant, the two counted together.
 
 The detail-read cap keeps a stolen member session or an approver's from scraping masked previews quickly; a sender
 reviewing a transfer uses a few. Approval decisions are capped per approver so a compromised approver session can't
@@ -861,6 +871,19 @@ the inspector on every attempt ends `failed`: blocked, with an operator alert, a
 No unauthenticated person can make the service email an address of their choosing. The only public trigger, a code
 request, goes to an address a member chose.
 
+**As built (#230).** The notification worker keeps the windows of the last three DLP rows in `notice_windows` (data
+model 2.5, architecture 4.6):
+
+- **Policy and approver changes:** a trailing 10-minute window per tenant. The first change makes the notice due in 10
+  minutes; every change until then joins it; one email per active admin lists every kind of change. A deactivation
+  that clears an approver designation joins it as `approvers_changed` while two or more approvers are left.
+- **Approval requests:** per approver, 20 emails in the hour since their window began, then one digest when the hour
+  ends, counting every request they could still decide then.
+- **A deactivation that leaves fewer than two approvers** emails every active admin at once
+  (`dlp_approver_deactivated`): once per deactivation, which only an admin can make.
+- **"No eligible approver" notices to the admins** (not in the table above: the system sends them when it refuses an
+  approval request): at most 3 a day per tenant. The cap was only the 30 confirmations a minute of group K before.
+
 ### 7.2 Caps
 
 The caps are in section 2.2, groups A and G. Three design points:
@@ -904,7 +927,9 @@ The caps are in section 2.2, groups A and G. Three design points:
   received a link. Under an SES pause nothing is sent for that tenant until it is lifted.
 - **Events.** The configuration set publishes bounce, complaint, delivery, reject and delivery-delay events, tagged
   with the tenant and the email type, through an SNS topic to a queue the notification worker reads (#22). They
-  update the recipient's delivery status (FR-7) and the suppression list.
+  update the recipient's delivery status (FR-7) and the suppression list. An uploader's emails carry the upload
+  request's ID in the tag `upload_request_id`, so a bounce or reject of any of them marks the request `bounced`,
+  which its page shows the member, and a bounce or complaint suppresses the address as for a recipient (#228).
 - **Shared sending IPs.** Dedicated IPs ($24.95 an IP a month, and a warm-up period) are not in v1.
 - **Quota.** Request at least 100,000 emails a day and 20 a second in both regions before the load test (capacity
   3.2). The notification worker sends below that rate and backs off when throttled.

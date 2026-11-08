@@ -387,6 +387,8 @@ class ScanTarget:
     inspection_state: InspectionState
     upload_request_id: UUID | None = None
     """A received file's request (#213): its notices, not a transfer's evaluation, follow."""
+    dlp_blocked: bool = False
+    """A received file a DLP rule blocked (FR-51, #221): its tag says so."""
 
 
 async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
@@ -404,6 +406,7 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
                 File.unscannable_allowed,
                 File.inspection_state,
                 File.upload_request_id,
+                File.dlp_blocked,
             ).where(File.id == file_id, in_scope(File, session))
         )
     ).first()
@@ -420,7 +423,26 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
         unscannable_allowed=row.unscannable_allowed,
         inspection_state=InspectionState(row.inspection_state),
         upload_request_id=row.upload_request_id,
+        dlp_blocked=row.dlp_blocked,
     )
+
+
+async def block_received(session: AsyncSession, file_id: UUID) -> bool:
+    """A DLP rule blocked this received file (FR-51, #221): as the scan worker, in the
+    transaction that records its result. Only a received file can be blocked (a check)."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        update(File)
+        .where(
+            File.id == file_id,
+            File.upload_request_id.is_not(None),
+            in_scope(File, session),
+        )
+        .values(dlp_blocked=True)
+        .returning(File.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.first() is not None
 
 
 async def record_scan(

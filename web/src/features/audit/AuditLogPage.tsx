@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { ChevronLeft, ChevronRight, Download, FileText, Search } from 'lucide-react';
 import { PageShell } from '@/components/layout';
@@ -32,6 +33,7 @@ import {
   EMPTY_FILTER,
   filterBody,
   filterProblems,
+  formFromSearch,
   KNOWN_ACTIONS,
   MAX_ACTIONS,
   toggleAction,
@@ -58,14 +60,21 @@ const actorLabelKey: Record<ActorType, string> = {
  * The tenant's audit log (#216; FR-27, FR-28, FR-29, UC-4): a filter form, the results newest first with cursor paging,
  * an event's details in a dialog, and CSV and JSON exports. Every filter, the email and IP address included, travels
  * in the POST body of `searchAuditEvents` and `exportAuditEvents`, never in this page's address (T-47). Searching
- * needs the admin role; exporting also a sign-in in the last 15 minutes (`AdminAccessNote`).
+ * needs the admin role; exporting also a sign-in in the last 15 minutes (`AdminAccessNote`). A link may start the page
+ * with actions and a time range (`formFromSearch`), as the DLP report's "export with the audit log" does (#222): the
+ * search runs with them, ready to export.
  */
 export function AuditLogPage() {
   const { t } = useTranslation();
-  const [form, setForm] = useState<FilterForm>(EMPTY_FILTER);
+  const [searchParams] = useSearchParams();
+  const [initial] = useState(() => {
+    const linked = formFromSearch(searchParams);
+    return linked && filterProblems(linked).length === 0 ? linked : null;
+  });
+  const [form, setForm] = useState<FilterForm>(initial ?? EMPTY_FILTER);
   const [touched, setTouched] = useState(false);
   /** The filter of the search shown: set when the admin searches, so typing doesn't search on every key. */
-  const [filter, setFilter] = useState<AuditFilter | undefined>(undefined);
+  const [filter, setFilter] = useState<AuditFilter | undefined>(() => (initial ? filterBody(initial) : undefined));
   /** The cursors of the pages before the one shown, and the one shown (`null` for the first page). */
   const [cursors, setCursors] = useState<(string | null)[]>([null]);
   const cursor = cursors[cursors.length - 1] ?? null;

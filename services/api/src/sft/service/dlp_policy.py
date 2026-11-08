@@ -33,16 +33,28 @@ rule or detector is `404`, as is a deleted one.
 A write that changes nothing (the values sent are the ones there) returns the item as it is,
 with no new revision, version, event, email or charge.
 
-**What #218 accepts** (the Should parts are #221's, refused with `422 validation_failed` until
-then rather than stored and ignored): only `enforce` mode, `sent` rules, one approver, no 24-hour
-window, keyword lists but no patterns. `require_approval` is accepted with its rule: the tenant
-needs more active approvers than the rule needs (`422 approvers_insufficient`) to create or enable
-one; #220 makes it act. A tenant has at most 50 live rules and 50 detectors.
+**What is accepted** (#218, and #221's Should parts): `enforce` and `monitor` mode (FR-52);
+rules for sent files, and for received files (FR-51), which only allow and record or block, test
+`content` or `not_inspected` and apply to any recipient; one or two approvers (FR-44), two only
+with `require_approval`; the sender's 24-hour window (FR-49) on a `content` rule for sent files;
+keyword lists and patterns (FR-38, FR-39). `require_approval` needs more active approvers than
+the rule needs (`422 approvers_insufficient`) to create or enable one. A tenant has at most 50
+live rules, 50 detectors and 20 patterns.
 
-**Keyword lists** are checked by the detector library as the inspector will compile them
-(`sft.dlp.detect.validate`), then together with the tenant's other live detectors, so a set the
-inspector couldn't compile is refused when it is saved, not when a file is scanned. Their terms
-are stored sealed (`sft.service.dlp_definitions`) and never logged.
+**Keyword lists and patterns** are checked by the detector library as the inspector will compile
+them (`sft.dlp.detect.validate`), then together with the tenant's other live detectors, so a set
+the inspector couldn't compile is refused when it is saved, not when a file is scanned. A pattern
+is refused, with a pointer to `pattern`, if it doesn't compile in RE2, is longer than 512
+characters, compiles to more than 1,000 instructions forward or reverse, or matches the empty
+string (detectors 5). Definitions are stored sealed (`sft.service.dlp_definitions`) and never
+logged. `getDlpDetector` shows how many files stopped a pattern for its scan-time budget, and
+when last (#164).
+
+**`testDlpDetectors`** (FR-56) runs detectors on up to 16,384 characters of sample text, in
+memory, and returns each match masked as findings are: the IDs asked for, a `draft` that isn't
+saved, or every detector when neither is sent. The text is never stored or logged; the audit
+event names the detectors and counts only (`dlp.detector_tested`). 30 a minute per account
+(abuse 2.2, K).
 
 **Built-in detectors** come from the inspection engine: `listDlpDetectors` lists them with names
 and descriptions in the caller's language (`Accept-Language`, else the tenant's default language),
@@ -57,12 +69,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timedelta
 from enum import StrEnum
+from string import ascii_lowercase
 from typing import Any, Final
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sft.core.errors import Conflict, FieldError, NotFound, Unprocessable, json_pointer
+from sft.core.errors import Conflict, FieldError, NotFound, TooLarge, Unprocessable, json_pointer
 from sft.core.ids import uuid7
 from sft.data import audit, dlp_policy, tenants
 from sft.data.audit import Origin, Target
@@ -82,13 +95,14 @@ from sft.data.models import (
     InspectionReason,
 )
 from sft.data.outbox import DLP_POLICY_CHANGED, enqueue
-from sft.dlp.detect import BUILTIN_DETECTORS, DetectorError, validate
+from sft.dlp.detect import BUILTIN_DETECTORS, DetectorError, try_detectors, validate
 from sft.dlp.detect.tenant import TenantDetectors
 from sft.dlp.engine import load_engine
 from sft.service.caller import Caller
 from sft.service.dlp_definitions import (
     Definition,
     Keywords,
+    PatternDefinition,
     detector_unit,
     open_definition,
     seal_definition,
@@ -109,6 +123,12 @@ DETECTOR_TARGET: Final = "dlp_detector"
 
 MAX_LIVE_RULES: Final = 50
 MAX_DETECTORS: Final = 50
+MAX_PATTERNS: Final = 20
+MAX_TEST_TEXT: Final = 16_384
+"""Characters of sample text `testDlpDetectors` takes (abuse 2.2, K): more is `413`."""
+MAX_TEST_MATCHES: Final = 100
+DRAFT: Final = "draft"
+"""How `testDlpDetectors` names the draft's matches."""
 MAX_TRUSTED_DOMAINS: Final = 500
 MIN_APPROVAL_TIMEOUT: Final = timedelta(hours=1)
 MAX_APPROVAL_TIMEOUT: Final = timedelta(days=7)
@@ -222,6 +242,9 @@ class DetectorView:
     revision: int | None = None
     definition: Definition | None = None
     created_at: datetime | None = None
+    budget_stops: int | None = None
+    """For a pattern in `getDlpDetector`: the files that stopped it for its budget (#164)."""
+    last_budget_stop_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,8 +305,7 @@ class RuleUpdate:
 
 @dataclass(frozen=True, slots=True)
 class DetectorCreate:
-    """`DlpDetectorCreate`. The pattern fields are #221's: sent with `kind: keywords` or at all
-    before then, they are refused."""
+    """`DlpDetectorCreate`. The pattern fields, sent with `kind: keywords`, are refused."""
 
     name: str
     kind: DlpDetectorKind
@@ -293,6 +315,7 @@ class DetectorCreate:
     pattern: str | None = None
     context_keywords: Sequence[str] | None = None
     min_length: int | None = None
+    case_insensitive: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,10 +339,6 @@ def _invalid(detail: str, *fields: str | int) -> Unprocessable:
     """`422 validation_failed`, pointing at the body field that breaks the rule, if one does."""
     pointer = json_pointer(*fields) if fields else None
     return Unprocessable("validation_failed", detail, errors=[FieldError(detail, pointer=pointer)])
-
-
-def _not_yet(field: str, what: str) -> Unprocessable:
-    return _invalid(f"{what} arrives with #221; it can't be set yet.", field)
 
 
 def _stale() -> Conflict:
@@ -387,9 +406,19 @@ async def get_dlp_detector(
             language = _language(language, (await tenants.get_policy(session)).default_locale)
             return _builtin(detector_id, language)
         detector = await dlp_policy.get_live_detector(session, own_id)
-    if detector is None:
-        raise NotFound
-    return _own(scope.tenant_id, detector)
+        if detector is None:
+            raise NotFound
+        stops = None
+        if detector.kind == DlpDetectorKind.PATTERN.value:
+            stops = await dlp_policy.pattern_stops(session, detector.id)
+    view = _own(scope.tenant_id, detector)
+    if detector.kind != DlpDetectorKind.PATTERN.value:
+        return view
+    return replace(
+        view,
+        budget_stops=0 if stops is None else stops.files,
+        last_budget_stop_at=None if stops is None else stops.last_at,
+    )
 
 
 def _own_id(detector_id: str) -> UUID | None:
@@ -549,8 +578,6 @@ async def update_dlp_policy(
 ) -> PolicyView:
     """`updateDlpPolicy`: change the fields sent (module docstring)."""
     authorize(caller, "updateDlpPolicy", now=now)
-    if change.mode is DlpMode.MONITOR:
-        raise _not_yet("mode", "Monitor mode (FR-52)")
     timeout = change.approval_timeout
     if timeout is not None and not MIN_APPROVAL_TIMEOUT <= timeout <= MAX_APPROVAL_TIMEOUT:
         raise _invalid("approval_timeout is between PT1H and P7D.", "approval_timeout")
@@ -635,13 +662,27 @@ async def _check_rule(
     """The rule's checks (module docstring), on its fields as they would be stored; the fields
     with those that don't apply to its condition cleared. `sent` names the fields the request
     sent, for the pointer of an error."""
-    if fields.direction != DlpDirection.SENT.value:
-        raise _not_yet("direction", "Rules for received files (FR-51)")
-    if fields.include_sender_24h:
-        raise _not_yet("include_sender_24h", "The sender's 24-hour window (FR-49)")
-    if fields.approvals_required != 1:
-        raise _not_yet("approvals_required", "Two approvers (FR-44)")
     condition = DlpCondition(fields.condition)
+    if fields.direction == DlpDirection.RECEIVED.value:
+        # FR-51: a received file's rule allows and records or blocks; nobody confirms it.
+        if fields.action not in (DlpAction.ALLOW_AND_RECORD.value, DlpAction.BLOCK.value):
+            raise _invalid("A rule for received files allows and records, or blocks.", "action")
+        if condition is DlpCondition.NEW_DOMAIN:
+            raise _invalid("A rule for received files tests content or inspection.", "condition")
+        if fields.recipient_scope != DlpRecipientScope.ANY.value:
+            raise _invalid("A rule for received files has no recipients.", "recipient_scope")
+        if fields.include_sender_24h:
+            raise _invalid("A rule for received files has no sender.", "include_sender_24h")
+    if fields.include_sender_24h and condition is not DlpCondition.CONTENT:
+        raise _invalid(
+            "The sender's 24 hours add up a content rule's matches.", "include_sender_24h"
+        )
+    if fields.approvals_required not in (1, 2):
+        raise _invalid("A rule needs one or two approvers.", "approvals_required")
+    if fields.approvals_required == 2 and fields.action != DlpAction.REQUIRE_APPROVAL.value:
+        if "approvals_required" in sent:
+            raise _invalid("Two approvers apply only to require_approval.", "approvals_required")
+        fields = replace(fields, approvals_required=1)  # the action changed away from approval
     if condition is DlpCondition.CONTENT:
         if not fields.detectors:
             raise _invalid("A content rule names at least one detector.", "detectors")
@@ -803,9 +844,16 @@ async def update_dlp_rule(
             action="dlp_rule.changed",
             target=Target(RULE_TARGET, rule.id),
             changes=[PolicyChange.RULE_CHANGED],
-            details=_rule_details(new, **{f"changed_{name}": True for name in changed}),
+            details=_rule_details(
+                new, **{f"changed_{_audit_name(name)}": True for name in changed}
+            ),
         )
         return new
+
+
+def _audit_name(field: str) -> str:
+    """A rule field as an audit details key, which holds lower-case letters only."""
+    return "sender_window" if field == "include_sender_24h" else field
 
 
 def _stored(value: object) -> object:
@@ -846,12 +894,35 @@ async def delete_dlp_rule(
 
 # ---- the tenant's own detectors ----
 
+_PATTERN_FIELDS: Final = ("pattern", "context_keywords", "case_insensitive", "min_length")
+_FIELD_OF_REASON: Final[Mapping[str, str]] = {
+    "expression_too_long": "pattern",
+    "does_not_compile": "pattern",
+    "too_complex": "pattern",
+    "matches_empty_string": "pattern",
+    "invalid_context_keywords": "context_keywords",
+    "invalid_min_length": "min_length",
+}
+_DETAIL_OF_REASON: Final[Mapping[str, str]] = {
+    "expression_too_long": "A pattern has at most 512 characters.",
+    "does_not_compile": "The pattern doesn't compile in RE2.",
+    "too_complex": "The pattern compiles to more than 1,000 RE2 instructions.",
+    "matches_empty_string": "The pattern matches the empty string.",
+    "invalid_context_keywords": "A context keyword has 1 to 100 characters.",
+    "invalid_min_length": "min_length is at most 512.",
+    "too_many_patterns": "A tenant has at most 20 patterns.",
+    "keywords_too_large": "The tenant's keyword lists are too large together to inspect.",
+}
 
-def _definition_error(error: DetectorError) -> Unprocessable:
-    # The reason names the rule broken, never a term (sft.dlp.detect.tenant).
-    if error.reason == "keywords_too_large":
-        return _invalid("The tenant's keyword lists are too large together to inspect.", "keywords")
-    return _invalid(f"The keyword list breaks a rule: {error.reason}.", "keywords")
+
+def _definition_error(error: DetectorError, *prefix: str) -> Unprocessable:
+    """A save-time refusal of the detector library, pointing at the field it concerns (under
+    `prefix`, the draft of `testDlpDetectors`). The reason names the rule broken, never a term or
+    the expression (sft.dlp.detect.tenant)."""
+    detail = _DETAIL_OF_REASON.get(error.reason, f"The keyword list breaks a rule: {error.reason}.")
+    if error.reason == "too_many_patterns":
+        return _invalid(detail)
+    return _invalid(detail, *prefix, _FIELD_OF_REASON.get(error.reason, "keywords"))
 
 
 async def _check_definitions(
@@ -872,13 +943,76 @@ async def _check_definitions(
         raise _definition_error(error) from None
 
 
-def _keywords(terms: Sequence[str]) -> Keywords:
+def _keywords(terms: Sequence[str], *prefix: str) -> Keywords:
     if not 1 <= len(terms) <= 1000:
-        raise _invalid("A keyword list has 1 to 1,000 terms.", "keywords")
+        raise _invalid("A keyword list has 1 to 1,000 terms.", *prefix, "keywords")
     for index, term in enumerate(terms):
         if not term.strip() or len(term) > 100:
-            raise _invalid("A term has 1 to 100 characters.", "keywords", index)
+            raise _invalid("A term has 1 to 100 characters.", *prefix, "keywords", index)
     return Keywords(tuple(terms))
+
+
+def _pattern(
+    pattern: str | None,
+    context_keywords: Sequence[str] | None,
+    case_insensitive: bool,
+    min_length: int | None,
+    *prefix: str,
+) -> PatternDefinition:
+    """A pattern's fields as the contract takes them (FR-39); the library checks the rest."""
+    if pattern is None:
+        raise _invalid("A pattern needs its pattern.", *prefix, "pattern")
+    if not 1 <= len(pattern) <= 512:
+        raise _invalid("A pattern has 1 to 512 characters.", *prefix, "pattern")
+    context = tuple(context_keywords or ())
+    if len(context) > 50:
+        raise _invalid("A pattern has at most 50 context keywords.", *prefix, "context_keywords")
+    for index, term in enumerate(context):
+        if not term.strip() or len(term) > 100:
+            raise _invalid(
+                "A context keyword has 1 to 100 characters.", *prefix, "context_keywords", index
+            )
+    return PatternDefinition(
+        pattern=pattern,
+        context_keywords=context,
+        case_insensitive=case_insensitive,
+        min_length=min_length,
+    )
+
+
+def _new_definition(new: DetectorCreate, *prefix: str) -> Definition:
+    """The definition of a `DlpDetectorCreate`: a keyword list or a pattern, with only its own
+    kind's fields."""
+    if new.kind is DlpDetectorKind.PATTERN:
+        if new.keywords is not None:
+            raise _invalid("Only a keyword list has this field.", *prefix, "keywords")
+        return _pattern(
+            new.pattern, new.context_keywords, new.case_insensitive, new.min_length, *prefix
+        )
+    for name in ("pattern", "context_keywords", "min_length"):
+        if getattr(new, name) is not None:
+            raise _invalid("Only a pattern has this field.", *prefix, name)
+    if new.keywords is None:
+        raise _invalid("A keyword list needs its keywords.", *prefix, "keywords")
+    return _keywords(new.keywords, *prefix)
+
+
+def _changed_definition(old: Definition, change: DetectorUpdate) -> Definition:
+    """The definition with the fields of a `DlpDetectorUpdate` applied; another kind's fields
+    are refused."""
+    if isinstance(old, Keywords):
+        for name in _PATTERN_FIELDS:
+            if getattr(change, name) is not None:
+                raise _invalid("Only a pattern has this field.", name)
+        return old if change.keywords is None else _keywords(change.keywords)
+    if change.keywords is not None:
+        raise _invalid("Only a keyword list has this field.", "keywords")
+    return _pattern(
+        old.pattern if change.pattern is None else change.pattern,
+        old.context_keywords if change.context_keywords is None else change.context_keywords,
+        old.case_insensitive if change.case_insensitive is None else change.case_insensitive,
+        old.min_length if change.min_length is None else change.min_length,
+    )
 
 
 def _detector_details(detector: DlpDetector, **more: audit.Detail) -> dict[str, audit.Detail]:
@@ -901,16 +1035,9 @@ async def create_dlp_detector(
     now: datetime,
     idempotency: IdempotentRequest | None = None,
 ) -> Outcome[DetectorView]:
-    """`createDlpDetector`: a keyword list at revision 1 (patterns are #221's)."""
+    """`createDlpDetector`: a keyword list or a pattern at revision 1."""
     authorize(caller, "createDlpDetector", now=now)
-    if new.kind is DlpDetectorKind.PATTERN:
-        raise _not_yet("kind", "Patterns (FR-39)")
-    for name in ("pattern", "context_keywords", "min_length"):
-        if getattr(new, name) is not None:
-            raise _invalid("Only a pattern has this field.", name)
-    if new.keywords is None:
-        raise _invalid("A keyword list needs its keywords.", "keywords")
-    definition = _keywords(new.keywords)
+    definition = _new_definition(new)
     write = _write(caller, limiter, origin)
     if caller.user_id is None:  # pragma: no cover - authorize admits only members here
         raise NotFound
@@ -922,6 +1049,9 @@ async def create_dlp_detector(
             live = await dlp_policy.list_live_detectors(session)
             if len(live) >= MAX_DETECTORS:
                 raise _invalid("A tenant has at most 50 detectors.")
+            patterns = sum(1 for d in live if d.kind == DlpDetectorKind.PATTERN.value)
+            if isinstance(definition, PatternDefinition) and patterns >= MAX_PATTERNS:
+                raise _invalid("A tenant has at most 20 patterns.")
             detector_id = uuid7()
             await _check_definitions(session, write.tenant_id, detector_id, definition)
             detector = await dlp_policy.insert_detector(
@@ -930,7 +1060,7 @@ async def create_dlp_detector(
                 1,
                 DetectorFields(
                     name=new.name,
-                    kind=DlpDetectorKind.KEYWORDS.value,
+                    kind=definition.kind.value,
                     definition_ct=seal_definition(write.tenant_id, definition),
                     enabled=new.enabled,
                 ),
@@ -977,10 +1107,6 @@ async def update_dlp_detector(
     own_id = _own_id(detector_id)
     if own_id is None:
         raise Conflict("invalid_state", "A built-in detector can't be changed.")
-    for name in ("pattern", "context_keywords", "case_insensitive", "min_length"):
-        if getattr(change, name) is not None:
-            raise _invalid("Only a pattern has this field.", name)
-    definition = None if change.keywords is None else _keywords(change.keywords)
     write = _write(caller, limiter, origin)
     if caller.user_id is None:  # pragma: no cover - authorize admits only members here
         raise NotFound
@@ -993,7 +1119,7 @@ async def update_dlp_detector(
         old = open_definition(write.tenant_id, detector.definition_ct)
         name = detector.name if change.name is None else change.name
         enabled = detector.enabled if change.enabled is None else change.enabled
-        wanted = old if definition is None else definition
+        wanted = _changed_definition(old, change)
         if (name, enabled, wanted) == (detector.name, detector.enabled, old):
             return _own(write.tenant_id, detector)
         if wanted != old or (enabled and not detector.enabled):
@@ -1062,3 +1188,117 @@ async def delete_dlp_detector(
             changes=[PolicyChange.DETECTOR_REMOVED],
             details={"revision": detector.revision, "kind": DlpDetectorKind(detector.kind)},
         )
+
+
+# ---- testDlpDetectors (FR-56) ----
+
+
+@dataclass(frozen=True, slots=True)
+class DetectorTest:
+    """`DlpDetectorTest`: the text, the detectors asked for and a draft, as sent."""
+
+    text: str
+    detectors: Sequence[str] | None = None
+    draft: DetectorCreate | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TestMatch:
+    detector: str
+    confidence: str
+    line: int
+    preview: str
+
+
+@dataclass(frozen=True, slots=True)
+class TestResult:
+    matches: tuple[TestMatch, ...]
+    truncated: bool
+
+
+def _letters(index: int) -> str:
+    """`a` to `z`, then `aa`, `ab`…: audit details keys hold lower-case letters, not digits."""
+    first, second = divmod(index, 26)
+    return ("" if first == 0 else ascii_lowercase[first - 1]) + ascii_lowercase[second]
+
+
+async def test_dlp_detectors(
+    database: Database,
+    caller: Caller,
+    test: DetectorTest,
+    *,
+    origin: Origin,
+    now: datetime,
+) -> TestResult:
+    """`testDlpDetectors` (module docstring). The route applies the 30 a minute per account."""
+    authorize(caller, "testDlpDetectors", now=now)
+    if len(test.text) > MAX_TEST_TEXT:
+        raise TooLarge("request_too_large", "The sample text has at most 16,384 characters.")
+    draft = None if test.draft is None else _new_definition(test.draft, "draft")
+    scope = tenant_scope(caller)
+    tenant_id = scope.tenant_id
+    assert tenant_id is not None  # noqa: S101 - tenant_scope gives a tenant scope
+    async with database.transaction(scope) as session:
+        live = {d.id: d for d in await dlp_policy.list_live_detectors(session)}
+        builtin: set[str] = set()
+        own: list[DlpDetector] = []
+        for index, name in enumerate(test.detectors or ()):
+            if name in BUILTIN_DETECTORS:
+                builtin.add(name)
+                continue
+            try:
+                found = live.get(UUID(name.removeprefix(CUSTOM_PREFIX)))
+            except ValueError:
+                found = None
+            if not name.startswith(CUSTOM_PREFIX) or found is None:
+                raise _invalid("No such detector.", "detectors", index)
+            if found not in own:
+                own.append(found)
+        everything = not test.detectors and draft is None
+        if everything:
+            builtin = set(BUILTIN_DETECTORS)
+            own = [d for d in live.values() if d.enabled]
+        units = [detector_unit(d.id, open_definition(tenant_id, d.definition_ct)) for d in own]
+        if draft is not None:
+            unit = detector_unit(UUID(int=0), draft)
+            units.append(replace(unit, id=DRAFT))
+        try:
+            if draft is not None:
+                validate(units[-1])
+            matches = try_detectors(test.text, units)
+        except DetectorError as error:
+            if draft is not None and error.detector_id == DRAFT:
+                raise _definition_error(error, "draft") from None
+            raise _definition_error(error) from None
+        wanted = builtin | {detector_ref(d.id) for d in own} | {CUSTOM_PREFIX + DRAFT}
+        kept = [
+            TestMatch(
+                DRAFT if m.detector == CUSTOM_PREFIX + DRAFT else m.detector,
+                m.confidence,
+                m.line,
+                m.preview,
+            )
+            for m in matches
+            if m.detector in wanted
+        ]
+        details: dict[str, audit.Detail] = {
+            "detectors": len(builtin) + len(own),
+            "draft_kind": None if draft is None else draft.kind,
+            "all_detectors": everything,
+            "matches": min(len(kept), MAX_TEST_MATCHES),
+            "truncated": len(kept) > MAX_TEST_MATCHES,
+        }
+        # The detectors by ID, never the text or a match (FR-56).
+        details |= {f"builtin_{name}": True for name in sorted(builtin) if not everything}
+        details |= {
+            f"detector_{_letters(index)}": d.id for index, d in enumerate(own) if not everything
+        }
+        await audit.record(
+            session,
+            action="dlp.detector_tested",
+            actor=caller.actor(),
+            target=Target(POLICY_TARGET, tenant_id),
+            origin=origin,
+            details=details,
+        )
+    return TestResult(tuple(kept[:MAX_TEST_MATCHES]), len(kept) > MAX_TEST_MATCHES)

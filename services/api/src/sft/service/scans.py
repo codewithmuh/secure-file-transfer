@@ -20,9 +20,17 @@ wait for it: completion records them `scan_failed` (`large_file_scanning_unavail
 (`sft.service.uploads`). The lifecycle jobs (#181) schedule it.
 
 **Received files** (#213) follow the same pass. A result has no transfer to evaluate; instead, in
-the transaction that records it, it counts towards its upload request's next notice
-(`note_received`): shareable, the member is told it arrived; blocked, both sides are told, the
-uploader without any finding or scan detail (FR-12). One notice per request per 5 minutes: the
+the transaction that records it, a file that would be shareable gets the DLP decision of the
+tenant's rules for received files (FR-51, #221; `sft.service.dlp_decision.decide_received`): a
+block in enforce mode sets `dlp_blocked`, and `dlp.decided` records it either way. Then the file
+counts towards its upload request's next notice (`note_received`): shareable, the member is told it
+arrived; blocked, both sides are told, the uploader without any finding, rule or scan detail
+(FR-12).
+
+**Patterns past their budget** (#164, detectors 5): the inspector names the tenant patterns it
+stopped on the file, and the same transaction counts one more stop for each
+(`dlp_pattern_stops`) and writes `dlp.pattern_budget_exceeded` with their IDs, never a match. The
+file's state doesn't change. One notice per request per 5 minutes: the
 result that makes it due writes one outbox message, delayed by that window, and the notification
 worker sends the counts of every file that settled meanwhile (architecture 4.3).
 """
@@ -34,17 +42,19 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from string import ascii_lowercase
 from typing import Final
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sft.data import audit, files, findings, tenants, upload_requests
+from sft.data import audit, dlp_policy, files, findings, tenants, upload_requests
 from sft.data.audit import Actor, Target
 from sft.data.database import Database
 from sft.data.findings import Counts
 from sft.data.models import (
     ActorType,
+    DlpAction,
     FileState,
     InspectionReason,
     InspectionState,
@@ -54,9 +64,15 @@ from sft.data.models import (
 )
 from sft.data.outbox import UPLOAD_REQUEST_FILES_SETTLED, enqueue
 from sft.data.scope import Scope
-from sft.service.evaluation import evaluate, is_shareable
+from sft.service import dlp_decision
+from sft.service.dlp_decision import Decided
+from sft.service.evaluation import DLP_RULE, evaluate, is_shareable
 
 FILE: Final = "file"
+CUSTOM_PREFIX: Final = "custom:"
+"""How a tenant pattern is named in a result's `budget_exceeded` (detectors 5)."""
+DLP_BLOCKED_TAG: Final = "dlp_blocked"
+"""The `scan` tag of a received file a DLP rule blocked: the API's read condition refuses it."""
 SYSTEM: Final = Actor(ActorType.SYSTEM)
 SWEEP_BATCH: Final = 100
 _AUDIT_KEY: Final = re.compile(r"[a-z][a-z_]{0,56}")
@@ -90,15 +106,26 @@ class InspectionResult:
     policy_version: int | None = None
     """The tenant's DLP policy version whose detectors the inspector ran with (#218); None when
     the inspector gave no result, or the tenant has no policy."""
+    budget_exceeded: tuple[str, ...] = ()
+    """The tenant patterns stopped on the file for spending their budget, `custom:<id>`
+    (#164)."""
 
 
 SKIPPED: Final = InspectionResult(InspectionState.SKIPPED)
 """The inspection of an infected file, or one whose scan failed: no findings are kept."""
 
 
-def tag_value(state: FileState, unscannable_allowed: bool, inspection: InspectionState) -> str:
+def tag_value(
+    state: FileState,
+    unscannable_allowed: bool,
+    inspection: InspectionState,
+    dlp_blocked: bool = False,
+) -> str:
     """The `scan` tag's value (ADR-0019). The API may read only `clean` and `unscannable_allowed`
-    objects, so a file whose inspection failed gets neither."""
+    objects, so a file whose inspection failed gets neither, and nor does a received file a DLP
+    rule blocked (FR-51)."""
+    if dlp_blocked:
+        return DLP_BLOCKED_TAG
     if is_shareable(state, unscannable_allowed, inspection):
         return "clean" if state is FileState.CLEAN else "unscannable_allowed"
     if inspection is InspectionState.FAILED and state in (FileState.CLEAN, FileState.UNSCANNABLE):
@@ -175,9 +202,24 @@ async def record(
         if upload_request_id is None
         else {"upload_request_id": upload_request_id}
     )
+    dlp_blocked = False
     if upload_request_id is not None:
         shareable = is_shareable(scan.state, allowed, inspection.state)
-        await note_received(session, upload_request_id, shareable=shareable)
+        if shareable:
+            decided = await dlp_decision.decide_received(
+                session,
+                file_id,
+                reasons=[r.value for r in inspection.reasons],
+                found=inspection.findings,
+            )
+            if decided is not None:
+                dlp_blocked = dlp_decision.blocks(decided)
+                if dlp_blocked:
+                    await files.block_received(session, file_id)
+                await _record_received_decision(session, file_id, upload_request_id, decided)
+        await note_received(session, upload_request_id, shareable=shareable and not dlp_blocked)
+    if inspection.budget_exceeded:
+        await _record_stops(session, file_id, inspection.budget_exceeded)
     await audit.record(
         session,
         action="file.scanned",
@@ -193,11 +235,86 @@ async def record(
             "unscannable_allowed": allowed,
             "inspection_state": inspection.state,
             "inspection_policy_version": inspection.policy_version,
+            **({"dlp_blocked": True} if dlp_blocked else {}),
             **reasons,
             **_audit_findings(inspection.findings),
         },
     )
     return True
+
+
+async def _record_received_decision(
+    session: AsyncSession, file_id: UUID, upload_request_id: UUID, decided: Decided
+) -> None:
+    """`dlp.decided` for a received file, and `dlp.rule_matched` per rule it matched: IDs, enums
+    and counts only, as for a transfer (`sft.service.evaluation`)."""
+    await audit.record(
+        session,
+        action="dlp.decided",
+        actor=SYSTEM,
+        target=Target(FILE, file_id),
+        details={
+            "system_actor": SystemActor.SCAN_WORKER,
+            "upload_request_id": upload_request_id,
+            "decision_id": decided.id,
+            "outcome": decided.outcome,
+            "mode": decided.mode,
+            "enforced": decided.enforced,
+            "policy_version": decided.policy_version,
+            "matched_rules": len(decided.matches),
+            "dlp_blocked": dlp_decision.blocks(decided),
+        },
+    )
+    for match in decided.matches:
+        await audit.record(
+            session,
+            action="dlp.rule_matched",
+            actor=SYSTEM,
+            target=Target(DLP_RULE, match.rule.id),
+            details={
+                "system_actor": SystemActor.SCAN_WORKER,
+                "decision_id": decided.id,
+                "file_id": file_id,
+                "rule_revision": match.rule.revision,
+                "action": DlpAction(match.rule.action),
+                "matched_count": match.count,
+            },
+        )
+
+
+MAX_STOPPED: Final = 20
+"""A tenant has at most 20 patterns (detectors 5), so a result names at most 20."""
+
+
+async def _record_stops(session: AsyncSession, file_id: UUID, stopped: Sequence[str]) -> None:
+    """The patterns stopped on the file (#164): one more stop each, and one
+    `dlp.pattern_budget_exceeded` with their IDs. A name that isn't `custom:<uuid>` is dropped:
+    the protocol allows only tenant patterns there."""
+    ids: list[UUID] = []
+    for name in stopped[:MAX_STOPPED]:
+        if not name.startswith(CUSTOM_PREFIX):
+            continue
+        try:
+            detector_id = UUID(name.removeprefix(CUSTOM_PREFIX))
+        except ValueError:
+            continue
+        if detector_id not in ids:
+            ids.append(detector_id)
+    if not ids:
+        return
+    await dlp_policy.record_pattern_stops(session, ids)
+    await audit.record(
+        session,
+        action="dlp.pattern_budget_exceeded",
+        actor=SYSTEM,
+        target=Target(FILE, file_id),
+        details={
+            "system_actor": SystemActor.SCAN_WORKER,
+            "patterns": len(ids),
+            # Details keys are lower-case letters only: `detector_a` to `detector_t`.
+            **{f"detector_{ascii_lowercase[i]}": detector_id for i, detector_id in enumerate(ids)},
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)

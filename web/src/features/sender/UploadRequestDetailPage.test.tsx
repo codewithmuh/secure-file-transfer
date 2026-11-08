@@ -3,7 +3,7 @@ import { renderToString } from 'react-dom/server';
 import '@/lib/i18n';
 import { resources } from '@/lib/i18n';
 import type { UploadRequest } from '@/api';
-import { RequestEndBanner } from './UploadRequestDetailPage';
+import { RequestEndBanner, UploaderDelivery } from './UploadRequestDetailPage';
 import type { RevocationStatus } from './revocation';
 
 const en = resources.en.translation;
@@ -41,5 +41,32 @@ describe('RequestEndBanner (#212, FR-20)', () => {
 
   it('says nothing while the request is open', () => {
     expect(banner('open', 'idle')).toBe('');
+  });
+});
+
+describe('UploaderDelivery (#228, FR-7)', () => {
+  const delivery = (state: UploadRequest['delivery_state']) =>
+    renderToString(<UploaderDelivery request={{ delivery_state: state, notified_at: '2026-11-08T05:00:00Z' }} date={(v) => v} />);
+
+  it('says the uploader\'s address bounced, in the uploader\'s words, not a recipient\'s', () => {
+    const html = delivery('bounced');
+    expect(html).toContain(en.deliveryState.bounced);
+    expect(html).toContain(escaped(en.requests.deliveryExplain.bounced));
+    expect(html).not.toContain(escaped(en.deliveryExplain.bounced));
+  });
+
+  it('explains a suppressed address, and says nothing more for a sent email', () => {
+    expect(delivery('suppressed')).toContain(escaped(en.requests.deliveryExplain.suppressed));
+    const sent = delivery('sent');
+    expect(sent).not.toContain(escaped(en.requests.deliveryExplain.bounced));
+    expect(sent).not.toContain(escaped(en.requests.deliveryExplain.suppressed));
+  });
+
+  it('has the words in both languages', () => {
+    for (const language of ['en', 'ja'] as const) {
+      const words = resources[language].translation.requests.deliveryExplain;
+      expect(words.bounced).toBeTruthy();
+      expect(words.suppressed).toBeTruthy();
+    }
   });
 });

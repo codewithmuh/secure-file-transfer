@@ -61,6 +61,7 @@ class EmailType(enum.StrEnum):
     DLP_POLICY_CHANGED = "dlp_policy_changed"
     API_KEY_EXPIRING = "api_key_expiring"
     API_KEY_FIRST_EXPORT = "api_key_first_export"
+    DLP_APPROVER_DEACTIVATED = "dlp_approver_deactivated"
 
 
 class PolicyChange(enum.StrEnum):
@@ -508,6 +509,23 @@ class DlpPolicyChanged(Email):
         }
 
 
+@dataclass(frozen=True, kw_only=True)
+class DlpApproverDeactivated(Email):
+    """To every tenant admin, at once (#230): a deactivation cleared an approver designation and
+    fewer than two approvers are left, so some transfers can't be approved: with `none_left`, none;
+    otherwise the one left, who can't approve their own. Names nobody."""
+
+    TYPE = EmailType.DLP_APPROVER_DEACTIVATED
+    none_left: bool
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _check("none_left", isinstance(self.none_left, bool))
+
+    def _context(self, links: Links, locale: Locale) -> dict[str, object]:
+        return {"dlp_policy_url": links.dlp_policy(), "none_left": self.none_left}
+
+
 # API keys (#215, #216; authn-authz 5.2, 5.3): to the tenant's own people. A key is named by its
 # prefix only, never its name (an admin's free text) or any of its secret.
 
@@ -574,6 +592,7 @@ EMAILS: dict[EmailType, type[Email]] = {
         DlpPolicyChanged,
         ApiKeyExpiring,
         ApiKeyFirstExport,
+        DlpApproverDeactivated,
     )
 }
 """Every email type and its class; a test checks it covers `EmailType`."""

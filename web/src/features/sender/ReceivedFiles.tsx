@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, Download, Trash2 } from 'lucide-react';
 import {
   Alert,
+  Badge,
   Button,
   Card,
   CardTitle,
@@ -18,16 +19,11 @@ import {
   toast,
 } from '@/components/ui';
 import type { Schema, UploadRequest } from '@/api';
-import {
-  createReceivedFileDownload,
-  deleteReceivedFile,
-  invalidateUploadRequests,
-  useReceivedFiles,
-} from '@/hooks/uploadRequests';
-import { checkContent, contentUrl, startDownload } from '@/features/recipient/linkApi';
+import { deleteReceivedFile, invalidateUploadRequests, useReceivedFiles } from '@/hooks/uploadRequests';
 import { formatDate, formatFileSize } from '@/lib/formatters';
 import { errorMessage } from '@/lib/problems';
 import { FileStateBadge, InspectionStateBadge } from './StateBadges';
+import { downloadReceivedFile } from './receivedDownload';
 import { DetectorName, Findings } from './TransferDetailPage';
 import { receivedFileActions } from './uploadRequests';
 
@@ -38,7 +34,10 @@ type ApiFile = Schema<'File'>;
  * scan state, size, the day it is deleted (`retention_until`), its inspection in brief and, on demand, its findings as
  * counts (`getFileInspection`, audited, so never polled). The request's owner downloads a shareable file by a grant
  * (`createReceivedFileDownload`), checked in the app and then handed to the browser's download manager by navigation,
- * with a warning for a file that couldn't be scanned (FR-18), and can delete one before its retention ends.
+ * with a warning for a file that couldn't be scanned (FR-18), and can delete one before its retention ends. An
+ * interrupted start resumes under the same grant on the next click (`resume_grant_id`, #229: `receivedDownload.ts`).
+ * A file a DLP rule for received files blocked (`inspection.dlp_blocked`, FR-51, #221) says so and is never
+ * downloadable; its findings still show, and it can be deleted.
  */
 export function ReceivedFiles({ request, isOwner }: { request: UploadRequest; isOwner: boolean }) {
   const { t } = useTranslation();
@@ -92,6 +91,8 @@ function ReceivedFileRow({ file, isOwner, onDelete }: { file: ApiFile; isOwner: 
   const findingsId = `findings-${file.id}`;
   const warningId = `warning-${file.id}`;
   const unscannable = file.state === 'unscannable';
+  const blockedByPolicy = inspection.dlp_blocked;
+  const blockedId = `blocked-${file.id}`;
   const canHaveFindings = (inspection.state === 'inspected' || inspection.state === 'partial') && inspection.detectors.length > 0;
 
   const download = async () => {
@@ -99,11 +100,7 @@ function ReceivedFileRow({ file, isOwner, onDelete }: { file: ApiFile; isOwner: 
     setNotice(null);
     setError(null);
     try {
-      const access = await createReceivedFileDownload(file.id);
-      const href = contentUrl(access.url);
-      // As on the recipient's page: a refused grant is explained here, not by the browser showing the API's JSON.
-      await checkContent(href);
-      startDownload(href);
+      await downloadReceivedFile(file.id);
       setNotice(t('requests.downloadStarted', { name: file.display_name }));
     } catch (failure) {
       setError(errorMessage(failure, t));
@@ -122,7 +119,13 @@ function ReceivedFileRow({ file, isOwner, onDelete }: { file: ApiFile; isOwner: 
           <div className="flex flex-wrap items-center gap-2">
             <FileStateBadge state={file.state} />
             {file.state !== 'uploading' && file.state !== 'completing' && <InspectionStateBadge state={inspection.state} />}
+            {blockedByPolicy && <Badge variant="danger">{t('requests.dlpBlocked')}</Badge>}
           </div>
+          {blockedByPolicy && (
+            <p id={blockedId} className="mt-1 max-w-xs text-xs text-gray-700">
+              {t('requests.dlpBlockedHint')}
+            </p>
+          )}
           {file.scan_detail && <p className="mt-1 max-w-xs text-xs text-gray-700">{t(`scanDetail.${file.scan_detail}`)}</p>}
           {inspection.reasons.length > 0 && (
             <p className="mt-1 max-w-xs text-xs text-gray-700">

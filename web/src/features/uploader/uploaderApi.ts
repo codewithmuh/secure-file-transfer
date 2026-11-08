@@ -6,10 +6,15 @@
  *   `X-Link-Session` and, on an unsafe call, its CSRF token (authn-authz 1), as for the recipient's pages.
  * - **Uploads.** The M3 upload engine (`FileUpload`, `features/sender/upload.ts`) runs unchanged over the session's
  *   operations (`sessionUploadApi`): `listSessionUploadedParts` first, so a resumed upload sends only missing parts,
- *   then part URLs from `requestSessionUploadPartUrls`, the `PUT`s to storage, and `completeSessionUpload`. An
- *   uploader can't delete a file, so the engine is given no `deleteFile`.
+ *   then part URLs from `requestSessionUploadPartUrls`, the `PUT`s to storage, and `completeSessionUpload`.
+ * - **Taking a file back** (#229). While the request is open, the uploader may remove a file they declared or
+ *   uploaded (`deleteSessionUploadFile`), unless it was blocked: it stops counting toward the limits and the company
+ *   never gets it. The engine is still given no `deleteFile`: the page removes a file, never an upload by itself.
  * - **What the uploader sees.** Each file's state from `listSessionFiles`, as a few plain words: a blocked file says
- *   only "blocked by the company's policy" or "couldn't be scanned", never a finding or a scan detail (FR-12).
+ *   only "blocked by the company's policy" or "couldn't be scanned", never a finding or a scan detail (FR-12). An
+ *   unscannable file the company's policy accepts (`warning: unscannable`) reads as accepted, not as a failure (#229).
+ *   A file the API marks `blocked` (malware, a failed scan, or the company's data policy, FR-51) reads "not accepted",
+ *   with no reason: the company sees why (#221).
  */
 import type { TFunction } from 'i18next';
 import { api, type FileState, type Schema } from '@/api';
@@ -42,6 +47,11 @@ export async function addSessionUploadFile(body: FileCreate, idempotencyKey: str
   return (await api.post('/session/files', { body, headers: { 'Idempotency-Key': idempotencyKey } })).data;
 }
 
+/** `deleteSessionUploadFile`: takes a file back while the request is open; a retry of a removed file is fine (`204`). */
+export async function deleteSessionUploadFile(fileId: string): Promise<void> {
+  await api.delete('/session/files/{file_id}', { path: { file_id: fileId } });
+}
+
 /** `listSessionFiles` for an uploader: the files they sent to this request, each with its state. */
 export async function listUploadedFiles(signal?: AbortSignal): Promise<SessionFile[]> {
   return (await api.get('/session/files', { signal })).data.items;
@@ -51,9 +61,19 @@ export async function listUploadedFiles(signal?: AbortSignal): Promise<SessionFi
 
 /**
  * A file's state in the uploader's words (FR-12). Infected is "blocked by the company's policy"; unscannable and a
- * failed scan are "couldn't be scanned". No finding and no scan detail is ever shown on this side.
+ * failed scan are "couldn't be scanned", unless the company's policy accepted the unscannable file (`warning`), which
+ * is "accepted" (#229). No finding and no scan detail is ever shown on this side.
  */
-export type UploaderFileStatus = 'uploading' | 'checking' | 'received' | 'blocked' | 'unscannable' | 'rejected' | 'removed';
+export type UploaderFileStatus =
+  | 'uploading'
+  | 'checking'
+  | 'received'
+  | 'accepted'
+  | 'blocked'
+  | 'unscannable'
+  | 'rejected'
+  | 'removed'
+  | 'notAccepted';
 
 const STATUS: Record<FileState, UploaderFileStatus> = {
   uploading: 'uploading',
@@ -67,18 +87,33 @@ const STATUS: Record<FileState, UploaderFileStatus> = {
   deleted: 'removed',
 };
 
-export function uploaderFileStatus(state: FileState): UploaderFileStatus {
+export function uploaderFileStatus(state: FileState, warning?: SessionFile['warning'], blocked?: boolean): UploaderFileStatus {
+  if (blocked && state !== 'deleted') return 'notAccepted';
+  if (state === 'unscannable' && warning === 'unscannable') return 'accepted';
   return STATUS[state];
+}
+
+/** The statuses whose file the uploader may take back (#229): every file but a blocked or deleted one. */
+const REMOVABLE: ReadonlySet<UploaderFileStatus> = new Set(['uploading', 'checking', 'received', 'accepted', 'rejected']);
+
+/**
+ * Whether the uploader may remove the file: not blocked and not deleted, as the API allows. A blocked file stays for
+ * the company to review (`409 invalid_state`), whatever blocked it.
+ */
+export function uploaderMayRemove(file: Pick<SessionFile, 'state' | 'warning' | 'blocked'>): boolean {
+  return REMOVABLE.has(uploaderFileStatus(file.state, file.warning, file.blocked));
 }
 
 export const uploaderStatusVariant: Record<UploaderFileStatus, BadgeVariant> = {
   uploading: 'info',
   checking: 'info',
   received: 'success',
+  accepted: 'success',
   blocked: 'danger',
   unscannable: 'warning',
   rejected: 'danger',
   removed: 'default',
+  notAccepted: 'danger',
 };
 
 /** The file list is read again fast while the service moves a file (a completion, a scan) or this tab uploads one. */

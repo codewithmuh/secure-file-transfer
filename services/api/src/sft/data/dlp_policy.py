@@ -42,6 +42,7 @@ from sqlalchemy import (
     tuple_,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -51,6 +52,7 @@ from sft.data.models import (
     DlpDetector,
     DlpFinding,
     DlpMode,
+    DlpPatternStop,
     DlpPolicy,
     DlpRule,
     Role,
@@ -418,6 +420,65 @@ async def scan_detectors(session: AsyncSession) -> ScanDetectors:
     )
     found = tuple(ScanDetector(r.id, r.kind, r.definition_ct) for r in rows)
     return ScanDetectors(version, found if version is not None else ())
+
+
+# ---- patterns stopped by their scan-time budget (#164, #221, revision 0027) ----
+
+
+@dataclass(frozen=True, slots=True)
+class PatternStops:
+    files: int
+    last_at: datetime
+
+
+async def record_pattern_stops(session: AsyncSession, detector_ids: Sequence[UUID]) -> int:
+    """One more file stopped each of these patterns, now: as the scan worker (`sft_scan`), in the
+    transaction that records the file's result. Only the scope's tenant's own detectors count (no
+    foreign key can say so: a detector's key has its revision), so a stop never names another
+    tenant's. In detector order, so two results that share patterns lock their rows in the same
+    order."""
+    require_scope(session, *_TENANT)
+    wanted = sorted(set(detector_ids))
+    if not wanted:
+        return 0
+    own = (
+        select(
+            DlpDetector.tenant_id,
+            DlpDetector.id,
+            literal(1),
+            func.now(),
+        )
+        .where(DlpDetector.id.in_(wanted), in_scope(DlpDetector, session))
+        .distinct()
+        .order_by(DlpDetector.tenant_id, DlpDetector.id)
+    )
+    statement = pg_insert(DlpPatternStop).from_select(
+        ["tenant_id", "detector_id", "files_stopped", "last_stopped_at"], own
+    )
+    result = await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=[DlpPatternStop.tenant_id, DlpPatternStop.detector_id],
+            set_={
+                "files_stopped": DlpPatternStop.files_stopped + 1,
+                "last_stopped_at": func.now(),
+            },
+            where=in_scope(DlpPatternStop, session),
+        ).returning(DlpPatternStop.detector_id)
+    )
+    return len(result.all())
+
+
+async def pattern_stops(session: AsyncSession, detector_id: UUID) -> PatternStops | None:
+    """How many files stopped the pattern, and when last; None if none ever did."""
+    require_scope(session, *_TENANT)
+    row = (
+        await session.execute(
+            select(DlpPatternStop.files_stopped, DlpPatternStop.last_stopped_at).where(
+                DlpPatternStop.detector_id == detector_id, in_scope(DlpPatternStop, session)
+            )
+        )
+    ).first()
+    return None if row is None else PatternStops(row.files_stopped, row.last_stopped_at)
 
 
 # ---- the daily cleanup (data model 6) ----

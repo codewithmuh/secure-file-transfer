@@ -141,7 +141,7 @@ async def get_file_inspection(
         file_id=file.id,
         state=state,
         reasons=tuple(InspectionReason(r) for r in file.inspection_reasons),
-        dlp_blocked=file.dlp_blocked,  # received files only (FR-51): false until #221
+        dlp_blocked=file.dlp_blocked,  # received files only (FR-51, #221)
         engine_version=file.inspection_engine_version,
         policy_version=file.inspection_policy_version,
         inspected_at=None if state is InspectionState.PENDING else file.scanned_at,

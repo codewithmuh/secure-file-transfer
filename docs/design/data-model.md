@@ -179,7 +179,10 @@ the SHA-256 of the presented token.
 | `suppressed` | The address was on the suppression list (2.5) when the worker came to send, so nothing was sent. |
 
 The transaction that moves a transfer to `sent` sets its recipients to `queued`. Creating an upload request does the
-same for its uploader, and an unlock does it for the subject it unlocks (2.4). `createTransfer` and
+same for its uploader, and an unlock does it for the subject it unlocks (2.4). For an uploader, `bounced` covers
+every email of the request, not only the link: SES's bounce or reject of the link, a code or the blocked-file notice
+marks the request (#228), since the address is what failed. A complaint suppresses the address (2.5) and leaves the
+state as it was: the email arrived. `createTransfer` and
 `createUploadRequest` already refuse an address that is suppressed at that moment (`422 recipient_undeliverable`).
 
 **As built (#178, revision 0012).** The recipient's link and status columns are on `transfer_recipients`, with
@@ -349,7 +352,7 @@ takes the grant's end from that read of the session, so a revocation or an ended
 
 **As built (#213, revision 0020).** `files.upload_request_id` has its composite foreign key, cascading, and
 `transfer_id` is nullable, with `files_owner_check` (exactly one is set), both added `NOT VALID` and validated, and
-`files (tenant_id, upload_request_id)` indexed. `retention_until` and `dlp_blocked` (false until #221) are allowed on
+`files (tenant_id, upload_request_id)` indexed. `retention_until` and `dlp_blocked` (set by the scan worker when a DLP rule blocks the file, #221) are allowed on
 received files only, each by a check. A received file's `retention_until` and `delete_after` are set together when its
 upload is accepted, the moment `completeSessionUpload` (or reconciliation) moves it to `scanning`, from the tenant's
 `received_file_retention_days` then (the decision #213 left open: FR-13's "from each file's upload" is the
@@ -447,6 +450,7 @@ nothing of a transfer; a recipient's reaches no upload request.
 | `processed_messages` | `consumer`, `message_id`, `tenant_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work, in the message's tenant scope, first: a second copy handled at the same time waits on the first one's row and is skipped once it commits. `message_id` is text, because intake queues use their source's event ID. The consumers may only insert, with `ON CONFLICT DO NOTHING` and no conflict target, and learn of a duplicate from the row count, so none of them can read another consumer's records. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`, #185), `message_id` is a UUID derived (version 5) from the sending tenant, `mail.messageId`, the event type and the event's timestamp, not the SQS message ID, because SES can publish one event more than once. A bounce that names several recipients is one event, handled in one transaction. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. `caller_id` is a member's user (so a key survives a new sign-in), an API key or a link session. While a request runs, its transaction holds an advisory lock on the key, so a second request with it gets `409 idempotency_in_progress` instead of waiting. An expired row is overwritten by the next use of its key. `sft_api` reads and writes rows in the tenant's scope; the daily job (`sft_jobs`) finds the tenants with expired rows in system scope and deletes them in each tenant's. Not audited: the change it records is. |
 | `email_suppressions` | `id`, `tenant_id`, `email_hmac`, `hmac_key_id`, `reason` (hard_bounce, complaint), `bounce_count`, `expires_at`, `ses_released_at` | Decides what we send (abuse and rate limits 7.4). SES's tenant-level suppression lists are the backstop; the account-level list is off, because it would block an address for every tenant (ADR-0015). Every entry belongs to the tenant whose email bounced or drew the complaint; no entry applies to every tenant. An entry suppresses while `expires_at` is empty or in the future. **A hard bounce** suppresses the address for that tenant for 90 days (`expires_at`, `bounce_count = 1`); after that one email may go out again, and if it hard-bounces too, `bounce_count` becomes 2 and `expires_at` is cleared, so the address stays suppressed until a tenant admin clears it. **A complaint** suppresses the address for that tenant with no expiry, until a tenant admin clears it. **Clearing** (`clearEmailSuppression`, which takes the address in the request body) sets `expires_at` to now and is audited with the admin's name. **An ended entry**, expired or cleared, stays as a marker for 365 days, so a second bounce is recognised, then the daily job deletes it. The first time the notification worker sends to an address whose entry has ended, it removes the address from the tenant's SES list first (it holds the address only then) and sets `ses_released_at`. As built (#217): clearing ends the tenant's live entries for the address (`sft_api` may update only `expires_at` and `updated_at`, revision 0023) and writes `email_suppression.cleared` with the entry as its target; "ended since its last release" is `expires_at <= now()` and `ses_released_at` empty or older than `updated_at`, so an entry that bounces again and ends again is released again. The release is SES's `DeleteSuppressedDestination` with the tenant's name, before a link or code email, recorded with `email_suppression.released`. `email_hmac` is the address's pseudonym under the `email-hmac` keyring, never the address. A lookup computes the pseudonym under every key version that still has rows and re-keys a match under an old version to the active one, and a version leaves the keyring only when no row uses it (encryption and keys 6.5). Unique on `(tenant_id, email_hmac)`. |
+| `notice_windows` | `id`, `tenant_id`, `notice` (dlp_policy_changed, dlp_approval_digest, dlp_no_eligible_approver), `user_id` (the approver, for the digest only), `window_started_at`, `sent`, `changes`, `changed_at`, `due_at` | The notification worker's windows of coalesced and capped notices (#230, revision 0028; abuse and rate limits 7.1; architecture 4.6). Unique on `(tenant_id, notice, user_id)` with nulls not distinct: one row per tenant and kind, and one per approver for the digest. `changes` holds the kinds of DLP policy change waiting for the coalesced notice, `changed_at` the latest, `due_at` when the notice or the digest is due; `sent` counts the emails of the window that began at `window_started_at`. Only `sft_notify` reads and writes it, in its tenant's scope; nothing deletes a row (a tenant has two, plus one per approver). Not audited: a window is bookkeeping of emails about changes audited when they were made, and every email is audited (`email.sent`). |
 | `tenant_usage` | `tenant_id` (PK), `bytes_reserved` | The storage quota (abuse and rate limits 6.1). Declaring a file reserves its declared size with one conditional update, `bytes_reserved + size <= quota`. The reservation is released once, when the file becomes `rejected` or, if it never was, when it is deleted, in the transaction that records it. The quota (2 TB) comes from deploy configuration and is the same for every tenant; v1 has no per-tenant overrides (section 10). |
 
 **Fail-closed audit** (NFR-15, architecture 5.2). A change to an audited table can't commit without an audit event in
@@ -582,8 +586,8 @@ with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` 
   `sft_operator` inserts a new tenant's policy and rules; `sft_scan` and `sft_jobs` read them (the scan worker's
   detectors and version, the decision of #219); `sft_jobs` deletes retired revisions, finding them across tenants in
   system scope, and reads `dlp_findings (tenant_id, detector)` to know which detectors findings still name.
-- Until #221: monitor mode, `received` rules, two approvers, the 24-hour window and patterns are refused with
-  `422 validation_failed` by the API, not by a check, so #221 needs no migration for them.
+- Monitor mode, `received` rules, two approvers, the 24-hour window and patterns were refused by the API until #221,
+  which accepts them (below); no check changed.
 
 **As built (#219, revision 0025).** `dlp_decisions`, `dlp_decision_rules`, `dlp_confirmations` and
 `dlp_known_domains` exist, with `transfers.dlp_decision_id`.
@@ -624,6 +628,41 @@ with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` 
   `state`. No system role reads a justification, a comment or a decision. Both tables have the audit trigger.
 - Eligible approvers are read through `users (tenant_id) WHERE dlp_approver AND status = 'active'`, which revision
   0004 made.
+
+**As built (#221, revision 0027; DLP-6).**
+
+- `dlp_findings.transfer_id`: a transfer's message findings (FR-50), written by the API at `createTransfer`, counts
+  only (no `detail_ct`). `file_id` is nullable, and exactly one of the two is set (`dlp_findings_subject_check`, added
+  `NOT VALID` and validated); a message's findings are unique per detector (a unique index built `CONCURRENTLY`). They
+  go with their transfer (`ON DELETE CASCADE`). The decision adds them to a `content` rule's count as a file's.
+- **The sender's 24 hours** (FR-49): a rule with `include_sender_24h` (only a `content` rule for sent files) adds the
+  findings of the sender's other transfers that moved to `sent` in the 24 hours before the decision: their counted
+  files' and their messages'. Read through the partial index `transfers (tenant_id, created_by, sent_at) WHERE sent_at
+  IS NOT NULL` (section 5), as `sft_api`, `sft_scan` or `sft_jobs`, which read `dlp_findings.transfer_id` now.
+- **Received files** (FR-51): the scan worker decides in the transaction that records a received file's result, if the
+  file would be shareable and the tenant has a live, enabled rule for received files. The decision has `file_id`, no
+  recipients (both counts 0); a `block` in enforce mode sets `files.dlp_blocked` (`sft_scan` may now read and set it)
+  and tags the object `scan=dlp_blocked`, which the API's read condition refuses. A tenant without such a rule gets no
+  decision for its received files. `dlp.decided` (target the file) and `dlp.rule_matched` record it.
+- **Monitor mode** (FR-52): every decision is written with `enforced = false`; a transfer is sent and a received file
+  never blocked, whatever the outcome.
+- **Two approvers** (FR-44): `approvals_required = 2` is accepted on a `require_approval` rule while the tenant has
+  more than two active approvers (the sender may be one); the request then waits for two different approvers.
+- `dlp_pattern_stops`: `(tenant_id, detector_id)`, `files_stopped`, `last_stopped_at`: the files that stopped a tenant
+  pattern for its scan-time budget (#164, detectors 5). The scan worker upserts it with `dlp.pattern_budget_exceeded`
+  in the transaction that records the file, only for its own tenant's detectors (an `INSERT … SELECT` from
+  `dlp_detectors`, since no key can name a detector without its revision). `sft_api` reads it for `getDlpDetector`. A
+  row outlives the detector's revisions; it holds IDs and counts only. Audited.
+- **Received rules' checks** are the API's (`422` with a pointer): `allow_and_record` or `block`, `content` or
+  `not_inspected`, scope `any`, no 24-hour window. The database checks of revision 0024 still hold too.
+
+**As built (#222; DLP-7).** No migration: the report reads the indexes above. **Decisions by recipient domain** look
+the domains up at read time from the transfers' recipients (`transfer_recipients.domain`), each domain counted once
+per decision, since a decision stores only the counts of untrusted and new recipients; a purged transfer's decisions
+drop out of that breakdown alone. Decisions by sender count transfers only (a received file has no sender). "Files not
+fully inspected" counts the files scanned in the range whose inspection was `partial` or `not_inspected`, each reason
+once per file. The policy changes are counted from the audit log (`dlp_policy.updated`, `dlp_rule.*`,
+`dlp_detector.*`).
 
 ## 3. State machines
 

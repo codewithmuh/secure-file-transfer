@@ -214,6 +214,7 @@ REGISTRY: Final[tuple[Permission, ...]] = (
             "requestSessionUploadPartUrls",
             "listSessionUploadedParts",
             "completeSessionUpload",
+            "deleteSessionUploadFile",
         ),
         uploader=True,
     ),

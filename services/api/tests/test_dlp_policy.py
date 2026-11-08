@@ -349,17 +349,13 @@ async def test_a_detector_a_live_rule_uses_and_a_built_in_one_cant_be_deleted(
 @pytest.mark.parametrize(
     ("path", "body", "pointer"),
     [
-        ("/v1/dlp/policy", {"mode": "monitor"}, "#/mode"),
         ("/v1/dlp/policy", {"trusted_domains": ["com"]}, "#/trusted_domains/0"),
         ("/v1/dlp/policy", {"trusted_domains": ["bad_domain.example"]}, "#/trusted_domains/0"),
         ("/v1/dlp/policy", {"approval_timeout": "PT30M"}, "#/approval_timeout"),
-        ("/v1/dlp/rules", {"direction": "received", "action": "block"}, "#/direction"),
+        # #221: a rule for received files tests content or inspection only.
+        ("/v1/dlp/rules", {"direction": "received", "action": "block"}, "#/condition"),
         ("/v1/dlp/rules", {"include_sender_24h": True}, "#/include_sender_24h"),
-        (
-            "/v1/dlp/rules",
-            {"approvals_required": 2, "action": "require_approval"},
-            "#/approvals_required",
-        ),
+        ("/v1/dlp/rules", {"approvals_required": 2}, "#/approvals_required"),
         ("/v1/dlp/rules", {"condition": "content"}, "#/detectors"),
         ("/v1/dlp/rules", {"condition": "content", "detectors": ["jp_nothing"]}, "#/detectors/0"),
         (
@@ -368,7 +364,7 @@ async def test_a_detector_a_live_rule_uses_and_a_built_in_one_cant_be_deleted(
             "#/detectors/0",
         ),
         ("/v1/dlp/rules", {"condition": "not_inspected"}, "#/reasons"),
-        ("/v1/dlp/detectors", {"kind": "pattern", "pattern": "[0-9]+"}, "#/kind"),
+        ("/v1/dlp/detectors", {"kind": "pattern"}, "#/pattern"),
         ("/v1/dlp/detectors", {"kind": "keywords"}, "#/keywords"),
         (
             "/v1/dlp/detectors",
@@ -377,7 +373,7 @@ async def test_a_detector_a_live_rule_uses_and_a_built_in_one_cant_be_deleted(
         ),
     ],
 )
-async def test_what_218_doesnt_accept_yet_is_refused(
+async def test_what_the_policy_doesnt_accept_is_refused(
     migrated_db: ScratchDatabase, path: str, body: dict[str, object], pointer: str
 ) -> None:
     tenant = seed_tenant(migrated_db)

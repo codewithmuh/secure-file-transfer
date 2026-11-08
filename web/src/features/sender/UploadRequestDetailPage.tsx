@@ -21,7 +21,8 @@ type Revocation = ReturnType<typeof useRevocation>;
 
 /**
  * One upload request (#212, #213; UC-2, FR-10 to FR-13, FR-20, NFR-14): its state and expiry, where the uploader's
- * link email stands, whether the uploader verified or is locked, and the files received. Polled while open. The
+ * link email stands (`bounced` too when SES reports a bounce of any of the request's emails, #228), whether the
+ * uploader verified or is locked, and the files received. Polled while open. The
  * member who created it can revoke it (shown as done and retried in the background on `503`, as revoking a transfer
  * is: `revocation.ts`), unlock a locked uploader (a new link is emailed), and download or delete what arrived. A tenant
  * admin sees another member's request as metadata only.
@@ -106,13 +107,7 @@ function RequestView({ request }: { request: UploadRequest }) {
             <div>
               <dt className="text-gray-500">{t('requests.linkEmail')}</dt>
               <dd className="mt-0.5">
-                <DeliveryStateBadge state={request.delivery_state} />
-                {request.notified_at && (
-                  <div className="mt-1 text-xs text-gray-600">{t('delivery.notifiedAt', { date: date(request.notified_at) })}</div>
-                )}
-                {EXPLAINED_DELIVERY_STATES.includes(request.delivery_state) && (
-                  <p className="mt-1 text-xs text-gray-700">{t(`deliveryExplain.${request.delivery_state}`)}</p>
-                )}
+                <UploaderDelivery request={request} date={date} />
               </dd>
             </div>
             <div>
@@ -208,6 +203,32 @@ function RevokeUploadRequest({ revocation }: { revocation: Revocation }) {
 }
 
 /** What the page says about the request's end: revoked (confirmed or not, with a retry), or expired. */
+/**
+ * Where the uploader's emails stand (FR-7): the link email's delivery state, when it went out, and, for a bounce or a
+ * suppressed address, what it means in the uploader's words (#228): any email of the request may have bounced, the
+ * link, a code or the blocked-file notice, so the address is the thing to check.
+ */
+export function UploaderDelivery({
+  request,
+  date,
+}: {
+  request: Pick<UploadRequest, 'delivery_state' | 'notified_at'>;
+  date: (value: string) => string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <>
+      <DeliveryStateBadge state={request.delivery_state} />
+      {request.notified_at && (
+        <div className="mt-1 text-xs text-gray-600">{t('delivery.notifiedAt', { date: date(request.notified_at) })}</div>
+      )}
+      {EXPLAINED_DELIVERY_STATES.includes(request.delivery_state) && (
+        <p className="mt-1 text-xs text-gray-700">{t(`requests.deliveryExplain.${request.delivery_state}`)}</p>
+      )}
+    </>
+  );
+}
+
 export function RequestEndBanner({
   request,
   revocation,

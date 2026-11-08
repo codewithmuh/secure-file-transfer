@@ -71,6 +71,12 @@ describe('received files: who may download and delete (#213, UC-3, FR-13)', () =
     expect(receivedFileActions({ state: 'deleted', shareable: false }, true)).toEqual({ download: false, remove: false });
   });
 
+  it('never offers to download a file a DLP rule for received files blocked, but lets the owner delete it (#221, FR-51)', () => {
+    const blocked = { state: 'clean' as const, shareable: true, inspection: { dlp_blocked: true } };
+    expect(receivedFileActions(blocked, true)).toEqual({ download: false, remove: true });
+    expect(receivedFileActions({ ...blocked, inspection: { dlp_blocked: false } }, true)).toEqual({ download: true, remove: true });
+  });
+
   it('gives an admin looking at another member\'s request the metadata only', () => {
     expect(receivedFileActions({ state: 'clean', shareable: true }, false)).toEqual({ download: false, remove: false });
   });

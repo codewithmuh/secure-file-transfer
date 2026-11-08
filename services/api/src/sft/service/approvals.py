@@ -27,7 +27,7 @@ remembers it.
   `409 invalid_state`; then `409 transfer_revoked`, `409 transfer_expired` and `409 invalid_state`
   for a request that isn't pending. Then the decision (`dlp_approval_decisions`, the comment sealed
   with `sft.service.fields`, one per approver):
-  - an approval that gives the request its `approvals_required` (one, or two with #221) makes it
+  - an approval that gives the request its `approvals_required` (one, or two, FR-44) makes it
     `approved` and sends the transfer as the evaluation does (`sft.service.evaluation.send`:
     counters, recipients queued, domains known, `transfer.sent`, the recipients' emails); the
     sender is emailed `dlp_approval_decided`. Short of that, it stays `pending`;
@@ -467,7 +467,7 @@ async def _record(
         },
     )
     if not complete:
-        return  # a rule that needs two approvers waits for the second (FR-44, #221)
+        return  # a rule that needs two approvers waits for the second (FR-44)
     await dlp_approvals.end_request(session, request.id, to=ApprovalState.APPROVED, ended_at=now)
     counted = await files.counted_states(session, locked.id)
     await send(session, locked, [f.id for f in counted])

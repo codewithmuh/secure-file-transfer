@@ -17,7 +17,7 @@ import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -31,7 +31,16 @@ from member_fixtures import (
     seed_user,
     session_caller,
 )
-from notify_fixtures import WEB_APP_URL, AdmitAll, Sent, drain, message, notifier, pending
+from notify_fixtures import (
+    WEB_APP_URL,
+    AdmitAll,
+    Sent,
+    drain,
+    elapse,
+    message,
+    notifier,
+    pending,
+)
 from pg import ScratchDatabase
 from sft.core.errors import RateLimited
 from sft.core.settings import MailSettings
@@ -558,10 +567,13 @@ async def test_a_dlp_policy_change_emails_every_active_admin_naming_the_change(w
     second = seed_user(w.db, w.tenant.id, role="admin")
     seed_user(w.db, w.tenant.id, role="admin", status="deactivated")
     sent = Sent()
-    done = await notifier(w.database, sent).handle(
-        message(w.tenant.id, "dlp_policy.changed.rule_added")
-    )
+    worker = notifier(w.database, sent)
+    done = await worker.handle(message(w.tenant.id, "dlp_policy.changed.rule_added"))
     assert done is Done.PROCESSED
+    # Coalesced (#230): the notice waits for its 10 minutes.
+    assert sent.emails == []
+    elapse(w.db, w.tenant.id, timedelta(minutes=10))
+    assert await drain(worker, w.db, w.tenant.id) == [Done.PROCESSED]
     to = {
         email
         for (email,) in w.db.sql(
@@ -582,7 +594,10 @@ async def test_an_admin_api_change_reaches_the_admins_through_the_outbox(w: Worl
         )
         assert response.status_code == 201, response.text
     sent = Sent()
-    assert await drain(notifier(w.database, sent), w.db, w.tenant.id) == [Done.PROCESSED]
+    worker = notifier(w.database, sent)
+    assert await drain(worker, w.db, w.tenant.id) == [Done.PROCESSED]
+    elapse(w.db, w.tenant.id, timedelta(minutes=10))  # the coalesced notice is due (#230)
+    assert await drain(worker, w.db, w.tenant.id) == [Done.PROCESSED]
     [email] = sent.emails
     assert email.email_type == "dlp_policy_changed"
     assert "A detector or keyword list was added" in email.text

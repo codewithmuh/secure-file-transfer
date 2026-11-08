@@ -332,6 +332,8 @@ export const sessionFiles: Schema<'SessionFileList'> = {
 
 export const uploadRequestId = '0190c0de-0000-7000-8000-0000000000b1';
 export const receivedFindingsFileId = '0190c0de-0000-7000-8000-0000000000c2';
+/** A received file a DLP rule for received files blocked (#221). */
+export const dlpBlockedFileId = '0190c0de-0000-7000-8000-0000000000c7';
 
 const uploadRequest = (id: string, extra: Partial<Schema<'UploadRequest'>> = {}): Schema<'UploadRequest'> => ({
   id,
@@ -421,7 +423,10 @@ const received = (id: string, name: string, state: ApiFile['state'], extra: Part
     ...extra,
   });
 
-/** What arrived: a clean file with findings, one allowed though unscannable (FR-18), one infected, one still scanning. */
+/**
+ * What arrived: a clean file with findings, one allowed though unscannable (FR-18), one infected, one still scanning,
+ * and one a DLP rule for received files blocked (FR-51, #221).
+ */
 export const receivedFiles: Schema<'FileList'> = {
   items: [
     received('0190c0de-0000-7000-8000-0000000000c1', 'contract.pdf', 'clean'),
@@ -439,6 +444,10 @@ export const receivedFiles: Schema<'FileList'> = {
     received('0190c0de-0000-7000-8000-0000000000c5', 'photos.zip', 'scanning', {
       retention_until: null,
       inspection: { state: 'pending', reasons: [], dlp_blocked: false, detectors: [] },
+    }),
+    received(dlpBlockedFileId, 'customers.csv', 'clean', {
+      shareable: false,
+      inspection: { state: 'inspected', reasons: [], dlp_blocked: true, detectors: ['jp_my_number'] },
     }),
   ],
 };
@@ -470,7 +479,10 @@ export const uploaderSession = (locale: Schema<'Locale'>): Schema<'LinkSession'>
   },
 });
 
-/** The uploader's files: received, blocked, unscannable and one left uploading by an earlier visit. */
+/**
+ * The uploader's files: received, blocked, unscannable, one left uploading by an earlier visit, and one the company's
+ * checks didn't accept (`blocked`, no reason; #221).
+ */
 export const uploaderFiles: Schema<'SessionFileList'> = {
   items: [
     { id: '0190c0de-0000-7000-8000-0000000000c1', display_name: 'contract.pdf', content_type: 'application/pdf', size: 10_485_760, state: 'clean' },
@@ -484,6 +496,7 @@ export const uploaderFiles: Schema<'SessionFileList'> = {
       state: 'uploading',
       upload: { part_size: 5_242_880, part_count: 2 },
     },
+    { id: dlpBlockedFileId, display_name: 'customers.csv', content_type: 'text/csv', size: 1_048_576, state: 'clean', blocked: true },
   ],
 };
 
@@ -611,6 +624,26 @@ export const keywordList: Schema<'DlpDetector'> = {
   created_at: '2026-11-05T00:00:00Z',
 };
 
+export const patternId = 'custom:0190c0de-0000-7000-8000-0000000000c8';
+/** The pattern's address on the admin page, encoded as the app encodes it. */
+export const patternPath = encodeURIComponent(patternId);
+
+/** A pattern (#221; FR-39) that files stopped for its scan-time budget, as `getDlpDetector` shows it. */
+export const patternDetector: Schema<'DlpDetector'> = {
+  id: patternId,
+  kind: 'pattern',
+  name: 'Invoice numbers',
+  enabled: true,
+  revision: 3,
+  pattern: 'INV-[0-9]{6}',
+  context_keywords: ['invoice', '請求書'],
+  case_insensitive: true,
+  min_length: 10,
+  created_at: '2026-11-05T00:00:00Z',
+  budget_exceeded_files: 2,
+  budget_exceeded_last_at: '2026-11-07T03:00:00Z',
+};
+
 export const dlpDetectors: Schema<'DlpDetectorList'> = {
   engine_version: '1.0.0',
   items: [
@@ -618,7 +651,20 @@ export const dlpDetectors: Schema<'DlpDetectorList'> = {
     builtIn('payment_card', 'Payment card number', 'Card numbers that pass the Luhn check.'),
     builtIn('cloud_credential', 'Cloud credential', 'Access keys of the major cloud providers.'),
     keywordList,
+    { ...patternDetector, budget_exceeded_files: undefined, budget_exceeded_last_at: undefined },
   ],
+};
+
+/** The policy in monitor mode (#221; FR-52): everything is recorded, nothing held. */
+export const dlpPolicyMonitor: Schema<'DlpPolicy'> = { ...dlpPolicy, mode: 'monitor' };
+
+/** What `testDlpDetectors` finds in the sample text (#221; FR-56): masked previews, as findings are. */
+export const detectorTestResult: Schema<'DlpDetectorTestResult'> = {
+  matches: [
+    { detector: 'draft', confidence: 'high', line: 2, preview: 'INV-••••12' },
+    { detector: 'draft', confidence: 'medium', line: 5, preview: 'INV-••••90' },
+  ],
+  truncated: false,
 };
 
 const rule = (id: string, name: string, extra: Partial<Schema<'DlpRule'>>): Schema<'DlpRule'> => ({
@@ -642,6 +688,8 @@ const rule = (id: string, name: string, extra: Partial<Schema<'DlpRule'>>): Sche
 });
 
 export const myNumberRuleId = '0190c0de-0000-7000-8000-0000000000d1';
+/** A rule for received files (#221; FR-51). */
+export const receivedRuleId = '0190c0de-0000-7000-8000-0000000000d6';
 
 export const dlpRules: Schema<'DlpRuleList'> = {
   policy_version: 12,
@@ -658,6 +706,14 @@ export const dlpRules: Schema<'DlpRuleList'> = {
     }),
     rule('0190c0de-0000-7000-8000-0000000000d4', 'Credentials', { detectors: ['cloud_credential'], action: 'block', enabled: false }),
     rule('0190c0de-0000-7000-8000-0000000000d5', 'New recipient domain', { condition: 'new_domain' }),
+    rule(receivedRuleId, 'Uploads with My Numbers', { direction: 'received', detectors: ['jp_my_number'], action: 'block' }),
+    rule('0190c0de-0000-7000-8000-0000000000d7', 'Invoices to outsiders', {
+      detectors: [patternId],
+      include_sender_24h: true,
+      recipient_scope: 'untrusted',
+      action: 'require_approval',
+      approvals_required: 2,
+    }),
   ],
 };
 
@@ -745,11 +801,17 @@ const requestSummary = (
   rule_names: ['Project names to outsiders'],
 });
 
+/** What the transfer's message holds (#221; FR-50). */
+const messageFindings = (): Schema<'DlpFinding'>[] => [
+  { detector: keywordListId, detector_name: 'Project names', count_low: 0, count_medium: 0, count_high: 1, details_visible: false },
+];
+
 const transferDlp = (
   of: Transfer,
   outcome: Schema<'DlpOutcome'>,
   rules: ReturnType<typeof matchedRule>[],
   request: Schema<'ApprovalRequestSummary'> | null = null,
+  inMessage: Schema<'DlpFinding'>[] = [],
 ): Schema<'TransferDlp'> => ({
   transfer_id: of.id,
   state: of.state,
@@ -773,13 +835,19 @@ const transferDlp = (
     inspection: f.inspection,
     findings: f.inspection.detectors.length > 0 ? findings() : [],
   })),
-  message_findings: [],
+  message_findings: inMessage,
   approval_request: request,
 });
 
-export const warnedDlp = transferDlp(warned, 'warn', [matchedRule(0, 'warn'), matchedRule(4, 'warn', 'new_domain')]);
+export const warnedDlp = transferDlp(warned, 'warn', [matchedRule(0, 'warn'), matchedRule(4, 'warn', 'new_domain')], null, messageFindings());
 export const approvalNeededDlp = transferDlp(approvalNeeded, 'require_approval', [matchedRule(1, 'require_approval'), matchedRule(0, 'warn')]);
-export const pendingDlp = transferDlp(pending, 'require_approval', [matchedRule(1, 'require_approval')], requestSummary(pendingRequestId, 'pending', pendingId));
+export const pendingDlp = transferDlp(
+  pending,
+  'require_approval',
+  [matchedRule(1, 'require_approval')],
+  requestSummary(pendingRequestId, 'pending', pendingId),
+  messageFindings(),
+);
 export const blockedDlp = transferDlp(blocked, 'block', [matchedRule(3, 'block'), matchedRule(0, 'warn')]);
 export const rejectedDlp = transferDlp(
   rejected,
@@ -847,4 +915,83 @@ export const approvalQueue: Schema<'ApprovalRequestPage'> = {
     { ...requestSummary('0190c0de-0000-7000-8000-000000000054', 'pending', blockedId, otherMemberId), rule_names: ['My Numbers'] },
   ],
   next_cursor: null,
+};
+
+// ---- DLP reports (#222; FR-55) ----
+
+const reportDay = (date: string, warn: number, block: number, none: number) => ({
+  date,
+  by_outcome: [
+    { key: 'none', count: none },
+    { key: 'warn', count: warn },
+    { key: 'block', count: block },
+  ],
+});
+
+/** A month of decisions: by outcome and day, rule (one retired), detector, sender, domain, approver and reason. */
+export const dlpReport: Schema<'DlpReport'> = {
+  from: '2026-10-09T00:00:00Z',
+  to: '2026-11-08T05:00:00Z',
+  policy_changes: 4,
+  decisions_by_outcome: [
+    { key: 'none', count: 40 },
+    { key: 'allow_and_record', count: 3 },
+    { key: 'warn', count: 9 },
+    { key: 'require_approval', count: 2 },
+    { key: 'block', count: 3 },
+  ],
+  decisions_by_day: [
+    reportDay('2026-10-12', 2, 0, 8),
+    reportDay('2026-10-20', 4, 1, 12),
+    reportDay('2026-11-02', 3, 2, 20),
+  ],
+  matches_by_rule: [
+    { key: myNumberRuleId, count: 9 },
+    { key: dlpRules.items[1]?.id ?? myNumberRuleId, count: 2 },
+    { key: '0190c0de-0000-7000-8000-0000000000df', count: 1 },
+  ],
+  matches_by_detector: [
+    { key: 'jp_my_number', count: 14 },
+    { key: keywordListId, count: 5 },
+    { key: patternId, count: 2 },
+  ],
+  decisions_by_sender: [
+    { key: memberId, count: 12 },
+    { key: otherMemberId, count: 5 },
+  ],
+  decisions_by_recipient_domain: [
+    { key: 'newcorp.example', count: 7 },
+    { key: 'partner.example', count: 4 },
+  ],
+  approvals_by_approver: [
+    { approver_id: otherMemberId, approved: 3, rejected: 1, median_seconds_to_decide: 5400 },
+    { approver_id: memberId, approved: 1, rejected: 0, median_seconds_to_decide: null },
+  ],
+  not_inspected_by_reason: [
+    { key: 'encrypted', count: 3 },
+    { key: 'too_large', count: 1 },
+  ],
+};
+
+/** Decisions for a transfer and for a received file, one recorded in monitor mode only. */
+export const dlpDecisionPage: Schema<'DlpDecisionPage'> = {
+  items: [
+    { ...(warnedDlp.decision as Schema<'DlpDecision'>) },
+    {
+      id: '0190c0de-0000-7000-8000-000000000981',
+      transfer_id: null,
+      file_id: dlpBlockedFileId,
+      policy_version: 12,
+      mode: 'monitor',
+      outcome: 'block',
+      enforced: false,
+      untrusted_recipients: 0,
+      new_domains: 0,
+      matched_rules: [
+        { rule_id: receivedRuleId, revision: 1, name: 'Uploads with My Numbers', condition: 'content', action: 'block', matched_count: 2, threshold: 1 },
+      ],
+      decided_at: '2026-11-02T04:00:00Z',
+    },
+  ],
+  next_cursor: 'next-page',
 };

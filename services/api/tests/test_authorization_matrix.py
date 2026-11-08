@@ -611,6 +611,11 @@ EXPECTED: dict[str, dict[str, int]] = {
     "getApprovalRequest": approval_read_row(item=True),
     "approveTransfer": decide_row(step_up=True),
     "rejectTransfer": decide_row(step_up=False),
+    # DLP-6 and DLP-7 (#221, #222): sample-text tests are the policy's admins'; the reports are
+    # read as the audit log is, by an admin or a key with `audit:read`.
+    "testDlpDetectors": dlp_row(200, step_up=False, item=False),
+    "listDlpDecisions": audit_row(200, step_up=False),
+    "getDlpReport": audit_row(200, step_up=False),
 }
 
 # The policy operations, which need the admin role; a transfer's decision (#219) is the owner's.
@@ -652,6 +657,7 @@ COVERED_BY_RECEIVED_FILE_TESTS = frozenset(
         "requestSessionUploadPartUrls",
         "listSessionUploadedParts",
         "completeSessionUpload",
+        "deleteSessionUploadFile",
         "createReceivedFileDownload",
         "getReceivedFileDownloadContent",
     }
@@ -780,6 +786,9 @@ def request_for(operation: str, world: World) -> tuple[str, str, dict[str, objec
         "getApprovalRequest": ("GET", approval, None),
         "approveTransfer": ("POST", f"{approval}/approve", {}),
         "rejectTransfer": ("POST", f"{approval}/reject", {"comment": "Not this one"}),
+        "testDlpDetectors": ("POST", "/v1/dlp/detector-tests", {"text": "Sample text"}),
+        "listDlpDecisions": ("GET", "/v1/dlp/decisions", None),
+        "getDlpReport": ("GET", "/v1/dlp/report", None),
     }[operation]
 
 

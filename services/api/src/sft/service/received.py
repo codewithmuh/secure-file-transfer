@@ -25,9 +25,18 @@ the request's tenant scope, whose quota, policy and idempotency keys they use.
   `received_file_retention_days` from now (FR-13), and its scan message. A revocation rejects every
   open upload at once (`sft.service.uploads.reject_request_uploads`), so parts sent later are
   never assembled (NFR-6).
+- **Removal** (`deleteSessionUploadFile`, #229): the uploader takes back a file they declared or
+  uploaded while the request is open (`410` once it ended), under the request's row lock, which a
+  completion and a member's grant take too. The file is removed as the member's early delete
+  removes it (`removed_at`, `delete_after` now, its reservation released), so it no longer counts
+  towards the limits and the deletion job deletes it, aborting an open upload. A shareable file
+  still counted in the request's next notice is taken off it (`withdraw_arrival`). A blocked file
+  (infected, failed, unscannable and not allowed, inspection failed or blocked by a DLP rule) is
+  the company's to see and stays: `409 invalid_state`, as for a file already deleted. Removing a
+  removed file again changes nothing, so a retry gets `204`.
 - **Audited** as the uploader (actor type `uploader`, its request's ID): `file.added`,
   `file.part_urls_issued`, `file.completion_started`, `file.upload_incomplete`, `file.uploaded`,
-  `file.rejected`.
+  `file.rejected`, `file.removed` (reason `uploader_removed`).
 
 **The member's side.** `listUploadRequestFiles` lists a request's files as `getUploadRequest`
 reaches it: Own for a member, Tenant for an admin acting as one and an API key with
@@ -64,10 +73,18 @@ from sft.data import audit, files, findings, upload_requests, usage
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
 from sft.data.database import Database
-from sft.data.models import File, FileState, StorageClass, UploadRequest, UploadRequestState
+from sft.data.models import (
+    File,
+    FileState,
+    InspectionState,
+    StorageClass,
+    UploadRequest,
+    UploadRequestState,
+)
 from sft.data.scope import Scope, SubjectKind
 from sft.service import fields, scan_timing, uploads
 from sft.service.caller import Caller, CallerKind
+from sft.service.evaluation import is_blocked, is_shareable
 from sft.service.idempotency import IdempotentRequest, Outcome, once, replay
 from sft.service.links import SessionFile, uploader_file
 from sft.service.objects import PART_URL_SECONDS, ObjectStore, ObjectStoreError
@@ -111,6 +128,8 @@ UPLOAD_REQUESTS_WRITE: Final = "upload_requests:write"
 class RemoveReason(StrEnum):
     EARLY_DELETE = "early_delete"
     """FR-13: the member deleted a received file before its retention ended."""
+    UPLOADER_REMOVED = "uploader_removed"
+    """#229: the uploader took the file back while the request was open."""
 
 
 def _too_many_files() -> Unprocessable:
@@ -550,6 +569,67 @@ async def complete_session_upload(
     if error is None:  # pragma: no cover - every branch above sets one or returns
         raise RuntimeError("completion ended without a result")
     raise error
+
+
+def _uploader_may_remove(file: File) -> bool:
+    """A file the uploader may take back: not deleted and not blocked (module docstring)."""
+    if file.state == FileState.DELETED.value or file.dlp_blocked:
+        return False
+    state, inspection = FileState(file.state), InspectionState(file.inspection_state)
+    return not is_blocked(state, file.unscannable_allowed, inspection)
+
+
+async def delete_session_file(
+    database: Database, caller: Caller, file_id: UUID, *, origin: Origin, now: datetime
+) -> None:
+    """`deleteSessionUploadFile`: the uploader removes one of their files while the request is
+    open (module docstring, #229)."""
+    who = _uploader(caller, "deleteSessionUploadFile", now)
+    async with database.transaction(who.scope) as session:
+        row = await _request(session, who.request_id, lock=True)
+        try:
+            file = await files.get_request_file(session, who.request_id, file_id)
+        except NotFoundError:
+            raise NotFound from None
+        if file.removed_at is not None:
+            return  # removed already: a retry, or the member's early delete
+        closed = _request_open(row, now)
+        if closed is not None:
+            raise closed
+        if not _uploader_may_remove(file):
+            raise Conflict(
+                "invalid_state",
+                "This file was blocked, so it stays for the company to review.",
+                current_state=file.state,
+            )
+        removed = await files.remove_received_file(session, file.id)
+        if removed is None:  # pragma: no cover - read above under the request's row lock
+            return
+        if file.state != FileState.REJECTED.value:
+            await usage.release_storage(session, file.declared_size)
+        shareable = is_shareable(
+            FileState(file.state),
+            file.unscannable_allowed,
+            InspectionState(file.inspection_state),
+        )
+        withdrawn = False
+        if shareable and file.scanned_at is not None:
+            withdrawn = await upload_requests.withdraw_arrival(
+                session, who.request_id, settled_at=file.scanned_at
+            )
+        await audit.record(
+            session,
+            action="file.removed",
+            actor=caller.actor(),
+            target=Target(FILE, file.id),
+            origin=origin,
+            details={
+                "upload_request_id": who.request_id,
+                "state": FileState(file.state),
+                "reason": RemoveReason.UPLOADER_REMOVED,
+                "notice_withdrawn": withdrawn,
+            },
+        )
 
 
 # ---- the member's side ----
