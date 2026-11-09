@@ -44,6 +44,10 @@ services:
       OIDC_REDIRECT_URI: http://localhost:8000/v1/auth/callback
       OIDC_LOGOUT_URL: http://localhost:8180/realms/sft/protocol/openid-connect/logout
       OIDC_PROVIDER_NAME: local-keycloak
+      # Tenant SSO (#231): Keycloak takes the provider as `kc_idp_hint`; the seed proves the local
+      # tenant's domain itself, so this DNS stand-in only serves domains an admin claims by hand.
+      OIDC_IDP_HINT_PARAMETER: kc_idp_hint
+      SSO_DNS_OVERRIDES: '{}'
       # K_csrf: one obviously fake key, 32 bytes of "x" in base64.
       CSRF_KEYRING: '[{"id":"local","state":"active","key":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="}]'
       # The email-hmac keyring (#145), per-address rate limits' pseudonyms: 32 bytes of "y".
@@ -72,6 +76,9 @@ services:
       ENVIRONMENT: local
       # API keys (#215): local keys are `sft_dev_…`, and their hashes exist only in this database.
       API_KEY_ENVIRONMENT: dev
+      # Field encryption (#236, #233): the in-process KMS stand-in, which binds the encryption
+      # context as KMS does; in AWS the fields key's alias, `alias/sft/<env>/fields`.
+      FIELDS_KMS_KEY_ID: local
     # 8000: the API. 8001: /healthz, /readyz and /metrics, which the cloud load balancer never routes.
     ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]
     stop_grace_period: 30s # more than the 20 s drain; Compose's default 10 s would SIGKILL mid-drain
@@ -154,6 +161,8 @@ services:
       CLAMD_HOST: clamd
       INSPECTOR_HOST: inspector
       SCAN_LARGE_POOL_SIZE: "2"
+      # DLP data keys (#233): the KMS stand-in, allowing this worker `dlp-dek` only, as the key policy.
+      FIELDS_KMS_KEY_ID: local
       AWS_ACCESS_KEY_ID: local-fake
       AWS_SECRET_ACCESS_KEY: local-fake
     # The default network for the stack, and the inspector's, which has no way out.
@@ -174,6 +183,22 @@ services:
       <<: *scan-worker-env
       SCAN_POOL: large
     ports: ["127.0.0.1:8013:8001"]
+
+  guardduty: # GuardDuty Malware Protection's stand-in (#234): scans the large-files bucket, tags, sends the result
+    <<: [*hardening, *api-image]
+    command: ["python", "-m", "sft.workers.guardduty_standin"]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: local # it refuses to start anywhere else
+      S3_ENDPOINT_URL: http://s3:9090
+      S3_LARGE_FILES_BUCKET: sft-local-large-files
+      SQS_ENDPOINT_URL: http://sqs:9324
+      SQS_QUEUE_PREFIX: sft-local-
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    depends_on:
+      s3-init: { condition: service_completed_successfully }
+      sqs: { condition: service_healthy }
 
   inspector: # the DLP inspector (ADR-0022): our image, its own entry point, no credentials
     <<: [*hardening, *api-image]
@@ -237,6 +262,24 @@ services:
     depends_on:
       <<: *database-ready
       s3-init: { condition: service_completed_successfully }
+
+  # ---- The field key job (#236): one-shot, never started by `make up` ----
+  # `make field-keys STEP=backfill|rotate|rewrap|purge` runs one step, as the chart's CronJob does. It acts
+  # as the API (its login role), the only workload that may unwrap a field data key.
+  field-keys:
+    <<: [*hardening, *api-image]
+    profiles: [jobs]
+    restart: "no"
+    entrypoint: ["python", "-m", "sft.workers.field_keys"]
+    command: ["backfill"]
+    healthcheck: { disable: true }
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ENVIRONMENT: local
+      DATABASE_URL: postgresql://sft_api:test-only-password@postgres:5432/sft
+      FIELDS_KMS_KEY_ID: local
+    depends_on:
+      <<: *database-ready
 
   # ---- Database jobs: one-shot, in order, on every `make up`. Each is safe to repeat. ----
 
@@ -448,7 +491,10 @@ services:
       KC_HOSTNAME: http://localhost:8180 # the issuer, the same for the browser and for containers
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HEALTH_ENABLED: "true"
-    volumes: ["./local/keycloak/sft-realm.json:/opt/keycloak/data/import/sft-realm.json:ro"]
+    # The pool's realm, and a customer's own identity provider that it brokers for tenant SSO (#231).
+    volumes:
+      - "./local/keycloak/sft-realm.json:/opt/keycloak/data/import/sft-realm.json:ro"
+      - "./local/keycloak/customer-realm.json:/opt/keycloak/data/import/customer-realm.json:ro"
     ports: ["127.0.0.1:8180:8080"]
     healthcheck:
       # The image has no curl or wget; ask the management port's readiness check over bash's /dev/tcp.

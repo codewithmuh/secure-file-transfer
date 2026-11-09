@@ -32,7 +32,7 @@ Then each class adds the uses of table 4.3, each limited by `kms:ViaService` in 
 | Key | Users |
 |---|---|
 | files | API E D, scan worker D (files bucket only), replication D in Tokyo and E D in Osaka, GuardDuty's role E D (large-files only), BreakGlass D, all through S3 for the two buckets; Karpenter V and the EC2 Fleet service-linked role (named) for scan volumes |
-| fields | API E D with purpose `field-dek` or `dlp-dek`; scan worker E D with `dlp-dek` only; both need `tenant_id` in the context |
+| fields | API E D, and `ReEncrypt` for the field key job's re-wrap (#236), with purpose `field-dek` or `dlp-dek`; scan worker E D with `dlp-dek` only; both need `tenant_id` in the context |
 | database | The deploy role's grants for RDS |
 | audit | Archive job (Tokyo), API and operator API `GenerateDataKey`; recovery job, audit reader and BreakGlass `Decrypt`; replication; all through S3 for the archive bucket. In the retained stack also its state bucket, trail and alert delivery role |
 | logs | CloudWatch Logs, CloudTrail and log delivery, each by `aws:SourceAccount` and its context or source; Loki and Tempo through S3; the lifecycle jobs for CloudTrail log files only; audit reader and BreakGlass D |

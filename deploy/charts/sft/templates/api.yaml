@@ -27,6 +27,7 @@ External Secrets Secret.
   "S3_FILES_BUCKET" (printf "%s-files-%s" $prefix (toString $c.accountId))
   "S3_LARGE_FILES_BUCKET" (printf "%s-large-files-%s" $prefix (toString $c.accountId))
   "S3_FILES_KMS_KEY_ID" $c.filesKeyArn
+  "FIELDS_KMS_KEY_ID" (printf "alias/sft/%s/fields" .Values.environment)
   "TRUSTED_PROXIES" .Values.network.publicSubnetsCidr
   "ENVIRONMENT" .Values.environment
   "API_KEY_ENVIRONMENT" (get (dict "dev" "dev" "staging" "stg" "prod" "prd") .Values.environment)

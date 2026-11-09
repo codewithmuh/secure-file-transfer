@@ -122,3 +122,12 @@ misconfigurations:
       (sha256-<digest>.sig and .att), which a re-sign must rewrite (#107). Images are deployed by digest, never by
       tag, and admission accepts only digests with a valid signature from our build identity or a listed vendor, so
       a rewritten fallback tag can't change what runs (ADR-0007, T-70).
+  - id: AVD-AWS-0066 # Lambda tracing
+    paths:
+      - "**/modules/signin-triggers/main.tf"
+    statement: >-
+      The sign-in triggers' function (#238) runs in the private subnets with no way out but the interface endpoints,
+      and there is no X-Ray endpoint: Active tracing would need one, or a route out, for a function that answers in
+      milliseconds and keeps no state. Its JSON logs go to its own log group under the logs key, every refusal is
+      counted and logged by limit ID, and every attempt and success reaches the audit log through the signin-events
+      queue (NFR-15), which is what an investigation of sign-ins reads (T-89, authn-authz 2.4).

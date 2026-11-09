@@ -444,3 +444,35 @@ def test_the_dlp_should_actions_are_catalogued(migrated_db: ScratchDatabase) -> 
         assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
         for table in tables:
             assert audited[table], f"{action}: {table} changes without the audit trigger"
+
+
+# The audit actions of tenant SSO and break-glass (#231, #232), with the audited tables whose
+# changes each covers in its transaction. Break-glass grants are a platform table, which has no
+# audit trigger: each step writes its own security-critical platform event, and the approval, the
+# end and the expiry one in each named tenant's log too.
+SSO_AND_BREAK_GLASS_ACTIONS = {
+    "sso_domain.claimed": ("sso_domains",),
+    "sso_domain.verified": ("sso_domains",),
+    "sso_domain.deleted": ("sso_domains",),
+    "tenant_sso.updated": ("tenants", "sso_group_roles"),
+    "tenant_sso.configured": ("idp_connections", "sso_domains", "tenants"),
+    "user.provisioned": ("users", "user_identities"),
+    "user.identity_bound": ("user_identities",),
+    "member.signed_in": ("member_sessions",),
+    "member.sign_in_refused": (),
+    "break_glass.requested": (),
+    "break_glass.approved": (),
+    "break_glass.ended": (),
+    "break_glass.expired": (),
+    "break_glass.lapsed": (),
+}
+
+
+def test_the_sso_and_break_glass_actions_are_catalogued(migrated_db: ScratchDatabase) -> None:
+    audited = dict(migrated_db.sql(TENANT_TABLES, trigger=TRIGGER))
+    source = "".join(path.read_text() for path in Path(sft.__file__).parent.rglob("*.py"))
+    for action, tables in SSO_AND_BREAK_GLASS_ACTIONS.items():
+        assert re.fullmatch(r"[a-z][a-z_]*(\.[a-z][a-z_]*)+", action), action
+        assert f'"{action}"' in source, f"{action} is catalogued but nothing writes it"
+        for table in tables:
+            assert audited[table], f"{action}: {table} changes without the audit trigger"

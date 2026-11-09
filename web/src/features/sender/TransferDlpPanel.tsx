@@ -12,7 +12,17 @@ import { formatDate } from '@/lib/formatters';
 import { useAuthStore } from '@/stores/authStore';
 import { approvalStateVariant, shortId } from '@/features/approvals/approvals';
 import { InspectionStateBadge } from './StateBadges';
-import { CHANGEABLE_STATES, dlpStage, filesToRemove, findingTotal, flaggedRecipients, JUSTIFICATION_MAX, textProblem, type DlpStage } from './dlpView';
+import {
+  CHANGEABLE_STATES,
+  dlpStage,
+  filesToRemove,
+  findingTotal,
+  flaggedRecipients,
+  JUSTIFICATION_MAX,
+  locationParts,
+  textProblem,
+  type DlpStage,
+} from './dlpView';
 import { dlpActionVariant, isBuiltinDetector } from './states';
 
 /**
@@ -220,6 +230,28 @@ export function FindingLine({ finding }: { finding: DlpFinding }) {
         medium: finding.count_medium,
         low: finding.count_low,
       })}
+      {/* Only the file's owner and the transfer's approvers get these (FR-53, #233); never a matched value. */}
+      {finding.details_visible && (finding.locations?.length || finding.previews?.length) ? (
+        <div className="mt-1 ml-4 text-gray-600">
+          {finding.locations && finding.locations.length > 0 && (
+            <p>
+              {t('dlp.where')}{' '}
+              {finding.locations
+                .map((location) =>
+                  locationParts(location)
+                    .map((part) => t(part.key, part.values))
+                    .join(t('common.listSeparator')),
+                )
+                .join(' / ')}
+            </p>
+          )}
+          {finding.previews && finding.previews.length > 0 && (
+            <p>
+              {t('dlp.previews')} <span className="font-mono">{finding.previews.join(' / ')}</span>
+            </p>
+          )}
+        </div>
+      ) : null}
     </li>
   );
 }

@@ -5,13 +5,11 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
-  # #175: a file failed for an engine error pages; one over 2 GB that no engine scans doesn't.
+  # #175: a file failed for an engine error pages.
   - interval: 1m
     input_series:
       - series: 'scan_results_total{state="scan_failed", reason="engine_error", job="scan-worker"}'
         values: '0 0 1 1 1'
-      - series: 'scan_results_total{state="scan_failed", reason="large_file_scanning_unavailable", job="jobs"}'
-        values: '0 1 2 3 4'
       - series: 'scan_results_total{state="clean", reason="none", job="scan-worker"}'
         values: '0 10 20 30 40'
     alert_rule_test:
@@ -27,17 +25,39 @@ tests:
               summary: A file ended scan_failed, or a scan message is in a dead-letter queue (FR-19).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/scan-failed.md
 
-  # #175: only large files waiting for GuardDuty: no page.
+  # #234: GuardDuty scans files over 2 GB, so a large file that GuardDuty failed, or that got no result by its
+  # deadline, pages like any other.
   - interval: 1m
     input_series:
-      - series: 'scan_results_total{state="scan_failed", reason="large_file_scanning_unavailable"}'
-        values: '0 1 2 3 4 5'
-      - series: 'scan_results_total{state="scan_failed", reason="deadline_passed"}'
-        values: '0 0 0 0 0 0'
+      - series: 'scan_results_total{state="scan_failed", reason="deadline_passed", job="jobs"}'
+        values: '0 0 1 1 1'
     alert_rule_test:
-      - eval_time: 5m
+      - eval_time: 3m
+        alertname: ScanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: A file ended scan_failed, or a scan message is in a dead-letter queue (FR-19).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/scan-failed.md
+
+  # #234: a GuardDuty result in its dead-letter queue pages: a file over 2 GB is left without its result.
+  - interval: 1m
+    input_series:
+      - series: 'aws_sqs_approximate_number_of_messages_visible_maximum{dimension_QueueName="sft-prod-apne1-guardduty-results-dlq"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 1m
         alertname: ScanFailed
         exp_alerts: []
+      - eval_time: 3m
+        alertname: ScanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: A file ended scan_failed, or a scan message is in a dead-letter queue (FR-19).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/scan-failed.md
 
   # #175: a scan message in a dead-letter queue pages, whatever the files' states.
   - interval: 1m

@@ -104,12 +104,13 @@ aren't drawn.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `tenants` | `id`, `name`, `status` (active, suspended), `recovery_contact`, `sso_required`, `sso_mfa_confirmed_by`, `sso_mfa_confirmed_at` | Created by a platform operator (FR-34), with a second contact besides the first admin, through which operator-assisted recovery confirms a request (`recoverTenantAdmin`, authentication and authorization 2.5). A tenant that uses SSO has an `idp_connections` row and its proven domains in `sso_domains` (FR-26). `sso_required` lets its members sign in only through the identity provider, except its fallback admins. `sso_mfa_confirmed_by` and `sso_mfa_confirmed_at` record the tenant admin's confirmation that their identity provider enforces MFA, which is also audited. Suspending a tenant ends every session of the tenant (2.4). |
+| `tenants` | `id`, `name`, `status` (active, suspended), `recovery_contact`, `sso_required`, `sso_mfa_confirmed_by`, `sso_mfa_confirmed_at`, `sso_jit` | Created by a platform operator (FR-34), with a second contact besides the first admin, through which operator-assisted recovery confirms a request (`recoverTenantAdmin`, authentication and authorization 2.5). A tenant that uses SSO has an `idp_connections` row and its proven domains in `sso_domains` (FR-26). `sso_required` lets its members sign in only through the identity provider, except its fallback admins. `sso_mfa_confirmed_by` and `sso_mfa_confirmed_at` record the tenant admin's confirmation that their identity provider enforces MFA, which is also audited. `sso_jit` (default on) lets a first SSO sign-in from an address on a proven domain create the member (#231). Suspending a tenant ends every session of the tenant (2.4). |
 | `tenant_policies` | `tenant_id` (PK), `max_expiry`, `unscannable_policy` (block, allow_with_warning), `received_file_retention_days` (1–90, default 30), `allowed_domains`, `blocked_domains`, `default_locale` (en, ja) | One row per tenant (FR-23, FR-24, FR-33). As built (revision 0023, #217): `allowed_domains` and `blocked_domains` are `text[]`, at most 500 each, empty by default, of lower-case domains in their IDNA (ASCII) form; each covers its subdomains, and blocked wins over allowed (`sft.service.domain_rules`). |
 | `users` | `id`, `tenant_id`, `email`, `email_normalized`, `role` (admin, member), `status` (invited, active, deactivated), `sso_fallback`, `dlp_approver`, `invitation_token_hash`, `invitation_expires_at` | Unique on `(tenant_id, email_normalized)` (FR-22, FR-25). `dlp_approver` marks a member or admin a tenant admin named as a DLP approver (FR-43, 2.7). `invitation_token_hash` (unique) is the SHA-256 of the one-time invitation link that binds an SSO identity to this user: 256 random bits, valid 7 days, replaced by a new invitation and cleared when it is used (authentication and authorization 2.5). `sso_fallback` marks the at most two admins of an SSO tenant who keep a local sign-in. Deactivating a user clears `dlp_approver` and `sso_fallback`, so a deactivated user is never an approver or a fallback admin. |
 | `idp_connections` | `id`, `tenant_id` (empty for the platform's own pools), `kind` (local, oidc, saml), `provider_name`, `issuer`, `status` (active, inactive) | One row for each of the platform's own user pools for local members (FR-25): Tokyo, and the Osaka standby in staging and prod (authentication and authorization 2.3). One row for each tenant's SSO provider (FR-26), written by the operator API (`configureTenantSso`). The provider exists in both pools under the same name, so one row and one identity serve either pool. `provider_name` is unique: the pool's ID, or the name the operator CLI gives a tenant's provider. `issuer` is recorded for checks and display, but it is not unique and never used to find a connection, because issuer strings repeat across tenants (a copied SAML entity ID, a shared multi-tenant issuer). |
-| `sso_domains` | `domain` (PK, lowercase), `tenant_id`, `idp_connection_id`, `verified_at` | Email domains a tenant has proven with a DNS TXT record (authentication and authorization 2.5). The primary key means a domain belongs to one tenant at most. "Continue with SSO" finds the tenant's connection through it. |
-| `user_identities` | `id`, `tenant_id`, `user_id`, `idp_connection_id`, `subject`, `expires_at` | Unique on `(idp_connection_id, subject)`: a subject is only unique within the connection it came through. Sign-in finds the connection from how the sign-in arrived (the pool that issued the token, and for SSO the provider it names), then the identity. Through a tenant's connection it accepts only an identity whose user is in that tenant, so one tenant's identity provider can never sign anyone in to another tenant (FR-26, NFR-12). Rows are written in two places only: by the notification worker, from the `sub` Cognito returns when it creates a local member, and by the invitation flow, which binds an SSO subject to the invited user (authentication and authorization 2.4). An email claim never finds or binds a user. A member can hold one local identity per pool, so one in Tokyo and one in Osaka after a failover. A sign-in reset deletes the member's local identities in the API transaction. `expires_at` is set only on the temporary local sign-in that operator-assisted recovery gives an SSO tenant's admin, for 72 hours. |
+| `sso_domains` | `id`, `tenant_id`, `domain` (lowercase, ASCII), `verification_token`, `idp_connection_id`, `verified_at`, `created_by` | Email domains a tenant claims and proves with a DNS TXT record (authentication and authorization 2.5, #231). Unique on `(tenant_id, domain)`, and on `domain` where `verified_at` is set: a proven domain belongs to one tenant at most, and a pending claim blocks no other tenant (decided in #231; the design first made `domain` the key, which would let a squatter's claim block the owner). `verification_token` is published in DNS, so it is no secret. An operator links proven domains to the tenant's connection (`configureTenantSso`); "Continue with SSO" finds the connection through a linked one (`lookup_sso_domain`), and proven domains are trusted recipient domains in the DLP decision (FR-45). |
+| `sso_group_roles` | `id`, `tenant_id`, `group_name`, `role` | Identity provider groups that give a member created just in time a role (#231); unique per tenant and group. |
+| `user_identities` | `id`, `tenant_id`, `user_id`, `idp_connection_id`, `subject`, `expires_at` | Unique on `(idp_connection_id, subject)`: a subject is only unique within the connection it came through. Sign-in finds the connection from how the sign-in arrived (the pool that issued the token, and for SSO the provider it names), then the identity. Through a tenant's connection it accepts only an identity whose user is in that tenant, so one tenant's identity provider can never sign anyone in to another tenant (FR-26, NFR-12). Rows are written by the notification worker, from the `sub` Cognito returns when it creates a local member; by the invitation flow, which binds an SSO subject to the invited user; and by the sign-in callback just in time (#231), which binds an SSO subject to the tenant's user at the token's address, only on a domain the tenant proved and linked to that connection (authentication and authorization 2.4). An email claim never finds or binds a user across tenants or outside the proven domains, and never for a local sign-in. A member can hold one local identity per pool, so one in Tokyo and one in Osaka after a failover. A sign-in reset deletes the member's local identities in the API transaction. `expires_at` is set only on the temporary local sign-in that operator-assisted recovery gives an SSO tenant's admin, for 72 hours. |
 | `api_keys` | `id`, `tenant_id`, `created_by`, `name`, `key_prefix`, `key_hash`, `scopes`, `expires_at`, `revoked_at`, `last_used_at` | The full key is shown once, at creation. `key_prefix` is the environment's prefix (`sft_dev_`, `sft_stg_`, `sft_prd_`) plus the first 8 characters of the secret, so a tenant admin can recognise a key without seeing it (authentication and authorization 5.1). Deactivating or demoting the owner revokes their keys in the same transaction. `last_used_at` is updated at most once an hour, not on every call (FR-32). As built (revisions 0021, 0022, #215, #216): `scopes` is a `text[]` of 1 to 5 contract scopes; `expires_at` at most 365 days after `created_at`; `revoked_reason` (admin, owner_deactivated, owner_demoted) with `revoked_at`; `expiry_notice` (14 or 3), the last expiry email the daily job asked for; `first_exported_at`, the key's first audit export, which emails the admins once. `sft_api` reads and writes keys in tenant scope and finds one by its hash only through `lookup_api_key`; `sft_jobs` reads IDs, times and the notice, `sft_notify` the owner, prefix and expiry, never the hash or name. The audit trigger watches inserts and `revoked_at`. |
 | `tenant_data_keys` | `tenant_id`, `key_version`, `wrapped_key`, `created_at`, `retired_at` | Primary key `(tenant_id, key_version)`. The tenant's 256-bit data key for field encryption, as KMS returned it wrapped under the fields key with the encryption context `purpose` and `tenant_id` (encryption and keys 3.2). Each year a new version takes over new writes, and `retired_at` is set on the one it replaces, which from then on only decrypts. A version is deleted once no row uses it (section 6). |
 
@@ -239,7 +240,7 @@ due.
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `completion_started_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `inspection_state`, `inspection_reasons`, `inspection_engine_version`, `inspection_policy_version`, `dlp_blocked`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1; the inspection columns in 3.5. `dlp_blocked` is set only on a received file a DLP rule blocked (FR-51). |
+| `files` | `id`, `tenant_id`, `transfer_id` or `upload_request_id`, `display_name_ct`, `data_key_version`, `content_type`, `declared_size`, `actual_size`, `sha256`, `storage_class` (standard, large), `storage_key`, `s3_upload_id`, `s3_version_id`, `state`, `last_part_at`, `part_urls_issued`, `completion_started_at`, `removed_at`, `scan_attempts`, `scan_deadline`, `scan_engine` (clamav, guardduty), `scan_detail`, `scanned_at`, `unscannable_allowed`, `inspection_state`, `inspection_reasons`, `inspection_engine_version`, `inspection_policy_version`, `dlp_blocked`, `retention_until`, `delete_after`, `deleted_at` | Exactly one of `transfer_id` and `upload_request_id` is set, each through its own composite foreign key, enforced by a check constraint. `storage_key` is `tenants/{tenant_id}/files/{file_id}` and is unique. `display_name_ct` is the encrypted file name (2.1). States in section 3.1; the inspection columns in 3.5. `dlp_blocked` is set only on a received file a DLP rule blocked (FR-51). `part_urls_issued` counts the part URLs issued over the file's life, at most 10 × `part_count`, added by the conditional update that records `last_part_at` (#165, revision 0033, abuse 6.1). |
 | `download_counters` | `tenant_id`, `recipient_id`, `file_id`, `download_limit`, `count`, `first_downloaded_at`, `last_downloaded_at` | Primary key `(recipient_id, file_id)`. All rows for a transfer are created in the transaction that moves it to `sent`, with the transfer's limit copied in, so a row always exists before the first download. The two times are the recipient's download status (FR-7). |
 | `download_grants` | `id`, `tenant_id`, `file_id`, `s3_version_id`, `recipient_id` and `link_session_id`, or `user_id` and `member_session_id`, `byte_budget`, `bytes_served`, `request_count`, `expires_at`, `active_stream_id`, `active_stream_until`, `archived_at` | One counted download of one file by one session (abuse and rate limits 5.4). A check constraint requires exactly one of the two pairs, each through composite foreign keys; the keys to the session cascade on delete. `id` is the API's `grant_id`. |
 
@@ -524,7 +525,7 @@ Two tables have no tenant and no row-level security. Only `sft_operator`, the op
 | Table | Key columns | Notes |
 |---|---|---|
 | `operator_sessions` | `id`, `token_hash`, `signature_hash`, `aws_account_id`, `operator_name`, `expires_at` (15 min), `revoked_at` | Created by `createOperatorToken` from a signed STS `GetCallerIdentity` request (authentication and authorization 8.2). `token_hash` and `signature_hash` are both unique: the SHA-256 of the operator token, and of the request's signature, so a signature seen before is refused. `operator_name` is the operator's Identity Center user name (the role session name), recorded on every operator audit event. |
-| `break_glass_grants` | `id`, `requester`, `approver`, `incident_id`, `reason`, `tenant_ids`, `starts_at`, `ends_at`, `assignment_request_id`, `recorded_by` (tool, reconciliation), `review_due_at`, `review_url` | The service's copy of a break-glass grant (FR-35, authentication and authorization 8.3). The authoritative record is the Identity Center assignment plus CloudTrail. `recordBreakGlassGrant` writes this row as best effort, with a security-critical platform audit event and one in each listed tenant's audit log. Every 15 minutes a job in `sft-operator` matches CloudTrail's assignments by `assignment_request_id` (unique) and writes any missing row with `recorded_by = reconciliation`. `tenant_ids` is an array, not a foreign key, because platform rows don't refer to tenant rows. |
+| `break_glass_grants` | `id`, `requester`, `approver`, `incident_id`, `reason`, `tenant_ids`, `duration_minutes`, `state` (requested, active, ended, expired, lapsed, withdrawn), `self_approved`, `requested_at`, `approved_at`, `starts_at`, `ends_at`, `ended_at`, `ended_by`, `assignment_request_id`, `recorded_by` (service, tool, reconciliation), `review_due_at`, `review_url` | The service's copy of a break-glass grant (FR-35, authentication and authorization 8.3). The authoritative record is the Identity Center assignment plus CloudTrail. `recordBreakGlassGrant` writes this row as best effort, with a security-critical platform audit event and one in each listed tenant's audit log. Every 15 minutes a job in `sft-operator` matches CloudTrail's assignments by `assignment_request_id` (unique) and writes any missing row with `recorded_by = reconciliation`. `tenant_ids` is an array, not a foreign key, because platform rows don't refer to tenant rows. Break-glass in the service (#232, authentication and authorization 8.5) writes the same table: `requestBreakGlass` a `requested` row, `approveBreakGlass` (a second operator) makes it `active` with `starts_at` and `ends_at` from the database's clock, at most an hour apart; the operator API's sweep marks it `expired` after `ends_at` and a request nobody approved within an hour `lapsed`. While it is active and before `ends_at`, `sft_breakglass` reads the rows of `tenant_ids` (`break_glass_tenants()`, revision 0030). |
 
 ### 2.7 Data loss prevention
 
@@ -577,7 +578,8 @@ with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` 
   detector and a `not_inspected` rule a reason. `trusted_domains` holds at most 500 lowercase domains, and
   `approval_timeout` is 1 hour to 7 days (default 72 hours).
 - `definition_ct` is the definition as JSON, sealed with M2's stand-in (`sft.service.dlp_definitions`), **not yet
-  encrypted**; `dlp_key_version` stays empty until DLP-8 changes that one module.
+  encrypted**; `dlp_key_version` stays empty until DLP-8 changes that one module. (Since #233, revision 0032: sealed
+  with the tenant's DLP data key, `dlp_key_version` set; older rows are resealed by the field key job.)
 - **The default policy** is the database function `dlp_default_policy(tenant, created_by, locale)`: the policy at
   version 1 and the eight rules of detectors 6, named in the tenant's default language (English or Japanese). It does
   nothing for a tenant that has a policy. Revision 0024 runs it for every existing tenant, `createTenant` in the
@@ -599,7 +601,7 @@ with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` 
 - `dlp_decision_rules`: primary key `(decision_id, rule_id)`; its key to `dlp_rules (tenant_id, id, revision)` has no
   `ON DELETE`, so the database itself keeps a revision a decision applied, and the daily cleanup skips it.
 - `dlp_confirmations`: `justification_ct` sealed with M2's stand-in (`sft.service.fields`, not yet encrypted), so
-  `data_key_version` stays empty until M6. No unique key per decision: #220's requests may follow an expired one.
+  `data_key_version` stays empty until M6 (since #236: encrypted, with its version). No unique key per decision: #220's requests may follow an expired one.
 - `dlp_known_domains`: lowercase IDNA domains, `first_sent_at` and `last_sent_at`; written, in sorted order, by the
   transaction that moves a transfer to `sent`, and deleted by the daily cleanup 365 days after `last_sent_at`.
 - `transfers.dlp_decision_id` was added as data model 7 says for a key on an existing table: indexed `CONCURRENTLY`,
@@ -621,7 +623,7 @@ with #219 and the approval tables with #220 (both below), and `tenant_dlp_keys` 
   by composite keys; it goes with its transfer (`ON DELETE CASCADE`).
 - `dlp_approval_decisions`: unique `(approval_request_id, approver_id)`; a check that a rejection has `comment_ct`;
   `comment_ct` sealed with M2's stand-in (`sft.service.fields`, not yet encrypted), so `data_key_version` stays
-  empty until M6. It goes with its request.
+  empty until M6 (since #236: encrypted, with its version). It goes with its request.
 - **Grants.** `sft_api` reads and inserts both, and updates only a request's `state` and `ended_at`. `sft_jobs` reads
   a request's `id`, `tenant_id`, `transfer_id`, `state` and `expires_at`, and updates `state` and `ended_at`, finding
   due requests across tenants in system scope (`jobs_find`). `sft_notify` reads `id`, `tenant_id`, `transfer_id` and
@@ -663,6 +665,27 @@ drop out of that breakdown alone. Decisions by sender count transfers only (a re
 fully inspected" counts the files scanned in the range whose inspection was `partial` or `not_inspected`, each reason
 once per file. The policy changes are counted from the audit log (`dlp_policy.updated`, `dlp_rule.*`,
 `dlp_detector.*`).
+
+**As built (#236, revision 0031; #233, revision 0032): field and DLP data keys.**
+
+- `tenant_data_keys` and `tenant_dlp_keys`: `(tenant_id, key_version)` primary key, `wrapped_key` (16 to 1,024 bytes,
+  KMS's blob), `created_at`, `retired_at`; one live version per tenant (the partial unique index `<table>_live_key`);
+  `key_version >= 1`; `retired_at >= created_at`. Row-level security as every tenant table. Not audited
+  (`NOT_AUDITED`): a version is made with the first value sealed under it, in an audited transaction, and the field key
+  job writes `data_key.rotated`, `data_key.rewrapped`, `data_key.deleted` and `fields.resealed` itself.
+- **Foreign keys.** `files`, `transfers`, `upload_requests`, `dlp_confirmations` and `dlp_approval_decisions`:
+  `(tenant_id, data_key_version) → tenant_data_keys`; `dlp_findings` and `dlp_detectors`: `(tenant_id, dlp_key_version)
+  → tenant_dlp_keys`. Added `NOT VALID`, then validated, with the referencing columns indexed `CONCURRENTLY` where no
+  index existed (`files`, `transfers`, `upload_requests`, `dlp_findings`). The data layer sets each version column from
+  the value it writes (`sft.core.sealed.key_version`), empty for no value.
+- **Grants.** `sft_api`: select, insert and delete versions, update only `wrapped_key` and `retired_at`; update
+  `justification_ct`, `comment_ct`, `definition_ct` and their version columns, for the field key job's reseal only.
+  `sft_scan`: select and insert `tenant_dlp_keys`; still no select on `dlp_findings.detail_ct`. No other role reaches
+  either table. The field key job finds its tenants through `field_key_tenants(p_after uuid)`, a lookup function that
+  returns tenant IDs, 500 at a time, with `sft_lookup` reading `tenants (id)` in lookup scope.
+- `dlp_findings.detail_ct` holds the finding's location hints, as the inspector wrote them, and masked previews, as
+  JSON sealed with the DLP data key and bound to the finding's ID; the API reads them back into the contract's
+  `DlpLocation` (`sft.service.finding_details`).
 
 ## 3. State machines
 
@@ -731,9 +754,12 @@ stateDiagram-v2
   then 5 attempts, each the slower of clamd's timeout (30 s plus 0.2 s per MB) and the inspector's (15 minutes of wall
   clock plus the time to receive the bytes), and the visibility timeout between two attempts
   (`sft.service.scan_timing`). The scan sweep (`sft.workers.scan_sweep`, scheduled with the lifecycle jobs) records
-  `scan_failed` with `scan_detail = deadline_passed`, the inspection `failed`. A file over 2 GB, which nothing scans
-  until GuardDuty is connected (M6), doesn't wait for it: completion records it `scan_failed` with
-  `large_file_scanning_unavailable`, the inspection `skipped`, and runs the evaluation. `scan_detail` also says why a
+  `scan_failed` with `scan_detail = deadline_passed`, the inspection `failed`. A file over 2 GB gets no scan message:
+  GuardDuty's result, from the `guardduty-results` queue, records it (#234), with `scan_engine = guardduty` and the
+  inspection `not_inspected` for `too_large`, since the DLP inspector never reads it (FR-47); the worker acts only for
+  the version completion recorded, and only when GuardDuty's own tag on it names the same result. Its deadline is two
+  hours after completion, then the sweep records `deadline_passed`. `large_file_scanning_unavailable`, which
+  completion recorded for such a file before #234, is kept only for the rows that have it. `scan_detail` also says why a
   file is `unscannable` (`encrypted`, `limit_exceeded`) or failed every attempt (`engine_error`), and the contract's
   `File` shows it.
 - **A scan has a deadline.** When a file enters `scanning`, `scan_deadline` is set from its size: long enough for every
@@ -1098,7 +1124,7 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 
 | Query | Index |
 |---|---|
-| Credential lookups | unique `transfer_recipients (link_token_hash)`, `upload_requests (link_token_hash)`, `link_sessions (session_hash)`, `member_sessions (session_hash)`, `api_keys (key_hash)`, `users (invitation_token_hash)`, `idp_connections (provider_name)`, `user_identities (idp_connection_id, subject)`; the primary key of `sso_domains` |
+| Credential lookups | unique `transfer_recipients (link_token_hash)`, `upload_requests (link_token_hash)`, `link_sessions (session_hash)`, `member_sessions (session_hash)`, `api_keys (key_hash)`, `users (invitation_token_hash)`, `idp_connections (provider_name)`, `user_identities (idp_connection_id, subject)`; unique `sso_domains (domain)` where proven |
 | Operator tokens and replayed signatures | unique `operator_sessions (token_hash)`, `operator_sessions (signature_hash)` |
 | Identities of a user | `user_identities (tenant_id, user_id)` |
 | Sessions of a user or a tenant (revocation, the 10-session cap) | `member_sessions (tenant_id, user_id, created_at)` |
@@ -1164,7 +1190,7 @@ How the PRD's data lifecycle table and the architecture's operational retention 
 | Operator sessions | `expires_at` (15 minutes) | The operator API's daily job deletes them. A replayed signature is refused by its age (1 minute) once the row is gone. |
 | Break-glass grants | `ends_at + 365 days`, like audit events | The operator API's daily job |
 | Email suppressions | `expires_at + 365 days` for an ended entry (expired, or cleared by a tenant admin); an entry without `expires_at` stays until a tenant admin clears it (2.5) | Daily job |
-| Retired data key versions | No row's `data_key_version` uses the version any more | Purge job; the foreign key refuses the delete while a row still uses it |
+| Retired data key versions | No row's `data_key_version` uses the version any more | The field key job's `purge` (#236, as the API); the foreign key refuses the delete while a row still uses it |
 | Outbox rows | `published_at + 7 days` | Daily job |
 | Processed messages | `processed_at + 14 days` | Daily job |
 | Idempotency keys | `expires_at` (24 hours) | Daily job |
@@ -1173,7 +1199,7 @@ How the PRD's data lifecycle table and the architecture's operational retention 
 | DLP approval requests past their expiry | `dlp_approval_requests.expires_at` while `pending` | Lifecycle job: the request expires and the transfer goes back to its sender (3.2) |
 | Replaced DLP rule and detector revisions | `retired_at` set, and no decision (rules) or live rule or finding (detectors) refers to the revision | Daily job. As built (#218): a detector revision a later revision replaced goes at once, since the later one carries the detector's name on; the last revision of a deleted detector stays while a live rule or a finding names it (`custom:<id>`). As built (#219): a rule revision a decision applied stays; its foreign key keeps it too. |
 | Known recipient domains | `last_sent_at + 365 days` | Daily job. As built (#219), with `retention.rows_deleted` per batch, which counts rows and names no domain |
-| Retired DLP data key versions | No row's `dlp_key_version` uses the version any more | Purge job; the foreign key refuses the delete while a row still uses it |
+| Retired DLP data key versions | No row's `dlp_key_version` uses the version any more | The field key job's `purge` (#233); the foreign key refuses the delete while a row still uses it |
 
 **Why `purge_after` is computed, not tracked.** After a transfer ends, no download or verification can happen, and its
 files are deleted within 7 days, so its last audit event is at most 7 days after `ended_at`. An upload request's last
@@ -1319,7 +1345,7 @@ take well under 1 GB together; the DLP tables about 4 GB, and their audit events
 | FR-14, FR-15 (verification) | `verification_codes`, `link_sessions`, the `link_token_hash` columns, `download_grants` (a content URL works only with its session) |
 | FR-16 to FR-19 (scanning) | `files` (state, scan columns, `storage_class`, `scan_engine`, `scan_deadline`, `unscannable_allowed`), `tenant_policies.unscannable_policy` |
 | FR-20, FR-21 (control and lifecycle) | `ended_at`, `expires_in`, `expires_at`, `delete_after`, `purge_after` (section 6) |
-| FR-22 to FR-26 (tenant administration and sign-in) | `users` (invitations, `sso_fallback`), `tenants` (SSO settings), `idp_connections`, `sso_domains`, `user_identities`, `tenant_policies`, `member_sessions` |
+| FR-22 to FR-26 (tenant administration and sign-in) | `users` (invitations, `sso_fallback`), `tenants` (SSO settings), `idp_connections`, `sso_domains`, `sso_group_roles`, `user_identities`, `tenant_policies`, `member_sessions` |
 | FR-27 to FR-29 (audit) | `audit_events` |
 | FR-32 (API keys) | `api_keys` |
 | FR-33 (languages) | `tenant_policies.default_locale`, `transfer_recipients.locale`, `upload_requests.locale` |

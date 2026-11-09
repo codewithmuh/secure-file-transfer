@@ -306,9 +306,10 @@ async def test_a_my_number_spreadsheet_to_an_untrusted_domain_warns_and_the_memb
     [file] = shown["files"]
     [found] = [f for f in file["findings"] if f["detector"] == "jp_my_number"]
     assert found["detector_name"] == "My Number (Individual Number)"
-    assert (found["count_high"], found["details_visible"]) == (3, False)
-    assert "locations" not in found
-    assert "previews" not in found
+    # The owner sees the location hints and masked previews (#233), never a number.
+    assert (found["count_high"], found["details_visible"]) == (3, True)
+    assert {"sheet": "社員", "row": 2} in found["locations"]
+    assert all(n not in p for n in numbers for p in found["previews"])
     assert (shown["message_findings"], shown["approval_request"]) == ([], None)
     japanese = await w.dlp(transfer_id, "ja")
     assert "マイナンバー・個人番号" in {
@@ -328,7 +329,9 @@ async def test_a_my_number_spreadsheet_to_an_untrusted_domain_warns_and_the_memb
     [(justification,)] = w.db.sql(
         "SELECT justification_ct FROM dlp_confirmations WHERE transfer_id = :id", id=transfer_id
     )
-    assert justification == b"\x00Payroll for the auditor"  # sealed (M2's stand-in)
+    # Sealed under the tenant's field data key (#236): format 1, never the text.
+    assert justification[0] == 1
+    assert b"Payroll" not in justification
     sent = await emails(w.db, w.tenant.id)
     assert [e.email_type for e in sent.to(NEW)] == ["transfer_link"]
 
@@ -338,6 +341,8 @@ async def test_a_my_number_spreadsheet_to_an_untrusted_domain_warns_and_the_memb
         "dlp.decided",
         "transfer.awaiting_confirmation",
         "email.sent",  # dlp_confirmation_needed, to the member
+        "dlp_findings.details_read",  # the owner's two reads with hints and previews (#233)
+        "dlp_findings.details_read",
         "transfer.confirmed",
         "transfer.sent",
     ]

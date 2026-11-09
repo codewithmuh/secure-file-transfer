@@ -10,7 +10,8 @@ for the operator API (both build on `ServerSettings`), `RelaySettings` for the o
 `WorkerSettings`, its base, for the workers to come), `MigrationSettings` for the migration job,
 `BootstrapSettings` for the database bootstrap job, `MailSettings` for whatever sends email (the
 notification worker, whose `NotifySettings` adds it to a worker's), `InspectorSettings` for the
-DLP inspector, `ScanSettings` for the scan workers and `JobSettings` for the lifecycle jobs.
+DLP inspector, `ScanSettings` for the scan workers, `JobSettings` for the lifecycle jobs and
+`FieldKeySettings` for the field key job (#236).
 `ClockSettings` (`ENVIRONMENT` and the clock's test hook) is part of the API's and the jobs'.
 
 In AWS (#184) the database and Valkey URLs name a user and no password: with `DATABASE_IAM_AUTH`
@@ -102,6 +103,20 @@ def _iam_valkey(url: SecretStr) -> None:
 _CACHE_NAME = r"^[a-z][a-z0-9-]{0,39}$"
 # A keyring setting holds the keyring, or `secretsmanager:<id>` (sft.core.keyrings).
 _KEYRING_SETTING = "a JSON list of keys with `id`, `state` and base64 `key`, or secretsmanager:<id>"
+
+
+# The fields key (#236, encryption and keys 3.2, 4.1): its alias or ARN, or `local` for the
+# in-process stand-in of the local stack and the tests (`sft.runtime.kms.LocalKms`).
+_FIELDS_KEY = (
+    r"^(local|alias/[A-Za-z0-9/_-]{1,250}|mrk-[0-9a-f]{32}|"
+    r"arn:aws:kms:[a-z0-9-]+:[0-9]{12}:(key/mrk-[0-9a-f]{32}|alias/[A-Za-z0-9/_-]{1,250}))$"
+)
+_FIELDS_KEY_DESCRIPTION = (
+    "The fields key that wraps the tenants' data keys (encryption and keys 3.2): its alias, "
+    "`alias/sft/<env>/fields`, or ARN; `local` for the in-process stand-in of the local stack "
+    "and the tests, which the chart never sets (deploy/tests) and which warns at startup "
+    "outside ENVIRONMENT=local or test."
+)
 
 
 # Pods set enableServiceLinks: false, so Service variables can't clash with these (architecture 8).
@@ -425,6 +440,44 @@ class Settings(ServerSettings, ClockSettings):
         description="dev, stg or prd: the `sft_<env>_` of API keys. Required unless "
         "ENVIRONMENT=test.",
     )
+    # Tenant SSO (#231, authn and authz 2.4, 2.5): how the pool is told which provider to use, where
+    # the identity provider's groups arrive, and the local stand-in for DNS when a domain is proven.
+    oidc_idp_hint_parameter: Literal["identity_provider", "kc_idp_hint"] = Field(
+        default="identity_provider",
+        description="The authorization request's parameter that names the provider: Cognito's "
+        "`identity_provider`, or Keycloak's `kc_idp_hint` for the local stand-in.",
+    )
+    oidc_groups_claim: str = Field(
+        default="custom:sso_groups",
+        min_length=1,
+        max_length=128,
+        description="The ID token claim with the identity provider's groups, mapped by the pool "
+        "(user pool attribute `custom:sso_groups`): a list, or Cognito's `[a,b]` string.",
+    )
+    sso_dns_overrides: str | None = Field(
+        default=None,
+        max_length=65536,
+        description="A test hook: JSON object of TXT record name to its values, used instead of "
+        "DNS to prove SSO domains. Only ENVIRONMENT=local or test may set it.",
+    )
+    sso_dns_nameservers: str | None = Field(
+        default=None,
+        max_length=1024,
+        pattern=r"^[0-9a-fA-F.:]+(,[0-9a-fA-F.:]+)*$",
+        description="Comma-separated resolver addresses for proving SSO domains; by default the "
+        "system's (in AWS, the VPC resolver).",
+    )
+
+    @model_validator(mode="after")
+    def _dns_overrides_only_in_tests(self) -> Self:
+        if self.sso_dns_overrides is not None and self.environment not in _HOOK_ENVIRONMENTS:
+            raise ValueError(
+                "SSO_DNS_OVERRIDES is a test hook: only ENVIRONMENT=local or test may set it"
+            )
+        return self
+
+    # Field encryption (#236, #233): the fields key the tenants' data keys are wrapped under.
+    fields_kms_key_id: str = Field(pattern=_FIELDS_KEY, description=_FIELDS_KEY_DESCRIPTION)
 
     @model_validator(mode="after")
     def _api_keys_need_their_environment(self) -> Self:
@@ -461,6 +514,18 @@ class Settings(ServerSettings, ClockSettings):
     def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
         check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
         return value
+
+    @model_validator(mode="after")
+    def _trusted_proxies_behind_the_load_balancer(self) -> Self:
+        # #129: behind the load balancer with no trusted proxy, every client's address would be
+        # the load balancer's, so per-IP limits and the failed-authentication block would apply
+        # to everyone at once. Only the compose stack and the test suite have no load balancer.
+        if not self.trusted_proxies and self.environment not in _HOOK_ENVIRONMENTS:
+            raise ValueError(
+                "TRUSTED_PROXIES is required unless ENVIRONMENT=local or test: the load "
+                "balancer's subnets, so per-IP limits count clients, not the load balancer"
+            )
+        return self
 
 
 _QUEUE_PREFIX = r"^[a-z0-9]+(-[a-z0-9]+)*-$"
@@ -590,6 +655,9 @@ class ScanSettings(WorkerSettings):
         description="The serverless cache's name, for IAM tokens, as the API's setting.",
     )
 
+    # DLP data keys (#233, encryption and keys 3.3): the worker unwraps `dlp-dek` keys only.
+    fields_kms_key_id: str = Field(pattern=_FIELDS_KEY, description=_FIELDS_KEY_DESCRIPTION)
+
     @model_validator(mode="after")
     def _iam_valkey_url(self) -> Self:
         if self.valkey_iam_cache is not None:
@@ -707,6 +775,20 @@ class OperatorSettings(ServerSettings):
         pattern=r"^https?://[^\s/]+(:\d+)?/?$",
         description="The STS endpoint the API sends signed requests to; by default the "
         "regional one, `https://sts.<AWS_REGION>.amazonaws.com`. Never taken from a request.",
+    )
+    # Break-glass in the service (#232, authn and authz 8.3): a second operator approves, unless
+    # the environment has one maintainer, where self-approval is allowed, marked and alerted.
+    break_glass_self_approval: bool = Field(
+        default=False,
+        description="Lets the requester approve their own break-glass request, marked "
+        "`self_approved` and alerted (threat model R-08). For a single-maintainer run only.",
+    )
+    break_glass_sweep_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=60,
+        description="How often the operator API records expired and lapsed break-glass requests "
+        "and refreshes the break-glass metrics.",
     )
 
     @property
@@ -1041,6 +1123,116 @@ class KeyRotationSettings(_Base):
         if isinstance(value, str):
             return [part.strip() for part in value.split(",") if part.strip()]
         return value
+
+
+class FieldKeySettings(ClockSettings):
+    """The field key job's settings (#236; encryption and keys 3.2, 7.2): it runs as the API's
+    workload, the only one that may unwrap field data keys, so it has the API's database role and
+    the fields key; nothing else."""
+
+    database_url: PostgresUrl = Field(
+        description="The API's login role, `sft_api`: the field key job acts as the API.",
+    )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection, as the API does.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    fields_kms_key_id: str = Field(pattern=_FIELDS_KEY, description=_FIELDS_KEY_DESCRIPTION)
+    field_key_batch_size: int = Field(
+        default=200,
+        ge=1,
+        le=1000,
+        description="Rows resealed per transaction, so each stays well inside 30 seconds.",
+    )
+    field_key_steps: Annotated[list[Literal["backfill", "rotate", "rewrap", "purge"]], NoDecode] = (
+        Field(
+            default_factory=list,
+            description="Comma-separated: the steps a run takes, in order, when the command names "
+            "none (the chart's CronJob: rotate,backfill,purge).",
+        )
+    )
+    field_key_max_age_days: int = Field(
+        default=365,
+        ge=30,
+        le=730,
+        description="`rotate`: a live data key version older than this gets a successor "
+        "(encryption and keys 7.2: yearly).",
+    )
+
+    @field_validator("field_key_steps", mode="before")
+    @classmethod
+    def _steps(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [part.strip() for part in value.split(",") if part.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        return self
+
+
+class GuardDutyStandInSettings(_Base):
+    """The local GuardDuty stand-in's settings (#234, `sft.workers.guardduty_standin`): S3Mock's
+    large-files bucket, which it scans, and ElasticMQ's `guardduty-results` queue, to which it
+    sends each result. It runs only in the compose stack and the tests."""
+
+    environment: Environment = Field(
+        default="prod",
+        description="local or test: the stand-in refuses to start anywhere else.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    s3_endpoint_url: str = Field(
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="S3Mock, in the compose network."
+    )
+    s3_large_files_bucket: str = Field(pattern=_BUCKET)
+    sqs_endpoint_url: str = Field(
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="ElasticMQ, in the compose network."
+    )
+    sqs_queue_prefix: str = Field(pattern=_QUEUE_PREFIX)
+    guardduty_poll_seconds: float = Field(
+        default=5.0, gt=0, le=300, description="How often it lists the bucket for new versions."
+    )
+
+    @model_validator(mode="after")
+    def _local_only(self) -> Self:
+        if self.environment not in _HOOK_ENVIRONMENTS:
+            raise ValueError("the GuardDuty stand-in runs only with ENVIRONMENT=local or test")
+        return self
+
+
+class SignInTriggerSettings(_Base):
+    """The Cognito sign-in triggers' settings (#238, `sft.workers.signin_trigger`): the counter
+    store, which holds each account's failed sign-ins, and the `signin-events` queue. The Lambda
+    function's environment sets them; AWS_REGION and AWS_LAMBDA_RUNTIME_API are Lambda's own."""
+
+    valkey_url: ValkeyUrl = Field(
+        description="The counter store, as the triggers' own Valkey user, "
+        "sft-<env>-signin-trigger.",
+    )
+    valkey_iam_cache: str | None = Field(
+        default=None,
+        pattern=_CACHE_NAME,
+        description="The serverless cache's name, for IAM tokens. Unset only in tests.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    sqs_queue_prefix: str = Field(
+        pattern=_QUEUE_PREFIX,
+        description="Names the environment's queues: `sft-dev-apne1-` makes its signin-events.",
+    )
+    sqs_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Tests only, for ElasticMQ. In AWS the SDK finds SQS's VPC endpoint itself.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_valkey_url(self) -> Self:
+        if self.valkey_iam_cache is not None:
+            _iam_valkey(self.valkey_url)
+        return self
 
 
 EXIT_BAD_SETTINGS = 2

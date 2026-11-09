@@ -25,8 +25,8 @@ second upload (`sft.service.idempotency.replay`).
 
 **Scanning** (#175): a completed file gets its scan message by its real size, to the small or the
 large ClamAV pool, and a scan deadline that grows with its size (`sft.service.scan_timing`). Above
-2,000,000,000 bytes only GuardDuty scans, which isn't connected before M6, so such a file is
-recorded `scan_failed` (`large_file_scanning_unavailable`) at completion.
+2,000,000,000 bytes only GuardDuty scans: no message, and GuardDuty's result records the file
+(#234, `sft.service.guardduty`), or the scan sweep at its deadline.
 
 **The evaluation** (#174, data model 3.2) runs after every removal of a file from a transfer that
 isn't a draft and after every rejection, under the transfer's row lock, so removing the blocked
@@ -36,13 +36,14 @@ on the files left (#219).
 
 **Received files** (#213) share completion's phase 3 (`to_scanning`) and the rejections: a file
 of an upload request gets its `retention_until` when it reaches `scanning`, from the tenant's
-`received_file_retention_days` (FR-13), and has no transfer to evaluate; a file over 2 GB counts
-towards its request's next notice instead (`sft.service.scans.note_received`). A revoked or
-expired request rejects its open uploads at once (`reject_request_uploads`, NFR-6). The uploader's
-calls are `sft.service.received`'s.
+`received_file_retention_days` (FR-13), and has no transfer to evaluate: its scan result counts
+towards its request's next notice (`sft.service.scans.note_received`). A revoked or expired
+request rejects its open uploads at once (`reject_request_uploads`, NFR-6). The uploader's calls
+are `sft.service.received`'s.
 
-Not here yet: group F's per-file part-URL count and the tenant's daily upload volume (abuse and
-rate limits 2.2, 6.1) are byte and per-item budgets the limiter doesn't count yet.
+**Group F's budgets** (#165, abuse and rate limits 2.2, 6.1; `sft.service.rate_limits.uploads`):
+a declaration spends its size from the tenant's 200 GB of declared uploads a day, and a file gets
+at most 10 times its `part_count` in part URLs over its life, counted with the file.
 """
 
 from __future__ import annotations
@@ -75,8 +76,6 @@ from sft.data.database import Database
 from sft.data.models import (
     File,
     FileState,
-    InspectionState,
-    ScanDetail,
     StorageClass,
     Transfer,
     TransferState,
@@ -88,7 +87,9 @@ from sft.service.evaluation import evaluate
 from sft.service.idempotency import IdempotentRequest, Outcome, once, replay
 from sft.service.objects import PART_URL_SECONDS, ObjectStore, ObjectStoreError
 from sft.service.permissions import Reach, authorize
-from sft.service.scans import note_received
+from sft.service.rate_limits import RateLimiter
+from sft.service.rate_limits.limits import KeyType
+from sft.service.rate_limits.uploads import part_url_cap, part_urls_refused, upload_charges
 from sft.service.transfers import (
     FileView,
     audit_details,
@@ -411,6 +412,7 @@ async def add_file(
     request: FileRequest,
     *,
     policy: UploadPolicy,
+    limiter: RateLimiter,
     origin: Origin,
     now: datetime,
     idempotency: IdempotentRequest | None = None,
@@ -418,7 +420,8 @@ async def add_file(
     """`addTransferFile`: declare a file and start its multipart upload (FR-1, FR-2).
 
     With an `Idempotency-Key`, a retry of the same request gets the first answer, with the file as
-    it is now, and neither starts an upload nor declares a file again.
+    it is now, and neither starts an upload nor declares a file again. The tenant's daily upload
+    volume (#165) is peeked before the upload starts and charged as the declaration's last step.
     """
     reach = authorize(caller, "addTransferFile", now=now)
     if not 1 <= request.size <= MAX_FILE_SIZE:
@@ -429,7 +432,9 @@ async def add_file(
 
     async def rebuild(session: AsyncSession, file_id: UUID) -> FileView | None:
         try:
-            return file_view(tenant_id, await files.get_file(session, file_id))
+            return file_view(
+                await fields.tenant_keys(session, tenant_id), await files.get_file(session, file_id)
+            )
         except NotFoundError:
             return None
 
@@ -446,6 +451,8 @@ async def add_file(
         if replayed is not None:
             return replayed
         await _check_draft(session, caller, transfer_id, request.size, reach=reach, now=now)
+    charges = upload_charges({KeyType.TENANT: str(tenant_id)}, request.size)
+    await limiter.peek_all(charges)
 
     file_id = uuid7()
     storage_class = storage_class_for(request.size)
@@ -466,7 +473,9 @@ async def add_file(
             session,
             file_id=file_id,
             transfer_id=transfer_id,
-            display_name_ct=fields.seal(tenant_id, request.display_name),
+            display_name_ct=(await fields.tenant_keys(session, tenant_id, write=True)).seal(
+                fields.FILE_NAME, file_id, request.display_name
+            ),
             content_type=request.content_type,
             declared_size=request.size,
             storage_class=storage_class.value,
@@ -489,7 +498,9 @@ async def add_file(
                 part_count=part_count,
             ),
         )
-        return file_view(tenant_id, file)
+        # Last: a refusal rolls the declaration back; nothing before it charged anything.
+        await limiter.check_all(charges)
+        return file_view(await fields.tenant_keys(session, tenant_id), file)
 
     try:
         async with database.transaction(scope) as session:
@@ -566,7 +577,8 @@ async def part_urls(
     now: datetime,
 ) -> list[PartUrl]:
     """`requestUploadPartUrls`: a pre-signed URL per part, each for its exact size, valid 15
-    minutes (abuse and rate limits 6.2)."""
+    minutes (abuse and rate limits 6.2), at most 10 times the file's `part_count` over its life
+    (#165): past that, `429`."""
     reach = authorize(caller, "requestUploadPartUrls", now=now)
     if not 1 <= len(part_numbers) <= MAX_PART_URLS or len(set(part_numbers)) != len(part_numbers):
         raise invalid(json_pointer("part_numbers"), "Ask for 1 to 100 different parts.")
@@ -583,12 +595,17 @@ async def part_urls(
                     json_pointer("part_numbers", index),
                     "The part number is beyond the file's part_count.",
                 )
-        if await files.touch_parts(session, file.id) is None:
+        touched = await files.touch_parts(
+            session, file.id, parts=len(part_numbers), cap=part_url_cap(file.part_count)
+        )
+        if touched is None:
             # A completion or a removal moved the file on since it was read: it isn't uploading,
-            # so no URL is issued and nothing is audited.
+            # so no URL is issued and nothing is audited. Or it has had all its URLs (#165).
             moved = await files.get_file(session, file.id)
             if moved.removed_at is not None:
                 raise NotFound
+            if moved.state == FileState.UPLOADING.value:
+                raise part_urls_refused()
             raise Conflict(
                 "invalid_state", "The file is past uploading.", current_state=moved.state
             )
@@ -714,7 +731,7 @@ async def complete_upload(
         if file.state not in (FileState.UPLOADING.value, FileState.COMPLETING.value):
             if file.removed_at is not None:
                 raise NotFound
-            return file_view(tenant_id, file)
+            return file_view(await fields.tenant_keys(session, tenant_id), file)
         conflict = draft_conflict(transfer)
         limits = None if conflict else await _limits(session, transfer.id)
         if file.removed_at is not None:
@@ -758,7 +775,7 @@ async def complete_upload(
             raise NotFound from None
         if file.state != FileState.COMPLETING.value:
             # Another call finished it first.
-            return file_view(tenant_id, file)
+            return file_view(await fields.tenant_keys(session, tenant_id), file)
         conflict = draft_conflict(transfer)
         if conflict or file.removed_at is not None or not isinstance(outcome, Assembled | Missing):
             if conflict:
@@ -797,7 +814,9 @@ async def complete_upload(
                 small_pool_max=small_pool_max,
                 origin=origin,
             )
-            return file_view(tenant_id, await files.get_file(session, file.id))
+            return file_view(
+                await fields.tenant_keys(session, tenant_id), await files.get_file(session, file.id)
+            )
     if error is None:  # pragma: no cover - every branch above sets one or returns
         raise RuntimeError("completion ended without a result")
     raise error
@@ -837,9 +856,8 @@ async def to_scanning(
     """Completion's phase 3 when the parts were assembled at the declared size, under the
     transfer's row lock: `scanning` with the size, version and deadline, and the scan message for
     the pool its size and `small_pool_max` pick (ADR-0019's split, `SCAN_SMALL_POOL_MAX_BYTES`).
-    A file only GuardDuty scans is `scan_failed` at once (`large_file_scanning_unavailable`) and
-    the evaluation runs. The API's `completeUpload` and reconciliation's re-run (#181) share it,
-    each as its own actor.
+    A file only GuardDuty scans gets no message: GuardDuty's result records it (#234). The API's
+    `completeUpload` and reconciliation's re-run (#181) share it, each as its own actor.
 
     A received file (#213) is held under its request's row lock instead: it gets its
     `retention_until` from now, the tenant's `received_file_retention_days` ahead (FR-13), and
@@ -857,7 +875,7 @@ async def to_scanning(
         retention_days=retention,
     ):  # pragma: no cover - the lock holds the state seen
         raise RuntimeError("the file changed under its owner's row lock")
-    # By the real size: the small or the large ClamAV pool, or GuardDuty's (no message, M6).
+    # By the real size: the small or the large ClamAV pool, or GuardDuty's (no message, #234).
     topic = scan_timing.scan_topic(assembled.size, small_pool_max=small_pool_max)
     if topic is not None:
         await enqueue(session, topic, {"file_id": file.id})
@@ -878,44 +896,9 @@ async def to_scanning(
             "storage_class": storage_class,
         },
     )
-    if topic is not None:
-        return
-    # Over 2,000,000,000 bytes: only GuardDuty scans it, and nothing records its result before
-    # M6. Rather than wait out a deadline, it is `scan_failed` now, so the member sees why, and
-    # the evaluation runs (a draft's is a no-op; a send holds the transfer). Never shareable.
-    recorded = await files.record_scan(
-        session,
-        file.id,
-        state=FileState.SCAN_FAILED,
-        engine=None,
-        detail=ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
-        attempts=0,
-        unscannable_allowed=False,
-        inspection_state=InspectionState.SKIPPED,
-    )
-    if not recorded:  # pragma: no cover - the lock holds the state seen
-        raise RuntimeError("the file changed under its owner's row lock")
-    await audit.record(
-        session,
-        action="file.scanned",
-        actor=actor,
-        target=target,
-        origin=origin,
-        details={
-            **details,
-            **owner,
-            "state": FileState.SCAN_FAILED,
-            "scan_detail": ScanDetail.LARGE_FILE_SCANNING_UNAVAILABLE,
-            "inspection_state": InspectionState.SKIPPED,
-        },
-    )
-    if file.upload_request_id is not None:
-        # Blocked: both sides are told, in the request's next notice (FR-12).
-        await note_received(session, file.upload_request_id, shareable=False)
-    elif file.transfer_id is not None:
-        await evaluate(
-            session, file.transfer_id, actor=actor, now=now, origin=origin, details=details
-        )
+    # Over 2,000,000,000 bytes there is no message: GuardDuty scanned the object when completion
+    # assembled it, and its result reaches the large pool's workers (#234). The scan deadline is
+    # the fallback: no result by then, and the sweep records `scan_failed`.
 
 
 # ---- deleteFile ----

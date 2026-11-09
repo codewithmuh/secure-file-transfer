@@ -46,6 +46,10 @@ dependencies = [
   # TLS on the API's public port (#184, encryption and keys 2.2): the ECDSA key and self-signed
   # certificate each pod makes at start. Already in the lock through joserfc; 50.0.2 is 2026-09-30.
   "cryptography>=50.0.2",
+  # Tenant SSO (#231): proving an email domain reads its DNS TXT record (authn-authz 2.5). The
+  # resolver is async and pure Python. 2.9.1 is 2026-10-29; the cap holds 2.9.2 (2026-11-03) back
+  # until it is 7 days old (threat model T-68); lift it then.
+  "dnspython>=2.9.1,<2.9.2",
 ]
 
 [dependency-groups]

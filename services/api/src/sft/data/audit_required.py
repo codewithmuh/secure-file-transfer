@@ -70,6 +70,12 @@ NOT_AUDITED: Final[dict[str, str]] = {
     "notice_windows": "A notice window is the notification worker's bookkeeping of emails about "
     "changes audited when they were made (a DLP policy change, an approval request, a "
     "deactivation), and every email it sends is audited as `email.sent` (#230, abuse 7.1).",
+    "tenant_data_keys": "A field data key version is created with the first value sealed under it, "
+    "in a transaction whose change is audited; the field key job writes its own event for every "
+    "rotation, re-wrap and purge (#236, encryption and keys 3.2).",
+    "tenant_dlp_keys": "As tenant_data_keys: created with the first finding detail or detector "
+    "definition sealed under it, in an audited transaction; the field key job audits the rest "
+    "(#233, encryption and keys 3.3).",
 }
 
 

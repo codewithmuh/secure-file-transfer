@@ -27,7 +27,7 @@ pytestmark = pytest.mark.anyio
 MB = 1_000_000
 
 
-@pytest.mark.parametrize("size", [1, 5 * MB, 100 * MB, 150 * MB, 2_000 * MB, 5_000 * MB])
+@pytest.mark.parametrize("size", [1, 5 * MB, 100 * MB, 150 * MB, 2_000 * MB])
 def test_the_deadline_covers_every_attempt_of_both_engines_and_the_waits(size: int) -> None:
     now = datetime(2026, 11, 5, tzinfo=UTC)
     deadline = scan_timing.scan_deadline(size, now)
@@ -41,10 +41,13 @@ def test_the_deadline_covers_every_attempt_of_both_engines_and_the_waits(size: i
 
 def test_the_deadline_grows_with_the_size() -> None:
     now = datetime(2026, 11, 5, tzinfo=UTC)
-    sizes = [5 * MB, 100 * MB, 150 * MB, 2_000 * MB, 5_000 * MB]
+    sizes = [5 * MB, 100 * MB, 150 * MB, 2_000 * MB]
     deadlines = [scan_timing.scan_deadline(size, now) for size in sizes]
     assert deadlines == sorted(deadlines)
     assert len(set(deadlines)) == len(deadlines)
+    # Over 2 GB GuardDuty scans, outside our queues: a fixed wait for its result (#234).
+    for size in (2_000_000_001, 5_000 * MB):
+        assert scan_timing.scan_deadline(size, now) == now + scan_timing.GUARDDUTY_DEADLINE
     # A 2 GB ClamAV scan takes about 2 minutes (abuse 6.4); its timeout leaves room for more.
     assert scan_timing.clamd_timeout(2_000 * MB) > timedelta(minutes=6)
 

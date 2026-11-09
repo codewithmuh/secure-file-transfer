@@ -160,7 +160,7 @@ There are four ways to make the service email someone, and each one is capped:
 
 | Key | Value used | Notes |
 |---|---|---|
-| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. The limiter already counts an IPv6 address per /64 (#97); the WAF rate rules still key each IPv6 address separately, so dual-stack needs a WAF change too. |
+| IP | The client address from the `X-Forwarded-For` entry our load balancer adds (ADR-0002) | The load balancer is IPv4-only in v1. The limiter already counts an IPv6 address per /64 (#97); the WAF rate rules still key each IPv6 address separately, so dual-stack needs a WAF change too. The API refuses to start without `TRUSTED_PROXIES` unless `ENVIRONMENT` is `local` or `test` (#129): with none, every client would be the load balancer, and one per-IP count would hold everyone. |
 | Account | The member's user ID; for sign-in, the Cognito user | |
 | Tenant | `tenant_id` from the member session or API key | Recipients and uploaders don't count against their tenant's request budget (2.2, H) |
 | Invited email | HMAC-SHA-256 of the normalized address (data model section 1) | Never the address itself. For 25 hours after an HMAC key rotation, each per-address limit adds the old pseudonym's count, so a rotation never resets a cap (#22). |
@@ -288,8 +288,20 @@ over the last 2 minutes; a client that reads nothing at all is closed by the loa
 minute, `SESSION_UPLOAD`) and spend none of the tenant's group H budget, as no link session does. The request's rows
 are PostgreSQL's, under the request's row lock: the 101st declaration and the 51st counted file are
 `422 too_many_files`, a total past 20 GB `413 total_too_large`, and `completeSessionUpload` counts again in its first
-phase, so parallel completes can't pass either. Each declaration reserves the requesting tenant's storage quota. The
-per-file part-URL count and the tenant's daily volume are #165's, as for members.
+phase, so parallel completes can't pass either. Each declaration reserves the requesting tenant's storage quota and its daily upload volume, as below.
+
+**As built (#165, #235).** The tenant's 200 GB a day is a `Budget` in megabytes
+(`F.tenant_upload_bytes`, `sft.service.rate_limits.uploads`), for members', API keys' and uploaders' declarations
+together, as group D's byte caps are: peeked before the multipart upload starts, so a refused declaration starts
+none, and charged as the last step of the declaring transaction, so a refusal there rolls the declaration back and
+aborts the upload. A UTC day, not a sliding 24 hours: the worst case is twice the cap across midnight. A rejected or
+removed file keeps its charge, so rejected uploads can't be replayed for free (AB-5). Over the cap is `429` with
+`Retry-After` until the day ends. The part-URL cap is counted in PostgreSQL, not the counter store
+(`files.part_urls_issued`, revision 0033): a file may keep uploading for longer than the store's 25-hour keys (4.2),
+since its upload is rejected only 24 hours after its last part. The call's parts are added by the conditional update
+that records `last_part_at`, so parallel calls can't pass the cap together, and a call that would pass it gets none of
+its URLs. Over the cap is `429 rate_limited` with `Retry-After: 86400`: no wait frees more URLs for that file, so the
+client declares the file again.
 
 **As built for an uploader's removal (#229).** `deleteSessionUploadFile` is in the same group, per link session and IP.
 A removed file stops counting toward the 50 files and 20 GB and releases its storage reservation, but its declaration
@@ -397,9 +409,17 @@ release a backlog in seconds; `rejectTransfer`, a safety action, counts only aga
 **Why sign-in needs a trigger.** After 5 failed passwords, Cognito locks the user out for 2^(n−5) seconds, capped at
 about 15 minutes, so failures 6 to 14 can come at 1, 3, 7, 15, 31, 63, 127, 255 and 511 seconds: 14 in the first 15
 minutes. A pre-authentication trigger counts each attempt per account in the counter store over a sliding 15
-minutes, and the post-authentication trigger clears the count. The trigger denies the 11th attempt, and denies
-sign-in when it can't reach the store. It is a small function in the VPC, deployed by Terraform. NFR-14 keeps its 10
+minutes, and the post-authentication trigger takes the successful attempt out (as built, below). The trigger denies
+the 11th attempt, and denies sign-in when it can't reach the store. It is a small function in the VPC, deployed by Terraform. NFR-14 keeps its 10
 and names the trigger, rather than moving to Cognito's curve.
+
+**As built (#238).** The pre-authentication trigger records each attempt in a sliding log per account
+(`B.account_failures`, `sft.service.signin_triggers`), and the post-authentication trigger takes the newest entry out
+again, so the log holds the attempts nothing succeeded with. With 10 of them in 15 minutes, the next attempt, the
+11th, is refused with a message that names no reason, and audited as `sign_in.refused`. A success takes out only its
+own attempt: it clears no earlier failure, which ages out with its window, so an attacker who guesses between a
+member's own sign-ins gains nothing. Unknown usernames are counted nowhere. With the counter store or the queue
+unreachable, both triggers deny the sign-in.
 
 ### 2.4 How limits behave
 
@@ -423,6 +443,38 @@ and names the trigger, rather than moving to Cognito's curve.
   an attempt (FR-27).
 - **Clients** wait for `Retry-After`; a key that keeps ignoring it ends up at the WAF's per-IP limit. v1 sends no
   IETF `RateLimit` headers, which are still a draft.
+
+### 2.5 Each limit, its code and its test (#235)
+
+Every NFR-14 limit and every limit #235 names, with the code that enforces it and a test that sends past it and gets
+the answer of section 2.4. Limits live in `services/api/src/sft/service/rate_limits/` (`limits.py` for rates and
+quotas, `downloads.py` and `uploads.py` for budgets and leases); tests in `services/api/tests/` unless a path says
+otherwise. Besides the rows below, `test_rate_limits.py` drives every limit of `limits.ALL` against a real Valkey:
+the burst is admitted, the next request refused with the exact `Retry-After`, and the window rolls over; and each
+group's failure mode with the store down.
+
+| Limit | Key and value | Code | Test that hits it | Answer |
+|---|---|---|---|---|
+| Link-page requests (NFR-14) | IP, 60 a minute | `A.ip_requests`, bundle `LINK_STEP` on `resolveLink`, `requestVerificationCode`, `createLinkSession` | `test_links.py::test_link_page_requests_past_60_a_minute_from_one_ip_get_429` | `429`, `Retry-After` |
+| Link-page floods, at the WAF | IP, 100 link requests a minute; 30 link page loads in 5 minutes | `rate-links-ip` (`infra/modules/edge/waf.tf`); `challenge-link-pages` (`infra/modules/web-cdn/waf.tf`) | `infra/modules/edge/tests/waf.tftest.hcl`, `infra/modules/web-cdn/tests/waf.tftest.hcl` (static); k6 and the browser matrix in staging, pending the AWS run | `429`, `Retry-After: 60`; a Challenge |
+| Codes per address (NFR-14) | Invited email, 5 an hour; 50 a day | `A.address_codes_hour`, `A.address_codes_day`, bundle `REQUEST_CODE` | `test_links.py::test_the_6th_code_to_one_address_in_an_hour_is_429` | `429` |
+| Codes per link | Subject, 20 a day, 1 every 30 s | `A.link_codes_day`, `A.link_code_gap` | `test_links.py::test_the_21st_code_on_one_link_in_a_day_is_429_and_another_tenants_link_still_gets_one` | `429` |
+| A code's attempts and lifetime (NFR-14) | Verification proof, 5 attempts, 10 minutes | PostgreSQL, one conditional update (`sft.data.codes`) | `test_links.py::test_a_code_is_refused_after_10_minutes_and_after_5_attempts`, `::test_20_parallel_wrong_codes_count_exactly_5` | `422 code_attempts_exhausted`, `422 code_expired` |
+| Lockout (NFR-14) | Subject, 20 failures until unlocked | PostgreSQL (`sft.data.link_subjects`) | `test_links.py::test_the_20th_failure_locks_the_recipient_archives_it_and_tells_the_people` | `403 recipient_locked` |
+| API requests per tenant (NFR-14) | Tenant, 1,000 a minute, members and API keys together | `H.tenant_requests` in `TENANT_OPERATION`, `UPLOAD`, `AUDIT_SEARCH`, `RECEIVED_GRANT_REQUEST` | `test_api_rate_limits.py::test_a_tenants_callers_share_its_1000_requests_a_minute` | `429` |
+| Failed authentications | IP, 100 in 5 minutes, then 15 minutes blocked | `H.failed_auth`, `CountFailedAuthentications` | `test_api_rate_limits.py::test_100_failed_authentications_block_the_ip_on_every_route` | `429` on every route |
+| Sign-in starts and callbacks | IP, 60 a minute each | `B.start_ip`, `B.callback_ip` | `test_signin.py::test_the_sign_in_routes_apply_their_rate_limits` | `429`; `503` with the store down |
+| Failed sign-ins per account (NFR-14) | Account, 10 in 15 minutes | `B.account_failures`, the Cognito pre-authentication trigger (`sft.service.signin_triggers`, #238; 2.3) | `test_signin_triggers.py::test_the_11th_failed_sign_in_in_15_minutes_is_refused`, `::test_a_success_counts_no_failure_and_resets_none`; against Cognito, pending the AWS run | Sign-in denied, no reason given |
+| Download bytes per recipient | Subject, 25 GB of grants a UTC day | `D.subject_bytes` (`downloads.py`), charged with the grant | `test_downloads.py::test_a_recipient_past_25_gb_of_grants_in_a_day_gets_429` | `429`, `Retry-After` to midnight UTC |
+| Download bytes per tenant | Tenant, 500 GB of grants a UTC day | `D.tenant_bytes` (`downloads.py`) | `test_downloads.py::test_two_grants_racing_for_the_tenants_last_bytes_charge_only_the_winner` | `429`, `Retry-After` to midnight UTC |
+| Concurrent streams | Session 6, IP 20, tenant 200, pod 100 | Leases (`downloads.py`), the pod's count in process | `test_downloads.py::test_a_7th_stream_of_one_session_is_429_and_a_full_pod_503` | `429`; `503`, `Retry-After: 10` |
+| Upload bytes declared per tenant (#165) | Tenant, 200 GB a UTC day, uploaders' included | `F.tenant_upload_bytes` (`uploads.py`), peeked, then charged in the declaring transaction | `test_received_files.py::test_an_uploaders_files_count_against_the_tenants_daily_volume`, `test_transfers.py::test_a_declaration_over_the_days_volume_starts_no_upload`, `::test_a_declaration_refused_its_daily_volume_leaves_nothing` | `429`, `Retry-After` to midnight UTC |
+| Part URLs per file (#165) | File, 10 × `part_count` over its life | `files.part_urls_issued` (revision 0033), `sft.data.files.touch_parts` | `test_transfers.py::test_a_file_gets_ten_times_its_part_count_in_part_urls`, `::test_a_call_that_would_pass_the_cap_gets_none_of_its_urls`, `test_received_files.py::test_an_uploaders_file_gets_ten_times_its_part_count_in_part_urls` | `429`, `Retry-After: 86400` |
+| Storage quota | Tenant, 2 TB | PostgreSQL usage row | `test_transfers.py::test_a_file_beyond_the_quota_is_refused_and_its_upload_dropped` | `413 storage_quota_exceeded` |
+| Recipient emails | Member or key 200 an hour, tenant 2,000, address 20 a day | Group G | `test_send_limits.py::test_the_21st_link_email_to_one_address_in_a_day_is_refused` | `429` |
+| A maximal send during a store outage (#129) | 50 recipients at the per-pod limits | `fallback_limit` with `Rate.max_cost` (`local.py`) | `test_send_limits.py::test_a_send_to_50_recipients_passes_on_the_per_pod_limits`, `test_rate_limits.py::test_a_send_to_50_recipients_passes_during_an_outage` | Admitted |
+| Trusted proxies outside local (#129) | `TRUSTED_PROXIES` required unless `ENVIRONMENT` is `local` or `test` | `Settings` (`sft.core.settings`) | `test_settings.py::test_the_api_refuses_to_start_without_trusted_proxies_outside_local_and_test` | The API doesn't start |
+| WAF rate rules and logging (abuse 3) | Every rule of 3.2, logging of 3.4 | `infra/modules/edge/waf.tf`, `infra/modules/web-cdn/waf.tf` | `terraform test` in both modules (`infra/scripts/check.sh test`, CI's infra job); live, pending the AWS run | As 3.2 |
 
 ## 3. WAF
 
@@ -749,10 +801,10 @@ in 5.1. Internet egress is the same either way.
 | File size | 5 GB declared; the real size must equal the declared size (FR-2) | API, when declared and when completed | `413 file_too_large`, `422 upload_size_mismatch` |
 | Total per transfer or upload request | 20 GB declared (FR-2, FR-11) | PostgreSQL, under the row lock | `413 total_too_large` |
 | File declarations per upload request | 100 in total, rejected files included | PostgreSQL | `422 too_many_files` |
-| Parts and part URLs | The service chooses `part_size` (at least 5 MiB) so a file has at most 1,000 parts; at most 100 part URLs per call and 10 × `part_count` over a file's life | API schema; counter store | `422 validation_failed`; `429` |
+| Parts and part URLs | The service chooses `part_size` (at least 5 MiB) so a file has at most 1,000 parts; at most 100 part URLs per call and 10 × `part_count` over a file's life | API schema; PostgreSQL (`files.part_urls_issued`, #165) | `422 validation_failed`; `429` |
 | Part URL lifetime | At most 15 minutes | Signature, and a bucket policy on signature age | `403` from S3 |
 | Unfinished uploads; abandoned drafts | Rejected and aborted 24 hours after the last part; drafts cancelled after 7 days without activity | Reconciliation job (data model 6); draft job | — |
-| Tenant daily upload volume | 200 GB declared in 24 hours | Counter store | `429` |
+| Tenant daily upload volume | 200 GB declared per UTC day (#165) | Counter store | `429` |
 | Tenant storage | 2 TB of files that are uploading, scanning or stored | PostgreSQL usage row | `413 storage_quota_exceeded` |
 
 **Uploaders** can upload only to the one open upload request they verified for, within its 50 files and 20 GB. Their
@@ -835,6 +887,20 @@ bucket only (#22). Results map to file states like this:
   worker re-reads the file's state. Ten 2 GB files run at least 2 at a time (the cap with the pool at its 3-pod
   floor), so they take at most about 10 minutes, inside NFR-5's 15 for a 20 GB transfer, and less as the pool grows. GuardDuty publishes no time-to-result target, so the scan ADR measures it. Without the counter store, the
   cap is skipped and the fair queue alone applies.
+- **As built for GuardDuty (#234).** Completion sends a file over 2,000,000,000 bytes no scan message: GuardDuty
+  scanned the object when completion assembled it, and its result event reaches the `guardduty-results` queue, which
+  the large pool's scan workers read (`sft.service.guardduty`, `sft.workers.scan.GuardDutyConsumer`). The event is
+  only a prompt (T-50): a result is recorded only for a file still `scanning`, for the version completion recorded,
+  and only when GuardDuty's own tag on that version (`GuardDutyMalwareScanStatus`) names the same result; a tag that
+  names another result is ignored, and a tag not there yet, or a file still `completing`, is tried again after the
+  queue's visibility timeout, up to 5 receives, then the dead-letter queue, which pages. `UNSUPPORTED` is `encrypted`
+  with `PASSWORD_PROTECTED` and `limit_exceeded` otherwise; `FAILED` and `ACCESS_DENIED` are `scan_failed`
+  (`engine_error`) at once, since GuardDuty retries before it reports and offers no re-scan. The inspection is
+  `not_inspected` for `too_large`: the DLP inspector never reads these files, so the tenant's rules for files not
+  inspected decide (FR-47). The `scan` tag follows, keeping GuardDuty's. With no result within two hours of
+  completion (`GUARDDUTY_DEADLINE`, until staging measures GuardDuty's time to result), the sweep records
+  `scan_failed` (`deadline_passed`). Locally a stand-in tags each new version and sends the event
+  (`sft.workers.guardduty_standin`, local development). The live check against GuardDuty is pending the AWS run.
 - **The declared content type is never used.** The scan worker reads the version recorded at completion and downloads
   serve that same version (5.6), so the bytes can't change between scan and download. Unscannable files allowed by
   policy are served with the `unscannable` warning (FR-18).
@@ -1013,7 +1079,7 @@ Prometheus rules in `deploy/alerts/` with `promtool` unit tests, and their runbo
 | `HttpFlood` | WAF blocks above 10× baseline for 5 minutes, together with an error or latency burn | Page | `http-flood` |
 | `DownloadCapacity` | Active streams above 70 % of the pods' total cap for 10 minutes, or any stream refused with `503` | Ticket | `download-capacity` |
 | `TenantQuota` | A tenant at 80 % of its storage quota, its daily upload volume or its daily granted download bytes | Ticket | `tenant-quota` |
-| `ScanFailed` | Any file ends `scan_failed` for a reason other than `large_file_scanning_unavailable` (a file over 2 GB before GuardDuty is connected, M6), or a scan dead-letter queue isn't empty (FR-19) | Page | `scan-failed` |
+| `ScanFailed` | Any file ends `scan_failed`, whichever engine (GuardDuty scans files over 2 GB since #234), or a scan or `guardduty-results` dead-letter queue isn't empty (FR-19) | Page | `scan-failed` |
 | `ScanEvasion` | A tenant's unscannable rate above 5 % of its files in an hour, or more than 20 limits-exceeded results in an hour | Ticket | `scan-evasion` |
 | `DlpInspectorFailing` | Inspector failures above 1 % of inspections for 10 minutes, any file ending `failed`, or NFR-23's p95 missed for 30 minutes (this one joins when staging measures NFR-23) | Page | `dlp-inspector` |
 | `DlpEvasion` | A tenant's files not fully inspected for `encrypted` or `limit_exceeded` above 5 % in an hour, or one sender with more than 20 warnings confirmed in a day | Ticket | `dlp-evasion` |
@@ -1070,9 +1136,10 @@ verification funnel, streams and email reputation.
 | Resume and the grant budget (FR-6) | Interrupt at 50 % and resume with Range: `206`, count unchanged. Past 3 × size, or the 21st request: `403 download_grant_exhausted`. The four browsers of NFR-22 resume a cut download with Range and the `Strict` cookie; the result for each is recorded. | CI; staging browser matrix |
 | Revocation (NFR-6) | Revoke during a 1 GB stream: it stops within 35 s. New grant or content request after the revocation: `410` at once | CI integration; staging |
 | Deploy during a download | A rolling deploy during a 5 GB download: the stream finishes or is cut after 120 s and resumes without a new count | Staging release rehearsal |
+| WAF rules, as configured | `terraform test` plans the edge and web-cdn modules against a mocked AWS provider and checks every rule's name, priority, action, limit, window and custom `429`, the body-size exception, the levers off by default, the rollout switch, the NAT IP set, and each web ACL's logging filter and redacted headers (#235, `infra/modules/*/tests/waf.tftest.hcl`, `infra/scripts/check.sh test`) | CI, every pull request that changes `infra/` |
 | WAF rules | k6 from a test runner: more than 100 link requests a minute from one IP get a WAF `429` within 2 minutes, which the web app can read (CORS headers, `Retry-After`); a body over 8 KB on another route is blocked; managed rules don't block Japanese messages or messages with code | Staging |
 | WAF challenge | More than 30 recipient-page loads in 5 minutes from one IP: a client that can't run JavaScript gets no page, and each browser of NFR-22 passes without the user noticing and still reads the link from the fragment | Staging browser matrix |
-| Sign-in WAF and failed sign-ins | Twice the busiest 5 minutes at design load (2,000 sign-ins, 80 of them from one address) pass with no block; a token request from outside the NAT IP set is blocked. 11 wrong passwords within 15 minutes: the 11th is denied by the trigger; a success clears the count. | Staging (needs Cognito) |
+| Sign-in WAF and failed sign-ins | Twice the busiest 5 minutes at design load (2,000 sign-ins, 80 of them from one address) pass with no block; a token request from outside the NAT IP set is blocked. 11 wrong passwords within 15 minutes: the 11th is denied by the trigger; a success takes out its own attempt and clears no earlier failure. | Staging (needs Cognito); the trigger's counting, failing closed and audit in CI (#238, `test_signin_triggers.py`) |
 | Byte, stream and storage caps | A recipient of a transfer with no download limit is refused past 25 GB of grants in a day; a tenant past 500 GB; a 7th stream for one session and a 201st for one tenant get `429`; a client reading below 2 KB/s for 2 minutes is cut. Declaring past 2 TB gets `413 storage_quota_exceeded`; past 200 GB in 24 hours, `429`. | CI |
 | Scan fairness | One tenant uploads 50 large files: other tenants' files still meet NFR-5, that tenant never has more large-file scans running than one fewer than the large pool's pods, the pool keeps at least 3 pods while its files wait, and no deferred message reaches the dead-letter queue | Staging load test |
 | Bounces, complaints and the automatic pause | SES mailbox simulator: bounce, complaint and suppression addresses give an undeliverable recipient, a suppression entry and the metrics. 3 complaints in 1,000 emails pause the tenant's sending, open a ticket and keep its emails in the outbox; 2 in 1,000, or 3 in 500, don't. | Staging |
@@ -1117,6 +1184,13 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
 - **DLP, [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64).** AB-12, group K, the inspection
   limits (6.5), the DLP emails (7.1, 7.2), signals and alerts (8.1, 8.2), and `rejectTransfer` among the safety
   actions. The API README lists group K.
+
+- **M6 abuse, [#234](https://github.com/codewithmuh/secure-file-transfer/issues/234) and
+  [#235](https://github.com/codewithmuh/secure-file-transfer/issues/235).** GuardDuty results for files over 2 GB
+  (6.4); group F's daily upload volume and per-file part-URL cap ([#165](https://github.com/codewithmuh/secure-file-transfer/issues/165),
+  2.2 F, 6.1); `TRUSTED_PROXIES` required outside local and test ([#129](https://github.com/codewithmuh/secure-file-transfer/issues/129), 2.1);
+  static tests of every WAF rule and its logging (9.2); and the table of 2.5. The Cognito sign-in triggers for failed
+  sign-ins per account and the sign-in audit followed in [#238](https://github.com/codewithmuh/secure-file-transfer/issues/238) (2.3).
 
 - **Rate limiting, [#97](https://github.com/codewithmuh/secure-file-transfer/issues/97).** Groups A, B, G
   (`inviteUser`), H and J are data in `services/api/src/sft/service/rate_limits/limits.py`, with each operation's

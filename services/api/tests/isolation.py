@@ -339,7 +339,41 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
     seed_dlp_approvals(db, tenant_id, marker, rows)
     seed_notice_windows(db, tenant_id, rows)
     seed_dlp_should(db, tenant_id, rows)
+    seed_data_keys(db, tenant_id, marker)
+    seed_sso(db, tenant_id, marker, rows)
     return Seeded(tenant_id, marker, rows)
+
+
+def seed_sso(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
+    """Tenant SSO (#231, revision 0029): a proven domain named with the marker, linked to the
+    tenant's connection, a pending claim, and a group role named with the marker."""
+    for key in ("sso_domain", "sso_domain_pending", "sso_group_role"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, verified_at, "
+        "idp_connection_id, created_by) VALUES (:id, :tenant, :domain, repeat('i', 32), now(), "
+        ":connection, :user)",
+        id=rows["sso_domain"],
+        tenant=tenant_id,
+        domain=f"{marker}.example",
+        connection=rows["connection"],
+        user=rows["user"],
+    )
+    db.sql(
+        "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, created_by) "
+        "VALUES (:id, :tenant, :domain, repeat('p', 32), :user)",
+        id=rows["sso_domain_pending"],
+        tenant=tenant_id,
+        domain=f"pending-{marker}.example",
+        user=rows["user"],
+    )
+    db.sql(
+        "INSERT INTO sso_group_roles (id, tenant_id, group_name, role) "
+        "VALUES (:id, :tenant, :marker, 'admin')",
+        id=rows["sso_group_role"],
+        tenant=tenant_id,
+        marker=marker,
+    )
 
 
 def seed_transfers(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
@@ -737,6 +771,23 @@ def seed_dlp_should(db: Sql, tenant_id: uuid.UUID, rows: dict[str, uuid.UUID]) -
         tenant=tenant_id,
         detector=rows["dlp_detector"],
     )
+
+
+def seed_data_keys(db: Sql, tenant_id: uuid.UUID, marker: str) -> None:
+    """Field and DLP data keys (#236, #233; revisions 0031, 0032): a retired version 1 and a live
+    version 2 of each, their wrapped keys holding the marker, so a read of theirs shows."""
+    for table in ("tenant_data_keys", "tenant_dlp_keys"):
+        for version, retired in ((1, True), (2, False)):
+            db.sql(
+                f"INSERT INTO {table} (tenant_id, key_version, wrapped_key, created_at, "  # noqa: S608
+                "retired_at) VALUES (:tenant, :version, convert_to(:marker, 'UTF8') || "
+                "decode(repeat('00', 16), 'hex'), now() - interval '2 days', "
+                "CASE WHEN :retired THEN now() - interval '1 day' END)",
+                tenant=tenant_id,
+                version=version,
+                marker=marker,
+                retired=retired,
+            )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

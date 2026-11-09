@@ -127,6 +127,7 @@ check then fails, the web app relied on something the contract no longer says.
 |---|---|---|
 | `/sign-in` | Sign-in: the password sign-in, and SSO once `config.ssoSignIn` is on (M6) | Public |
 | `/auth/callback` | The web app's landing page after the API's own callback (`completeSignIn`): loads the session, then goes to the checked return path | Public |
+| `/auth/step-up-complete` | Where a step-up sign-in ends in its popup (#232): posts `{type: 'sft:step-up-complete'}` to its opener, on its own origin only, and closes; without an opener it goes to `/` | Public |
 | `/` | Dashboard: the five newest transfers and the five newest upload requests (`listTransfers`, `listUploadRequests`) | Member |
 | `/transfers` | Transfer list, with a state filter and "load more"; an admin's "every transfer in the organization" switch (`scope=tenant`, #217) adds the owner and revoke | Member |
 | `/transfers/new` | Create, upload and send a transfer; "email me on the first download" (`notify_on_first_download`, #214) | Member |
@@ -143,6 +144,7 @@ check then fails, the web app relied on something the contract no longer says.
 | `/admin/api-keys` | API keys (#215): list, create (the secret shown once), revoke | Admin |
 | `/admin/dlp` | DLP policy (#218, #221): settings (enforce or monitor mode, with its warning; trusted domains; approval timeout), rules (for sent or received files, the sender's last 24 hours, two approvers), keyword lists and patterns (`/admin/dlp/patterns/:id`, with their budget stops), each list and pattern with "Test on sample text" (`testDlpDetectors`); every write confirmed | Admin |
 | `/admin/dlp/reports` | DLP report (#222): a range of at most 92 days, decisions by outcome over time, matches by rule and by detector (inline SVG and CSS bars, each with a text alternative and a table view), senders, recipient domains, approvers, files not fully inspected, policy changes, and the decisions with filters and "load more"; "Export with the audit log" opens `/admin/audit` filtered to `dlp.decided` over the range | Admin |
+| `/admin/sso` | Single sign-on (#231, FR-26): the connection an operator set up, email domains claimed and proven by a DNS TXT record (copy the record, verify, remove), the confirmation that the identity provider enforces MFA, "require SSO", members created at their first SSO sign-in, and the group-to-role list | Admin |
 
 Every M5 page is routed: upload requests and the uploader (#212, #213), the audit log and API keys (#215, #216), the
 DLP policy and approvals (#218, #220). `npm run check:mocks` (part of `npm run check`) walks the imports from
@@ -188,6 +190,21 @@ expiry ends the page within 15 seconds.
 download keeps its grant in the tab's `sessionStorage` until the browser has the download and sends it as
 `resume_grant_id` on the next click (`receivedDownload.ts`), as the recipient's page does, so an interrupted start
 resumes. A `bounced` link email is explained in the uploader's words: any email of the request may have bounced.
+
+**Step-up, re-authenticate and retry** (#232, FR-35, authn-authz 3.3). Every step-up operation (inviting, updating,
+deactivating and resetting a user, the tenant policy, creating an API key, the audit export, the DLP policy writes,
+approving a transfer and the SSO writes) goes through the one `apiClient`, so one interceptor handles them all
+(`src/lib/stepUp.ts`). A member request answered `401 reauthentication_required` opens "Confirm it's you"
+(`features/auth/StepUpDialog.tsx`, mounted once in `Providers`), and the page's call keeps waiting, so its form state
+stays as it was. The dialog's button opens `startSignIn` in a popup, the same way in as the session's
+`session.auth_method` (`sso` with only the address's domain, else `local`), coming back to `/auth/step-up-complete`
+through `/auth/callback`. The opener accepts only a message from its own origin, of that one type, from that popup;
+then it reloads `GET /me` without the page leaving its "signed in" state (the sign-in made a new session and revoked the
+old one, so the CSRF token in memory is stale), and sends the same request again, once. Requests that fail together
+share one dialog; a second `reauthentication_required` is never retried. A sign-in as someone else sends nothing and
+reloads the app. If the browser blocks the popup, the dialog offers a sign-in on this page (`return_to` is the page),
+after which the member sends their change again. Cancelling leaves the page's own explanation (`AdminAccessNote`),
+which keeps the `403 passkey_required` text as before.
 
 **Extend expiry and the first-download email** (#214, `features/sender/`). `/transfers/new` sends
 `notify_on_first_download`. On `/transfers/:id` the owner of a submitted, not ended transfer gets "Extend expiry": the
@@ -260,3 +277,6 @@ Admins switch the policy to monitor mode, write rules for received files, with t
 approvers, add patterns and test lists and patterns on sample text; senders and approvers see the message's findings,
 members see a received file the policy blocked and uploaders see it "not accepted" (#221); admins read the DLP report
 and export its decisions with the audit log (#222).
+Admins set up single sign-on and prove their email domains (#231); every step-up operation asks "Confirm it's you" and
+sends the change again after a sign-in in a popup (#232). The local stack offers "Continue with SSO"
+(`local/web/config.json`, `ssoSignIn: true`).

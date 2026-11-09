@@ -206,6 +206,7 @@ def test_valkey_iam_settings_need_tls_and_no_password() -> None:
         "s3_files_bucket": "sft-test-files",
         "s3_large_files_bucket": "sft-test-large-files",
         "valkey_iam_cache": "sft-dev-apne1-valkey",
+        "fields_kms_key_id": "alias/sft/dev/fields",
     }
     with pytest.raises(ValidationError, match="TLS VALKEY_URL"):
         ScanSettings(valkey_url=SecretStr("redis://sft-dev-scan@valkey:6379"), **scan)

@@ -36,6 +36,7 @@ src/sft/
   runtime/      what api and workers both need to run as a pod
     internal.py       /healthz, /readyz, /metrics on the internal port
     s3.py             the files buckets behind ObjectStore (boto3 in a thread pool)
+    kms.py            the fields key behind KeyService (boto3 in a thread pool), and LocalKms, its stand-in
   service/      business rules and permission checks
     caller.py         Caller: who is calling and how they signed in; its audit actor and rate-limit keys
     permissions.py    the permission registry (authn and authz 6.3) and authorize()
@@ -44,7 +45,9 @@ src/sft/
     sending.py        sendTransfer and cancelTransfer; evaluation.py the locked evaluation (data model 3.2)
     scans.py          recording a scan and an inspection; the sweep; scan_timing.py routing and deadlines
     file_reads.py     getFile and getFileInspection; tenant_policy.py the tenant's policy (FR-23)
-    objects.py        ObjectStore, the object storage the service sees; fields.py seals names and messages
+    objects.py        ObjectStore, the object storage the service sees
+    fields.py         field encryption: per-tenant data keys, seal and open every *_ct value (#236)
+    field_keys.py     the field key job: backfill, rotate, re-wrap, purge; finding_details.py DLP-8's details
     email/            every email, rendered in English and Japanese as text and HTML (Email below)
     rate_limits/      the limits as data, the limiter and its per-pod fallback
   data/         PostgreSQL: SQLAlchemy, the scope of every transaction, roles, migrations; Valkey counters
@@ -54,7 +57,8 @@ src/sft/
     tenants.py        data-access functions for tenants (one module per table or aggregate)
     users.py          data-access functions for users and their invitations
     transfers.py      transfers and recipients; files.py the files' state changes; usage.py the quota
-    findings.py       DLP findings, counts only; suppressions.py the tenant's suppression list
+    findings.py       DLP findings and their sealed details; suppressions.py the tenant's suppression list
+    data_keys.py      the tenants' wrapped data keys, and the sealed columns the field key job reseals
     models.py         the tables, for queries
     roles.py          the PostgreSQL roles; bootstrap.py creates them
     rls.py            grants and row-level security policies, for migrations
@@ -72,7 +76,7 @@ src/sft/
     inspector.py      the inspector service (`python -m sft.dlp.inspector`): one fresh child per file
     child.py          the child: rlimits and a seccomp filter (sandbox.py, seccomp.py), then extract and detect
     protocol.py       the strict-schema frames between scan worker, inspector and child; client.py is the worker's side
-  core/         settings, logging, tracing and UUIDv7 IDs, used by every layer
+  core/         settings, logging, tracing and UUIDv7 IDs, used by every layer; sealed.py the stored field format
     errors.py         the errors any layer raises (NotFound, Conflict, RateLimited ...), without HTTP
     pseudonyms.py     email pseudonyms for logs and rate-limit keys, with the rotation overlap
     telemetry.py      OpenTelemetry setup, the span attribute allowlist, trace context for messages
@@ -597,6 +601,13 @@ tenant comes from the send's `tenant_id` tag, so an event without one (Cognito's
 deleted; so are deliveries, delays and transient bounces. A copy is handled once: its ID is derived from SES's message
 ID, the event type and its time. An entry found under an older `email-hmac` key moves to the active key.
 
+It also reads **the sign-in triggers' events** from the `signin-events` queue (#238, `sft.service.signin_triggers`):
+each Cognito sign-in attempt, refusal and success, in the outbox's envelope, recorded in the member's tenant with the
+system actor `signin_trigger`. A `sign_in.check`, which the trigger queued 10 minutes after the attempt, records
+`sign_in.failed` when the attempt is still in the account's log of failures in the counter store. The triggers
+themselves are one Lambda function, `python -m sft.workers.signin_trigger`, the same image, which speaks the Lambda
+Runtime API and counts each account's failed sign-ins (NFR-14: the 11th in 15 minutes is refused). Both fail closed.
+
 `python -m sft.workers.invite_backlog` (the same as `python -m sft.workers.notify invite-backlog`) is the one-off pass
 that invites, through the pool, every member left `invited` before the pool existed (#193): a new `member.invited`
 message each, skipping members who already have an identity on the pool's connection. It reads the worker's settings,
@@ -695,10 +706,12 @@ behind `sft.service.objects.ObjectStore`.
 - **The scan worker** (`python -m sft.workers.scan`, `SCAN_POOL=small|large`, #175, #176) reads the version recorded at
   completion once and tees it to clamd and the DLP inspector; records the scan, the inspection and the findings in one
   transaction; then tags the object and runs the evaluation. A failed attempt is retried by SQS; the 5th records what
-  it has. Files go to the small pool up to 100 MB, the large one up to 2 GB; files over 2 GB wait for GuardDuty (M6),
-  so completion records them `scan_failed` (`large_file_scanning_unavailable`) at once. The read follows clamd; an
-  inspector that falls 64 MiB behind for 30 s is dropped for the attempt. Group G's caps on a send are read before
-  the row lock and charged all or nothing, in batched counter calls (`RateLimiter.check_all`).
+  it has. Files go to the small pool up to 100 MB, the large one up to 2 GB; files over 2 GB are GuardDuty's: the
+  large pool's workers also read the `guardduty-results` queue and record each result confirmed by GuardDuty's tag on
+  the recorded version (#234, `sft.service.guardduty`); locally `sft.workers.guardduty_standin` plays GuardDuty.
+  The read follows clamd; an inspector that falls 64 MiB behind for 30 s is dropped for the attempt. Group G's caps
+  on a send are read before the row lock and charged all or nothing, in batched counter calls
+  (`RateLimiter.check_all`).
 - **Tests.** `tests/test_send.py`, `tests/test_scan_worker.py` and the others run with stand-ins for clamd and the
   inspector on real sockets (`tests/scan_fixtures.py`). `tests/test_scan_engines.py` runs the worker against the real
   clamd, as the local stack configures it, with `TEST_CLAMD_URL` (skipped without it; CI's Python job runs clamd), and
@@ -909,3 +922,15 @@ retries) or 2 (bad settings).
 
 Its tests (`tests/test_key_rotation.py`) run the rules against fakes, and the adapters against botocore's Stubber and
 an in-memory Kubernetes API.
+
+### The field key job
+
+`python -m sft.workers.field_keys [backfill|rotate|rewrap|purge ...]` (#236, #233; encryption and keys 3.2, 7.2) runs as
+the API: the API's service account, so its IAM role, and `sft_api`. `backfill` reseals every value not under its
+tenant's live data key version (M2's unencrypted values, and rows under a retired version); `rotate` makes a new
+version once the live one is `FIELD_KEY_MAX_AGE_DAYS` old; `rewrap` wraps every version again with KMS `ReEncrypt`;
+`purge` deletes retired versions no row uses. With no step named it takes `FIELD_KEY_STEPS`; the chart's daily
+`field-keys` CronJob (Tokyo) sets `rotate,backfill,purge`. Settings: `DATABASE_URL`, `DATABASE_IAM_AUTH`,
+`AWS_REGION`, `FIELDS_KMS_KEY_ID` (`alias/sft/<env>/fields`, or `local` for the stand-in), `FIELD_KEY_BATCH_SIZE`
+(200 rows a transaction), `ENVIRONMENT`. It logs one report line of counts and exits 0, 1 (safe to run again) or 2.
+Runbook: [field-keys](../../docs/runbooks/field-keys.md).

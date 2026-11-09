@@ -8,6 +8,7 @@
 #   validate     terraform init -backend=false and validate, for every root
 #   tflint       tflint with the AWS ruleset, every root and module (infra/.tflint.hcl)
 #   trivy        Trivy's misconfiguration scan (exceptions in .trivyignore.yaml)
+#   test         terraform test for every module with a tests/ folder, against a mocked AWS provider (#235)
 #   all          all of the checks above, reporting every failure
 #   lock <root>  write the root's .terraform.lock.hcl for every platform in LOCK_PLATFORMS
 #
@@ -163,6 +164,32 @@ trivy() {
     --ignorefile .trivyignore.yaml --skip-dirs '**/.terraform' infra
 }
 
+# Modules with tests (infra/modules/*/tests/*.tftest.hcl): `terraform test` plans them against a mocked AWS provider,
+# so no test reaches AWS. A module has no lock file of its own, so the dev edge root's is copied in for the run, which
+# pins the provider to the version the roots use, and removed after, with the module's .terraform folder.
+test() {
+  local -a dirs=()
+  local d
+  while IFS= read -r d; do dirs+=("${d%/tests}"); done < <(find infra/modules -type d -name tests -not -path '*/.terraform/*' \
+    -not -path '*/charts/*' -exec sh -c 'ls "$1"/*.tftest.hcl >/dev/null 2>&1' sh {} \; -print | sort)
+  # shellcheck disable=SC2016 # the script runs inside the container
+  container bridge --entrypoint sh "$TERRAFORM_IMAGE" -c '
+    status=0
+    for d in "$@"; do
+      echo "--- $d"
+      cp infra/environments/dev/ap-northeast-1/edge/.terraform.lock.hcl "$d/.terraform.lock.hcl"
+      if out=$(terraform -chdir="$d" init -backend=false -input=false -lockfile=readonly -no-color 2>&1); then
+        terraform -chdir="$d" test -no-color || status=1
+      else
+        echo "$out"
+        status=1
+      fi
+      rm -rf "$d/.terraform.lock.hcl" "$d/.terraform"
+    done
+    exit "$status"
+  ' sh "${dirs[@]}"
+}
+
 lock() {
   local root=${1:?usage: check.sh lock <root directory>}
   local -a platforms=()
@@ -178,7 +205,7 @@ lock() {
 
 all() {
   local status=0 check
-  for check in conventions fmt validate tflint trivy; do
+  for check in conventions fmt validate tflint trivy test; do
     echo "=== $check"
     "$check" || { echo "=== $check failed" >&2; status=1; }
   done
@@ -186,11 +213,11 @@ all() {
 }
 
 case "${1:-}" in
-  conventions | fmt | validate | tflint | trivy | all) "$1" ;;
+  conventions | fmt | validate | tflint | trivy | test | all) "$1" ;;
   fmt-fix) fmt_fix ;;
   lock) lock "${2:-}" ;;
   *)
-    sed -n '4,12p' "$0" >&2
+    sed -n '4,13p' "$0" >&2
     exit 2
     ;;
 esac

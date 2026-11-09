@@ -2,10 +2,17 @@
 export const DEFAULT_RETURN_PATH = '/';
 
 /**
- * Route prefixes a member may be sent back to after sign-in: the protected routes in `app/router.tsx`. The sign-in
+ * Route prefixes a member may be sent back to after sign-in: the protected routes in `app/router.tsx`, and the page a
+ * step-up sign-in ends on in its popup (#232), which only tells the window that opened it and closes. The sign-in
  * pages and the public link pages (`/t`, `/u`) are left out on purpose.
  */
-export const RETURN_PATH_PREFIXES = ['/transfers', '/upload-requests', '/admin'] as const;
+export const RETURN_PATH_PREFIXES = [
+  '/transfers',
+  '/upload-requests',
+  '/admin',
+  '/approvals',
+  '/auth/step-up-complete',
+] as const;
 
 /** The contract's limit for the return path (`ReturnTo`, maxLength 512). */
 const MAX_LENGTH = 512;

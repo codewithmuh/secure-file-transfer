@@ -23,6 +23,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, Update, and_, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.sealed import key_version
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
 from sft.data.models import (
     File,
@@ -69,6 +70,7 @@ async def insert_file(
             transfer_id=transfer_id,
             upload_request_id=upload_request_id,
             display_name_ct=display_name_ct,
+            data_key_version=key_version(display_name_ct),
             content_type=content_type,
             declared_size=declared_size,
             storage_class=storage_class,
@@ -243,11 +245,22 @@ async def _returning(session: AsyncSession, statement: Update) -> File | None:
     return file
 
 
-async def touch_parts(session: AsyncSession, file_id: UUID) -> File | None:
+async def touch_parts(
+    session: AsyncSession, file_id: UUID, *, parts: int = 0, cap: int | None = None
+) -> File | None:
     """Record upload activity on an `uploading` file that hasn't been removed: part URLs were
-    issued, so the 24-hour rule for unfinished uploads counts from now (data model 3.1)."""
+    issued, so the 24-hour rule for unfinished uploads counts from now (data model 3.1).
+
+    `parts` URLs are added to the file's count, and with `cap` only if the count stays within it
+    (#165): one conditional update, so parallel calls can't pass the cap together. None if the
+    file isn't uploading, or the cap refused."""
     statement = _transition(session, file_id, FileState.UPLOADING).where(File.removed_at.is_(None))
-    return await _returning(session, statement.values(last_part_at=func.now()))
+    if cap is not None:
+        statement = statement.where(File.part_urls_issued + parts <= cap)
+    return await _returning(
+        session,
+        statement.values(last_part_at=func.now(), part_urls_issued=File.part_urls_issued + parts),
+    )
 
 
 async def start_completion(session: AsyncSession, file_id: UUID) -> File | None:

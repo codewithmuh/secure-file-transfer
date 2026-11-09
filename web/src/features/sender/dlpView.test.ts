@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { DlpDecision, TransferDlp } from '@/api';
 import { dlpSignature } from '@/hooks/dlp';
-import { dlpStage, filesToRemove, findingTotal, flaggedRecipients, showsDlp, textProblem } from './dlpView';
+import { dlpStage, filesToRemove, findingTotal, flaggedRecipients, locationParts, showsDlp, textProblem } from './dlpView';
 
 const decision = (outcome: DlpDecision['outcome'], rules: DlpDecision['matched_rules'] = []): DlpDecision => ({
   id: 'd1',
@@ -95,5 +95,18 @@ describe('what the panel shows (#219)', () => {
     expect(textProblem('Client asked for it', true)).toBeNull();
     expect(textProblem('あ'.repeat(1001), false)).toBe('tooLong');
     expect(textProblem('あ'.repeat(1000), true)).toBeNull();
+  });
+});
+
+describe('locationParts (#233)', () => {
+  it('reads a hint in order: member, then where inside it, then the part', () => {
+    expect(
+      locationParts({ member: 'contracts/2026/appendix.xlsx', sheet: '顧客一覧', row: 340 }).map((p) => p.key),
+    ).toEqual(['dlp.location.member', 'dlp.location.sheet', 'dlp.location.row']);
+    expect(locationParts({ slide: 4, part: 'notes' })).toEqual([
+      { key: 'dlp.location.slide', values: { n: 4 } },
+      { key: 'dlp.location.part.notes', values: {} },
+    ]);
+    expect(locationParts({})).toEqual([]);
   });
 });

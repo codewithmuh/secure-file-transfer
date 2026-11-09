@@ -108,6 +108,7 @@ from sft.service.dlp_definitions import (
     seal_definition,
 )
 from sft.service.email.catalog import PolicyChange
+from sft.service.fields import KeyPurpose, TenantKeys, tenant_keys
 from sft.service.file_reads import DETECTOR_NAMES
 from sft.service.idempotency import IdempotentRequest, Outcome, once
 from sft.service.permissions import authorize
@@ -387,8 +388,9 @@ async def list_dlp_detectors(
     async with database.transaction(scope) as session:
         language = _language(language, (await tenants.get_policy(session)).default_locale)
         own = await dlp_policy.list_live_detectors(session)
+        keys = await _dlp_keys(session, scope.tenant_id)
     items = [_builtin(d, language) for d in builtin_ids()]
-    items += [_own(scope.tenant_id, d) for d in own]
+    items += [_own(keys, d) for d in own]
     return DetectorList(engine_version(), tuple(items))
 
 
@@ -406,12 +408,13 @@ async def get_dlp_detector(
             language = _language(language, (await tenants.get_policy(session)).default_locale)
             return _builtin(detector_id, language)
         detector = await dlp_policy.get_live_detector(session, own_id)
+        keys = await _dlp_keys(session, scope.tenant_id)
         if detector is None:
             raise NotFound
         stops = None
         if detector.kind == DlpDetectorKind.PATTERN.value:
             stops = await dlp_policy.pattern_stops(session, detector.id)
-    view = _own(scope.tenant_id, detector)
+    view = _own(keys, detector)
     if detector.kind != DlpDetectorKind.PATTERN.value:
         return view
     return replace(
@@ -447,14 +450,19 @@ def _builtin(detector_id: str, language: str) -> DetectorView:
     )
 
 
-def _own(tenant_id: UUID, detector: DlpDetector) -> DetectorView:
+async def _dlp_keys(session: AsyncSession, tenant_id: UUID, *, write: bool = False) -> TenantKeys:
+    """The tenant's DLP data keys, which seal its detectors' definitions (#233)."""
+    return await tenant_keys(session, tenant_id, KeyPurpose.DLP, write=write)
+
+
+def _own(keys: TenantKeys, detector: DlpDetector) -> DetectorView:
     return DetectorView(
         id=detector_ref(detector.id),
         kind=detector.kind,
         name=detector.name,
         enabled=detector.enabled,
         revision=detector.revision,
-        definition=open_definition(tenant_id, detector.definition_ct),
+        definition=open_definition(keys, detector.id, detector.definition_ct),
         created_at=detector.created_at,
     )
 
@@ -931,8 +939,9 @@ async def _check_definitions(
     """The library's save-time checks of one detector, then of the tenant's live detectors with
     it, as the inspector will compile them for every file."""
     unit = detector_unit(detector_id, definition)
+    keys = await _dlp_keys(session, tenant_id)
     others = [
-        detector_unit(d.id, open_definition(tenant_id, d.definition_ct))
+        detector_unit(d.id, open_definition(keys, d.id, d.definition_ct))
         for d in await dlp_policy.list_live_detectors(session)
         if d.id != detector_id and d.enabled
     ]
@@ -1061,7 +1070,11 @@ async def create_dlp_detector(
                 DetectorFields(
                     name=new.name,
                     kind=definition.kind.value,
-                    definition_ct=seal_definition(write.tenant_id, definition),
+                    definition_ct=seal_definition(
+                        await _dlp_keys(session, write.tenant_id, write=True),
+                        detector_id,
+                        definition,
+                    ),
                     enabled=new.enabled,
                 ),
                 created_by=created_by,
@@ -1089,7 +1102,8 @@ async def create_dlp_detector(
             rebuild=rebuild,
             resource_id=lambda detector: detector.id,
         )
-    return Outcome(_own(write.tenant_id, outcome.value), outcome.status, outcome.replayed)
+        keys = await _dlp_keys(session, write.tenant_id)
+    return Outcome(_own(keys, outcome.value), outcome.status, outcome.replayed)
 
 
 async def update_dlp_detector(
@@ -1116,12 +1130,13 @@ async def update_dlp_detector(
         detector = await dlp_policy.get_live_detector(session, own_id)
         if detector is None:
             raise NotFound
-        old = open_definition(write.tenant_id, detector.definition_ct)
+        keys = await _dlp_keys(session, write.tenant_id, write=True)
+        old = open_definition(keys, detector.id, detector.definition_ct)
         name = detector.name if change.name is None else change.name
         enabled = detector.enabled if change.enabled is None else change.enabled
         wanted = _changed_definition(old, change)
         if (name, enabled, wanted) == (detector.name, detector.enabled, old):
-            return _own(write.tenant_id, detector)
+            return _own(keys, detector)
         if wanted != old or (enabled and not detector.enabled):
             await _check_definitions(session, write.tenant_id, detector.id, wanted)
         if not await dlp_policy.retire_detector(session, detector.id, detector.revision):
@@ -1133,7 +1148,7 @@ async def update_dlp_detector(
             DetectorFields(
                 name=name,
                 kind=detector.kind,
-                definition_ct=seal_definition(write.tenant_id, wanted),
+                definition_ct=seal_definition(keys, detector.id, wanted),
                 enabled=enabled,
             ),
             created_by=created_by,
@@ -1153,7 +1168,7 @@ async def update_dlp_detector(
             changes=[PolicyChange.DETECTOR_CHANGED],
             details=_detector_details(new, **changed),
         )
-        return _own(write.tenant_id, new)
+        return _own(keys, new)
 
 
 async def delete_dlp_detector(
@@ -1258,7 +1273,8 @@ async def test_dlp_detectors(
         if everything:
             builtin = set(BUILTIN_DETECTORS)
             own = [d for d in live.values() if d.enabled]
-        units = [detector_unit(d.id, open_definition(tenant_id, d.definition_ct)) for d in own]
+        keys = await _dlp_keys(session, tenant_id)
+        units = [detector_unit(d.id, open_definition(keys, d.id, d.definition_ct)) for d in own]
         if draft is not None:
             unit = detector_unit(UUID(int=0), draft)
             units.append(replace(unit, id=DRAFT))

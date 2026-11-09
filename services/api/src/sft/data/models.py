@@ -36,6 +36,7 @@ from sqlalchemy import (
     SmallInteger,
     Text,
     UniqueConstraint,
+    Uuid,
     false,
     func,
     select,
@@ -74,7 +75,8 @@ class Tenant(TenantOwned, Base):
 
     Created by a platform operator (FR-34) with `recovery_contact`, the second contact an operator
     confirms an admin recovery through; empty only for rows from before revision 0005. The SSO
-    columns arrive with their feature (M6).
+    settings (#231, revision 0029): `sso_required`, who confirmed that the identity provider
+    enforces MFA, and whether a first SSO sign-in creates the member (`sso_jit`).
     """
 
     __tablename__ = "tenants"
@@ -82,6 +84,9 @@ class Tenant(TenantOwned, Base):
     __table_args__ = (
         CheckConstraint("status IN ('active', 'suspended')", name="status"),
         CheckConstraint("char_length(recovery_contact) BETWEEN 1 AND 320", name="recovery_contact"),
+        CheckConstraint(
+            "(sso_mfa_confirmed_by IS NULL) = (sso_mfa_confirmed_at IS NULL)", name="sso_mfa"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -90,6 +95,10 @@ class Tenant(TenantOwned, Base):
     recovery_contact: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+    sso_required: Mapped[bool] = mapped_column(server_default=text("false"))
+    sso_mfa_confirmed_by: Mapped[uuid.UUID | None]
+    sso_mfa_confirmed_at: Mapped[datetime | None]
+    sso_jit: Mapped[bool] = mapped_column(server_default=text("true"))
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -415,6 +424,13 @@ class IdpConnection(TenantOwned, Base):
         CheckConstraint("(kind = 'local') = (tenant_id IS NULL)", name="tenant"),
         UniqueConstraint("tenant_id", "id"),
         UniqueConstraint("provider_name"),
+        # One SSO provider per tenant (#231, revision 0029).
+        Index(
+            "idp_connections_tenant_id_idx",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -453,6 +469,131 @@ class UserIdentity(TenantOwned, Base):
     subject: Mapped[str] = mapped_column(Text)
     expires_at: Mapped[datetime | None]
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class SsoDomain(TenantOwned, Base):
+    """An email domain a tenant claimed for SSO, and proved with a DNS TXT record (#231; data
+    model 2.1; authn and authz 2.5). Proven once (`verified_at`) it belongs to that tenant alone,
+    routes "Continue with SSO" to the connection an operator linked it to, and is a trusted
+    recipient domain in the DLP decision (FR-45). `verification_token` is published in DNS, so it
+    is no secret."""
+
+    __tablename__ = "sso_domains"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(domain) BETWEEN 1 AND 253 AND domain = lower(domain)", name="domain"
+        ),
+        CheckConstraint("char_length(verification_token) = 32", name="verification_token"),
+        CheckConstraint("idp_connection_id IS NULL OR verified_at IS NOT NULL", name="linked"),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "domain"),
+        ForeignKeyConstraint(
+            ["tenant_id", "idp_connection_id"], ["idp_connections.tenant_id", "idp_connections.id"]
+        ),
+        ForeignKeyConstraint(["tenant_id", "created_by"], ["users.tenant_id", "users.id"]),
+        Index(
+            "sso_domains_domain_idx",
+            "domain",
+            unique=True,
+            postgresql_where=text("verified_at IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    domain: Mapped[str] = mapped_column(Text)
+    verification_token: Mapped[str] = mapped_column(Text)
+    idp_connection_id: Mapped[uuid.UUID | None]
+    verified_at: Mapped[datetime | None]
+    created_by: Mapped[uuid.UUID]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class SsoGroupRole(TenantOwned, Base):
+    """An identity provider group whose members a first SSO sign-in creates with a role (#231)."""
+
+    __tablename__ = "sso_group_roles"
+    __table_args__ = (
+        CheckConstraint("char_length(group_name) BETWEEN 1 AND 256", name="group_name"),
+        CheckConstraint(f"role IN {sql_values(Role)}", name="role"),
+        UniqueConstraint("tenant_id", "id"),
+        UniqueConstraint("tenant_id", "group_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    group_name: Mapped[str] = mapped_column(Text)
+    role: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class BreakGlassState(StrEnum):
+    """Where a break-glass request stands (#232; authn and authz 8.3)."""
+
+    REQUESTED = "requested"
+    ACTIVE = "active"
+    ENDED = "ended"
+    EXPIRED = "expired"
+    LAPSED = "lapsed"
+    WITHDRAWN = "withdrawn"
+
+
+class BreakGlassGrant(Base):
+    """A break-glass request and, once a second operator approves it, its grant (#232; data model
+    2.6; authn and authz 8.3). A platform table: no tenant, no row-level security, granted to
+    `sft_operator` alone. While a grant is `active` and before `ends_at`, `sft_breakglass` reads
+    the rows of `tenant_ids` (revision 0030's `break_glass_tenants()`), so access ends on time
+    whether or not anyone acts. `assignment_request_id`, `recorded_by`, `review_due_at` and
+    `review_url` are for grants the Identity Center path records (`recordBreakGlassGrant`)."""
+
+    __tablename__ = "break_glass_grants"
+    __table_args__ = (
+        CheckConstraint(f"state IN {sql_values(BreakGlassState)}", name="state"),
+        CheckConstraint("char_length(incident_id) BETWEEN 1 AND 64", name="incident_id"),
+        CheckConstraint("char_length(reason) BETWEEN 1 AND 1000", name="reason"),
+        CheckConstraint("cardinality(tenant_ids) <= 100", name="tenant_ids"),
+        CheckConstraint("duration_minutes BETWEEN 1 AND 60", name="duration_minutes"),
+        CheckConstraint(
+            "(approved_at IS NULL) = (state IN ('requested', 'lapsed', 'withdrawn'))",
+            name="approved",
+        ),
+        CheckConstraint(
+            "(approved_at IS NULL) = (starts_at IS NULL) AND (approved_at IS NULL) = "
+            "(ends_at IS NULL) AND (approved_at IS NULL) = (approver IS NULL)",
+            name="grant",
+        ),
+        CheckConstraint("ends_at <= starts_at + interval '1 hour'", name="ends_at"),
+        CheckConstraint("(ended_at IS NULL) = (state IN ('requested', 'active'))", name="ended_at"),
+        CheckConstraint("recorded_by IN ('service', 'tool', 'reconciliation')", name="recorded_by"),
+        UniqueConstraint("assignment_request_id"),
+        Index(
+            "break_glass_grants_state_idx",
+            "state",
+            postgresql_where=text("state IN ('requested', 'active')"),
+        ),
+        Index("break_glass_grants_requested_at_idx", "requested_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    incident_id: Mapped[str] = mapped_column(Text)
+    reason: Mapped[str] = mapped_column(Text)
+    tenant_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(Uuid))
+    duration_minutes: Mapped[int] = mapped_column(SmallInteger)
+    state: Mapped[str] = mapped_column(Text)
+    requester: Mapped[str] = mapped_column(Text)
+    approver: Mapped[str | None] = mapped_column(Text)
+    self_approved: Mapped[bool] = mapped_column(server_default=text("false"))
+    requested_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    approved_at: Mapped[datetime | None]
+    starts_at: Mapped[datetime | None]
+    ends_at: Mapped[datetime | None]
+    ended_at: Mapped[datetime | None]
+    ended_by: Mapped[str | None] = mapped_column(Text)
+    assignment_request_id: Mapped[str | None] = mapped_column(Text)
+    recorded_by: Mapped[str] = mapped_column(Text, server_default=text("'service'"))
+    review_due_at: Mapped[datetime | None]
+    review_url: Mapped[str | None] = mapped_column(Text)
 
 
 class SessionRevokedReason(StrEnum):
@@ -599,7 +740,8 @@ class ScanDetail(StrEnum):
     ENGINE_ERROR = "engine_error"
     DEADLINE_PASSED = "deadline_passed"
     LARGE_FILE_SCANNING_UNAVAILABLE = "large_file_scanning_unavailable"
-    """A file over 2 GB, which only GuardDuty scans (M6): recorded at completion until then."""
+    """A file over 2 GB completed before GuardDuty was connected (#234): no longer recorded, kept
+    for the rows that have it."""
 
 
 class InspectionState(StrEnum):
@@ -690,6 +832,12 @@ class Transfer(TenantOwned, Base):
             "sent_at",
             postgresql_where=text("sent_at IS NOT NULL"),
         ),
+        # Field encryption (#236, revision 0031): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "data_key_version"],
+            ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
+        ),
+        Index("transfers_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -879,6 +1027,14 @@ class File(TenantOwned, Base):
             "retention_until IS NULL OR upload_request_id IS NOT NULL", name="retention_until"
         ),
         CheckConstraint("NOT dlp_blocked OR upload_request_id IS NOT NULL", name="dlp_blocked"),
+        # Field encryption (#236, revision 0031): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "data_key_version"],
+            ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
+        ),
+        Index("files_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
+        # The per-file part-URL count (#165, revision 0033).
+        CheckConstraint("part_urls_issued >= 0", name="part_urls_issued"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -924,6 +1080,8 @@ class File(TenantOwned, Base):
     """A received file's deletion, from its upload's acceptance (FR-13)."""
     dlp_blocked: Mapped[bool] = mapped_column(server_default=false())
     """A received file a DLP rule blocked (FR-51): false until #221 decides."""
+    part_urls_issued: Mapped[int] = mapped_column(server_default=text("0"))
+    """Part URLs issued over the file's life, at most 10 times `part_count` (#165, abuse 6.1)."""
 
     @classmethod
     def reach(cls, subject: Subject) -> ColumnElement[bool]:
@@ -1060,6 +1218,12 @@ class DlpFinding(TenantOwned, Base):
             "detector",
             unique=True,
         ),
+        # DLP data keys (#233, revision 0032): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "dlp_key_version"],
+            ["tenant_dlp_keys.tenant_id", "tenant_dlp_keys.key_version"],
+        ),
+        Index("dlp_findings_tenant_id_dlp_key_version_idx", "tenant_id", "dlp_key_version"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1324,6 +1488,12 @@ class UploadRequest(TenantOwned, Base):
         CheckConstraint(
             "arrived_since_notice >= 0 AND blocked_since_notice >= 0", name="notice_counts"
         ),
+        # Field encryption (#236, revision 0031): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "data_key_version"],
+            ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
+        ),
+        Index("upload_requests_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1535,6 +1705,11 @@ class DlpDetector(TenantOwned, Base):
         CheckConstraint("char_length(name) BETWEEN 1 AND 100", name="name"),
         CheckConstraint(f"kind IN {sql_values(DlpDetectorKind)}", name="kind"),
         CheckConstraint("octet_length(definition_ct) > 0", name="definition_ct"),
+        # DLP data keys (#233, revision 0032): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "dlp_key_version"],
+            ["tenant_dlp_keys.tenant_id", "tenant_dlp_keys.key_version"],
+        ),
     )
 
     id: Mapped[uuid.UUID]
@@ -1723,6 +1898,11 @@ class DlpConfirmation(TenantOwned, Base):
             "justification_ct IS NULL OR octet_length(justification_ct) > 0",
             name="justification_ct",
         ),
+        # Field encryption (#236, revision 0031): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "data_key_version"],
+            ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1870,6 +2050,11 @@ class DlpApprovalDecision(TenantOwned, Base):
         CheckConstraint(f"decision IN {sql_values(ApprovalDecisionKind)}", name="decision"),
         CheckConstraint("comment_ct IS NULL OR octet_length(comment_ct) > 0", name="comment_ct"),
         CheckConstraint("decision <> 'reject' OR comment_ct IS NOT NULL", name="reject_comment"),
+        # Field encryption (#236, revision 0031): a key version can't go while a row uses it.
+        ForeignKeyConstraint(
+            ["tenant_id", "data_key_version"],
+            ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1941,3 +2126,53 @@ class DlpPatternStop(TenantOwned, Base):
     detector_id: Mapped[uuid.UUID]
     files_stopped: Mapped[int]
     last_stopped_at: Mapped[datetime]
+
+
+class _DataKeyVersion(TenantOwned):
+    """A version of a tenant's data key, as KMS returned it wrapped under the fields key
+    (encryption and keys 3.2, 3.3). Never the key itself."""
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    key_version: Mapped[int] = mapped_column(primary_key=True)
+    wrapped_key: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    retired_at: Mapped[datetime | None]
+
+    @classmethod
+    def reach(cls, subject: Subject) -> ColumnElement[bool]:
+        # A link session reads names and messages of its tenant's rows (FR-14), so it opens them
+        # with its tenant's keys; which rows it reaches is the other tables' `reach`.
+        return true()
+
+
+def _key_table_args(table: str) -> tuple[Any, ...]:
+    return (
+        ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        Index(
+            f"{table}_live_key",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("retired_at IS NULL"),
+        ),
+        CheckConstraint("key_version >= 1", name="key_version"),
+        CheckConstraint("octet_length(wrapped_key) BETWEEN 16 AND 1024", name="wrapped_key"),
+        CheckConstraint("retired_at IS NULL OR retired_at >= created_at", name="retired_at"),
+    )
+
+
+class TenantDataKey(_DataKeyVersion, Base):
+    """The tenant's field data key (`purpose = field-dek`, #236, revision 0031): file names,
+    messages, justifications and comments. Only the API unwraps it. At most one version is live
+    (not retired) and takes new writes; retired ones only decrypt, until no row uses them."""
+
+    __tablename__ = "tenant_data_keys"
+    __table_args__ = _key_table_args("tenant_data_keys")
+
+
+class TenantDlpKey(_DataKeyVersion, Base):
+    """The tenant's DLP data key (`purpose = dlp-dek`, #233, revision 0032): finding details and
+    detector definitions. The API and the scan worker unwrap it; the scan worker never the field
+    data key."""
+
+    __tablename__ = "tenant_dlp_keys"
+    __table_args__ = _key_table_args("tenant_dlp_keys")

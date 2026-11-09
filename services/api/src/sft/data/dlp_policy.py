@@ -46,6 +46,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from sft.core.sealed import key_version
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import (
     DlpDecisionRule,
@@ -342,6 +343,7 @@ async def insert_detector(
             name=fields.name,
             kind=fields.kind,
             definition_ct=fields.definition_ct,
+            dlp_key_version=key_version(fields.definition_ct),
             enabled=fields.enabled,
             created_by=created_by,
         )

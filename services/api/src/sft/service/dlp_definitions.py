@@ -1,14 +1,13 @@
-"""A tenant detector's definition, sealed for `dlp_detectors.definition_ct` (#218; data model 2.7;
-encryption and keys 3.3).
+"""A tenant detector's definition, sealed for `dlp_detectors.definition_ct` (#218, #233; data
+model 2.7; encryption and keys 3.3).
 
-The design stores keyword lists and patterns encrypted with the tenant's DLP data key, which
-arrives with DLP-8 (M6). Until then this module is the one place a definition passes through on
-its way to and from the column, so DLP-8 changes this module and a data migration, not its
-callers. The definition is JSON, sealed with the stand-in of M2 (`sft.service.fields.seal`,
-format 0, **not encrypted**); `dlp_key_version` stays empty.
+Keyword lists and patterns are JSON, encrypted with the tenant's DLP data key (`dlp-dek`,
+`sft.service.fields`), bound to the detector's ID, so the scan worker can read them to send to
+the inspector and nothing else can. A definition of a detector made before #233 is still format
+0 (not encrypted) until the field key job's backfill reseals it; it is read the same way.
 
-The tenant is the caller's scope, never the row's, as for every sealed field. Nothing here logs a
-definition: keyword lists hold a company's confidential terms.
+The keys are the caller's tenant's, never the row's, as for every sealed field. Nothing here logs
+a definition: keyword lists hold a company's confidential terms.
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from uuid import UUID
 from sft.data.models import DlpDetectorKind
 from sft.dlp.protocol import KeywordListSpec, PatternSpec
 from sft.dlp.units import KeywordList, Pattern, TenantDetector
-from sft.service.fields import SealedValueError, open_sealed, seal
+from sft.service.fields import DETECTOR_DEFINITION, SealedValueError, TenantKeys
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +46,8 @@ class PatternDefinition:
 Definition = Keywords | PatternDefinition
 
 
-def seal_definition(tenant_id: UUID, definition: Definition) -> bytes:
-    """`definition` as stored in `definition_ct` of `tenant_id`'s row."""
+def seal_definition(keys: TenantKeys, detector_id: UUID, definition: Definition) -> bytes:
+    """`definition` as stored in `definition_ct` of the detector's rows, under the DLP key."""
     if isinstance(definition, Keywords):
         body: dict[str, object] = {"kind": "keywords", "terms": list(definition.terms)}
     else:
@@ -59,13 +58,15 @@ def seal_definition(tenant_id: UUID, definition: Definition) -> bytes:
             "case_insensitive": definition.case_insensitive,
             "min_length": definition.min_length,
         }
-    return seal(tenant_id, json.dumps(body, ensure_ascii=False, separators=(",", ":")))
+    text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    return keys.seal(DETECTOR_DEFINITION, detector_id, text)
 
 
-def open_definition(tenant_id: UUID, value: bytes) -> Definition:
-    """The definition in a `definition_ct` value, read in `tenant_id`'s scope."""
+def open_definition(keys: TenantKeys, detector_id: UUID, value: bytes) -> Definition:
+    """The definition in a detector's `definition_ct` value, with the caller's tenant's keys."""
+    text = keys.open(DETECTOR_DEFINITION, detector_id, value)
     try:
-        body = json.loads(open_sealed(tenant_id, value))
+        body = json.loads(text)
         if body["kind"] == "keywords":
             return Keywords(tuple(str(t) for t in body["terms"]))
         if body["kind"] == "pattern":

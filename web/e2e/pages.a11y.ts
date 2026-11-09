@@ -58,6 +58,8 @@ import {
   rejectedRequestId,
   resolution,
   sessionFiles,
+  ssoDomainPendingId,
+  tenantSso,
   tenantTransferPage,
   tenantUploadRequestPage,
   transfer,
@@ -103,6 +105,8 @@ const answers: Record<string, unknown> = {
   [`/v1/files/${receivedFindingsFileId}/inspection`]: receivedInspection,
   '/v1/api-keys': apiKeyPage,
   '/v1/audit/events/search': auditPage,
+  // Single sign-on (#231).
+  '/v1/tenant/sso': tenantSso,
   // DLP (#218 to #220).
   '/v1/dlp/policy': dlpPolicy,
   '/v1/dlp/rules': dlpRules,
@@ -172,6 +176,7 @@ const memberPages = [
   ['upload request detail', `/upload-requests/${uploadRequestId}`],
   ['admin audit log', '/admin/audit'],
   ['admin API keys', '/admin/api-keys'],
+  ['admin single sign-on', '/admin/sso'],
   // DLP (#218 to #220): each section of the policy, each DLP state of a transfer, the approvals queue and a request.
   ['DLP settings', '/admin/dlp'],
   ['DLP rules', '/admin/dlp/rules'],
@@ -893,6 +898,12 @@ test('approval request: approve with a sign-in too old, and reject without a com
   await expect(approve.getByText(t.approve.stepUp)).toBeVisible();
   await expectNoWcagViolations(page, 'approve dialog');
   await approve.getByRole('button', { name: t.approve.action }).click();
+  // "Confirm it's you" asks first (#232); cancelling it (Escape closes only it) leaves the approve dialog explaining.
+  const stepUp = page.getByRole('dialog', { name: text().stepUp.title });
+  await expect(stepUp.getByRole('button', { name: text().stepUp.signIn })).toBeVisible();
+  await expectNoWcagViolations(page, 'step-up dialog');
+  await page.keyboard.press('Escape');
+  await expect(stepUp).toBeHidden();
   await expect(approve.getByRole('button', { name: text().admin.signInAgain })).toBeVisible();
   await expectNoWcagViolations(page, 'approve dialog, sign in again');
   await page.keyboard.press('Escape');
@@ -1033,4 +1044,18 @@ test('DLP reports: the charts as tables, the decisions list, and the export link
   await expect(page).toHaveURL(/\/admin\/audit\?action=dlp\.decided&from=/);
   await expect(page.locator('main').getByRole('heading', { level: 1, name: text().audit.title })).toBeVisible();
   await expectNoWcagViolations(page, 'audit log filtered to DLP decisions');
+});
+
+test('single sign-on: a domain the DNS doesn\'t prove yet, and the remove dialog (#231)', async ({ page }) => {
+  await page.route(`**/v1/tenant/sso/domains/${ssoDomainPendingId}/verify`, (route) =>
+    route.fulfill({ status: 422, json: problemOf(422, 'validation_failed') }),
+  );
+  await page.goto('/admin/sso');
+  const t = text().sso.domains;
+  await page.getByRole('button', { name: t.verifyDomain.replace('{{domain}}', 'example.co.jp') }).click();
+  await expect(page.getByText(t.verifyProblem.unverified)).toBeVisible();
+  await expectNoWcagViolations(page, 'single sign-on, domain unverified');
+  await page.getByRole('button', { name: t.removeDomain.replace('{{domain}}', 'example.co.jp') }).click();
+  await expect(page.getByRole('dialog', { name: t.removeTitle })).toBeVisible();
+  await expectNoWcagViolations(page, 'single sign-on, remove domain dialog');
 });

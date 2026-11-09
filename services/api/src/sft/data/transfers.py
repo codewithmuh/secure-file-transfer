@@ -26,6 +26,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, and_, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.sealed import key_version
 from sft.data.access import NotFoundError, in_scope, require_scope, tenant_of
 from sft.data.models import (
     DeliveryState,
@@ -67,6 +68,7 @@ async def insert_transfer(
             created_by=created_by,
             state=TransferState.DRAFT.value,
             message_ct=message_ct,
+            data_key_version=key_version(message_ct),
             expires_in=expires_in,
             download_limit=download_limit,
             notify_on_first_download=notify_on_first_download,

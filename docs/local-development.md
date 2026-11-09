@@ -26,6 +26,7 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 | `make smoke` | One real round trip to each stack service, from the host ([`local/smoke.py`](../local/smoke.py)), and a check that `sft_api` reads no tenant's rows without a scope |
 | `make seed` | Writes a tenant, an admin and a member who sign in through Keycloak, and prints how (section 7). Idempotent |
 | `make jobs JOB=<job>` | Runs one lifecycle job once: `expiry`, `deletion`, `reconciliation`, `storage-audit` or `cleanup` (section 7) |
+| `make field-keys STEP=<step>` | Runs one field key job step as the API: `backfill`, `rotate`, `rewrap` or `purge` (#236, section 4) |
 | `make e2e` | The M2 journey test against the running, seeded stack (section 7) |
 | `make web-e2e` | The web app's browser flows against the running, seeded stack, in the pinned Playwright image (section 8) |
 | `make test` | The API's tests. While the stack runs, the database tests use its server as `sft`, unless `TEST_DATABASE_URL` is set; they make and drop their own databases and leave `sft` alone |
@@ -82,6 +83,8 @@ over all of them.
 | Test admin | `dev.admin@example.com` / `local-only-admin-password`. User ID `44444444-4444-4444-8444-444444444444`, the same tenant, subject `55555555-5555-4555-8555-555555555555`. `make seed` writes it too. |
 | Notification worker's pool client | `sft-notify-local` / `local-only-notify-pool-secret`: a Keycloak client whose service account may only manage the realm's users (#197) |
 | Keycloak admin console | `admin` / `local-only-admin` at <http://localhost:8180/admin> |
+| SSO members (#231) | `sso.member@corp.localhost` / `local-only-sso-member-password` (group `staff`) and `sso.admin@corp.localhost` / `local-only-sso-admin-password` (group `sft-admins`, which the seed maps to `admin`), in Keycloak's `customer` realm, the local tenant's own identity provider. Choose "Continue with SSO" with that address; the first sign-in creates the member. |
+| Customer realm's broker client | `sft-pool` / `local-only-customer-broker-secret`: the `sft` realm signs in to the `customer` realm with it, as a Cognito pool federates to a tenant's provider |
 | Mail catcher | No sign-in; it accepts any SMTP credentials. Web UI at <http://localhost:8025> |
 
 ### PostgreSQL roles and passwords
@@ -141,12 +144,13 @@ role with the same password.
   the host, so compose sets `S3_PRESIGN_ENDPOINT_URL=http://localhost:9090`, used only to sign part URLs (#195). S3Mock
   checks no signature, so the different host costs nothing; the settings refuse it without `S3_ENDPOINT_URL`, so it is
   never set in AWS, where S3 signs its own host. The scan workers keep reading through `s3:9090`.
-- **No lifecycle rules, replication to Osaka or GuardDuty Malware Protection.** Large-file scans can't be tested
-  locally; tests put recorded GuardDuty events on `sft-local-guardduty-results` themselves.
-- **Files over 2,000,000,000 bytes are never scanned, locally and in dev, until M6.** Only GuardDuty scans them, and
-  nothing records its result before M6. So completion records such a file `scan_failed` at once, with
-  `scan_detail = large_file_scanning_unavailable`; `getFile` shows that, and sending its transfer holds it. It doesn't
-  page `ScanFailed`. Send files of up to 2 GB to test a journey end to end.
+- **No lifecycle rules, replication to Osaka or GuardDuty Malware Protection.** A stand-in plays GuardDuty for the
+  large-files bucket (#234): the `guardduty` service (`python -m sft.workers.guardduty_standin`) lists the bucket
+  every 5 seconds, reads each version that has no `GuardDutyMalwareScanStatus` tag, judges it (`THREATS_FOUND` if it
+  holds the EICAR test file, otherwise `NO_THREATS_FOUND`), tags it and sends the result event, as EventBridge
+  delivers it, to `sft-local-guardduty-results`. The large pool's scan worker records it, so a file over 2 GB becomes
+  shareable or blocked locally as it does in AWS. It is not an engine, and refuses to start unless `ENVIRONMENT` is
+  local or test; GuardDuty itself is tested in dev, pending the AWS run.
 - Versioning, object tags, `GetObjectAttributes`, multipart uploads with `ListParts` and pre-signed part URLs behave as
   the design uses them, and objects survive restarts in the `s3-data` volume.
 
@@ -157,8 +161,8 @@ role with the same password.
 - **Messages live in memory.** Restarting `sqs` loses them. There are no retention periods (4 and 14 days in AWS), no
   KMS and no queue policies, so any sender is accepted: the one-sender rule of the intake queues (threat model T-50)
   is tested in AWS.
-- **No AWS event sources.** SES sending events, GuardDuty results, SES tenant status and the sign-in triggers send
-  nothing locally. Tests put recorded events on the intake queues themselves.
+- **No AWS event sources.** SES sending events, SES tenant status and the sign-in triggers send nothing locally;
+  tests put recorded events on the intake queues themselves. GuardDuty's results come from its stand-in (S3 above).
 - Per-message delays, visibility timeouts and their extension, redrive to the dead-letter queue after 5 receives and
   `StartMessageMoveTask` behave as in SQS.
 
@@ -190,14 +194,28 @@ role with the same password.
   endpoints from discovery, and take the token revocation URL from settings, since Cognito has its own
   (`/oauth2/revoke` on the managed login domain).
 - **Cognito-shaped claims, not all of them.** The ID token carries `token_use`, `cognito:username` and
-  `custom:tenant_id`, and `sub` is Keycloak's own ID for the user. There is no `identities` claim, because there is no
-  federated SSO, and no `amr`, so the admin passkey rule's launch switch stays off locally, as it does until the
-  staging test (ADR-0016).
-- **No MFA.** The test member signs in with a password only; Cognito requires TOTP or a passkey. The `identity_provider`
-  parameter is ignored. Tenant SSO, threat protection and the breached-password check are tested in staging (M6). The
-  password policy matches the pool's: 15 to 99 characters.
-- **No sign-in triggers**, so no counting of failed sign-ins and no `sign_in.attempted` events. Tests put trigger events
-  on `sft-local-signin-events`.
+  `custom:tenant_id`, and `sub` is Keycloak's own ID for the user. There is no `amr`, so the admin passkey rule's
+  launch switch stays off locally, as it does until the staging test (ADR-0016).
+- **Tenant SSO through a second realm** (#231). The `customer` realm
+  ([`local/keycloak/customer-realm.json`](../local/keycloak/customer-realm.json)) plays the local tenant's own identity
+  provider, and the `sft` realm brokers to it under the tenant's provider name (the tenant ID without dashes), as a
+  Cognito pool federates to a tenant's provider. The API names the provider in `kc_idp_hint`
+  (`OIDC_IDP_HINT_PARAMETER`), where Cognito takes `identity_provider`. The broker's mappers put the provider's name
+  and the federated subject in an `identities` claim, one object where Cognito sends a list of one, and the groups in
+  `custom:sso_groups`, as a list where Cognito sends `[a,b]`; the API reads both shapes. `make seed` proves the
+  tenant's domain `corp.localhost` and links it to the connection. Domains an admin claims by hand are proven against
+  `SSO_DNS_OVERRIDES`, a JSON map of TXT names to values that only `ENVIRONMENT=local` or `test` may set (edit it in
+  compose.yaml to prove one); in AWS the API asks the VPC resolver. To add another tenant's provider, run the
+  operator's CLI against Keycloak: `python -m sft.runtime.sso_providers keycloak --tenant-id <id> --issuer
+  http://localhost:8180/realms/customer --idp-client-id sft-pool --idp-client-secret-file <file>
+  --admin-password-file <file>`. Brokering, and Cognito's federation, are checked end to end after M7; Cognito's is
+  pending the AWS run.
+- **No MFA.** The test member signs in with a password only; Cognito requires TOTP or a passkey. Threat protection and
+  the breached-password check are tested in staging. The password policy matches the pool's: 15 to 99 characters.
+- **No sign-in triggers in front of Keycloak**, so no counting of failed sign-ins and no `sign_in.*` events in the
+  local stack. The triggers' handlers (#238) are tested directly instead: `tests/test_signin_triggers.py` calls them
+  with Cognito-shaped events against Valkey, feeds what they send to the notification worker's consumer, and runs the
+  Lambda Runtime API loop against a stand-in. The notification worker reads `sft-local-signin-events` as in AWS.
 - **Secure cookies.** Keycloak marks its sign-in cookies `Secure`. Browsers send them to `http://localhost`; scripted
   clients must send them too, as `local/smoke.py` does. The API's own cookies (`__Host-sft_session`, and
   `__Host-sft_link` for recipients' link sessions, #179) are `Secure` and `__Host-` locally too: browsers treat
@@ -221,6 +239,16 @@ role with the same password.
 - **Sign-out.** The API's logout URL is Keycloak's logout endpoint without an ID token hint, so Keycloak asks to
   confirm the logout. The API session has ended either way, and the next sign-in asks for the password again
   (`prompt=login`).
+
+### KMS (an in-process stand-in)
+
+Field encryption (#236, #233) wraps each tenant's data keys with KMS. Locally there is no KMS container:
+`FIELDS_KMS_KEY_ID=local` makes the API, the scan workers and the field key job use `sft.runtime.kms.LocalKms`, which
+wraps data keys with AES-256-GCM under a fixed, public key derived in code, binds the encryption context
+(`purpose`, `tenant_id`) as KMS does, and refuses a purpose the process's role lacks: the scan workers get `dlp-dek`
+only, as the fields key's policy says. It protects nothing, and logs a warning when chosen; the chart never sets it.
+Values sealed locally are real AES-256-GCM, so a dump of the local database shows no file name or message either.
+Rows from before #236 hold M2's unencrypted format until `make field-keys STEP=backfill` reseals them.
 
 ### ClamAV
 

@@ -7,10 +7,11 @@ The alert of FR-19 ([abuse and rate limits](../security/abuse-and-rate-limits.md
 
 - A file ended `scan_failed` for an engine error (`scan_results_total{state="scan_failed", reason="engine_error"}`) or
   because its scan deadline passed (`reason="deadline_passed"`, recorded by the scan sweep), or
-- a message sits in `sft-<env>-<region>-scan-small-dlq` or `-scan-large-dlq`.
+- a message sits in `sft-<env>-<region>-scan-small-dlq`, `-scan-large-dlq` or `-guardduty-results-dlq`.
 
-Files over 2,000,000,000 bytes that end `scan_failed` with `large_file_scanning_unavailable` don't fire it: no engine
-scans them until GuardDuty is connected (M6), and the member sees that reason (`getFile`).
+Files over 2,000,000,000 bytes are GuardDuty's (#234): `engine_error` when GuardDuty answered `FAILED` or
+`ACCESS_DENIED`, `deadline_passed` when no result arrived within two hours of completion. Every reason pages; the
+`large_file_scanning_unavailable` of files completed before #234 no longer occurs.
 
 ## Impact
 
@@ -43,7 +44,14 @@ Locally: `docker compose logs scan-worker-small clamd`.
    is correct; check that clamd's limits (`MaxRecursion`, `MaxFiles`, `MaxScanSize`) are the chart's.
 4. **Messages in a dead-letter queue**: once the cause is fixed, move them back with `StartMessageMoveTask`. Each is a
    prompt only: the worker re-reads the file, skips one that has a result, and scans one still `scanning`.
-5. **A file that failed for a transient reason** stays `scan_failed`: the member removes it and uploads it again
+5. **GuardDuty, for files over 2 GB** (#234): `guardduty_results_total{outcome}` shows what the large pool's
+   workers did with each result. `too_early` that keeps rising means results come before completion commits or
+   before GuardDuty's tag; after 5 receives they land in `-guardduty-results-dlq`, and a redrive once the file is
+   `scanning` records them. `tag_mismatch` means an event disagreed with GuardDuty's tag on the object and was
+   ignored (T-50): look for who sent it. No results at all: check the plan's status
+   (`aws guardduty list-malware-protection-plans`, its EventBridge rule and the events delivery role) and the
+   GuardDuty service health in the Region.
+6. **A file that failed for a transient reason** stays `scan_failed`: the member removes it and uploads it again
    (`deleteFile` on the held transfer sends the rest). No operator action rescans a file.
 
 ## Escalate

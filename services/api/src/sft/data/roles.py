@@ -27,9 +27,14 @@ RELAY: Final = "sft_relay"
 JOBS: Final = "sft_jobs"
 ARCHIVE: Final = "sft_archive"
 RECOVERY: Final = "sft_recovery"
+BREAK_GLASS: Final = "sft_breakglass"
+"""A person's role, not a workload's: an operator with an active break-glass grant logs in as it
+(authn and authz 8.3, #232). It reads the grant's tenants' rows of a few tables and nothing else,
+through policies that end with the grant. Held to the workload roles' rules: listed with them."""
 
-WORKLOAD_ROLES: Final = (API, OPERATOR, SCAN, NOTIFY, RELAY, JOBS, ARCHIVE, RECOVERY)
-"""The roles a running workload logs in as. Each is granted only the tables it needs."""
+WORKLOAD_ROLES: Final = (API, OPERATOR, SCAN, NOTIFY, RELAY, JOBS, ARCHIVE, RECOVERY, BREAK_GLASS)
+"""The roles that log in to use tables: each running workload's, and break-glass's. Each is granted
+only the tables it needs."""
 
 LOGIN_ROLES: Final = (*WORKLOAD_ROLES, MIGRATE)
 """Every role that logs in: with IAM database authentication in AWS, a password only locally."""

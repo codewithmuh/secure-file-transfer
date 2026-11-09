@@ -303,6 +303,13 @@ Location hints point to where a match is, never what is around it: page 12; shee
 can be as revealing as a file name, so hints and previews are stored together, encrypted with the tenant's DLP data key,
 and deleted with the file's contents (data model 2.7).
 
+As built (#233): a hint is stored as the extractor wrote it (`sheet "顧客一覧", row 340`), and the API reads it into
+the contract's `DlpLocation`: the hint at its end (`page`, `sheet` and `row`, `slide`, `line`, `paragraph`, or a
+`part`: header, footer, footnotes and endnotes, comments, notes, document properties and sheet names as `properties`,
+the message), and what comes before it, an archive member's path, as `member`. A hint it doesn't know is `part:
+body`. A tenant keyword's preview is the listed term, so the sender sees which of the list's terms their own file
+holds, and never the rest of the list.
+
 ## 8. Accuracy testing (NFR-25)
 
 **The corpus is synthetic and generated, never collected.** A generator in the test suite builds the labelled corpus

@@ -192,6 +192,54 @@ The cost: names and messages can't be searched or sorted in SQL. The web app sor
 itself, and audit search doesn't use them (UC-4). The module uses a standard AEAD implementation, never its own
 cryptography, and a write is read back and checked before it commits.
 
+**As built (#236, revision 0031).** `sft.service.fields` seals and opens every `*_ct` value; `sft.core.sealed` is the
+stored format; `sft.runtime.kms` calls KMS.
+
+- **Format 1:** `0x01`, the key version (4 bytes), a 96-bit random nonce, the AES-256-GCM ciphertext and tag. The
+  additional authenticated data is, length-prefixed: a format tag, the purpose (`field-dek` or `dlp-dek`), the tenant,
+  the table, the column, the row's ID and the key version. A detector definition is bound to the detector's ID, which
+  its revisions share. Every write is decrypted again and compared before it is returned.
+- **Keys.** `tenant_data_keys (tenant_id, key_version, wrapped_key, created_at, retired_at)`, one live version per
+  tenant (a partial unique index). The first value sealed for a tenant makes version 1 in the same transaction (KMS
+  `GenerateDataKey` with the context `{"purpose": "field-dek", "tenant_id": ...}`); a race is settled by the keys.
+  Each ciphertext table's `data_key_version` is set from the value by the data layer and is a composite foreign key to
+  the version, so a version a row uses can't be deleted. A transaction loads its tenant's versions once
+  (`tenant_keys(session, tenant_id)`), from a per-process cache of at most 15 minutes keyed by the wrapped key's hash.
+- **The caller's tenant.** The keys are always the session's scope's tenant's; asking for another tenant's is refused
+  before any query. A value that doesn't open raises `FieldDecryptError` (a 500 to the caller), logs the tenant,
+  column and row by ID, and counts `field_decrypt_scope_mismatch_total{purpose}`, which pages.
+- **Who unwraps.** Each process installs one key holder with the purposes its role may use: the API both; the scan
+  worker `dlp-dek` only; the field key job both, as the API. The notification worker and the operator API install
+  none, so they can't seal or open anything.
+- **The expand step and the backfill.** M2's format 0 (plain text behind a zero byte) is still read, and counted in
+  `field_plaintext_reads_total{column}`, never written. The field key job (`python -m sft.workers.field_keys`, below)
+  reseals every format 0 value. After it has run in an environment, a dump holds no name or message in plain text;
+  the contract step that stops reading format 0, and a check that refuses it, follow once every environment shows no
+  plaintext reads (follow-up, section 10).
+- **The field key job** runs as the API (its service account, IAM role and `sft_api`), the only role the fields key
+  lets unwrap a field data key. It finds tenants with the lookup function `field_key_tenants` (IDs only) and acts in
+  each tenant's scope, a batch per transaction, each with its audit event: `backfill` reseals what isn't under the
+  live version (format 0, or a retired version: the re-encryption), `rotate` makes a new version once the live one is
+  a year old, `rewrap` wraps every version again with `ReEncrypt` (the API's statement now allows
+  `kms:ReEncryptFrom` and `kms:ReEncryptTo`, same conditions), and `purge` deletes retired versions no row uses. The
+  chart runs `rotate,backfill,purge` daily in Tokyo (the `field-keys` CronJob); runbook
+  [field-keys](../runbooks/field-keys.md).
+- **What stays plain (M6 combine).** #231's and #232's new text columns aren't sealed: `sso_domains.domain` is
+  matched across tenants at sign-in by `lookup_sso_domain` and is unique where proven, so it must be comparable (like
+  `transfer_recipients.domain`); `sso_domains.verification_token` is published in DNS by design; IdP issuers and
+  provider names are configuration, read before a tenant scope exists; IdP group names in `sso_group_roles` are
+  configuration, not content. `break_glass_grants.reason` and `incident_id` are platform rows with no tenant, written
+  and read by the operator API, which holds no data key (above), and a grant can name several tenants. None of them is
+  in `SEALED_COLUMNS`. #221's and #230's additions need no new sealed column either: a pattern's definition (RE2
+  expression, context keywords) is a detector definition, sealed in `dlp_detectors.definition_ct` with the DLP data
+  key exactly as a keyword list (3.3); a message's findings (`dlp_findings.transfer_id`) are counts only, with no
+  `detail_ct`, so they name no key version; `dlp_pattern_stops` holds IDs and counts, and `notice_windows` kinds of
+  change and times.
+- **Locally** `FIELDS_KMS_KEY_ID=local` selects an in-process stand-in that wraps with AES-GCM under a public, fixed
+  key, binds the context as KMS does, and refuses the purposes the process's role lacks. The chart never sets it (a
+  deploy test). Running against real KMS, the scan worker's denied `field-dek` call and the Osaka unwrap are **pending
+  the AWS run**.
+
 ### 3.3 DLP data keys
 
 DLP finding details and a tenant's own detectors are as revealing as file names: a sheet called "Layoffs 2027", the
@@ -214,6 +262,18 @@ data key.
    tenant), never the tenant on the row.
 5. **Deletion.** `detail_ct` is cleared when the file's contents are deleted (NFR-8), and a key version is deleted once
    no row uses it.
+
+**As built (#233, revision 0032).** `tenant_dlp_keys` has the shape and rules of `tenant_data_keys`; `sft_api` reads,
+makes, retires and deletes versions, `sft_scan` reads and makes them. `dlp_findings (tenant_id, dlp_key_version)` and
+`dlp_detectors (tenant_id, dlp_key_version)` refer to it. The scan worker seals each finding's location hints and
+masked previews (`sft.service.finding_details`) under the message's tenant's DLP key, bound to the finding's row, in
+the transaction that records the scan; `sft_scan` still can't select `detail_ct`. Detector definitions are sealed the
+same way when a detector is created or changed, and the field key job's backfill reseals older ones. Only the API
+opens details, for the file's owner and an active approver of the transfer's approval request, and audits each such
+response (`dlp_findings.details_read`). The NFR-26 canary test (`tests/test_dlp_canary.py`) runs synthetic My Numbers,
+card numbers and a keyword through every DLP flow and searches the database, logs, traces, metrics, queue messages,
+audit records and emails for them. In staging, a scan worker call for a `field-dek` key must be denied: **pending the
+AWS run**.
 
 ## 4. Key hierarchy and multi-Region keys
 
@@ -296,7 +356,7 @@ cancel a pending deletion. V = EBS volumes through EC2: grants for AWS resources
 
 | Principal | files | fields | database | audit | logs | secrets | platform | tfstate |
 |---|---|---|---|---|---|---|---|---|
-| API service | E D | E D | — | E, both Regions | — | D, own secrets | — | — |
+| API service (and the field key job, which runs as it, #236) | E D | E D, and `ReEncrypt` for the re-wrap | — | E, both Regions | — | D, own secrets | — | — |
 | Operator API (decision 12) | — | — | — | E, both Regions | — | — | — | — |
 | Scan worker | D, files up to 2 GB only | E D, `dlp-dek` only (3.3) | — | — | — | — | D, scan queues | — |
 | Notification worker | — | — | — | — | — | D, own secrets | D, its queues | — |
@@ -1102,6 +1162,10 @@ Applied in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26) 
   fields key (3.3), the scan worker's `dlp-dek` statement (4.3, 4.4), the inspector hop (2.2) and the classification
   rows (section 1). The data model has `tenant_dlp_keys` and the ciphertext columns (2.7); capacity A30 counts the
   extra KMS requests.
+
+- **Field encryption, [#236](https://github.com/codewithmuh/secure-file-transfer/issues/236), and DLP-8,
+  [#233](https://github.com/codewithmuh/secure-file-transfer/issues/233).** Built as 3.2 and 3.3 say. Open: the
+  contract step that stops reading format 0 values once the backfill has run everywhere.
 
 Left for later: every check in 9.2 that needs an AWS account waits for the AWS profile, and the on-demand rotation
 rehearsal (7.1) runs in the first staging build.

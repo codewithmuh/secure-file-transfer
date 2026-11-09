@@ -20,6 +20,8 @@ from sft.data.counters import CounterMetrics, CounterStore
 from sft.data.database import Database, psycopg_url
 from sft.data.migrate import run
 from sft.data.roles import API, MIGRATE, OPERATOR
+from sft.runtime.kms import LocalKms
+from sft.service import fields
 
 
 @pytest.fixture
@@ -39,6 +41,17 @@ def spans() -> Iterator[InMemorySpanExporter]:
     _SPANS.clear()
     yield _SPANS
     _SPANS.clear()
+
+
+@pytest.fixture(autouse=True)
+def field_keys() -> Iterator[fields.FieldKeys]:
+    """The process's data keys, as the API installs them, on the KMS stand-in (#236): every test
+    that seals or opens a name or message uses them. A test of a narrower workload installs its
+    own (the scan worker's `dlp-dek` only)."""
+    keys = fields.FieldKeys(LocalKms(), fields.FieldMetrics.create(CollectorRegistry()))
+    previous = fields.install(keys)
+    yield keys
+    fields.install(previous)
 
 
 class _Collector(BaseHTTPRequestHandler):

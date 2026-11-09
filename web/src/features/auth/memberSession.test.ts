@@ -4,6 +4,7 @@ import { csrfToken, currentMember, header, member, problem, setUpApi } from '@/t
 import {
   finishSignIn,
   isLogoutUrl,
+  refreshMemberSession,
   restoreMemberSession,
   signInUrl,
   signOutMember,
@@ -71,6 +72,39 @@ describe('restoreMemberSession: a refresh keeps the member signed in (#73 defect
     await restoreMemberSession();
 
     expect(storage.setItem).not.toHaveBeenCalled();
+  });
+});
+
+describe('refreshMemberSession: the new session after a step-up sign-in in a popup (#232)', () => {
+  it('loads the new CSRF token without the page going back to "checking", so its form stays mounted', async () => {
+    const newer = csrfToken('newer');
+    await setUpApi(() => ({ status: 200, data: currentMember(newer, 'admin') }));
+    useAuthStore.getState().setAuth({ ...member, role: 'admin' }, token);
+    const statuses: string[] = [];
+    const stop = useAuthStore.subscribe((state) => statuses.push(state.memberStatus));
+
+    const refreshed = await refreshMemberSession();
+    stop();
+
+    expect(refreshed).toEqual({ ...member, role: 'admin' });
+    expect(useAuthStore.getState().memberCsrfToken).toBe(newer);
+    expect(statuses).not.toContain('checking');
+  });
+
+  it('keeps how the session signed in, for the next step-up', async () => {
+    const body = currentMember(token);
+    body.session.auth_method = 'sso';
+    await setUpApi(() => ({ status: 200, data: body }));
+
+    await expect(refreshMemberSession()).resolves.toMatchObject({ authMethod: 'sso' });
+  });
+
+  it('resolves null and leaves the store as it was when the API can\'t answer', async () => {
+    await setUpApi(() => problem(503, 'service_unavailable'));
+    useAuthStore.getState().setAuth(member, token);
+
+    await expect(refreshMemberSession()).resolves.toBeNull();
+    expect(useAuthStore.getState().memberStatus).toBe('authenticated');
   });
 });
 

@@ -19,7 +19,9 @@ export interface paths {
          *     it chose (authn-authz 2.4). The verifier never leaves the server.
          *
          *     - `method=sso` sends only the domain of the member's address (`sso_domain`). If a tenant has proven that
-         *       domain, the browser goes to that tenant's identity provider; otherwise it falls back to local sign-in.
+         *       domain (`verifySsoDomain`) and an operator linked it to the tenant's active connection, the browser goes to
+         *       that tenant's identity provider; otherwise it falls back to local sign-in, so an unproven domain never
+         *       routes a sign-in.
          *     - `method=local` always goes to Cognito's own sign-in: a password and TOTP, or a passkey with user
          *       verification.
          *
@@ -73,8 +75,14 @@ export interface paths {
          *     API audits the reason: a state that is missing, reused or wrong; an invalid token; an unknown identity; a
          *     deactivated user; a suspended tenant; an inactive connection; an invitation that is used, expired or for
          *     another connection; a subject already bound to another user; or a local sign-in to a tenant that requires
-         *     SSO by someone who isn't one of its fallback admins. Nobody is created just in time: someone nobody invited
-         *     is told to ask their admin.
+         *     SSO by someone who isn't one of its fallback admins.
+         *
+         *     **Just in time (FR-26, #231).** An SSO sign-in whose subject has no identity yet, through the tenant's active
+         *     connection, with an `email` claim on one of the domains linked to that connection, binds the subject to the
+         *     tenant's user with that address, if there is one that isn't deactivated and has no identity on the
+         *     connection yet; otherwise, when the tenant has `jit_provisioning` on, it creates the member, active, with the
+         *     role its groups map to or `member`. The address never finds a user in another tenant, and never one outside
+         *     the connection's proven domains. Both are audited (`user.provisioned`, `user.identity_bound`).
          *
          *     Public. Rate limit: 60 callbacks per IP address per minute; fails closed with `503` when the sign-in state
          *     store or the counters are unavailable.
@@ -602,7 +610,8 @@ export interface paths {
          *
          *     Declaring a file reserves its size in the tenant's storage quota (2 TB of files uploading, scanning or stored
          *     by default; `413 storage_quota_exceeded`) and counts against the tenant's daily upload volume (200 GB declared
-         *     in 24 hours; `429`). Removing or rejecting the file releases the reservation (abuse-and-rate-limits 6.1).
+         *     per UTC day; `429` with `Retry-After` until the day ends). Removing or rejecting the file releases the
+         *     reservation, not the day's volume (abuse-and-rate-limits 6.1).
          *
          *     Errors: `403 permission_denied`, `409 invalid_state` (the transfer isn't a draft; `current_state` says what it
          *     is, for example `cancelled`), `413 file_too_large`, `413 total_too_large`, `413 storage_quota_exceeded`,
@@ -742,10 +751,12 @@ export interface paths {
          * @description Returns a pre-signed URL for each requested part, up to 100 per call. Each URL allows one `PUT` of exactly
          *     that part's size to object storage, for at most 15 minutes, and allows nothing else. Ask again for parts whose
          *     URL expired. URLs are issued only while the file is `uploading` and its transfer is a `draft`, and only to the
-         *     transfer's owner.
+         *     transfer's owner. A file gets at most 10 times its `part_count` URLs over its life; past that, `429` with
+         *     `Retry-After: 86400`, and the client declares the file again (abuse-and-rate-limits 6.1).
          *
          *     Errors: `403 permission_denied`, `409 invalid_state` (the file is past `uploading`, or the draft was cancelled
-         *     by its owner or after 7 days without activity), `422 validation_failed` (a part number beyond `part_count`).
+         *     by its owner or after 7 days without activity), `422 validation_failed` (a part number beyond `part_count`),
+         *     `429 rate_limited` (the file's part URLs are used up, or a group F rate).
          *
          *     Requirements: FR-2, NFR-3, NFR-6.
          */
@@ -1904,6 +1915,164 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/tenant/sso": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the tenant's single sign-on settings
+         * @description The tenant's SSO settings (FR-26, authn-authz 2.5): the identity provider connection an operator recorded
+         *     (`configureTenantSso`), the email domains the tenant has claimed and proven with a DNS TXT record, whether
+         *     members must sign in through the identity provider, which admin confirmed that the provider enforces MFA,
+         *     whether a first SSO sign-in creates the member just in time, and the identity provider groups that map to a
+         *     role.
+         *
+         *     Needs the admin role, from a session signed in with a passkey or SSO for a local admin
+         *     (`403 passkey_required`). API keys can't read it.
+         *
+         *     Errors: `403 passkey_required`.
+         *
+         *     Requirements: FR-26.
+         */
+        get: operations["getTenantSso"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Change the tenant's single sign-on settings
+         * @description Changes the fields sent; fields left out are unchanged (FR-26, authn-authz 2.5).
+         *
+         *     - `sso_required: true` lets members sign in only through the identity provider, except the tenant's
+         *       fallback admins (`updateUser`). It needs an `active` connection and a confirmation that the identity
+         *       provider enforces MFA, otherwise `422 validation_failed`.
+         *     - `confirm_idp_mfa: true` records the calling admin as the one who confirmed that the identity provider
+         *       enforces MFA, because Cognito's MFA doesn't apply to federated users (authn-authz 9.1).
+         *     - `jit_provisioning` lets a first SSO sign-in create the member, with the `member` role or the role its
+         *       groups map to (`group_roles`), when the address is on one of the connection's proven domains. With it off,
+         *       only members who already exist with that address can sign in through SSO.
+         *     - `group_roles` replaces the list. A group that maps to `admin` wins over one that maps to `member`. The
+         *       mapping applies when a sign-in creates a member; later role changes are `updateUser`'s.
+         *
+         *     Every change is audited, with counts, never the group names (FR-27).
+         *
+         *     **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+         *     passkey sign-in (`403 passkey_required`).
+         *
+         *     Errors: `401 reauthentication_required`, `403 passkey_required`, `422 validation_failed`.
+         *
+         *     Requirements: FR-26, FR-27.
+         */
+        patch: operations["updateTenantSso"];
+        trace?: never;
+    };
+    "/tenant/sso/domains": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim an email domain for single sign-on
+         * @description Starts proving an email domain (authn-authz 2.5): the answer names a DNS TXT record, `_sft-verification.` and
+         *     the domain, and the value to publish there. Once it is published, `verifySsoDomain` checks it. Until then the
+         *     domain routes no sign-in and counts as no trusted domain.
+         *
+         *     A domain belongs to one tenant at most once proven, so a pending claim blocks no other tenant: the first to
+         *     prove it holds it, and a later proof gets `409 invalid_state` (`verifySsoDomain`). A claim never says
+         *     whether another tenant holds the domain. Claiming one this tenant already claimed returns that claim. A tenant
+         *     holds at most 20 domains. The domain is lower-case and in its ASCII (IDNA) form; a subdomain is a domain of its
+         *     own.
+         *
+         *     **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+         *     passkey sign-in (`403 passkey_required`).
+         *
+         *     Errors: `401 reauthentication_required`, `403 passkey_required`, `422 validation_failed`.
+         *
+         *     Requirements: FR-26.
+         */
+        post: operations["claimSsoDomain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tenant/sso/domains/{sso_domain_id}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the claimed SSO domain. */
+                sso_domain_id: components["parameters"]["SsoDomainId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a claimed domain's DNS TXT record
+         * @description Looks up the claim's TXT record in DNS. When one of its values is the claim's, the domain is proven: from
+         *     then on "Continue with SSO" for an address on it goes to the tenant's identity provider, once an operator has
+         *     linked it to the connection (`configureTenantSso`), and the DLP decision treats it as a trusted recipient
+         *     domain (FR-45). The record can be removed afterwards. Verifying a proven domain again returns it unchanged.
+         *
+         *     **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+         *     passkey sign-in (`403 passkey_required`).
+         *
+         *     Errors: `401 reauthentication_required`, `403 passkey_required`, `404 not_found`,
+         *     `409 invalid_state` (another tenant proved the domain first; `current_state: pending`, the claim stays
+         *     pending), `422 validation_failed` (the record isn't there yet; `detail` names it), `503 service_unavailable`
+         *     (DNS didn't answer).
+         *
+         *     Requirements: FR-26, FR-45.
+         */
+        post: operations["verifySsoDomain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/tenant/sso/domains/{sso_domain_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the claimed SSO domain. */
+                sso_domain_id: components["parameters"]["SsoDomainId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Give up a domain
+         * @description Removes the claim. A proven domain stops routing sign-in at once and stops counting as a trusted recipient
+         *     domain. Members who already signed in through SSO keep their identity, and can still sign in through
+         *     "Continue with SSO" only from another proven domain. Audited.
+         *
+         *     **Step-up:** a sign-in in the last 15 minutes (`401 reauthentication_required`) and, for a local admin, a
+         *     passkey sign-in (`403 passkey_required`).
+         *
+         *     Errors: `401 reauthentication_required`, `403 passkey_required`, `404 not_found`.
+         *
+         *     Requirements: FR-26.
+         */
+        delete: operations["deleteSsoDomain"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dlp/policy": {
         parameters: {
             query?: never;
@@ -2578,15 +2747,18 @@ export interface paths {
          *     requires SSO, and which tenant admin confirmed that their identity provider enforces MFA. The operator API
          *     never manages providers itself.
          *
-         *     This writes the tenant's `idp_connections` row and its proven domains. A domain belongs to one tenant at most.
-         *     When the connection becomes `active`, every existing member is emailed an invitation link to bind their SSO
-         *     identity; their local sign-in keeps working until the tenant requires SSO. With `sso_required: true`, members
-         *     can sign in only through the identity provider, except the tenant's fallback admins (`updateUser`). Every
-         *     change is a record in the tenant's audit log. Sending the configuration the tenant already has returns it
-         *     unchanged.
+         *     This writes the tenant's `idp_connections` row and links the domains to it. Each domain must be one the
+         *     tenant claimed and proved itself (`claimSsoDomain`, `verifySsoDomain`), so a domain belongs to one tenant at
+         *     most and the operator never vouches for one. Domains linked before and left out are unlinked. Existing members
+         *     bind their SSO identity at their first SSO sign-in, by their address on a linked domain (`completeSignIn`,
+         *     just in time); their local sign-in keeps working until the tenant requires SSO. With `sso_required: true`,
+         *     members can sign in only through the identity provider, except the tenant's fallback admins (`updateUser`).
+         *     Every change is a record in the tenant's audit log. Sending the configuration the tenant already has returns
+         *     it unchanged.
          *
-         *     Errors: `404 not_found` (tenant), `422 validation_failed` (a domain held by another tenant, a provider name
-         *     that doesn't match the tenant ID, or an `sso_mfa_confirmed_by` who isn't an active admin of the tenant).
+         *     Errors: `404 not_found` (tenant), `422 validation_failed` (a domain the tenant hasn't proven, a provider name
+         *     that isn't the tenant ID without dashes, or an `sso_mfa_confirmed_by` who isn't an active admin of the
+         *     tenant).
          *
          *     Requirements: FR-26, FR-34.
          */
@@ -2667,6 +2839,109 @@ export interface paths {
          *     Requirements: FR-35, FR-27.
          */
         post: operations["recordBreakGlassGrant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/operator/break-glass-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List break-glass requests
+         * @description The latest break-glass requests, newest first, at most `limit` of them, optionally in one state. An `active`
+         *     grant's `ends_at` is when the database role stops reaching its tenants, whether or not anyone acts.
+         *
+         *     Requirements: FR-35.
+         */
+        get: operations["listBreakGlassRequests"];
+        put?: never;
+        /**
+         * Ask for break-glass access to tenant data
+         * @description The first of the two-person steps of break-glass in the service (authn-authz 8.3, FR-35): an operator asks
+         *     for read access to the named tenants' rows through the scoped database role `sft_breakglass`, with the
+         *     incident, a reason and a duration of at most 60 minutes. Nothing is reachable until a second operator
+         *     approves (`approveBreakGlass`). A request nobody approves within an hour lapses.
+         *
+         *     A security-critical platform audit record names the requester; the incident and the reason stay in the
+         *     request, never in an audit record's details.
+         *
+         *     Errors: `422 validation_failed` (a duration over 60 minutes, or a tenant that doesn't exist).
+         *
+         *     Requirements: FR-35, FR-27.
+         */
+        post: operations["requestBreakGlass"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/operator/break-glass-requests/{break_glass_request_id}/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the break-glass request. */
+                break_glass_request_id: components["parameters"]["BreakGlassRequestId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a break-glass request
+         * @description The second operator approves a `requested` request: it becomes `active` at once and ends `duration_minutes`
+         *     later, at `ends_at`, without anyone acting. While it is active, `sft_breakglass` reads the named tenants' rows
+         *     after `SET app.break_glass_grant = '<id>'`, and nothing else; the alert `BreakGlassActive` pages on-call
+         *     (deploy/alerts). The operator API records the expiry in the audit log within a minute of `ends_at`.
+         *
+         *     The approver must be another operator (`403 self_approval_forbidden`), except where the environment allows
+         *     self-approval for a single maintainer (`BREAK_GLASS_SELF_APPROVAL`), which is then marked `self_approved` and
+         *     alerts on its own (authn-authz 8.3, threat model R-08).
+         *
+         *     A security-critical platform audit record, and one in each named tenant's audit log, where its admins see it
+         *     (UC-4).
+         *
+         *     Errors: `403 self_approval_forbidden`, `404 not_found`, `409 invalid_state` (not `requested`, or lapsed).
+         *
+         *     Requirements: FR-35, FR-27.
+         */
+        post: operations["approveBreakGlass"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/operator/break-glass-requests/{break_glass_request_id}/end": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the break-glass request. */
+                break_glass_request_id: components["parameters"]["BreakGlassRequestId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * End break-glass access early
+         * @description Any operator ends an `active` grant before `ends_at` (`ended`), or withdraws a `requested` one (`withdrawn`).
+         *     Access ends with the transaction. Ending one that has already ended returns it unchanged. Audited as for the
+         *     approval.
+         *
+         *     Errors: `404 not_found`.
+         *
+         *     Requirements: FR-35, FR-27.
+         */
+        post: operations["endBreakGlass"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2991,9 +3266,9 @@ export interface components {
             /**
              * @description Why a file is `unscannable` or `scan_failed`, so the member sees what to do: encrypted content or a scan
              *     limit (`unscannable`, FR-18); an engine error on every attempt or a scan that passed its deadline
-             *     (`scan_failed`, FR-19). `large_file_scanning_unavailable`: a file over 2,000,000,000 bytes, which only
-             *     GuardDuty Malware Protection scans, and which isn't connected in the local and dev builds until M6.
-             *     Remove the file and send it in smaller parts, or wait for M6. Empty otherwise.
+             *     (`scan_failed`, FR-19). `large_file_scanning_unavailable`: a file over 2,000,000,000 bytes completed
+             *     before GuardDuty Malware Protection was connected (#234); no file gets it any more. Remove the file and
+             *     upload it again. Empty otherwise.
              * @enum {string|null}
              */
             scan_detail?: "encrypted" | "limit_exceeded" | "engine_error" | "deadline_passed" | "large_file_scanning_unavailable" | null;
@@ -3506,6 +3781,76 @@ export interface components {
              */
             logout_url: string;
         };
+        TenantSsoSettings: {
+            /** @description The tenant's identity provider, as an operator recorded it; `null` until one is. */
+            connection: components["schemas"]["TenantSsoConnection"] | null;
+            /** @description Members may sign in only through the identity provider, except the tenant's fallback admins. */
+            sso_required: boolean;
+            /**
+             * Format: uuid
+             * @description The admin who confirmed that the identity provider enforces MFA.
+             */
+            sso_mfa_confirmed_by: string | null;
+            /** Format: date-time */
+            sso_mfa_confirmed_at: string | null;
+            /** @description A first SSO sign-in from an address on a proven domain creates the member. */
+            jit_provisioning: boolean;
+            group_roles: components["schemas"]["SsoGroupRole"][];
+            domains: components["schemas"]["SsoDomain"][];
+        };
+        TenantSsoConnection: {
+            id: components["schemas"]["Id"];
+            /** @enum {string} */
+            kind: "oidc" | "saml";
+            /** @description The provider's name in the user pools, the tenant ID without dashes. */
+            provider_name: string;
+            issuer: string | null;
+            /** @enum {string} */
+            status: "active" | "inactive";
+        };
+        SsoGroupRole: {
+            /** @description A group name as the identity provider sends it, compared exactly. */
+            group: string;
+            role: components["schemas"]["Role"];
+        };
+        /** @description Only the fields sent are changed. */
+        TenantSsoSettingsUpdate: {
+            sso_required?: boolean;
+            /**
+             * @description Records the calling admin's confirmation that the identity provider enforces MFA.
+             * @enum {boolean}
+             */
+            confirm_idp_mfa?: true;
+            jit_provisioning?: boolean;
+            /** @description Replaces the list. Each group appears once. */
+            group_roles?: components["schemas"]["SsoGroupRole"][];
+        };
+        SsoDomainClaim: {
+            /**
+             * Format: hostname
+             * @description An email domain, such as `example.co.jp`.
+             */
+            domain: string;
+        };
+        SsoDomain: {
+            id: components["schemas"]["Id"];
+            /** Format: hostname */
+            domain: string;
+            /** @enum {string} */
+            status: "pending" | "verified";
+            /** @description Where to publish the TXT record, `_sft-verification.<domain>`. */
+            txt_record_name: string;
+            /** @description The value to publish, `sft-domain-verification=` and 32 random characters. Not a secret. */
+            txt_record_value: string;
+            /**
+             * Format: uuid
+             * @description The connection the domain routes sign-in to, once an operator linked it.
+             */
+            idp_connection_id: string | null;
+            /** Format: date-time */
+            verified_at: string | null;
+            created_at: components["schemas"]["Timestamp"];
+        };
         OperatorTokenRequest: {
             sts_request: components["schemas"]["SignedStsRequest"];
         };
@@ -3645,6 +3990,49 @@ export interface components {
              * @description Link to the after-action review once it is written.
              */
             review_url: string | null;
+        };
+        /**
+         * @description `requested` until a second operator approves, then `active` until `ends_at` (`expired`) or until an operator
+         *     ends it (`ended`). A request nobody approved within an hour `lapsed`; one its requester or another operator
+         *     withdrew is `withdrawn`.
+         * @enum {string}
+         */
+        BreakGlassState: "requested" | "active" | "ended" | "expired" | "lapsed" | "withdrawn";
+        BreakGlassRequestCreate: {
+            incident_id: string;
+            reason: string;
+            /** @description The tenants whose rows `sft_breakglass` may read while the grant is active. */
+            tenant_ids: components["schemas"]["Id"][];
+            duration_minutes: number;
+        };
+        BreakGlassRequest: {
+            id: components["schemas"]["Id"];
+            incident_id: string;
+            reason: string;
+            tenant_ids: components["schemas"]["Id"][];
+            duration_minutes: number;
+            state: components["schemas"]["BreakGlassState"];
+            /** @description Identity Center user name of the operator who asked. */
+            requester: string;
+            approver: string | null;
+            self_approved: boolean;
+            requested_at: components["schemas"]["Timestamp"];
+            /** Format: date-time */
+            approved_at: string | null;
+            /** Format: date-time */
+            starts_at: string | null;
+            /** Format: date-time */
+            ends_at: string | null;
+            /**
+             * Format: date-time
+             * @description When it ended early, expired, lapsed or was withdrawn.
+             */
+            ended_at: string | null;
+            /** @description The operator who ended or withdrew it; `null` when it expired or lapsed. */
+            ended_by: string | null;
+        };
+        BreakGlassRequestList: {
+            items: components["schemas"]["BreakGlassRequest"][];
         };
         /**
          * @description Why a transfer is `held` (data model 3.2): a file isn't shareable (`file_blocked`), a DLP rule blocks it
@@ -4326,6 +4714,10 @@ export interface components {
         UserId: components["schemas"]["Id"];
         /** @description ID of the API key. */
         ApiKeyId: components["schemas"]["Id"];
+        /** @description ID of the claimed SSO domain. */
+        SsoDomainId: components["schemas"]["Id"];
+        /** @description ID of the break-glass request. */
+        BreakGlassRequestId: components["schemas"]["Id"];
         /**
          * @description Opaque cursor from `next_cursor` of the previous page. Leave it out for the first page. An invalid or
          *     expired cursor returns `400 invalid_cursor`.
@@ -6336,6 +6728,151 @@ export interface operations {
             429: components["responses"]["TooManyRequests"];
         };
     };
+    getTenantSso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's SSO settings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantSsoSettings"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    updateTenantSso: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TenantSsoSettingsUpdate"];
+            };
+        };
+        responses: {
+            /** @description The tenant's SSO settings after the change. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantSsoSettings"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    claimSsoDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SsoDomainClaim"];
+            };
+        };
+        responses: {
+            /** @description The domain was already claimed by this tenant; the claim as it is. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SsoDomain"];
+                };
+            };
+            /** @description The claim, with the TXT record to publish. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SsoDomain"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    verifySsoDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the claimed SSO domain. */
+                sso_domain_id: components["parameters"]["SsoDomainId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The domain, proven. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SsoDomain"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteSsoDomain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the claimed SSO domain. */
+                sso_domain_id: components["parameters"]["SsoDomainId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The claim is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
     getDlpPolicy: {
         parameters: {
             query?: never;
@@ -7301,6 +7838,119 @@ export interface operations {
             422: components["responses"]["UnprocessableContent"];
             429: components["responses"]["TooManyRequests"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listBreakGlassRequests: {
+        parameters: {
+            query?: {
+                state?: components["schemas"]["BreakGlassState"];
+                /** @description Largest number of items to return. */
+                limit?: components["parameters"]["Limit"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The requests. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakGlassRequestList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    requestBreakGlass: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BreakGlassRequestCreate"];
+            };
+        };
+        responses: {
+            /** @description The request, waiting for a second operator. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakGlassRequest"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            422: components["responses"]["UnprocessableContent"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    approveBreakGlass: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the break-glass request. */
+                break_glass_request_id: components["parameters"]["BreakGlassRequestId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The grant, active. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakGlassRequest"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["TooManyRequests"];
+        };
+    };
+    endBreakGlass: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the break-glass request. */
+                break_glass_request_id: components["parameters"]["BreakGlassRequestId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request, ended. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BreakGlassRequest"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
         };
     };
 }

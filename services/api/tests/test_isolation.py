@@ -11,6 +11,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Seeded, Tenants
@@ -19,6 +20,7 @@ from sft.data import (
     audit,
     audit_reads,
     codes,
+    data_keys,
     dlp_approvals,
     dlp_decisions,
     dlp_policy,
@@ -32,6 +34,7 @@ from sft.data import (
     member_sessions,
     notice_windows,
     recipients,
+    sso,
     suppressions,
     transfers,
     upload_requests,
@@ -1912,6 +1915,136 @@ async def report_another_tenants_decisions(session: AsyncSession, tenants: Tenan
         ),
         await dlp_reports.report(session, since=PAST, until=FAR),
     )
+
+
+# ---- field and DLP data keys (#236, #233) ----
+
+
+@cases.add(scopes={API: [TENANT, RESOURCE], SCAN: [TENANT]})
+async def read_another_tenants_data_keys(session: AsyncSession, tenants: Tenants) -> object:
+    # Only the scope's own tenant's versions, whatever the caller asks for.
+    return [
+        await data_keys.list_keys(session, data_keys.KeyPurpose.FIELD),
+        await data_keys.list_keys(session, data_keys.KeyPurpose.DLP),
+    ]
+
+
+@cases.add(scopes={API: [TENANT]})
+async def change_another_tenants_data_keys(session: AsyncSession, tenants: Tenants) -> object:
+    marker = tenants.mine.marker.encode()
+    for purpose in data_keys.KeyPurpose:
+        await data_keys.insert_key(session, purpose, version=9, wrapped=marker * 2)
+        await data_keys.retire_live(session, purpose, now=FAR)
+        await data_keys.rewrap(session, purpose, version=1, before=marker, wrapped=marker * 2)
+        await data_keys.delete_retired(session, purpose, [1, 2])
+    return None
+
+
+@cases.add(scopes={API: [TENANT]})
+async def reseal_another_tenants_values(session: AsyncSession, tenants: Tenants) -> object:
+    found: list[object] = []
+    for column in data_keys.SEALED_COLUMNS:
+        stale = await data_keys.stale_values(session, column, current=99, limit=50)
+        found.append(stale)
+        theirs = data_keys.StoredValue(tenants.theirs.rows["file"], None, b"\x00x")
+        await data_keys.reseal(session, column, theirs, tenants.mine.marker.encode())
+    found.append(await data_keys.versions_in_use(session, data_keys.KeyPurpose.FIELD))
+    found.append(await findings.details_by_file(session, [tenants.theirs.rows["file"]]))
+    await audit.record(session, action="fields.resealed", actor=Actor(ActorType.SYSTEM))
+    return found
+
+
+@cases.add(scopes={API: [LOOKUP]})
+async def find_tenants_for_the_field_key_job(session: AsyncSession, tenants: Tenants) -> object:
+    # Across tenants by design, IDs only (revision 0031): the find must change nothing.
+    return await data_keys.tenants_after(session, None)
+
+
+# ---- tenant SSO (#231, revision 0029) ----
+
+SSO_ADMINS = {API: [TENANT], OPERATOR: [TENANT]}
+
+
+@cases.add(scopes=SSO_ADMINS)
+async def read_another_tenants_sso_settings(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    return (
+        await sso.get_connection(session),
+        await sso.list_domains(session),
+        await sso.get_domain(session, theirs["sso_domain"], for_update=True),
+        await sso.connection_domains(session, theirs["connection"]),
+        await sso.group_roles(session) if session.info.get("role") == API else None,
+    )
+
+
+@cases.add(scopes=API_TENANT)
+async def change_another_tenants_sso_domains(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    changed: list[object] = [await sso.delete_domain(session, theirs["sso_domain_pending"])]
+    with contextlib.suppress(NoResultFound):
+        changed.append(await sso.mark_verified(session, theirs["sso_domain_pending"]))
+    # A claim of their proven domain is this tenant's own pending claim, never theirs.
+    claim, _ = await sso.claim_domain(
+        session,
+        domain=f"{tenants.theirs.marker}.example",
+        token="t" * 32,
+        created_by=tenants.mine.rows["user"],
+    )
+    await audit.record(session, action="sso_domain.claimed", actor=ADMIN)
+    return changed, claim.tenant_id
+
+
+@cases.add(scopes=API_TENANT)
+async def replace_group_roles_never_reaches_another_tenant(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    result = await sso.replace_group_roles(session, [(tenants.mine.marker, Role.MEMBER)])
+    await audit.record(session, action="tenant_sso.updated", actor=ADMIN)
+    return result
+
+
+@cases.add(scopes={OPERATOR: [TENANT]})
+async def link_another_tenants_domains(session: AsyncSession, tenants: Tenants) -> object:
+    with contextlib.suppress(NoResultFound):
+        await sso.put_connection(
+            session,
+            kind="oidc",
+            provider_name=f"{tenants.mine.marker}-x",
+            issuer="x",
+            status="active",
+        )
+    linked = await sso.link_domains(
+        session, tenants.theirs.rows["connection"], [f"{tenants.theirs.marker}.example"]
+    )
+    await audit.record(session, action="tenant_sso.configured", actor=ADMIN)
+    return linked
+
+
+@cases.add(scopes={API: [TENANT], SCAN: [TENANT], JOBS: [TENANT]})
+async def another_tenants_proven_domains_are_not_trusted(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    return await sso.verified_domains(session)
+
+
+@cases.add(scopes=API_TENANT)
+async def bind_an_identity_to_another_tenants_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    bound = await sso.bind_identity(
+        session,
+        user_id=tenants.theirs.rows["user"],
+        connection_id=tenants.theirs.rows["connection"],
+        subject=f"bind-{tenants.mine.marker}",
+    )
+    await audit.record(session, action="user.identity_bound", actor=ADMIN)
+    return bound
+
+
+@cases.add(scopes={API: [TENANT, LOOKUP]})
+async def route_another_tenants_domain(session: AsyncSession, tenants: Tenants) -> object:
+    # A credential lookup, across tenants in lookup scope by design: it returns IDs and status.
+    return await sso.route_domain(session, f"pending-{tenants.theirs.marker}.example")
 
 
 test_isolation = cases.test()

@@ -9,9 +9,9 @@ and their findings' counts (never their details).
 
 1. **Recipients.** A recipient's domain is compared lowercase and IDNA-normalised (`xn--` labels),
    as the policy stores its trusted domains. It is **trusted** when it is, or is a subdomain of,
-   one of them (FR-45). The tenant's SSO domains would count too, but `sso_domains` doesn't exist
-   yet: M6 brings it. A domain is **new** when the tenant hasn't sent to it in the 365 days
-   before the decision (`dlp_known_domains`, FR-46).
+   one of them (FR-45), or of the tenant's proven SSO domains (`sso_domains`, #231), which
+   `decision_policy` adds to them. A domain is **new** when the tenant hasn't sent to it in the
+   365 days before the decision (`dlp_known_domains`, FR-46).
 2. **Rules.** Every live, enabled rule for sent files is tested:
    - `content`: the matches of its detectors at or above its confidence, added up over the
      counted files and the transfer's message (FR-48, FR-50), against its threshold; the count is

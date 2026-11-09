@@ -12,7 +12,7 @@ from sft.data.bootstrap import bootstrap
 from sft.data.database import sync_engine
 from sft.data.migrate import become_owner
 from sft.data.rls import LOOKUP_SEARCH_PATH
-from sft.data.roles import API, JOBS, LOGIN_ROLES, LOOKUP, MIGRATE, OWNER, RECOVERY
+from sft.data.roles import API, BREAK_GLASS, JOBS, LOGIN_ROLES, LOOKUP, MIGRATE, OWNER, RECOVERY
 
 # A superuser URL for a PostgreSQL 17 server, e.g. postgresql://postgres:…@127.0.0.1:5432/postgres.
 # Each test session makes its own databases there and drops them afterwards. The roles are
@@ -179,6 +179,9 @@ OWNER_DEFINER_FUNCTIONS: dict[str, tuple[str, ...]] = {
     "audit_partition_status()": (JOBS,),
     # The fail-closed audit check (#50): a trigger function, which no role calls itself.
     "audit_required()": (),
+    # Break-glass (#232, revision 0030): the tenants of the session's active grant, read by the
+    # `break_glass_read` policies as `sft_breakglass`.
+    "break_glass_tenants()": (BREAK_GLASS,),
 }
 """`SECURITY DEFINER` functions the owner may have, and the only roles that may execute each.
 

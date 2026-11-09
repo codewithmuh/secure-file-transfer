@@ -20,6 +20,7 @@ from sft.data.models import (
     ApprovalDecisionKind,
     ApprovalState,
     Base,
+    BreakGlassState,
     DeliveryState,
     DlpAction,
     DlpCondition,
@@ -1251,3 +1252,82 @@ def test_the_dlp_should_revision_keeps_the_sql_the_helpers_wrote_for_it() -> Non
     assert list(module.AUDIT) == [require_audit_sql(stops)]
     # Nobody new reads a finding's details.
     assert "detail_ct" not in " ".join(module.RLS)
+
+
+def test_the_tenant_sso_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #231. Found by its contents, not its number.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "LOOKUP_SSO_DOMAIN_BODY")
+    ]
+    domains, roles_table = "sso_domains", "sso_group_roles"
+    assert list(module.KEYS) == [
+        *tenant_keys_sql(domains),
+        tenant_foreign_key_sql(domains, "idp_connection_id", "idp_connections"),
+        tenant_foreign_key_sql(domains, "created_by", "users"),
+        *tenant_keys_sql(roles_table),
+    ]
+    dlp_read = _columns(module.DLP_READ_COLUMNS)
+    assert list(module.RLS) == [
+        *tenant_rls_sql(
+            domains, grants={"sft_api": "SELECT, INSERT, UPDATE, DELETE", "sft_operator": "SELECT"}
+        ),
+        grant_sql(domains, "sft_operator", "UPDATE", columns=["idp_connection_id", "updated_at"]),
+        grant_sql(domains, "sft_scan", "SELECT", columns=dlp_read),
+        grant_sql(domains, "sft_jobs", "SELECT", columns=dlp_read),
+        f"ALTER POLICY tenant_isolation ON {domains} TO sft_api, sft_operator, sft_scan, sft_jobs",
+        *lookup_read_sql(domains, _columns(module.LOOKUP_COLUMNS)),
+        *lookup_function_sql(
+            "lookup_sso_domain(p_domain text)",
+            returns="TABLE (connection_id uuid, owner_tenant_id uuid, provider_name text, "
+            "status text)",
+            body=module.LOOKUP_SSO_DOMAIN_BODY,
+        ),
+        *tenant_rls_sql(roles_table, grants={"sft_api": "SELECT, INSERT, DELETE"}),
+        grant_sql("idp_connections", "sft_operator", "SELECT, INSERT, UPDATE"),
+        grant_sql("idp_connections", "sft_api", "SELECT"),
+        policy_sql(
+            "tenant_isolation",
+            "idp_connections",
+            roles=["sft_api", "sft_operator"],
+            using="tenant_id = app_tenant_id()",
+            with_check="tenant_id = app_tenant_id()",
+        ),
+        grant_sql("user_identities", "sft_api", "INSERT"),
+        grant_sql("tenants", "sft_api", "UPDATE", columns=_columns(module.TENANT_SSO_COLUMNS)),
+    ]
+    assert list(module.AUDIT) == [require_audit_sql(domains), require_audit_sql(roles_table)]
+    # The DLP roles read a proven domain's name, never its token; the lookup returns no token.
+    assert "verification_token" not in module.DLP_READ_COLUMNS + module.LOOKUP_COLUMNS
+    assert f"{module.ROLES}" == sql_values(Role)
+
+
+def test_the_break_glass_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #232: the operator's platform table, and the person's read-only role, policy by policy.
+    [module] = [s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "READ_TABLES")]
+    assert list(module.GRANTS) == [
+        grant_sql("break_glass_grants", "sft_operator", "SELECT, INSERT, UPDATE")
+    ]
+    expected = []
+    for table in module.READ_TABLES:
+        key = "id" if table == "tenants" else "tenant_id"
+        expected += [
+            grant_sql(table, "sft_breakglass", "SELECT"),
+            policy_sql(
+                "break_glass_read",
+                table,
+                roles=["sft_breakglass"],
+                command="SELECT",
+                using=f"{key} = ANY (break_glass_tenants())",
+            ),
+        ]
+    assert list(module.RLS) == expected
+    assert (
+        f"({', '.join(repr(s.value) for s in BreakGlassState)})".replace('"', "'") == module.STATES
+    )
+
+
+def test_break_glass_reaches_nothing_without_an_active_grant(migrated_db: ScratchDatabase) -> None:
+    # The function the policies call: with no grant named it reaches no tenant
+    # (tests/test_break_glass.py tries an unknown grant, an ended one and an expired one).
+    rows = migrated_db.sql("SELECT cardinality(break_glass_tenants())")
+    assert rows == [(0,)]

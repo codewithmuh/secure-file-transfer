@@ -86,6 +86,7 @@ export const member = {
   name: 'aiko@example.co.jp',
   role: 'member' as const,
   dlpApprover: false,
+  authMethod: 'passkey' as const,
   tenantId: '0190c0de-0000-7000-8000-0000000000aa',
   tenantName: 'Example KK',
 };

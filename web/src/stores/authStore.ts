@@ -10,6 +10,8 @@ export interface Member {
   role: 'admin' | 'member';
   /** `user.dlp_approver`: the member may approve other members' transfers (FR-43). */
   dlpApprover: boolean;
+  /** `session.auth_method`: how this session signed in, so a step-up signs in the same way again (#232). */
+  authMethod: 'passkey' | 'password_totp' | 'local' | 'sso';
   tenantId: string;
   tenantName: string;
 }

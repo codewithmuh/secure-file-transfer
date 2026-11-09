@@ -41,6 +41,9 @@ from sft.data.outbox import OutboxMessage, Queue
 from sft.data.roles import SCAN
 from sft.data.scope import Subject
 from sft.service.caller import AuthMethod, Caller, CallerKind
+from sft.service.rate_limits import Charge, RateLimiter
+from sft.service.rate_limits.limits import KeyType
+from sft.service.rate_limits.uploads import F_TENANT_UPLOAD_BYTES
 from sft.service.uploads import UploadPolicy
 from sft.workers.consumer import Delivery
 from sft.workers.scan import Engines, Leases, ScanMetrics, SmallScanConsumer
@@ -805,7 +808,7 @@ async def test_the_uploaders_operations_need_the_uploaders_link_session(rig: Rig
         assert answer.json()["code"] == "authentication_required"
 
 
-async def test_a_received_file_over_2_gb_is_scan_failed_at_once_and_told_as_blocked(
+async def test_a_received_file_over_2_gb_waits_for_guardduty(
     rig: Rig,
 ) -> None:
     up = await uploader(rig)
@@ -822,13 +825,50 @@ async def test_a_received_file_over_2_gb_is_scan_failed_at_once_and_told_as_bloc
         )
     done = await complete(up, file_id)
     assert done.status_code == 200, done.text
-    assert done.json()["state"] == "scan_failed"
+    # GuardDuty's result records it (#234); nothing is told until then.
+    assert done.json()["state"] == "scanning"
     [(detail, storage)] = rig.w.db.sql(
         "SELECT scan_detail, storage_class FROM files WHERE id = :id", id=uuid.UUID(file_id)
     )
-    assert (detail, storage) == ("large_file_scanning_unavailable", "large")
+    assert (detail, storage) == (None, "large")
     [(blocked,)] = rig.w.db.sql(
         "SELECT blocked_since_notice FROM upload_requests WHERE id = :id", id=up.request_id
     )
-    assert blocked == 1
-    assert notices_due(rig, up.request_id) == [(300,)]
+    assert blocked == 0
+    assert notices_due(rig, up.request_id) == []
+
+
+# ---- group F's budgets for uploaders (#165, abuse 6.1) ----
+
+
+async def test_an_uploaders_files_count_against_the_tenants_daily_volume(rig: Rig) -> None:
+    up = await uploader(rig)
+    limiter: RateLimiter = rig.w.app.state.rate_limiter
+    tenant = {KeyType.TENANT: str(rig.tenant.id)}
+    # The tenant's members declared all but 12 MB of the day's 200 GB.
+    await limiter.check_all([Charge(F_TENANT_UPLOAD_BYTES, tenant, 200_000 - 12)])
+    first = await declare(up, size=SIZE)  # 6 MiB: 7 megabytes
+    assert first.status_code == 201, first.text
+    refused = await declare(up, "second.pdf", size=SIZE)
+    assert refused.status_code == 429
+    assert refused.json()["code"] == "rate_limited"
+    # Until the UTC day ends (on the world's clock): a fixed day, as the download byte caps.
+    assert 0 < int(refused.headers["Retry-After"]) <= 86400
+    files = rig.w.db.sql("SELECT count(*) FROM files WHERE upload_request_id = :r", r=up.request_id)
+    assert files == [(1,)]
+    # 5 megabytes are left, for a smaller file.
+    small = await declare(up, "small.pdf", size=5_000_000)
+    assert small.status_code == 201, small.text
+
+
+async def test_an_uploaders_file_gets_ten_times_its_part_count_in_part_urls(rig: Rig) -> None:
+    up = await uploader(rig)
+    declared = await declare(up)
+    file_id = declared.json()["id"]
+    count = declared.json()["upload"]["part_count"]
+    numbers = list(range(1, count + 1))
+    for _ in range(10):
+        assert (await part_urls(up, file_id, numbers)).status_code == 200
+    refused = await part_urls(up, file_id, [1])
+    assert refused.status_code == 429
+    assert refused.headers["Retry-After"] == "86400"

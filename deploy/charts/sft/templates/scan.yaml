@@ -23,8 +23,8 @@ data:
 {{- $w := $.Values.scanWorker }}
 {{- /*
 The scan worker's settings (sft.core.settings.ScanSettings): its pool and queue, the region's files buckets, the
-node-local clamd and inspector Services, and the large pool's size, which caps one tenant's large-file scans at one
-fewer (ADR-0019).
+node-local clamd and inspector Services, the large pool's size, which caps one tenant's large-file scans at one
+fewer (ADR-0019), and the fields key's alias, whose policy lets this role unwrap DLP data keys only (#233).
 */}}
 {{- $workerEnv := merge (dict
   "SCAN_POOL" $pool
@@ -35,7 +35,8 @@ fewer (ADR-0019).
   "CLAMD_PORT" (toString $.Values.clamd.port)
   "INSPECTOR_HOST" "dlp-inspector"
   "INSPECTOR_PORT" (toString $.Values.dlpInspector.port)
-  "SCAN_LARGE_POOL_SIZE" (toString $.Values.scanPools.large.replicas)) $w.env }}
+  "SCAN_LARGE_POOL_SIZE" (toString $.Values.scanPools.large.replicas)
+  "FIELDS_KMS_KEY_ID" (printf "alias/sft/%s/fields" $.Values.environment)) $w.env }}
 {{- $containers := include "sft.appContainer" (dict "root" $ "name" "scan-worker" "module" $w.module "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $workerEnv "resources" $w.resources) }}
 {{- $affinity := include "sft.onePerNode" (dict "component" "scan-worker") }}
 ---

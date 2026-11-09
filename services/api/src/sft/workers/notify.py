@@ -19,6 +19,9 @@ is never sent twice (ADR-0013; consumer.py).
   (`sft.runtime.cognito`), Keycloak's locally (`sft.runtime.keycloak`); `none` sends no invitation.
 - **SES's events** (#185): a second consumer reads the `ses-events` queue beside the notify queue
   and records bounces and complaints in the tenant's suppression list (`sft.service.ses_events`).
+- **The sign-in triggers' events** (#238): a third consumer reads the `signin-events` queue and
+  writes each attempt, refusal, failure and success to the member's tenant's audit log
+  (`sft.service.signin_triggers`), reading the counter store to tell a failed attempt.
 
 `python -m sft.workers.notify invite-backlog` runs the one-off pass that invites, through the
 pool, every member left `invited` before it existed (#193), then exits: 0 done, 1 failed.
@@ -58,6 +61,8 @@ from sft.service.notifications import CONSUMER, Done, Notifier, NotifyMetrics, i
 from sft.service.rate_limits import RateLimiter
 from sft.service.ses_events import CONSUMER as SES_CONSUMER
 from sft.service.ses_events import SesEvents, parse_event
+from sft.service.signin_triggers import SignInEvents
+from sft.service.signin_triggers import parse_message as parse_signin_message
 from sft.service.user_pool import UserPool
 from sft.workers.consumer import (
     LONG_POLL_SECONDS,
@@ -112,6 +117,24 @@ class SesEventsConsumer(Consumer):
         event = parse_event(delivery.body)
         if event is not None:  # parsed once already, the same way
             await self.events.handle(session, event)
+
+
+class SignInEventsConsumer(Consumer):
+    """The signin-events queue's consumer (#238): each sign-in trigger event in the member's
+    tenant, recorded once (`sft.service.signin_triggers.SignInEvents`)."""
+
+    name: ClassVar[str] = "signin-events"
+    queue: ClassVar[Queue] = Queue.SIGNIN_EVENTS
+
+    def __init__(self, database: Database, events: SignInEvents) -> None:
+        super().__init__(database)
+        self.events = events
+
+    def parse(self, body: str) -> OutboxMessage | None:
+        return parse_signin_message(body)
+
+    async def handle(self, session: AsyncSession, delivery: Delivery) -> None:
+        await self.events.handle(session, delivery.message)
 
 
 def threaded_send(
@@ -226,8 +249,13 @@ async def run_notify_worker(settings: NotifySettings, *, handle_signals: bool = 
         consumer_metrics,
     )
 
+    # The sign-in triggers' events (#238), each written to the member's tenant's audit log.
+    signin_loop = ConsumerLoop(
+        SignInEventsConsumer(database, SignInEvents(store)), queues, consumer_metrics
+    )
+
     async def both(stopping: asyncio.Event) -> None:
-        await asyncio.gather(loop.run(stopping), ses_loop.run(stopping))
+        await asyncio.gather(loop.run(stopping), ses_loop.run(stopping), signin_loop.run(stopping))
 
     refresh = asyncio.create_task(keyrings.run())
     try:

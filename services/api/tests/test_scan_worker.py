@@ -570,6 +570,7 @@ def test_the_worker_waits_out_a_long_poll() -> None:
         sqs_queue_prefix="sft-local-",
         s3_files_bucket="sft-local-files",
         s3_large_files_bucket="sft-local-large-files",
+        fields_kms_key_id="local",
     )
     queues = scan_queues(settings)
     assert queues._client.meta.config.read_timeout > LONG_POLL_SECONDS
@@ -719,6 +720,10 @@ async def test_a_japanese_keyword_list_matches_its_forms_and_the_file_records_th
         inspection = (await http.get(f"/v1/files/{file_id}/inspection")).json()
     [mine] = [f for f in inspection["findings"] if f["detector"] == detector]
     assert mine["detector_name"] == "社内プロジェクト"
+    # Only as the masked previews of what matched in the sender's own file (detectors 7, #233),
+    # never in the detector's name or anywhere else.
+    previews = mine.pop("previews")
+    assert "ORION計画" in previews
     assert "ORION" not in json.dumps(inspection, ensure_ascii=False)
 
 

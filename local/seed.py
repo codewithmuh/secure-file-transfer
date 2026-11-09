@@ -15,6 +15,10 @@ Run with `make seed` after `make up`. It writes, as the local server's superuser
 - a tenant, with its policy and its default DLP policy (#218);
 - an admin and a member, each with a `user_identities` row bound to its Keycloak subject in
   local/keycloak/sft-realm.json, so both sign in through Keycloak as members do through Cognito;
+- the tenant's SSO provider (#231): Keycloak's `customer` realm, brokered by the `sft` realm under
+  the tenant's provider name (local/keycloak/sft-realm.json), and its proven domain
+  `corp.localhost`, linked to it, so "Continue with SSO" for `sso.member@corp.localhost` signs in
+  through the customer's realm and creates the member just in time;
 - with `--suppress ADDRESS`, a suppression entry for that address in the tenant (#174), so a test
   can show `422 recipient_undeliverable`.
 
@@ -45,6 +49,12 @@ DEFAULT_URL = "postgresql://sft:sft-local-only@127.0.0.1:5432/sft"
 LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
 TENANT_ID = "11111111-1111-4111-8111-111111111111"
+# Tenant SSO (#231): the provider's name is the tenant ID without dashes, as in both pools.
+SSO_CONNECTION_ID = "77777777-7777-4777-8777-777777777777"
+SSO_DOMAIN_ID = "99999999-9999-4999-8999-999999999999"
+SSO_PROVIDER = TENANT_ID.replace("-", "")
+SSO_ISSUER = "http://localhost:8180/realms/customer"
+SSO_DOMAIN = "corp.localhost"
 TENANT_NAME = "Local Example Co"
 CONNECTION_ID = "66666666-6666-4666-8666-666666666666"
 PROVIDER = "local-keycloak"
@@ -163,6 +173,44 @@ def seed(connection: psycopg.Connection, suppress: list[str]) -> dict[str, int]:
         "dlp_policies",
         "SELECT dlp_default_policy(%(tenant)s, %(admin)s, 'en') "
         "WHERE NOT EXISTS (SELECT FROM dlp_policies WHERE tenant_id = %(tenant)s)",
+        {"tenant": TENANT_ID, "admin": admin},
+    )
+    run(
+        "idp_connections",
+        "INSERT INTO idp_connections (id, tenant_id, kind, provider_name, issuer, status) "
+        "VALUES (%(id)s, %(tenant)s, 'oidc', %(provider)s, %(issuer)s, 'active') "
+        "ON CONFLICT DO NOTHING",
+        {
+            "id": SSO_CONNECTION_ID,
+            "tenant": TENANT_ID,
+            "provider": SSO_PROVIDER,
+            "issuer": SSO_ISSUER,
+        },
+    )
+    run(
+        "sso_domains",
+        "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, verified_at, "
+        "idp_connection_id, created_by) VALUES (%(id)s, %(tenant)s, %(domain)s, "
+        "repeat('l', 32), now(), %(connection)s, %(admin)s) ON CONFLICT DO NOTHING",
+        {
+            "id": SSO_DOMAIN_ID,
+            "tenant": TENANT_ID,
+            "domain": SSO_DOMAIN,
+            "connection": SSO_CONNECTION_ID,
+            "admin": admin,
+        },
+    )
+    run(
+        "sso_group_roles",
+        "INSERT INTO sso_group_roles (id, tenant_id, group_name, role) VALUES "
+        "('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', %(tenant)s, 'sft-admins', 'admin') "
+        "ON CONFLICT DO NOTHING",
+        {"tenant": TENANT_ID},
+    )
+    run(
+        "tenants",
+        "UPDATE tenants SET sso_mfa_confirmed_by = %(admin)s, sso_mfa_confirmed_at = now() "
+        "WHERE id = %(tenant)s AND sso_mfa_confirmed_by IS NULL",
         {"tenant": TENANT_ID, "admin": admin},
     )
     for address in suppress:

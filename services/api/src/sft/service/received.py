@@ -89,6 +89,9 @@ from sft.service.idempotency import IdempotentRequest, Outcome, once, replay
 from sft.service.links import SessionFile, uploader_file
 from sft.service.objects import PART_URL_SECONDS, ObjectStore, ObjectStoreError
 from sft.service.permissions import authorize
+from sft.service.rate_limits import RateLimiter
+from sft.service.rate_limits.limits import KeyType
+from sft.service.rate_limits.uploads import part_url_cap, part_urls_refused, upload_charges
 from sft.service.transfers import FileView, audit_details, file_view, invalid, tenant_scope
 from sft.service.upload_requests import (
     effective_state,
@@ -257,13 +260,15 @@ async def add_session_file(
     request: FileRequest,
     *,
     policy: UploadPolicy,
+    limiter: RateLimiter,
     origin: Origin,
     now: datetime,
     idempotency: IdempotentRequest | None = None,
 ) -> Outcome[SessionFile]:
     """`addSessionUploadFile`: declare a file and start its multipart upload (FR-11), as
     `addTransferFile` does. A retry with the same `Idempotency-Key` gets the first answer and
-    starts no second upload."""
+    starts no second upload. The file counts against the requesting tenant's daily upload volume
+    (#165, abuse 6.1), peeked first and charged as the declaration's last step."""
     who = _uploader(caller, "addSessionUploadFile", now)
     if not 1 <= request.size <= MAX_FILE_SIZE:
         raise _file_too_large()
@@ -273,7 +278,7 @@ async def add_session_file(
             found = await files.get_request_file(session, who.request_id, file_id)
         except NotFoundError:
             return None
-        return uploader_file(who.tenant_id, found)
+        return uploader_file(await fields.tenant_keys(session, who.tenant_id), found)
 
     async with database.transaction(who.scope) as session:
         replayed = await replay(
@@ -286,6 +291,8 @@ async def add_session_file(
         if replayed is not None:
             return replayed
         await _check_open(session, who.request_id, request.size, now)
+    charges = upload_charges({KeyType.TENANT: str(who.tenant_id)}, request.size)
+    await limiter.peek_all(charges)
 
     file_id = uuid7()
     storage_class = storage_class_for(request.size)
@@ -305,7 +312,9 @@ async def add_session_file(
             session,
             file_id=file_id,
             upload_request_id=who.request_id,
-            display_name_ct=fields.seal(who.tenant_id, request.display_name),
+            display_name_ct=(await fields.tenant_keys(session, who.tenant_id, write=True)).seal(
+                fields.FILE_NAME, file_id, request.display_name
+            ),
             content_type=request.content_type,
             declared_size=request.size,
             storage_class=storage_class.value,
@@ -326,7 +335,9 @@ async def add_session_file(
                 "part_count": part_count,
             },
         )
-        return uploader_file(who.tenant_id, file)
+        # Last: a refusal rolls the declaration back; nothing before it charged anything.
+        await limiter.check_all(charges)
+        return uploader_file(await fields.tenant_keys(session, who.tenant_id), file)
 
     try:
         async with database.transaction(who.scope) as session:
@@ -374,7 +385,8 @@ async def session_part_urls(
     origin: Origin,
     now: datetime,
 ) -> list[PartUrl]:
-    """`requestSessionUploadPartUrls`: as `requestUploadPartUrls`, for a file of this request."""
+    """`requestSessionUploadPartUrls`: as `requestUploadPartUrls`, for a file of this request,
+    with the same cap of 10 times its `part_count` over its life (#165)."""
     who = _uploader(caller, "requestSessionUploadPartUrls", now)
     if not 1 <= len(part_numbers) <= MAX_PART_URLS or len(set(part_numbers)) != len(part_numbers):
         raise invalid(json_pointer("part_numbers"), "Ask for 1 to 100 different parts.")
@@ -387,8 +399,14 @@ async def session_part_urls(
                     json_pointer("part_numbers", index),
                     "The part number is beyond the file's part_count.",
                 )
-        if await files.touch_parts(session, file.id) is None:  # pragma: no cover - read above
-            raise _past_uploading(file.state)
+        touched = await files.touch_parts(
+            session, file.id, parts=len(part_numbers), cap=part_url_cap(file.part_count)
+        )
+        if touched is None:
+            moved = await files.get_request_file(session, who.request_id, file.id)
+            if moved.state != FileState.UPLOADING.value or moved.removed_at is not None:
+                raise _past_uploading(moved.state)  # a completion moved it on meanwhile
+            raise part_urls_refused()  # its part URLs are used up (#165)
         await audit.record(
             session,
             action="file.part_urls_issued",
@@ -485,7 +503,7 @@ async def complete_session_upload(
         if file.state not in (FileState.UPLOADING.value, FileState.COMPLETING.value):
             if file.removed_at is not None:
                 raise NotFound
-            return uploader_file(who.tenant_id, file)
+            return uploader_file(await fields.tenant_keys(session, who.tenant_id), file)
         closed = _request_open(row, now)
         limits = None if closed else await _limits(session, who.request_id)
         if file.removed_at is not None:
@@ -527,7 +545,9 @@ async def complete_session_upload(
         if file.state != FileState.COMPLETING.value:
             if file.removed_at is not None:
                 raise NotFound
-            return uploader_file(who.tenant_id, file)  # another call finished it first
+            return uploader_file(
+                await fields.tenant_keys(session, who.tenant_id), file
+            )  # another call finished it first
         closed = _request_open(row, now)
         if closed or file.removed_at is not None or not isinstance(assembled, Assembled | Missing):
             if closed:
@@ -565,7 +585,7 @@ async def complete_session_upload(
                 origin=origin,
             )
             accepted = await files.get_request_file(session, who.request_id, file.id)
-            return uploader_file(who.tenant_id, accepted)
+            return uploader_file(await fields.tenant_keys(session, who.tenant_id), accepted)
     if error is None:  # pragma: no cover - every branch above sets one or returns
         raise RuntimeError("completion ended without a result")
     raise error
@@ -681,7 +701,8 @@ async def list_request_files(
         require_visible(caller, reach, request)
         found = await files.list_request_files(session, request.id)
         detectors = await findings.detectors_by_file(session, [f.id for f in found])
-    return [file_view(tenant_id, f, detectors.get(f.id, ())) for f in found]
+        keys = await fields.tenant_keys(session, tenant_id)
+    return [file_view(keys, f, detectors.get(f.id, ())) for f in found]
 
 
 async def delete_file(

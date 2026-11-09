@@ -45,3 +45,8 @@ The plan covers the whole large-files bucket and tags each object with `GuardDut
 (#101) through `sft-<env>-events-delivery`. In Osaka the plan, rule and target exist only when
 `TF_VAR_malware_protection_enabled=true`, which the failover runbook sets: that apply creates them, and GuardDuty
 validates its access to the bucket then (architecture 3.2).
+
+The large pool's scan workers read that queue (#234, `sft.workers.scan.GuardDutyConsumer`): a result is recorded only
+for a file still `scanning`, for the version completion recorded, when the object's `GuardDutyMalwareScanStatus` tag
+names the same result; the worker then adds its own `scan` tag, keeping GuardDuty's. Running against GuardDuty is
+pending the AWS run; locally a stand-in plays it (docs/local-development.md).

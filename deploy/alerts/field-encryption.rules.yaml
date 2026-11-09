@@ -1,0 +1,27 @@
+# Alerts of field encryption (#236, #233; encryption and keys 3.2, 3.3), in Prometheus rule format, tested by
+# deploy/alerts/tests/field-encryption.test.yaml (`promtool test rules`, CI's deploy job).
+#
+# The series come from the API and the scan worker (sft.service.fields): field_decrypt_scope_mismatch_total{purpose}, a
+# sealed value that didn't open with the caller's tenant's keys, and field_key_unwraps_total{purpose,result}, KMS
+# calls for data keys. A mismatch is a possible isolation breach (the third isolation layer, data model 4.2).
+groups:
+  - name: field-encryption
+    rules:
+      # Encryption and keys 3.2, point 3: any value that didn't open with the caller's tenant's key pages at once.
+      - alert: FieldDecryptScopeMismatch
+        expr: sum(increase(field_decrypt_scope_mismatch_total[5m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: A sealed value didn't open with the caller's tenant's key, a possible isolation breach (NFR-12).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/field-keys.md
+
+      # KMS refuses or fails data key calls for 10 minutes: names, messages and DLP details can't be read or written.
+      - alert: FieldKeysUnavailable
+        expr: sum(increase(field_key_unwraps_total{result="error"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: KMS refuses or fails data key calls, so sealed fields can't be read or written (#236).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/field-keys.md

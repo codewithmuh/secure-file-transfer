@@ -1,0 +1,102 @@
+# Unit tests of break-glass.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../break-glass.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # #232: a grant approved by a second operator pages while it is active, and stops when it ends. It isn't
+  # self-approved, so that alert stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_active_grants{self_approved="false", job="operator-api"}'
+        values: '0 0 1 1 0 0'
+      - series: 'sft_break_glass_active_grants{self_approved="true", job="operator-api"}'
+        values: '0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BreakGlassActive
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: BreakGlassActive
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+      - eval_time: 3m
+        alertname: BreakGlassSelfApproved
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: BreakGlassActive
+        exp_alerts: []
+
+  # #232: a self-approved grant pages twice, as active and as self-approved, and both stop when it ends.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_active_grants{self_approved="false"}'
+        values: '0 0 0 0'
+      - series: 'sft_break_glass_active_grants{self_approved="true"}'
+        values: '0 1 1 0'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: BreakGlassSelfApproved
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: BreakGlassSelfApproved
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: A self-approved break-glass grant is active; no second operator approved it (FR-35, R-08).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+      - eval_time: 1m
+        alertname: BreakGlassActive
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+      - eval_time: 3m
+        alertname: BreakGlassSelfApproved
+        exp_alerts: []
+
+  # #232: a sweep that completes every run never pages. Its timestamp follows the clock (promtool's starts at 0).
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_sweep_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BreakGlassSweepStalled
+        exp_alerts: []
+
+  # #232: the sweep's last success stops at 5m. Exactly 5 minutes later it doesn't page yet; past 5 minutes it does.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_sweep_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0+60x5 300x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: BreakGlassSweepStalled
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: BreakGlassSweepStalled
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: The break-glass sweep hasn't completed for 5 minutes; grant expiry isn't being recorded (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+
+  # #232: no sweep series at all (the operator API isn't scraped) doesn't page here; service-unavailable's alert does.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_active_grants{self_approved="false"}'
+        values: '0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BreakGlassSweepStalled
+        exp_alerts: []

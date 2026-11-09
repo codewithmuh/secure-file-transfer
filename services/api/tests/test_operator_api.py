@@ -390,7 +390,8 @@ SAMPLE_ID = "0190f0f0-0000-7000-8000-000000000000"
 
 
 def request_of(method: str, path: str) -> tuple[str, str]:
-    return method.upper(), "/v1" + path.replace("{tenant_id}", SAMPLE_ID)
+    filled = path.replace("{tenant_id}", SAMPLE_ID).replace("{break_glass_request_id}", SAMPLE_ID)
+    return method.upper(), "/v1" + filled
 
 
 def implemented_operations() -> list[tuple[str, str, str]]:
@@ -418,6 +419,12 @@ def test_the_matrix_covers_every_operation_the_operator_app_serves() -> None:
         "listTenants",
         "getTenant",
         "suspendTenant",
+        # #231 and #232: tests/test_sso.py and tests/test_break_glass.py run them end to end.
+        "configureTenantSso",
+        "requestBreakGlass",
+        "listBreakGlassRequests",
+        "approveBreakGlass",
+        "endBreakGlass",
     }
 
 

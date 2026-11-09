@@ -15,6 +15,7 @@ from sft.core.settings import (
     OperatorSettings,
     Settings,
     load_settings,
+    setting_errors,
 )
 
 ENV_NAMES = (
@@ -50,6 +51,11 @@ ENV_NAMES = (
     "PUBLIC_TLS_KEY_FILE",
     "DATABASE_IAM_AUTH",
     "VALKEY_IAM_CACHE",
+    # Tenant SSO (#231).
+    "OIDC_IDP_HINT_PARAMETER",
+    "OIDC_GROUPS_CLAIM",
+    "SSO_DNS_OVERRIDES",
+    "SSO_DNS_NAMESERVERS",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -96,10 +102,16 @@ def test_defaults(clean_env: pytest.MonkeyPatch) -> None:
     assert s.audit_archive_tokyo_bucket == "sft-test-audit-archive"
     assert s.audit_archive_osaka_bucket is None
     assert (s.audit_archive_tokyo_endpoint_url, s.audit_archive_osaka_endpoint_url) == (None, None)
-    # Unset is the strictest environment, so a pod spec that forgets it gets no test hook (#182).
-    assert (s.environment, s.clock_offset_seconds) == ("prod", 0)
+    # The tests' environment (api_settings.py); unset is prod (#129's test below).
+    assert (s.environment, s.clock_offset_seconds) == ("local", 0)
     assert (s.download_recheck_seconds, s.download_streams_per_pod) == (30.0, 100)
     assert s.s3_presign_endpoint_url is None  # in AWS S3 signs its own host (#195)
+    # Cognito's provider parameter and group attribute; DNS proves SSO domains (#231).
+    assert (s.oidc_idp_hint_parameter, s.oidc_groups_claim) == (
+        "identity_provider",
+        "custom:sso_groups",
+    )
+    assert (s.sso_dns_overrides, s.sso_dns_nameservers) == (None, None)
 
 
 def test_reads_the_environment(clean_env: pytest.MonkeyPatch) -> None:
@@ -177,7 +189,7 @@ def test_the_valkey_url_is_required(clean_env: pytest.MonkeyPatch) -> None:
         Settings()
 
 
-@pytest.mark.parametrize("name", [n for n in API_ENV if n != "VALKEY_URL"])
+@pytest.mark.parametrize("name", [n for n in API_ENV if n not in ("VALKEY_URL", "ENVIRONMENT")])
 def test_every_sign_in_and_files_bucket_setting_is_required(
     clean_env: pytest.MonkeyPatch, name: str
 ) -> None:
@@ -323,6 +335,9 @@ def test_the_clock_hook_is_refused_anywhere_else(
 ) -> None:
     if environment is not None:
         clean_env.setenv("ENVIRONMENT", environment)
+    else:
+        clean_env.delenv("ENVIRONMENT")  # unset is prod
+    clean_env.setenv("TRUSTED_PROXIES", "10.0.0.0/20")  # required outside local and test (#129)
     clean_env.setenv("CLOCK_OFFSET_SECONDS", "90000")
     with pytest.raises(ValidationError, match="only ENVIRONMENT=local or test"):
         Settings()
@@ -420,3 +435,43 @@ def test_a_presign_endpoint_needs_the_s3_stand_in(clean_env: pytest.MonkeyPatch)
     clean_env.setenv("S3_PRESIGN_ENDPOINT_URL", "http://localhost:9090")
     with pytest.raises(ValidationError, match="for the local S3 stand-in only"):
         Settings()
+
+
+# ---- #129: per-IP limits behind the load balancer need its subnets ----
+
+
+@pytest.mark.parametrize("environment", ["dev", "staging", "prod", None])
+def test_the_api_refuses_to_start_without_trusted_proxies_outside_local_and_test(
+    clean_env: pytest.MonkeyPatch, environment: str | None
+) -> None:
+    """Behind the load balancer with no trusted proxy, every client's address would be the load
+    balancer's: per-IP limits and the failed-authentication block would apply to everyone."""
+    if environment is None:
+        clean_env.delenv("ENVIRONMENT")  # unset is prod, the strictest
+    else:
+        clean_env.setenv("ENVIRONMENT", environment)
+    with pytest.raises(ValidationError, match="TRUSTED_PROXIES is required") as refused:
+        Settings()
+    [error] = setting_errors(refused.value, Settings)
+    assert error["setting"] == "ENVIRONMENT, TRUSTED_PROXIES"
+    clean_env.setenv("TRUSTED_PROXIES", "10.0.0.0/20, 10.0.16.0/20")
+    assert len(Settings().trusted_proxies) == 2
+
+
+@pytest.mark.parametrize("environment", ["local", "test"])
+def test_the_compose_stack_and_the_suite_need_no_trusted_proxy(
+    clean_env: pytest.MonkeyPatch, environment: str
+) -> None:
+    clean_env.setenv("ENVIRONMENT", environment)
+    assert Settings().trusted_proxies == ()
+
+
+def test_the_dns_stand_in_is_a_test_hook(clean_env: pytest.MonkeyPatch) -> None:
+    # #231: only the local stack and the tests prove SSO domains without DNS.
+    clean_env.setenv("SSO_DNS_OVERRIDES", "{}")
+    clean_env.setenv("ENVIRONMENT", "dev")
+    clean_env.setenv("TRUSTED_PROXIES", "10.0.0.0/20")  # #129: required outside local and test
+    with pytest.raises(ValidationError, match="SSO_DNS_OVERRIDES is a test hook"):
+        Settings()
+    clean_env.setenv("ENVIRONMENT", "test")
+    assert Settings().sso_dns_overrides == "{}"

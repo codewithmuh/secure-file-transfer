@@ -733,3 +733,21 @@ async def test_the_link_metrics_count_each_result(w: World) -> None:
     assert sample("link_lookups_total", {"result": "not_found"}) == 1
     assert sample("verification_codes_total", {"result": "requested"}) == 1
     assert sample("verification_attempts_total", {"result": "match"}) == 1
+
+
+async def test_link_page_requests_past_60_a_minute_from_one_ip_get_429(w: World) -> None:
+    """NFR-14: at most 60 link-page requests per IP a minute (abuse 2.2 A, `A.ip_requests`). GCRA
+    admits 31 at once, then one every 2 s, so no minute holds more than 60 (#235)."""
+    address = unique()
+    w.transfer(address)
+    token = await w.link_for(address)
+    browser = await w.browser()
+    answers = [
+        (await browser.post("/v1/links/resolve", {"token": token})).status_code for _ in range(32)
+    ]
+    assert answers == [200] * 31 + [429]
+    refused = await browser.post("/v1/links/resolve", {"token": token})
+    assert refused.json()["code"] == "rate_limited"
+    assert int(refused.headers["retry-after"]) >= 1
+    w.clock.advance(60)  # a minute on: the window rolled over
+    assert (await browser.post("/v1/links/resolve", {"token": token})).status_code == 200

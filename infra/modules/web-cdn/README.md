@@ -15,6 +15,7 @@ been applied (infra/README.md).
 | Web ACL | `sft-<env>-apne1-web` in us-east-1: block list, IP reputation, core rule set, 2,000 per IP in 300 s, and a Challenge above 30 link page loads (`/t`) per IP in 300 s |
 | Logs | The web ACL's through WAF's log delivery, CloudFront's standard logs through CloudWatch Logs delivery, both configured in us-east-1 and written to the Tokyo `aws-waf-logs-*` bucket; no log group anywhere |
 | Record | `app.<env-domain>`, an alias to the distribution, through `aws.dns` |
+| Tests | `tests/waf.tftest.hcl`: `terraform test` against a mocked provider checks the web ACL's rules, the link-page Challenge and the logging (#235; `infra/scripts/check.sh test`). The browser matrix through the Challenge is staging's, pending the AWS run |
 
 IPv6 is off, like the API's load balancer: WAF rate rules key each IPv6 address on its own (abuse 2.1). Osaka's
 bucket is named, not looked up: the Tokyo stack applies first, and Osaka's then grants this distribution read access

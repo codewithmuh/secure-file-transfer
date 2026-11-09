@@ -646,14 +646,7 @@ class ApprovalRequestSummaryOut(BaseModel):
 
 
 def _finding(view: FindingView) -> DlpFinding:
-    return DlpFinding(
-        detector=view.detector,
-        detector_name=view.detector_name,
-        count_low=view.count_low,
-        count_medium=view.count_medium,
-        count_high=view.count_high,
-        details_visible=view.details_visible,
-    )
+    return DlpFinding.of(view)
 
 
 class TransferDlpOut(BaseModel):

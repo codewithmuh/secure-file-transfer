@@ -5,7 +5,7 @@ import { useUIStore } from '@/stores/uiStore';
 import { cn } from '@/lib/cn';
 import { seesApprovals } from '@/features/approvals/approvals';
 import { usePendingApprovalCount } from '@/hooks/dlp';
-import { Inbox, KeyRound, LayoutDashboard, ScrollText, Send, ShieldAlert, ShieldCheck, Users, Settings, X } from 'lucide-react';
+import { Fingerprint, Inbox, KeyRound, LayoutDashboard, ScrollText, Send, ShieldAlert, ShieldCheck, Users, Settings, X } from 'lucide-react';
 
 // Every M5 page has its entry: upload requests (#212), the audit log (#216), API keys (#215), DLP (#218), approvals (#220).
 const memberLinks = [
@@ -20,6 +20,7 @@ const adminLinks = [
   { to: '/admin/audit', icon: ScrollText, labelKey: 'admin.auditLog' },
   { to: '/admin/api-keys', icon: KeyRound, labelKey: 'admin.apiKeys' },
   { to: '/admin/dlp', icon: ShieldAlert, labelKey: 'dlpAdmin.title' },
+  { to: '/admin/sso', icon: Fingerprint, labelKey: 'sso.title' },
 ];
 
 export function Sidebar() {

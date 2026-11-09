@@ -63,3 +63,9 @@ variable "deletion_protection" {
   description = "True in prod: the pool holds every local member's credentials, which can't be exported (ADR-0016)."
   type        = bool
 }
+
+variable "trigger_function_arn" {
+  description = "The sign-in triggers' function (modules/signin-triggers, #238), for pre- and post-authentication."
+  type        = string
+  default     = null
+}

@@ -164,6 +164,7 @@ async def add_transfer_file(
     objects: ObjectsDep,
     policy: PolicyDep,
     idempotency: IdempotencyDep,
+    limiter: LimiterDep,
 ) -> File:
     """Declare a file and start its multipart upload (FR-1, FR-2)."""
     outcome = await uploads.add_file(
@@ -173,6 +174,7 @@ async def add_transfer_file(
         transfer_id,
         uploads.FileRequest(body.display_name, body.size, body.content_type),
         policy=policy,
+        limiter=limiter,
         origin=origin_of(request),
         now=_now(),
         idempotency=idempotency,
@@ -463,10 +465,11 @@ async def get_file(file_id: UUID, caller: CallerDep, database: DatabaseDep) -> F
 async def get_file_inspection(
     file_id: UUID, request: Request, caller: CallerDep, database: DatabaseDep
 ) -> FileInspection:
-    """The file's inspection and its findings, counts only (FR-36, FR-47, FR-53)."""
+    """The file's inspection and its findings, with details for the owner and approvers (FR-36,
+    FR-47, FR-53, #233)."""
     language = "ja" if request.headers.get("accept-language", "").startswith("ja") else "en"
     view = await file_reads.get_file_inspection(
-        database, caller, file_id, language=language, now=_now()
+        database, caller, file_id, language=language, now=_now(), origin=origin_of(request)
     )
     return FileInspection.of(view)
 

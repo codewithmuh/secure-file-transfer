@@ -109,9 +109,33 @@ module "user_pool" {
   from_address          = module.ses.from_address
   ses_configuration_set = module.ses.configuration_set
   sign_in_web_acl_arn   = data.terraform_remote_state.edge.outputs.sign_in_web_acl_arn
+  trigger_function_arn  = module.signin_triggers.function_arn
   deletion_protection   = false
 
   depends_on = [module.ses]
+}
+
+# The Cognito sign-in triggers (#238): failed sign-ins per account (NFR-14) and the sign-in audit (NFR-15), one
+# function in this Region's private subnets. This stack makes its role for both Regions.
+module "signin_triggers" {
+  source = "../../../../modules/signin-triggers"
+
+  environment      = "staging"
+  account_id       = var.account_id
+  region           = module.conventions.region
+  name_prefix      = module.conventions.name_prefix
+  kms_alias_prefix = module.conventions.kms_alias_prefix
+  create_role      = true
+  regions          = ["ap-northeast-1", "ap-northeast-3"]
+  image_uri        = var.signin_trigger_image
+  user_pool_arn    = module.user_pool.user_pool_arn
+
+  valkey = {
+    cache_arn         = data.terraform_remote_state.data.outputs.valkey_cache_arn
+    address           = data.terraform_remote_state.data.outputs.valkey_endpoint.address
+    port              = data.terraform_remote_state.data.outputs.valkey_endpoint.port
+    security_group_id = data.terraform_remote_state.data.outputs.valkey_security_group_id
+  }
 }
 
 module "app_secrets" {

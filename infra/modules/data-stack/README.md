@@ -9,7 +9,9 @@ It reads the network stack's state, then calls [`aurora`](../aurora/README.md), 
 [`queues`](../queues/README.md) with that stack's isolated subnets and its `main_nodes` and `scan_nodes` security
 groups, and [`kms-keys`](../kms-keys/README.md), [`files-buckets`](../files-buckets/README.md),
 [`audit-archive`](../audit-archive/README.md) (dev and staging) and
-[`events-delivery-role`](../events-delivery-role/main.tf) (Tokyo) for storage. It derives the names (`sft-<env>-aurora`, `sft/<env>/db/master`) and the workload role ARNs from the
+[`events-delivery-role`](../events-delivery-role/main.tf) (Tokyo) for storage, and
+[`break-glass-role`](../break-glass-role/README.md) for the break-glass database role and its alert (`break-glass.tf`,
+#232). It derives the names (`sft-<env>-aurora`, `sft/<env>/db/master`) and the workload role ARNs from the
 conventions module. A change to the layer is made here once, not in five roots. The roots keep the backend, the
 provider and the conventions module, and pass only what differs:
 

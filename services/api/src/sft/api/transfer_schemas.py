@@ -17,6 +17,7 @@ recur:
 from __future__ import annotations
 
 import unicodedata
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
@@ -35,7 +36,7 @@ from pydantic.json_schema import SkipJsonSchema
 from sft.core.addresses import is_plain_address
 from sft.data.models import UnscannablePolicy
 from sft.data.tenants import Policy
-from sft.service.file_reads import InspectionView
+from sft.service.file_reads import FindingView, InspectionView
 from sft.service.tenant_policy import PolicyChange
 from sft.service.transfers import FileView, SummaryView, TransferPage, TransferView
 from sft.service.uploads import PartUrl as PartUrlResult
@@ -407,7 +408,7 @@ class TransferPageOut(BaseModel):
 
 
 class DlpLocation(BaseModel):
-    """Where a match is (detectors 7). None are returned before DLP-8 encrypts them."""
+    """Where a match is (detectors 7): only for the file's owner and approvers (#233)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -434,11 +435,31 @@ class DlpFinding(BaseModel):
     count_high: int = Field(ge=0)
     details_visible: bool
     locations: Annotated[list[DlpLocation], Field(max_length=10)] | SkipJsonSchema[None] = None
-    """Only with details (DLP-8); left out, never null, until then."""
+    """Only with details (#233); left out, never null, otherwise."""
     previews: (
         Annotated[list[Annotated[str, Field(max_length=64)]], Field(max_length=3)]
         | SkipJsonSchema[None]
     ) = None
+
+    @classmethod
+    def of(cls, view: FindingView) -> DlpFinding:
+        """Details are set only when shown, so `exclude_unset` leaves them out otherwise."""
+        details: dict[str, Any] = {}
+        if view.details_visible and view.locations is not None and view.previews is not None:
+            details["locations"] = [
+                DlpLocation(**{k: v for k, v in asdict(loc).items() if v is not None})
+                for loc in view.locations
+            ]
+            details["previews"] = list(view.previews)
+        return cls(
+            detector=view.detector,
+            detector_name=view.detector_name,
+            count_low=view.count_low,
+            count_medium=view.count_medium,
+            count_high=view.count_high,
+            details_visible=view.details_visible,
+            **details,
+        )
 
 
 class FileInspection(BaseModel):
@@ -461,17 +482,7 @@ class FileInspection(BaseModel):
             engine_version=view.engine_version,
             policy_version=view.policy_version,
             inspected_at=view.inspected_at,
-            findings=[
-                DlpFinding(
-                    detector=f.detector,
-                    detector_name=f.detector_name,
-                    count_low=f.count_low,
-                    count_medium=f.count_medium,
-                    count_high=f.count_high,
-                    details_visible=f.details_visible,
-                )
-                for f in view.findings
-            ],
+            findings=[DlpFinding.of(f) for f in view.findings],
         )
 
 

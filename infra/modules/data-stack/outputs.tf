@@ -49,3 +49,11 @@ output "storage" {
     malware_protection_plan_arn = module.files_buckets.malware_protection_plan_arn
   }
 }
+
+output "break_glass" {
+  description = "The break-glass database role sft-<env>-break-glass-db and this Region's alert topic (#232)."
+  value = {
+    role_arn        = module.break_glass_role.role_arn
+    alert_topic_arn = module.break_glass_role.alert_topic_arn
+  }
+}

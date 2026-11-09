@@ -17,7 +17,8 @@ without connecting, and closes them at shutdown, after uvicorn has drained the r
 loads the `email-hmac` keyring and the upload policy, and opens the audit archive of both regions
 (#177), the link steps' services: the `code-hmac` and `csrf-hmac` keyrings and their metrics
 (#179), and the download services: the async content reader, the byte and stream caps and their
-metrics (#180). The app's clock (`sft.core.clock`) is the wall clock, which only a local or test
+metrics (#180), and installs the field encryption keys (#236, `sft.service.fields`). The app's
+clock (`sft.core.clock`) is the wall clock, which only a local or test
 environment may offset (#182). In AWS (#184) the keyrings come from Secrets Manager, read at startup
 and every 5 minutes after (`sft.runtime.secrets`), and the database and Valkey connections sign in
 with IAM tokens (`sft.data.iam_auth`). A route reaches them through the `get_database`,
@@ -56,6 +57,7 @@ from sft.api import (
     members,
     received,
     recipients,
+    sso,
     tenant_policy,
     transfers,
     upload_requests,
@@ -72,8 +74,10 @@ from sft.data.counters import CounterMetrics, CounterStore, ValkeyIam
 from sft.data.database import Database
 from sft.runtime.archive import S3AuditArchive
 from sft.runtime.content import S3Content
+from sft.runtime.kms import open_field_keys
 from sft.runtime.s3 import S3Objects
 from sft.runtime.secrets import Keyrings
+from sft.service import fields
 from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
 from sft.service.audit_search import ExportLeases
 from sft.service.csrf import CsrfKeyring
@@ -121,6 +125,11 @@ def _lifespan(
             iam_region=settings.aws_region if settings.database_iam_auth else None,
         )
         app.state.database = database
+        # Field encryption (#236, #233): both purposes, through the fields key, no call yet.
+        field_keys = open_field_keys(
+            key_id=settings.fields_kms_key_id, region=settings.aws_region, registry=registry
+        )
+        previous_keys = fields.install(field_keys)
         # The same for the counters: an outage applies each limit's failure mode instead.
         metrics = CounterMetrics.create(registry)
         valkey_iam = ValkeyIam.of(settings.valkey_iam_cache, settings.aws_region)
@@ -188,6 +197,8 @@ def _lifespan(
             await app.state.sign_in.aclose()
             await store.close()
             await database.dispose()
+            fields.install(previous_keys)
+            await field_keys.close()
 
     return lifespan
 
@@ -241,4 +252,5 @@ def create_app(
     dlp.register(app)  # the DLP policy, rules and detectors (#218)
     approval_routes.register(app)  # DLP approval requests and decisions (#220)
     dlp_reports.register(app)  # DLP decisions list and report (#222)
+    sso.register(app, settings)  # the tenant's SSO settings and domains (#231)
     return app

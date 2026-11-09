@@ -1,0 +1,46 @@
+# Alerts of the service's break-glass grants (FR-35, authn-authz 8.3; #232), in Prometheus rule format. Each links to
+# its runbook (NFR-17). Like scanning.rules.yaml, these are the reviewed, tested source until M7's alerting as code
+# loads them (`promtool test rules`, deploy/alerts/tests, run in CI's deploy job).
+#
+# The series come from the operator API's /metrics (sft.api.operator). Its sweep runs every 30 s, marks grants that
+# reached their end as expired, and then sets:
+# - sft_break_glass_active_grants{self_approved="true"|"false"}: the grants active now, both label values made at zero
+#   when the operator API starts, so the first grant shows as a change;
+# - sft_break_glass_sweep_last_success_timestamp_seconds: the Unix time of the last sweep that ran to the end.
+# The database stops a grant's reads at its end on its own (break_glass_tenants()); the sweep writes the records.
+#
+# AWS-side uses (an assumption of sft-<env>-break-glass-db, the BreakGlass permission set's assignment and sign-in)
+# page through EventBridge, not Prometheus (infra/modules/break-glass-role, authn-authz 8.3).
+groups:
+  - name: break-glass
+    rules:
+      # FR-35: a break-glass grant is active. It pages for as long as one is, so on-call knows that someone is
+      # reading tenant data and can check that an incident needs it.
+      - alert: BreakGlassActive
+        expr: sum(sft_break_glass_active_grants) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+
+      # Authn-authz 8.3: a grant its requester approved alone (BREAK_GLASS_SELF_APPROVAL), which only the
+      # single-maintainer reference run allows (threat model R-08). It pages on its own, beside BreakGlassActive.
+      - alert: BreakGlassSelfApproved
+        expr: sum(sft_break_glass_active_grants{self_approved="true"}) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: A self-approved break-glass grant is active; no second operator approved it (FR-35, R-08).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+
+      # The sweep hasn't run to the end for 5 minutes (ten runs). Database access still ends on time, but grants
+      # stay "active" in the service, their expiry records are missing, and the two alerts above can't be trusted.
+      # Only while the series exists: an operator API that is down is service-unavailable's alert.
+      - alert: BreakGlassSweepStalled
+        expr: time() - max(sft_break_glass_sweep_last_success_timestamp_seconds) > 300
+        labels:
+          severity: page
+        annotations:
+          summary: The break-glass sweep hasn't completed for 5 minutes; grant expiry isn't being recorded (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md

@@ -6,8 +6,9 @@ abuse and rate limits 6.4, 6.5).
 - up to 100 MB: `file.scan` on `Queue.SCAN_SMALL`, the small pool;
 - over 100 MB, up to 2,000,000,000 bytes: `file.scan_large` on `Queue.SCAN_LARGE`, ClamAV's large
   pool, so large files never delay small ones;
-- over 2,000,000,000 bytes: no message. Only GuardDuty scans these (M6); `storage_class` already
-  put them in the large-files bucket pair. `LARGE_FILE_THRESHOLD` stays the bucket choice only.
+- over 2,000,000,000 bytes: no message. Only GuardDuty scans these, and its result arrives on the
+  `guardduty-results` queue (#234); `storage_class` already put them in the large-files bucket
+  pair. `LARGE_FILE_THRESHOLD` stays the bucket choice only.
 
 **Timeouts grow with the size.** A ClamAV scan takes about 1 s plus 0.058 s per MB (abuse 6.4); a
 clamd attempt gets 30 s plus 0.2 s per MB, about three times that with room for the S3 read. The
@@ -18,6 +19,11 @@ plus the time to receive the bytes. An attempt lasts as long as the slower of th
 queues and the per-tenant caps defer scans, abuse 6.4), the 5 attempts SQS hands out before the
 dead-letter queue, and the visibility timeout between two of them. Past it, the scan sweep records
 `scan_failed`, so no file stays `scanning` for good.
+
+**GuardDuty's files** get a fixed deadline, `GUARDDUTY_DEADLINE` after completion (#234): GuardDuty
+publishes no time to result (ADR-0019), its own retries happen before it publishes, and EventBridge
+retries delivery. Two hours is eight times NFR-5's 15 minutes for a 20 GB transfer; staging
+measures GuardDuty's time to result for 2 GB and 5 GB objects and tunes it.
 """
 
 from __future__ import annotations
@@ -52,6 +58,9 @@ INSPECTOR_BASE: Final = timedelta(seconds=30)
 INSPECTOR_PER_MB: Final = 0.05
 """Receiving the bytes: the node volume writes about 125 MB/s, shared with clamd (ADR-0022)."""
 
+GUARDDUTY_DEADLINE: Final = timedelta(hours=2)
+"""How long a file over 2 GB waits for GuardDuty's result before the sweep fails it (#234)."""
+
 _MB: Final = 1_000_000
 
 
@@ -82,7 +91,9 @@ def scan_deadline(
 ) -> datetime:
     """When the scan sweep gives up on a file of `size` bytes that entered `scanning` at `now`."""
     topic = scan_topic(size, small_pool_max=small_pool_max)
-    queue = Queue.SCAN_LARGE if topic is None else topic.queue
+    if topic is None:
+        return now + GUARDDUTY_DEADLINE
+    queue = topic.queue
     return (
         now
         + QUEUE_ALLOWANCE

@@ -152,7 +152,17 @@ sequenceDiagram
     when it creates the Cognito user, from the `sub` that Cognito returns (2.5). An SSO identity is bound only
     through an invitation: the one-time invitation link starts sign-in for that invited user, and the callback binds
     the subject to that user (2.5). The email address in a token is never used to find or bind a user.
-  - There are no just-in-time accounts. Someone nobody invited is told to ask their admin.
+  - **Just in time (#231).** An SSO subject with no identity yet, arriving through a tenant's active connection, is
+    bound or created in that tenant's scope, never another's. The token's email address must be on one of the
+    domains the tenant proved and linked to that connection (2.5); otherwise the sign-in is refused
+    (`domain_not_proven`). A user of the tenant with that address, not deactivated and with no identity on the
+    connection yet, gets the subject (`user.identity_bound`), so existing members bind at their first SSO sign-in
+    without a mass of invitation emails. With nobody at that address, the tenant's `sso_jit` decides: on (the
+    default), the member is created active, with the role the token's groups map to (`sso_group_roles`, `admin` wins)
+    or `member` (`user.provisioned`); off, the sign-in is refused (`provisioning_off`) and the admin invites them. The
+    address is trusted only because the tenant proved the domain by DNS and chose the provider: it never reaches a
+    user of another tenant, nor an address outside the proven domains. A local sign-in still never binds by address.
+    This replaces the rule of no just-in-time accounts (decided in #231).
   - Refused and audited: an unknown identity (a platform event, since it has no tenant), a deactivated user, a
     suspended tenant, an inactive connection, an invitation that is used, expired or meant for another connection, a
     subject already bound to another user, and a local sign-in to a tenant that requires SSO by a user who isn't one
@@ -167,6 +177,15 @@ sequenceDiagram
   seconds old. Attempts for usernames that don't exist have no tenant: they count in metrics and WAF data, not in a
   tenant's audit log. Failed SSO sign-ins happen at the tenant's identity provider and are in its logs; refusals at
   our callback are audited by the API at once.
+- **As built (#238).** One Lambda function serves both triggers (`sft.workers.signin_trigger`, the API image;
+  `infra/modules/signin-triggers`). Cognito's trigger events carry no source IP or user agent, so the records don't
+  either; Cognito's user activity log and the sign-in web ACL's logs hold them for investigations. The records are
+  `sign_in.attempted`, `sign_in.refused` (an attempt the per-account limit refused), `sign_in.failed` and
+  `sign_in.authenticated`, by the system actor `signin_trigger` with the member as the target, since whoever tried
+  may not be the member. An attempt is marked failed by a check the pre-authentication trigger queues with it,
+  delayed 10 minutes: if the attempt is still in the account's log of failures then (abuse 2.3), no success took it
+  out, and the notification worker records `sign_in.failed`. The trigger denies the sign-in when it can't reach the
+  counter store or the queue.
 - Every sign-in creates a new session (section 3.3).
 
 ### 2.5 Invitations, recovery and SSO setup
@@ -240,15 +259,26 @@ sign out users of the two pools. The internet-facing API role and the operator A
 **SSO setup (FR-26).**
 
 - A tenant admin asks for SSO; an operator sets it up with the operator CLI. The tenant first proves each email domain
-  with a DNS TXT record. A domain belongs to one tenant at most.
-- The CLI creates the SAML or OIDC provider in both pools with the operator's own AWS credentials, named after the
-  tenant ID. It maps only email and subject, requires signed SAML assertions, and sets no identity provider
-  identifiers. It then records the configuration through the operator API (`configureTenantSso`), which
+  with a DNS TXT record, itself, on its SSO page (#231): `claimSsoDomain` gives a token to publish at
+  `_sft-verification.<domain>` as `sft-domain-verification=<token>`, and `verifySsoDomain` looks it up through the
+  VPC resolver. A domain belongs to one tenant at most: the first proof wins, and a pending claim blocks nobody. The
+  operator never vouches for a domain; `configureTenantSso` links only domains the tenant proved.
+- The CLI (`python -m sft.runtime.sso_providers`, #231) creates the SAML or OIDC provider in both pools with the
+  operator's own AWS credentials, named after the tenant ID (without dashes), no Terraform. It maps only email,
+  subject and groups (`custom:sso_groups`, which the app client may read and write so Cognito stores the mapping),
+  requires signed SAML assertions, sets no identity provider identifiers, and adds the provider to the app client's
+  identity providers, which Terraform sets at creation and then leaves alone. Locally the same CLI writes the
+  provider into Keycloak, which brokers to a second realm that plays the customer's provider. It then records the configuration through the operator API (`configureTenantSso`), which
   writes the tenant's `idp_connections` row and proven domains. The API role never manages providers.
 - The tenant admin confirms that their identity provider enforces MFA, and the confirmation is audited. Cognito's MFA
   doesn't apply to federated users (section 9.1).
 - **SSO required.** When a tenant sets it, its members can sign in only through the identity provider, except its
-  fallback admins.
+  fallback admins. A tenant admin sets it on the SSO page (`updateTenantSso`), or the operator with
+  `configureTenantSso`; it needs an active connection and the MFA confirmation. The callback refuses a local sign-in
+  by anyone else (`sso_required`), and a fallback admin's local sign-in is a security-critical record.
+- **Group roles.** A tenant admin maps identity provider groups to roles (`sso_group_roles`); the mapping applies when
+  a sign-in creates a member. Later role changes are `updateUser`'s, with its step-up and session ends, so a group
+  change at the identity provider never changes a live session's rights.
 - **Fallback admins.** An SSO tenant may name up to two admins (`sso_fallback`, set with `updateUser`, step-up) who keep
   a local sign-in for when its identity provider breaks. The worker creates their Cognito users as for a local
   invitation. They choose "Sign in with a password or passkey", which works whatever the domain of their address,
@@ -348,7 +378,8 @@ devices; starting an 11th ends the oldest.
 
 **Step-up.** `inviteUser`, `updateUser`, `deactivateUser`, `updateTenantPolicy`, `createApiKey`, `resetUserSignIn`,
 `exportAuditEvents`, the DLP policy writes (`updateDlpPolicy`, `createDlpRule`, `updateDlpRule`, `deleteDlpRule`,
-`createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector`) and `approveTransfer` need a sign-in within the last 15
+`createDlpDetector`, `updateDlpDetector`, `deleteDlpDetector`), `approveTransfer` and the SSO writes (`updateTenantSso`,
+`claimSsoDomain`, `verifySsoDomain`, `deleteSsoDomain`, #231) need a sign-in within the last 15
 minutes. An approval releases data to outsiders, so it is as sensitive as an audit export; `rejectTransfer` only stops
 sharing and needs none. `inviteUser` is on the list because an invitation can
 create an admin; since an invitation never changes an existing user's role (2.5), every way to grant the admin role
@@ -693,6 +724,10 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `operator.tenant.sso.update` | `configureTenantSso` | — | — | — | — | — | Yes | Records the connection and domains that the operator CLI set up in both pools |
 | `operator.tenant.admin_recovery` | `recoverTenantAdmin` | — | — | — | — | — | Yes | Only after an out-of-band check with the tenant's second contact; security-critical; the tenant's admins are emailed (2.5) |
 | `operator.break_glass.record` | `recordBreakGlassGrant` | — | — | — | — | — | Yes | Best effort: the Identity Center assignment and CloudTrail are the record, and a job fills any gap (8.3) |
+| `sso.read` | `getTenantSso` | — | Tenant | — | — | — | — | The tenant's connection, domains, SSO rules and group roles (2.5, #231) |
+| `sso.update` | `updateTenantSso`, `claimSsoDomain`, `verifySsoDomain`, `deleteSsoDomain` | — | Tenant, step-up | — | — | — | — | Web session only; a domain is proven by its DNS TXT record and is one tenant's at most; requiring SSO needs an active connection and the MFA confirmation (2.5) |
+| `operator.break_glass.request` | `requestBreakGlass`, `listBreakGlassRequests`, `endBreakGlass` | — | — | — | — | — | Yes | Any operator asks, with an incident, a reason, the tenants and at most 60 minutes; any operator ends a grant early (8.3, #232) |
+| `operator.break_glass.approve` | `approveBreakGlass` | — | — | — | — | — | Yes | A second operator (`403 self_approval_forbidden`), unless the environment allows self-approval, which is marked and alerts (8.3) |
 
 ### 6.4 Resource rules
 
@@ -825,6 +860,7 @@ The login roles use IAM database authentication, one per workload (#22).
 | `sft_migrate` | Migration job | Becomes `sft_owner` with `SET ROLE` | Not applied: the table owner |
 | `sft_owner` | Nobody logs in; owns every table | — | — |
 | `sft_lookup` | Nobody logs in; owns the credential lookup functions | — | No `BYPASSRLS`: `lookup_read` policies and column-level `SELECT` on the credential tables only |
+| `sft_breakglass` | A person with an active break-glass grant (8.3, #232), never a workload; IAM role `sft-{env}-break-glass-db`, assumed from the `BreakGlass` permission set with the grant's ID as a session tag | None of the app's scopes: `app.break_glass_grant` names the grant | `break_glass_read` policies: `SELECT` only, on `tenants`, `users`, `transfers`, `transfer_recipients`, `files`, `upload_requests` and `audit_events`, rows of the grant's tenants only, while the grant is active and before its `ends_at` (`break_glass_tenants()`, revision 0030). File names and messages are ciphertext to it. |
 | Master user | Break-glass only (8.3) | — | Bypasses everything; any use alerts (#22) |
 
 - **Find across, act within.** A lifecycle job finds due work with one cross-tenant query in system scope, then handles
@@ -974,6 +1010,22 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
   the management account through `sts:AssumeRoot` for at most 15 minutes (ADR-0006). The management account's root
   user has a hardware security key, is never used, and any sign-in alerts.
 
+### 8.5 Break-glass in the service (#232)
+
+The Identity Center path above stays the way in when the API or the database is down. When they are up, which is
+most incidents that need tenant data, the operator API runs the two-person rule itself and grants a narrower,
+read-only database role instead of the master user:
+
+| Step | How |
+|---|---|
+| Request | `requestBreakGlass`: the incident, a reason, the tenants and at most 60 minutes. A security-critical platform record names the requester; the incident and the reason stay in the request row, never in an audit event's details (free text, data model 2.5). Nothing is reachable yet. |
+| Approval | `approveBreakGlass` by another operator within an hour, otherwise the request lapses. The requester gets `403 self_approval_forbidden`, unless the environment sets `BREAK_GLASS_SELF_APPROVAL` for a single maintainer (dev in the reference run), when it is marked `self_approved` and alerts on its own (threat model R-08). The grant starts at the approval and ends `duration_minutes` later, by the database's clock. Records go to the platform log and to each named tenant's log, where its admins see them (UC-4). |
+| Use | The operator assumes `sft-{env}-break-glass-db` from the `BreakGlass` permission set, with the grant's ID as the session tag `sft-break-glass-grant` (CloudTrail keeps it), signs in to the database as `sft_breakglass` with an IAM token, and runs `SET app.break_glass_grant = '<id>'`. The role reads seven tables, rows of the grant's tenants only (7.3); file names and messages are ciphertext. docs/runbooks/break-glass.md has the steps. |
+| End | At `ends_at` the policies stop matching, whether or not anyone acts. `endBreakGlass` ends a grant early, or withdraws a request. The operator API's sweep, every 30 seconds, records each expiry and lapse in the platform log and the tenants' logs (`break_glass.expired`, `break_glass.lapsed`). |
+| Alerts | `BreakGlassActive` pages while any grant gives access, `BreakGlassSelfApproved` while a self-approved one does, `BreakGlassSweepStalled` when the sweep hasn't run for 5 minutes (deploy/alerts/break-glass.rules.yaml, with promtool tests). EventBridge alerts on every assumption of the database role (infra/modules/break-glass-role). |
+
+The live parts, the IAM role, the alert routing and the network path to the database, are pending the AWS run.
+
 ## 9. Residual risks and tests
 
 ### 9.1 Residual risks
@@ -994,6 +1046,7 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 | Break-glass can read anything the workloads can, file names and messages included through an application pod, and with one maintainer nobody else approves it | It has to be able to repair the platform, and a two-person rule needs two people | One hour at most; alerts to every operator, including on every exec into an application pod; records in the tenant's audit log, reconciled from CloudTrail; CloudTrail in Object Lock; the SCP on keys and logging; the after-action review. Accepted (threat model R-08). |
 | Code sets the wrong tenant in the scope, which row-level security then trusts | Row-level security checks `app.tenant_id`, not where it came from | The scope comes only from the credential row; the isolation suite; tenant encryption context (7.6) |
 | No SAML single logout | The identity provider's session continues | Our session ends at sign-out; `prompt=login` is forwarded to the identity provider |
+| A tenant's identity provider can sign in as any of that tenant's users on its proven domains, admins included (just in time, #231) | The tenant chose the provider and proved the domains by DNS; whoever runs them controls those mailboxes anyway | Only the tenant's own users, only on domains linked to that connection, never a user with an identity there already; every binding and creation audited; group roles apply only to members it creates; fallback admins should use an address outside the proven domains (2.5) |
 
 ### 9.2 Tests
 
@@ -1012,7 +1065,7 @@ records it. That is an accepted residual risk (section 9.1, threat model R-08).
 | Link access | After an end-to-end run, no link token appears in load balancer, CDN, WAF or application logs. `resolveLink` reveals nothing; a code works only for its own subject; a superseded code fails; 5 attempts per code; lockout at 20; unlocking clears both `link_token_hash` and `link_issued_at`, issues a new link, and the old one fails; another transfer's file IDs get `404`; an uploader can't download and a recipient can't upload; revocation ends sessions within 5 seconds (NFR-6). One browser holds 10 link sessions, each picked by `X-Link-Session`, verifying a second link leaves the first working, and an 11th ends the oldest. The content GET works with the grant's session in the cookie and no `X-Link-Session`, gets `401` without the cookie and `404` with another session. | Every pull request; staging end to end |
 | API keys | The checksum rejects typos; only the hash is stored; scopes hold; a download gets `403`; a key can't create keys or unlock; every call, reads included, writes its own audit record; a second export within the hour and an export of more than 100,000 events are refused; a revoked or expired key gets `401` on the next call; deactivating the owner revokes their keys | Every pull request |
 | Operator access | The operator API has no load balancer or ingress. RBAC: `Operator` can port-forward only in `sft-operator` and the `grafana` namespace, and can't exec, attach, port-forward, patch or restart in application namespaces; Argo CD refuses a sync or change from `ReadOnly` or `Operator`. The token exchange refuses another role, `BreakGlass`, a role from another account (another environment's `Operator` included), a wrong audience or Region, an old or replayed signature, any action other than `GetCallerIdentity`, and any host other than the configured STS endpoint. | Every pull request; staging |
-| Break-glass | A drill: request, approval, alerts within 5 minutes (including one for an exec into an API pod), assignment removed after 1 hour, the service record written, or filled in by reconciliation when the drill stops the API first, review written | Staging, in every disaster recovery drill |
+| Break-glass | A drill: request, approval, alerts within 5 minutes (including one for an exec into an API pod), assignment removed after 1 hour, the service record written, or filled in by reconciliation when the drill stops the API first, review written. In the service (#232): self-approval refused, `sft_breakglass` reads only the grant's tenants and only until `ends_at`, an early end stops it at once, the sweep records expiries and lapses, every step audited (tests/test_break_glass.py); the alert rules' promtool tests (deploy/alerts/tests) | Every pull request; staging, in every disaster recovery drill |
 | User pool configuration | Static checks on the Terraform: MFA required, Plus plan, threat protection enforced, admin-only sign-up, implicit grant off, no provider identifiers, the app client can't write `email` or `custom:tenant_id`, both triggers attached in both pools. Once deployed, a daily drift check. | Every pull request; daily |
 | DLP approvals and findings | The authorization matrix adds an approver who is a member, an approver who is an admin, and the transfer's sender who is also an approver. The sender is refused on their own request (`403 self_approval_forbidden`), also when an API key created the transfer; a member without the designation gets `403`; a second decision by the same approver doesn't count twice; an API key gets `403` on `confirmTransfer`, `approveTransfer` and `rejectTransfer` and never sees location hints or previews; an admin who isn't an approver sees counts only; approving without a recent sign-in gets `401 reauthentication_required`; taking away `dlp_approver` stops that user deciding at once | Every pull request |
 

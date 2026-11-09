@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getConfig } from './config';
+import { stepUpInterceptor } from './stepUp';
 import { useAuthStore } from '@/stores/authStore';
 
 declare module 'axios' {
@@ -93,3 +94,7 @@ apiClient.interceptors.response.use(
     return Promise.reject(error);
   },
 );
+
+// After the 401 handling above: a `401 reauthentication_required` from a step-up operation asks the member to confirm
+// it's them, then sends the same request once more (#232, `./stepUp`).
+apiClient.interceptors.response.use(undefined, stepUpInterceptor(apiClient, requestScope));
