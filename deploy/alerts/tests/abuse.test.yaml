@@ -72,11 +72,12 @@ tests:
         alertname: LinkProbing
         exp_alerts: []
 
-  # Abuse 8.2: wrong codes at 2 a minute for ten hours, then 60 a minute: over 5 times the baseline, a page.
+  # Abuse 8.2: wrong codes at 1 a minute for ten hours (15 in any 15 minutes, under the floor of 20), then 60 a
+  # minute: over 5 times the baseline, a page.
   - interval: 1m
     input_series:
       - series: 'verification_attempts_total{result="mismatch", job="api"}'
-        values: '0+2x600 1200+60x60'
+        values: '0+1x600 600+60x60'
     alert_rule_test:
       - eval_time: 590m
         alertname: VerificationGuessing

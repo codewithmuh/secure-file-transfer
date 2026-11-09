@@ -117,6 +117,7 @@ from sft.data.users import (
     set_sso_fallback,
     start_sign_in_reset,
 )
+from sft.service.api_keys import key_hash
 
 TENANT, RESOURCE, SYSTEM = ScopeKind.TENANT, ScopeKind.RESOURCE, ScopeKind.SYSTEM
 LOOKUP, PLATFORM = ScopeKind.LOOKUP, ScopeKind.PLATFORM
@@ -1331,9 +1332,10 @@ async def clear_another_tenants_finding_details(session: AsyncSession, tenants: 
 @cases.add(scopes={API: [TENANT, LOOKUP]})
 async def look_up_and_use_another_tenants_key(session: AsyncSession, tenants: Tenants) -> object:
     theirs = tenants.theirs.rows
-    key_hash = hashlib.sha256(str(theirs["api_key_token"]).encode()).digest()
+    # The service's own hash: an API key is a random token, not a password, so SHA-256 fits it.
+    hashed = key_hash(str(theirs["api_key_token"]))
     try:
-        found = await api_keys.lookup_key(session, key_hash)
+        found = await api_keys.lookup_key(session, hashed)
     except ScopeNotAllowedError:
         found = None
     try:

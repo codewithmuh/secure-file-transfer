@@ -50,7 +50,8 @@ groups:
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/link-enumeration.md
 
       # Abuse 8.2: wrong verification codes at more than 5 times their 7-day rate, and at least 20 in 15 minutes, so a
-      # quiet week doesn't make a handful of typos page.
+      # quiet week doesn't make a handful of typos page. With less than 7 days of history the baseline reads low, and
+      # the floor of 20 is what holds.
       - alert: VerificationGuessing
         expr: |
           sum(rate(verification_attempts_total{result="mismatch"}[15m]))
@@ -67,7 +68,11 @@ groups:
 
       # More than 10 recipients or uploaders locked out within an hour (20 failed attempts each, NFR-14).
       - alert: VerificationGuessing
-        expr: sum(increase({__name__=~"recipient_lockouts_total|uploader_lockouts_total"}[1h])) > 10
+        # Two sums, not one regex on __name__: increase() drops the name, and the two series would then share a label set.
+        expr: |
+          (sum(increase(recipient_lockouts_total[1h])) or vector(0))
+            + (sum(increase(uploader_lockouts_total[1h])) or vector(0))
+          > 10
         labels:
           severity: page
           condition: lockouts
