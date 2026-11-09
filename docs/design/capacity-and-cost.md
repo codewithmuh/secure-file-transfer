@@ -358,7 +358,7 @@ stays inside its own account (open question 4 chose an account per environment).
 | Prometheus | 2 replicas, 30 days (ADR-0009): 2.0, 7.0 | 1 replica, 3 days (dev) or 7 days (staging): 0.5, 2.0 |
 | Alertmanager and Grafana | 2 + 1: 0.4, 1.0 | 1 + 1: 0.2, 0.5 |
 | Loki | Simple scalable (2 write, 2 read, 1 backend): 1.0, 2.5 | Single binary: 0.25, 1.0 |
-| Tempo | Distributor, 2 ingesters, querier, compactor: 0.5, 1.5 | Single binary: 0.25, 0.75 |
+| Tempo | Single binary (ADR-0009, amended by #243): 0.5, 1.5 | Single binary: 0.25, 0.75 |
 | OpenTelemetry gateway collectors | 2: 0.4, 0.8 | 1: 0.2, 0.4 |
 | Karpenter, on the `system` group | 2: 0.5, 1.0 | 1: 0.25, 0.5 |
 | CoreDNS, on the `system` group | 2: 0.2, 0.15 | 2: 0.2, 0.15 |
@@ -367,7 +367,7 @@ stays inside its own account (open question 4 chose an account per environment).
 | Egress proxy, Envoy, on the `system` group (ADR-0021) | 2 replicas in different AZs: 0.2, 0.5 | 2 replicas: 0.2, 0.5 |
 | **Cluster-level, main pool** | **4.7, 13.85** | **1.65, 5.35** |
 | **Cluster-level, `system` group** | **2.4, 4.55** | **1.55, 2.45** |
-| Per-node agents: VPC CNI, kube-proxy, EBS CSI node, Pod Identity agent, node exporter, log and telemetry agent | 0.3, 0.4 per node | 0.3, 0.4 per node |
+| Per-node agents: VPC CNI, kube-proxy, EBS CSI node, Pod Identity agent, the log and telemetry agent (no node exporter: the kubelets' metrics, #243) | 0.3, 0.4 per node | 0.3, 0.4 per node |
 
 | Environment | App pods (A41) | Main-pool platform and agents | Main-pool requests | Main pool | Scan pool | `system` group |
 |---|---|---|---|---|---|---|

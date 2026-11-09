@@ -26,3 +26,14 @@ scanPools:
   large: { replicas: 2 }
 signatureMirror:
   replicas: 1
+
+# Failover toggles (docs/runbooks/regional-failover.md), flipped by ops/failover-values.sh. While pilotLight is false,
+# holdWorkers true keeps every worker at zero and every CronJob suspended, so nothing acts before the recovery job has
+# re-applied the security-critical changes (architecture 7); the API and the migration job run.
+failover:
+  holdWorkers: true
+
+# The synthetic probe (#248, docs/runbooks/synthetic-probe.md). Off until this environment's AWS side exists (the
+# runbook's setup list); then this line becomes true in both Regions (suspended in the pilot light, like every CronJob).
+probe:
+  enabled: false

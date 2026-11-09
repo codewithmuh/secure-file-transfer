@@ -1,0 +1,49 @@
+{{- if and (eq .Values.environment "dev") (eq .Values.region "ap-northeast-3") }}{{ fail "dev runs in Tokyo only (architecture 3.3)" }}{{ end }}
+{{- /*
+One Application per chart, unless the cluster is a pilot light (architecture 3.2): then none, and the stack's pods,
+volumes and alerts are gone with them. Each chart gets the cluster's values file for its network, then its
+environment's sizes, then the facts only Terraform knows under `global`, which every chart and subchart reads.
+*/}}
+{{- if not .Values.pilotLight }}
+{{- range $name, $app := .Values.applications }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observability-{{ $name }}
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io] # pruning the Application prunes what it made
+spec:
+  project: observability
+  source:
+    repoURL: {{ $.Values.repoURL | quote }}
+    targetRevision: {{ $.Values.targetRevision }}
+    path: deploy/observability/charts/{{ $name }}
+    helm:
+      releaseName: {{ $name }}
+      valueFiles:
+        - {{ printf "../../../environments/%s/%s/values.yaml" $.Values.environment $.Values.region | quote }}
+        - {{ printf "../../environments/%s.yaml" $.Values.environment | quote }}
+      valuesObject:
+        global:
+          imageRegistry: {{ $.Values.cluster.registry }}
+          sft:
+            environment: {{ $.Values.environment }}
+            region: {{ $.Values.region }}
+            accountId: {{ $.Values.cluster.accountId | quote }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{ $app.namespace }}
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions:
+      - PruneLast=true
+      - FailOnSharedResource=true
+      # The Prometheus Operator's resources are large; server-side apply has no annotation size limit.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+  revisionHistoryLimit: 10
+{{- end }}
+{{- end }}

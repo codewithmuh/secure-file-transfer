@@ -3,11 +3,9 @@
 # nobody shortens a record's retention or deletes it, except the deploy role at teardown in dev and staging.
 
 locals {
-  writers = concat(
-    local.primary ? [local.role_arns["archive"]] : [],
-    # The lifecycle jobs rewrite a download grant's committed record in both Regions (#181), as the audit key allows.
-    [local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]],
-  )
+  # The archive job writes its batches to both Regions before it moves its cursor (#183, data model 2.5); the lifecycle
+  # jobs rewrite a download grant's committed record in both Regions (#181), as the audit key allows.
+  writers = [local.role_arns["archive"], local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]]
   readers = concat(
     [local.role_arns["recovery"]], local.audit_reader_arn_patterns, var.break_glass_principal_arn_patterns,
   )
@@ -137,7 +135,7 @@ data "aws_iam_policy_document" "bucket" {
     }
   }
 
-  # Writers: the archive job in Tokyo; the API and the operator API in both Regions (architecture 5.2).
+  # Writers, in both Regions: the archive job, the API and the operator API (architecture 5.2), the lifecycle jobs.
   statement {
     sid       = "DenyWritesToEveryoneElse"
     effect    = "Deny"

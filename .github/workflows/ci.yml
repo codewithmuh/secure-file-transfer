@@ -57,6 +57,12 @@ jobs:
       - name: Check the ruleset's required checks are jobs that report on every PR (#59)
         if: ${{ !cancelled() }}
         run: .github/scripts/check-ruleset.sh
+      - name: Dry-run the drill and teardown scripts, with no AWS (ops/test.sh, #252 to #254)
+        if: ${{ !cancelled() }}
+        run: ops/test.sh
+      - name: Shellcheck the drill and teardown scripts (ops/)
+        if: ${{ !cancelled() }}
+        run: shellcheck -x ops/*.sh ops/lib/*.sh # the runner's shellcheck
 
   local-stack:
     # Also the M2 journey (#182) and the M3 browser journey (#200): each the whole journey on this stack, every pull
@@ -499,3 +505,5 @@ jobs:
           exit-code: "1"
       - name: The alert rules pass their unit tests (promtool from the pinned Prometheus image, deploy/alerts)
         run: deploy/alerts/test.sh
+      - name: The observability stack and its dashboards pass their tests (deploy/observability, #243, #244)
+        run: uv run --project services/api --locked pytest -p no:cacheprovider deploy/observability/tests

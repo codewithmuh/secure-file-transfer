@@ -20,8 +20,14 @@ Nothing here has been applied (infra/README.md).
 | `replication.tf` | Replication to Osaka without RTC, and in prod its own role |
 
 The bucket policy denies requests without TLS 1.2, other encryption, reads to all but the recovery job, the audit
-reader and BreakGlass, writes to all but the archive job (Tokyo), the API and the operator API, replica writes to all
-but the replication role, and changes to the bucket's settings to all but the owning deploy role and Admin.
+reader and BreakGlass, writes to all but the archive job, the API, the operator API and the lifecycle jobs, replica
+writes to all but the replication role, and changes to the bucket's settings to all but the owning deploy role and
+Admin.
+
+**Who writes what, in both Regions.** The archive job (#183) writes each batch to Tokyo's and Osaka's bucket itself,
+and moves its cursor only once both hold it ([data model](../../../docs/design/data-model.md) 2.5), so "archived" means
+both Regions. The API and the operator API write each security-critical record to both too (architecture 5.2).
+Replication to Osaka stays as a second copy; it is untimed, and nothing waits for it.
 
 Records leave only through the lifecycle rule: a current version expires at 365 days, when its retention ends, and the
 version itself one day after it becomes noncurrent (ADR-0012).

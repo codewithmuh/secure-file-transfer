@@ -1,0 +1,116 @@
+# Alerts of the lifecycle jobs (#181; NFR-8, NFR-15), the audit archive job (#183; NFR-15, data model 2.5, threat model
+# T-45) and the metadata purge (#224; NFR-9, data model 6), in Prometheus rule format. Each links to its runbook (NFR-17); promtool tests are in
+# deploy/alerts/tests/lifecycle.test.yaml.
+#
+# Every job is a CronJob that pushes its registry to the Pushgateway after each run, grouped by `job`, so every value
+# is the one the last run left (docs/operations/metrics.md 7): audit_archive_lag_seconds, metadata_purge_blocked{kind},
+# metadata_purge_lag_seconds, and lifecycle_job_last_success_timestamp_seconds{job="audit-archive"|"purge"}. A job
+# that stops running leaves its last values in place, so each job also has a staleness alert on its last success.
+# Prometheus scrapes the Pushgateway with honor_labels (OBS, #243), so `job` is the job's own name.
+groups:
+  - name: lifecycle
+    rules:
+      # NFR-15: every audit event is in both regions' archive within 60 s; the job runs every minute, so the oldest
+      # committed event not yet archived passing 2 minutes means it is failing or falling behind (data model 2.5).
+      - alert: AuditArchiveLagging
+        expr: max(audit_archive_lag_seconds) > 120
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The audit archive is more than 2 minutes behind the database (NFR-15).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-lag.md
+
+      # The job hasn't finished a run for 5 minutes: it fails every time (a region refuses writes), or no longer runs,
+      # and its lag gauge is stale.
+      - alert: AuditArchiveJobNotRunning
+        expr: time() - max(lifecycle_job_last_success_timestamp_seconds{job="audit-archive"}) > 300
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The audit archive job hasn't finished a run for 5 minutes (NFR-15).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-lag.md
+
+      # Data model 6: a transfer or upload request due for the purge still has a file that isn't deleted, so the purge
+      # skips it rather than orphan the object. Only a bug gets here.
+      - alert: MetadataPurgeBlocked
+        expr: max(metadata_purge_blocked) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: The purge skipped metadata past its retention because a file isn't deleted yet (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+      # NFR-9: after a run, purgeable metadata is still there more than a day past its purge_after: the run stopped
+      # part way (its deadline, an error) and the backlog grows.
+      - alert: MetadataPurgeBehind
+        expr: max(metadata_purge_lag_seconds) > 86400
+        labels:
+          severity: ticket
+        annotations:
+          summary: Metadata past its retention is more than a day overdue for the purge (NFR-9).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+      # The daily purge hasn't succeeded for 26 hours: a run failed or didn't start, and its gauges are a day old.
+      - alert: MetadataPurgeNotRunning
+        expr: time() - max(lifecycle_job_last_success_timestamp_seconds{job="purge"}) > 93600
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The metadata purge hasn't finished a run for 26 hours (NFR-9).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+      # NFR-8: a file's contents are deleted in both regions within 7 days of its trigger. lifecycle_overdue_deletions
+      # counts the files past that, after the deletion job's last run: a commitment already missed.
+      - alert: FileDeletionOverdue
+        expr: max(lifecycle_overdue_deletions) > 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: Files are still not deleted 7 days after their trigger (NFR-8).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+      # The oldest due deletion is 6 days old: a day before NFR-8's deadline, time to find out why in working hours.
+      - alert: FileDeletionLagging
+        expr: max(lifecycle_deletion_lag_seconds) > 518400
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: A file's deletion has been due for more than 6 days, a day short of NFR-8's 7.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+      # NFR-15: a download grant whose committed audit record isn't confirmed after reconciliation's retries. The
+      # cleanup keeps such grants, so the gauge only falls when the record is written.
+      - alert: UnarchivedGrants
+        expr: max(lifecycle_unarchived_grants) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Download grants have waited over 15 minutes for their committed audit record (NFR-15).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+      # The other jobs' staleness (the archive, the purge and the partitions have their own): a job's gauges are only as
+      # fresh as its last run. expiry, deletion and reconciliation run every 5 minutes; storage-audit and cleanup daily.
+      - alert: LifecycleJobNotRunning
+        expr: time() - max by (job) (lifecycle_job_last_success_timestamp_seconds{job=~"expiry|deletion|reconciliation"}) > 1800
+        for: 5m
+        labels:
+          severity: ticket
+          condition: every_5_minutes
+        annotations:
+          summary: A lifecycle job that runs every 5 minutes hasn't finished a run for 30 minutes (NFR-8).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+      - alert: LifecycleJobNotRunning
+        expr: time() - max by (job) (lifecycle_job_last_success_timestamp_seconds{job=~"storage-audit|cleanup"}) > 93600
+        for: 15m
+        labels:
+          severity: ticket
+          condition: daily
+        annotations:
+          summary: A daily lifecycle job hasn't finished a run for 26 hours.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md

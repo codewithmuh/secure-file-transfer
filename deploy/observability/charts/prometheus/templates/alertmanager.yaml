@@ -1,0 +1,110 @@
+{{- $a := .Values.alertmanager }}
+{{- $prefix := include "prom.prefix" . }}
+{{- $region := .Values.global.sft.region }}
+{{- /*
+Alertmanager (ADR-0009): pages and tickets through SNS in its own Region, signed with its Pod Identity role
+(sft-<env>-alertmanager, infra/modules/observability) and sent through the egress proxy's platform listener, since SNS
+has no endpoint here (ADR-0021). Its configuration is the AlertmanagerConfig below, made from deploy/alerts/alertmanager.yaml,
+so no Secret is in Git.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alertmanager
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Alertmanager
+metadata:
+  name: sft
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $a.replicas }}
+  image: {{ include "prom.image" (list . .Values.images.alertmanager) }}
+  serviceAccountName: alertmanager
+  automountServiceAccountToken: false
+  podMetadata:
+    labels:
+      {{- include "prom.labels" . | nindent 6 }}
+  nodeSelector:
+    {{- toYaml .Values.pools.main | nindent 4 }}
+  securityContext:
+    {{- include "prom.podSecurity" . | nindent 4 }}
+  containers:
+    - name: alertmanager
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+    - name: config-reloader
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+  initContainers:
+    - name: init-config-reloader
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+  resources:
+    {{- toYaml $a.resources | nindent 4 }}
+  retention: 120h
+  alertmanagerConfiguration:
+    name: sft
+---
+{{- /*
+The routing is deploy/alerts/alertmanager.yaml (#245; this chart's alerts/ is a link to deploy/alerts), the file
+deploy/alerts/test.sh checks with amtool and route tests. It is loaded as it is, with its four placeholders replaced
+by the cluster's facts, and written as the operator's AlertmanagerConfig, so no Secret is in Git or in this project.
+The chart adds what only the cluster knows: SNS's Regional URL and the egress proxy's platform listener on every
+receiver (ADR-0021). deploy/observability/tests checks that every route, matcher, inhibition and topic of the file
+arrives unchanged.
+*/}}
+{{- $source := .Files.Get "alerts/alertmanager.yaml" }}
+{{- $source = $source | replace "@ENVIRONMENT@" .Values.global.sft.environment | replace "@REGION_SHORT@" (ternary "apne1" "apne3" (eq $region "ap-northeast-1")) | replace "@REGION@" $region | replace "@ACCOUNT_ID@" (toString .Values.global.sft.accountId) }}
+{{- $am := required "deploy/alerts/alertmanager.yaml is missing" ($source | fromYaml) }}
+{{- $http := dict "proxyURL" (printf "http://%s:%v" .Values.network.egressProxy.host .Values.network.egressProxy.platformPort) }}
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: sft
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+  annotations:
+    sft.io/source: deploy/alerts/alertmanager.yaml
+spec:
+  route:
+    {{- include "prom.amRoute" $am.route | nindent 4 }}
+  inhibitRules:
+    {{- range $am.inhibit_rules }}
+    - sourceMatch:
+        {{- include "prom.amMatchers" .source_matchers | nindent 8 }}
+      targetMatch:
+        {{- include "prom.amMatchers" .target_matchers | nindent 8 }}
+      {{- with .equal }}
+      equal: {{ toJson . }}
+      {{- end }}
+    {{- end }}
+  receivers:
+    {{- range $am.receivers }}
+    - name: {{ .name }}
+      snsConfigs:
+        {{- range .sns_configs }}
+        - apiURL: https://sns.{{ $region }}.amazonaws.com
+          topicARN: {{ .topic_arn }}
+          sigv4:
+            region: {{ .sigv4.region }}
+          sendResolved: {{ .send_resolved }}
+          subject: {{ .subject | toJson }}
+          message: {{ .message | toJson }}
+          httpConfig:
+            {{- toYaml $http | nindent 12 }}
+        {{- end }}
+    {{- end }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alertmanager
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: alertmanager, alertmanager: sft }

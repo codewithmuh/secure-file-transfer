@@ -21,3 +21,10 @@ network:
   publicSubnetsCidr: 10.10.128.0/21
   endpointSubnetsCidr: 10.10.144.0/24
   isolatedSubnetsCidr: 10.10.136.0/21
+# The observability charts' facts (deploy/observability, #243), which their Applications pass under `global`.
+global:
+  imageRegistry: 000000000000.dkr.ecr.ap-northeast-1.amazonaws.com
+  sft:
+    environment: dev
+    region: ap-northeast-1
+    accountId: "000000000000"

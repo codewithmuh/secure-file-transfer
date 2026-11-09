@@ -1,0 +1,56 @@
+# prod's observability stack (capacity 4.3, A28, A33): two Prometheus replicas with 30 days on 200 GB each, two
+# Alertmanagers, Loki in simple scalable mode (2 write, 2 read, 1 backend), Tempo, two gateway collectors. Every chart
+# reads this file after the cluster's values file; each takes only its own keys.
+
+prometheus:
+  replicas: 2
+  retention: 30d
+  storage: 200Gi
+  retentionSize: 180GB
+  resources:
+    requests: { cpu: "1", memory: 3584Mi }
+    limits: { memory: 5Gi }
+
+alertmanager:
+  replicas: 2
+
+loki:
+  deploymentMode: SimpleScalable
+  loki:
+    # Two write pods hold every stream twice, so one can restart without losing what isn't flushed yet.
+    commonConfig: { replication_factor: 2 }
+    limits_config: { retention_period: 2160h } # 90 days (PRD data lifecycle)
+  singleBinary: { replicas: 0 }
+  write:
+    replicas: 2
+    persistence: { size: 25Gi }
+    resources:
+      requests: { cpu: 250m, memory: 640Mi }
+      limits: { memory: 1Gi }
+  read:
+    replicas: 2
+    resources:
+      requests: { cpu: 200m, memory: 384Mi }
+      limits: { memory: 768Mi }
+  backend:
+    replicas: 1
+    persistence: { size: 25Gi }
+    resources:
+      requests: { cpu: 100m, memory: 512Mi }
+      limits: { memory: 768Mi }
+
+tempo:
+  persistence: { size: 25Gi }
+  tempo:
+    retention: 336h # 14 days (A33)
+    resources:
+      requests: { cpu: 500m, memory: 1536Mi }
+      limits: { memory: 2Gi }
+
+gateway:
+  replicas: 2
+
+grafana:
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { memory: 768Mi }

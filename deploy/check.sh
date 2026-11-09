@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The deploy config's static checks, as CI's `deploy` job runs them: helm lint for every cluster and part, helm
-# template for every values file (render.sh), and kubeconform on the output, Argo CD's own kinds included. The
+# The deploy config's static checks, as CI's `deploy` job runs them: helm lint for every cluster and part, the
+# observability stack's charts included, helm template for every values file (render.sh), and kubeconform on the
+# output, Argo CD's and the Prometheus Operator's kinds included. The
 # runtime-contract test runs after it: `uv run --project services/api --locked pytest deploy/tests`.
 # Needs helm 3 and kubeconform; their versions are pinned in .github/workflows/ci.yml. With an argument, the rendered
 # manifests are kept in that directory (CI scans them with Trivy); without one they go to a temporary directory.
@@ -44,6 +45,21 @@ for values in "$root"/deploy/environments/*/*/values.yaml; do
   for part in application operator; do
     helm lint --strict --quiet "$root/deploy/charts/sft" --values "$values" "${cluster[@]}" --set "part=$part"
   done
+
+  # The observability stack (#243): its root's chart, then each chart with the values its Application names, unless
+  # the cluster is a pilot light, which runs none of it.
+  helm lint --strict --quiet "$root/deploy/observability/argocd" --values "$values" \
+    --set "environment=$env" --set "region=$region" \
+    --set "cluster.registry=$fake_account.dkr.ecr.$region.amazonaws.com" --set-string "cluster.accountId=$fake_account"
+  if ! grep -q '^pilotLight: true' "$values"; then
+    for chart in prometheus loki tempo collectors grafana; do
+      helm lint --strict --quiet "$root/deploy/observability/charts/$chart" \
+        --values "$values" --values "$root/deploy/observability/environments/$env.yaml" \
+        --set "global.imageRegistry=$fake_account.dkr.ecr.$region.amazonaws.com" \
+        --set "global.sft.environment=$env" --set "global.sft.region=$region" \
+        --set-string "global.sft.accountId=$fake_account" 2> >(grep -v 'symbolic link' >&2)
+    done
+  fi
 done
 
 echo "== helm template: every values file"

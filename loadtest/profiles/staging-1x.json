@@ -1,0 +1,10 @@
+{
+  "name": "staging-1x",
+  "factor": 1,
+  "duration": "5h",
+  "gracefulStop": "20m",
+  "bytesSample": 0.1,
+  "maxFileBytes": 5000000000,
+  "smallFileBytes": 65536,
+  "vus": { "transfers": [60, 300], "uploadRequests": [20, 100], "reads": [30, 200] }
+}

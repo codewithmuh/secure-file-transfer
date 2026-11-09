@@ -1,0 +1,102 @@
+# Unit tests of audit.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../audit.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # NFR-15, T-81: Osaka's archive writes fail for 5 minutes: a page naming the Region. Tokyo's succeed.
+  - interval: 1m
+    input_series:
+      - series: 'audit_archive_write_failures_total{region="ap-northeast-3", job="api"}'
+        values: '0 0 1 2 3 4 5 6 7 8 9 10'
+      - series: 'audit_archive_write_failures_total{region="ap-northeast-1", job="api"}'
+        values: '0x11'
+      # The archive job's own batch failures (pushed) don't page here: AuditArchiveLagging covers them.
+      - series: 'audit_archive_write_failures_total{region="ap-northeast-1", job="audit-archive"}'
+        values: '0 1 2 3 4 5 6 7 8 9 10 11'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AuditArchiveWriteFailing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: AuditArchiveWriteFailing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              region: ap-northeast-3
+            exp_annotations:
+              summary: Security-critical audit records can't be written to the ap-northeast-3 archive; new download grants fail (NFR-15).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-writes.md
+
+  # Data model 6: rows in the default partition open a ticket at once.
+  - interval: 1h
+    input_series:
+      - series: 'sft_audit_default_partition_rows{job="audit-partitions"}'
+        values: '0 0 3 3'
+      - series: 'sft_audit_partition_months_covered{job="audit-partitions"}'
+        values: '4 4 4 4'
+      - series: 'sft_audit_partition_last_success_timestamp_seconds{job="audit-partitions"}'
+        values: '0+3600x3'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: AuditPartitions
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: AuditPartitions
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: default_rows
+            exp_annotations:
+              summary: Audit events are in the default partition because their month had no partition (data model 6).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+  # Next month missing: quiet on 2 January (promtool's clock starts on 1 January 1970), a ticket from 26 January.
+  # The step stops succeeding at 23 days 22 hours, so 26 hours later it is stale too.
+  - interval: 1h
+    input_series:
+      - series: 'sft_audit_partition_months_covered{job="audit-partitions"}'
+        values: '1x700'
+      - series: 'sft_audit_default_partition_rows{job="audit-partitions"}'
+        values: '0x700'
+      - series: 'sft_audit_partition_last_success_timestamp_seconds{job="audit-partitions"}'
+        values: '0+3600x574 2066400x125'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: AuditPartitions
+        exp_alerts: []
+      - eval_time: 610h
+        alertname: AuditPartitions
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: next_month_missing
+            exp_annotations:
+              summary: Next month has no audit partition and this month ends within 7 days (data model 6).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+          - exp_labels:
+              severity: ticket
+              condition: stale
+            exp_annotations:
+              summary: The audit partition step hasn't succeeded for 26 hours (data model 6).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+  # A step that has never pushed its gauges opens a ticket after 26 hours.
+  - interval: 1h
+    input_series:
+      - series: 'audit_archive_write_failures_total{region="ap-northeast-1", job="api"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20h
+        alertname: AuditPartitions
+        exp_alerts: []
+      - eval_time: 27h
+        alertname: AuditPartitions
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: never_reported
+            exp_annotations:
+              summary: The audit partition step has never reported its metrics (data model 6).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md

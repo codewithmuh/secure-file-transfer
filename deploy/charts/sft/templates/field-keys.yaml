@@ -25,7 +25,7 @@ metadata:
 spec:
   schedule: {{ $job.schedule | quote }}
   timeZone: Etc/UTC
-  suspend: {{ .Values.pilotLight }}
+  suspend: {{ include "sft.cronSuspended" . }}
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 600
   successfulJobsHistoryLimit: 1

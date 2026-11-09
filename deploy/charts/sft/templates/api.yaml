@@ -75,7 +75,7 @@ spec:
             matchLabels:
               {{- include "sft.selectorLabels" $ctx | nindent 14 }}
       containers:
-        {{- include "sft.appContainer" (dict "root" $ "name" "api" "module" $w.module "publicPort" 8000 "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "proxyListener" "api" "env" $env "secretEnv" $secretEnv "preStop" true "resources" $w.resources) | nindent 8 }}
+        {{- include "sft.appContainer" (dict "root" $ "name" "api" "traced" true "module" $w.module "publicPort" 8000 "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "proxyListener" "api" "env" $env "secretEnv" $secretEnv "preStop" true "resources" $w.resources) | nindent 8 }}
       volumes:
         {{- include "sft.tmpVolume" . | nindent 8 }}
 ---

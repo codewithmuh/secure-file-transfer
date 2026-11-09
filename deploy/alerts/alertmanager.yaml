@@ -1,0 +1,81 @@
+# Alertmanager's routing (ADR-0009, #245): pages, tickets and the heartbeat, each to its own SNS topic in the cluster's
+# Region (infra/modules/alarms/topics.tf), and the inhibitions during drills. deploy/alerts/test.sh checks it with
+# amtool and tests its routes (`amtool check-config`, `amtool config routes test`).
+#
+# The observability stack (the OBS track, deploy/observability) loads this file and replaces four placeholders with
+# the cluster's facts, which only Terraform knows: @ENVIRONMENT@ (dev, staging, prod), @REGION@ (ap-northeast-1 or
+# ap-northeast-3), @REGION_SHORT@ (apne1, apne3) and @ACCOUNT_ID@. Nothing else in it varies by cluster.
+#
+# Alertmanager signs its SNS calls as its own Pod Identity role, sft-<env>-alertmanager, the one role besides
+# CloudWatch that the topics let publish. SNS has no VPC endpoint here, so the calls go through the egress proxy's
+# platform listener (ADR-0021); if the proxy fails, the heartbeat stops and CloudWatch pages (ADR-0009).
+#
+# Who gets what: the page and ticket topics reach the operators' addresses (TF_VAR_alert_emails at apply); a pager
+# service subscribes to the page topic when there is one. Alert text holds alert names, labels and summaries only,
+# never tenant data (the rules' labels carry none, abuse 8.1).
+route:
+  receiver: ticket
+  group_by: [alertname, condition, slo]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  routes:
+    # The always-firing Watchdog, every minute, to the heartbeat topic. CloudWatch counts the messages and pages when
+    # five minutes pass without one (heartbeat-missing). Nothing else goes there, and nothing subscribes to it.
+    - receiver: heartbeat
+      matchers: [alertname="Watchdog", severity="heartbeat"]
+      group_by: [alertname]
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+    # Pages: something users feel now, or a security event. Re-sent every hour while it lasts.
+    - receiver: page
+      matchers: [severity="page"]
+      repeat_interval: 1h
+    # Tickets: to look at during working hours. Re-sent once a day while it lasts.
+    - receiver: ticket
+      matchers: [severity="ticket"]
+      repeat_interval: 24h
+
+inhibit_rules:
+  # NFR-1: during a drill (DrillInProgress, from sft_drill_active), the alerts it sets off on purpose stay quiet. Alerts
+  # marked security="true" (break-glass, isolation, operator records) are never inhibited: a drill is no cover for an
+  # insider. The watchdog's heartbeat keeps flowing, so a drill that kills the cluster still pages from CloudWatch.
+  - source_matchers: [alertname="DrillInProgress"]
+    target_matchers: [severity=~"page|ticket", security!="true", alertname!="DrillInProgress"]
+  # A burn rate that pages makes its ticket redundant.
+  - source_matchers: [alertname="ErrorBudgetBurn", severity="page"]
+    target_matchers: [alertname="ErrorBudgetBurn", severity="ticket"]
+    equal: [slo]
+
+receivers:
+  - name: page
+    sns_configs:
+      - topic_arn: arn:aws:sns:@REGION@:@ACCOUNT_ID@:sft-@ENVIRONMENT@-@REGION_SHORT@-alerts-page
+        sigv4:
+          region: "@REGION@"
+        subject: '[sft-@ENVIRONMENT@-@REGION_SHORT@ page] {{ .CommonLabels.alertname }} {{ .Status }}'
+        message: &message |-
+          {{ range .Alerts }}{{ .Status | toUpper }}: {{ .Labels.alertname }}{{ if .Labels.condition }} ({{ .Labels.condition }}){{ end }}{{ if .Labels.slo }} ({{ .Labels.slo }}){{ end }}
+          {{ .Annotations.summary }}
+          Runbook: {{ .Annotations.runbook_url }}
+          Since: {{ .StartsAt }}
+
+          {{ end }}
+        send_resolved: true
+  - name: ticket
+    sns_configs:
+      - topic_arn: arn:aws:sns:@REGION@:@ACCOUNT_ID@:sft-@ENVIRONMENT@-@REGION_SHORT@-alerts-ticket
+        sigv4:
+          region: "@REGION@"
+        subject: '[sft-@ENVIRONMENT@-@REGION_SHORT@ ticket] {{ .CommonLabels.alertname }} {{ .Status }}'
+        message: *message
+        send_resolved: true
+  - name: heartbeat
+    sns_configs:
+      - topic_arn: arn:aws:sns:@REGION@:@ACCOUNT_ID@:sft-@ENVIRONMENT@-@REGION_SHORT@-heartbeat
+        sigv4:
+          region: "@REGION@"
+        subject: 'sft-@ENVIRONMENT@-@REGION_SHORT@ heartbeat'
+        message: 'Watchdog'
+        send_resolved: false

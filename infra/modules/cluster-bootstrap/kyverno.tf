@@ -126,7 +126,7 @@ resource "helm_release" "kyverno_policies" {
     eksAddonRegistry     = local.eks_addon_registry
     eksAddonRepositories = local.eks_addon_repositories
     systemNamespaces     = local.system_namespaces
-    hostAccessNamespaces = var.host_access_namespaces
+    hostAccessNamespaces = local.host_access_namespaces
   })]
 
   # default is labelled first, or the namespace policy would refuse the label's own update.

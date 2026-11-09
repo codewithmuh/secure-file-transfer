@@ -27,6 +27,8 @@ locals {
   system_namespaces = concat(
     ["kube-system", "argocd", "kyverno", "karpenter", "egress-proxy"],
     var.pilot_light ? ["external-secrets"] : [],
+    # The node agents run on every node, the system nodes included, to collect their pods' logs (ADR-0009).
+    [local.node_agents_namespace],
   )
 
   # Outside Kyverno's webhooks (ADR-0004, ADR-0007). Their images are pinned here and Kyverno's background reports
@@ -46,6 +48,7 @@ locals {
     argocd           = 3131
     platform         = 3132
     key-rotation     = 3133
+    synthetic-probe  = 3134 # #248: the probe's own way in from outside
   }
   proxy_url = { for name, port in local.proxy_ports : name => "http://${local.proxy_host}:${port}" }
 

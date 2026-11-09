@@ -1,0 +1,135 @@
+# Loki for one cluster (ADR-0009). The Application (deploy/observability/argocd) adds the cluster's facts under
+# `global` and its network from the cluster's values file; deploy/observability/environments/<env>.yaml sizes it.
+
+global:
+  imageRegistry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com, from the Application
+  sft:
+    environment: ""
+    region: ""
+    accountId: ""
+
+# The cluster's network (deploy/environments/<env>/<region>/values.yaml), for the network policy's S3 rule.
+network:
+  vpcCidr: ""
+  podIdentityAgent: 169.254.170.23/32
+
+loki:
+  # SingleBinary or SimpleScalable, per environment.
+  deploymentMode: SingleBinary
+  fullnameOverride: loki
+
+  serviceAccount:
+    create: true
+    name: loki # Pod Identity binds sft-<env>-loki to monitoring/loki (infra/modules/observability)
+    # No Kubernetes API: the ring is memberlist over the headless Service. Pod Identity needs no token.
+    automountServiceAccountToken: false
+  rbac:
+    namespaced: true
+  enterprise:
+    enabled: false
+
+  loki:
+    image:
+      repository: mirror/grafana/loki # ADR-0007: our mirror, by digest; the registry is global.imageRegistry
+      tag: 3.6.16@sha256:79f3fbf2a3eca97dd735e2aa0871a2fc15365a81c68dea67f639b092c301f454
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      runAsGroup: 10001
+      fsGroup: 10001
+      fsGroupChangePolicy: OnRootMismatch
+      seccompProfile: { type: RuntimeDefault }
+    containerSecurityContext:
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities: { drop: [ALL] }
+    enableServiceLinks: false
+    configStorageType: ConfigMap # no Secrets in Git or in the project (deploy/observability/argocd)
+    # One tenant: the cluster. Only the node agents write and only Grafana reads (network policies below).
+    auth_enabled: false
+    commonConfig:
+      replication_factor: 1
+    # The bucket's name is tpl'd in the chart's final pass, with the cluster's facts from `global.sft`.
+    storage:
+      type: s3
+      bucketNames:
+        chunks: '{{ printf "sft-%s-%s-loki-%s" .Values.global.sft.environment (ternary "apne1" "apne3" (eq .Values.global.sft.region "ap-northeast-1")) .Values.global.sft.accountId }}'
+        ruler: '{{ printf "sft-%s-%s-loki-%s" .Values.global.sft.environment (ternary "apne1" "apne3" (eq .Values.global.sft.region "ap-northeast-1")) .Values.global.sft.accountId }}'
+      s3:
+        region: '"{{ .Values.global.sft.region }}"'
+        # The bucket's default encryption is the logs key (encryption 3.1); Pod Identity supplies the credentials.
+    schemaConfig:
+      configs:
+        - from: "2026-11-01"
+          store: tsdb
+          object_store: s3
+          schema: v13
+          index: { prefix: index_, period: 24h }
+    limits_config:
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      max_cache_freshness_per_query: 10m
+      split_queries_by_interval: 15m
+      query_timeout: 300s
+      volume_enabled: true
+      # Logs kept, enforced by the compactor: the PRD's 90 days in prod, less in dev and staging (capacity 4.3). The
+      # bucket's lifecycle rule is a safety net a few days later (infra/modules/observability).
+      retention_period: 2160h
+    compactor:
+      retention_enabled: true
+      delete_request_store: s3
+    analytics:
+      reporting_enabled: false # no usage reports leave the cluster (ADR-0021)
+    ruler:
+      enable_api: false
+
+  # Loki's own chart extras that this design doesn't use: its gateway (nothing outside the namespace writes but the
+  # agents), caches, canary, tests, MinIO, the rules sidecar and self-monitoring.
+  gateway:
+    enabled: false
+  chunksCache:
+    enabled: false
+  resultsCache:
+    enabled: false
+  lokiCanary:
+    enabled: false
+  test:
+    enabled: false
+  minio:
+    enabled: false
+  sidecar:
+    rules:
+      enabled: false
+  ruler:
+    enabled: false
+  memberlist:
+    service:
+      publishNotReadyAddresses: true
+
+  singleBinary:
+    replicas: 1
+    nodeSelector: { sft.io/pool: main }
+    resources:
+      requests: { cpu: 250m, memory: 1Gi }
+      limits: { memory: 1536Mi }
+    persistence:
+      enabled: true
+      size: 15Gi
+      storageClass: observability # cluster-bootstrap: gp3, encrypted with the account's default key
+  write:
+    replicas: 0
+    nodeSelector: { sft.io/pool: main }
+    persistence:
+      volumeClaimsEnabled: true
+      size: 25Gi
+      storageClass: observability
+  read:
+    replicas: 0
+    nodeSelector: { sft.io/pool: main }
+  backend:
+    replicas: 0
+    nodeSelector: { sft.io/pool: main }
+    persistence:
+      volumeClaimsEnabled: true
+      size: 25Gi
+      storageClass: observability

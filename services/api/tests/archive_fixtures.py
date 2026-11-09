@@ -22,7 +22,9 @@ class FakeArchiveStore:
     fail: set[Region] = field(default_factory=set)
     writes: int = 0
 
-    async def put_once(self, region: Region, key: str, body: bytes) -> bool:
+    async def put_once(
+        self, region: Region, key: str, body: bytes, *, content_type: str = "application/json"
+    ) -> bool:
         self.writes += 1
         if region in self.fail:
             raise ArchiveWriteError("ServiceUnavailable")

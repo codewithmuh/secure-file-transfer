@@ -585,7 +585,12 @@ def test_only_the_jobs_role_may_delete_and_the_api_role_never_files(
         "sso_domains",
         "sso_group_roles",
     }
-    assert not any(table in ("files", "transfers") for table, _ in by_table)
+    # The purge (#224, revision 0034) deletes whole transfers and upload requests, as sft_jobs,
+    # their files with them; no role deletes a file row on its own.
+    assert {role for table, role in by_table if table in ("transfers", "upload_requests")} == {
+        "sft_jobs"
+    }
+    assert not any(table == "files" for table, _ in by_table)
 
 
 async def test_the_api_roles_delete_is_refused(migrated_db: ScratchDatabase) -> None:

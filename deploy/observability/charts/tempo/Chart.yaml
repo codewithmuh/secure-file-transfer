@@ -1,0 +1,13 @@
+apiVersion: v2
+name: sft-tempo
+description: >-
+  Tempo for one cluster (ADR-0009): the traces the gateway collectors keep after tail sampling, in this Region's Tempo
+  bucket under the logs key, through Pod Identity. Single binary in every environment (ADR-0009, amended by #243).
+type: application
+version: 0.1.0
+# The upstream chart, pinned, vendored in charts/ so Argo CD renders it from Git alone (ADR-0005, ADR-0007). Its
+# checksum is in deploy/observability/charts/SHA256SUMS.
+dependencies:
+  - name: tempo
+    version: 3.2.1
+    repository: https://grafana-community.github.io/helm-charts

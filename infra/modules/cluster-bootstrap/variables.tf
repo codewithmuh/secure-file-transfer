@@ -261,8 +261,9 @@ variable "additional_mirror_digests" {
 
 variable "host_access_namespaces" {
   description = <<-EOT
-    Namespaces whose pods may use host namespaces, host paths and host ports: the node agents of ADR-0009, once their
-    namespace exists. Privileged containers stay refused everywhere.
+    Namespaces whose pods may use host namespaces, host paths and host ports, besides node-agents, the node agents'
+    namespace of ADR-0009, which this module makes and always includes (observability.tf). Privileged containers stay
+    refused everywhere.
   EOT
   type        = list(string)
   default     = []

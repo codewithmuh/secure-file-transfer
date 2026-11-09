@@ -1,0 +1,7 @@
+apiVersion: v2
+name: sft-grafana
+description: >-
+  Grafana for one cluster (ADR-0009): read-only, provisioned from Git with its data sources and every dashboard in
+  dashboards/, alone in the grafana namespace and reached only by port-forward.
+type: application
+version: 0.1.0

@@ -139,11 +139,11 @@ root_package = "sft"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Layers: api | workers -> runtime -> service -> data | dlp -> core"
+name = "Layers: api | workers | probe -> runtime -> service -> data | dlp -> core"
 type = "layers"
 containers = ["sft"]
 layers = [
-  "api | workers",
+  "api | workers | probe",
   "runtime",
   "service",
   "data | dlp",
@@ -171,4 +171,15 @@ forbidden_modules = [
   "boto3", "botocore",
   "fastapi", "starlette", "uvicorn",
   "prometheus_client", "opentelemetry",
+]
+
+# The synthetic probe (#248, NFR-1) measures the service as a customer sees it: through the public API, with HTTP and
+# the mailbox only. It may use `core` (settings, logs) and nothing that reaches the database or the queues.
+[[tool.importlinter.contracts]]
+name = "The probe sees the service only through its public API"
+type = "forbidden"
+source_modules = ["sft.probe"]
+forbidden_modules = [
+  "sft.api", "sft.workers", "sft.runtime", "sft.service", "sft.data", "sft.dlp",
+  "sqlalchemy", "psycopg", "alembic", "valkey", "fastapi", "starlette", "uvicorn",
 ]

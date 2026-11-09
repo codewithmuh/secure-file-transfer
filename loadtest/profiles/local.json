@@ -1,0 +1,10 @@
+{
+  "name": "local",
+  "factor": 0.05,
+  "duration": "5m",
+  "gracefulStop": "5m",
+  "bytesSample": 1,
+  "maxFileBytes": 8000000,
+  "smallFileBytes": 4096,
+  "vus": { "transfers": [4, 20], "uploadRequests": [2, 10], "reads": [2, 10] }
+}

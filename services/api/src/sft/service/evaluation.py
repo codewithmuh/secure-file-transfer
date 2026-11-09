@@ -78,7 +78,7 @@ from sft.data.outbox import (
     TRANSFER_SENT,
     enqueue,
 )
-from sft.service import dlp_decision
+from sft.service import dlp_decision, sli
 from sft.service.dlp_decision import Decided
 
 TRANSFER: Final = "transfer"
@@ -282,8 +282,18 @@ async def evaluate(
             target=Target(DLP_RULE, match.rule.id),
         )
     if decided.sends:
+        timing = await files.shareable_timing(session, transfer_id)
         await send(session, locked, [f.id for f in counted], decision_id=decided.id)
         await record("transfer.sent", files=len(counted), decision_id=decided.id)
+        if locked.state is TransferState.SUBMITTED and not file_removed:
+            # NFR-5's time to shareable (#242). A file removal is the member's act, which
+            # restarts the clock, like a confirmation (`sft.service.sli`).
+            sli.observe_shareable(
+                sli.ShareableKind.TRANSFER,
+                started_at=timing.started_at,
+                now=now,
+                largest=timing.largest,
+            )
         return Outcome.SENT
     if decided.outcome is not DlpOutcome.BLOCK:
         await transfers.change_state(

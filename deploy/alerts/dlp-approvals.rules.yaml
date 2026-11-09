@@ -1,0 +1,23 @@
+# Alerts of DLP approvals (FR-43; architecture 6, "Approvals not decided"; abuse 8.2, DlpApprovalBacklog; #245), tested
+# by deploy/alerts/tests/dlp-approvals.test.yaml.
+#
+# The series come from the notification worker (sft.service.notifications): emails_sent_total{type} and
+# email_caps_hit_total{cap}. When a sender's transfer needs approval and the tenant has no eligible approver, every
+# active admin gets `dlp_no_eligible_approver`, capped per tenant (`tenant_no_eligible_approver`). The age of the
+# oldest pending request, DlpApprovalBacklog's other half, waits for its metric (docs/operations/slos.md).
+groups:
+  - name: dlp-approvals
+    rules:
+      # A tenant's rules ask for approval that nobody can give, so its transfers wait until their requests expire and
+      # go back to their senders. Tenant admins are told; this tells the operator, who can tell the tenant.
+      - alert: DlpApprovalBacklog
+        expr: |
+          sum(increase(emails_sent_total{type="dlp_no_eligible_approver"}[1h])) > 0
+          or
+          sum(increase(email_caps_hit_total{cap="tenant_no_eligible_approver"}[1h])) > 0
+        labels:
+          severity: ticket
+          condition: no_eligible_approver
+        annotations:
+          summary: A tenant's DLP rules need approval but it has no eligible approver; its transfers wait (FR-43).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md

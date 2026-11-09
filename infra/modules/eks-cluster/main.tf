@@ -41,7 +41,8 @@ locals {
     archive                   = "${var.global_name_prefix}-archive"
     migrate                   = "${var.global_name_prefix}-migrate"
     operator                  = "${var.global_name_prefix}-operator"
-    key_rotation              = "${var.global_name_prefix}-key-rotation" # #185; the KMS and IAM policies name it
+    key_rotation              = "${var.global_name_prefix}-key-rotation"    # #185; the KMS and IAM policies name it
+    synthetic_probe           = "${var.global_name_prefix}-synthetic-probe" # #248
   }
   role_arns = { for k, n in local.role_names : k => "arn:aws:iam::${var.account_id}:role/${n}" }
 

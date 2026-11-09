@@ -1,0 +1,72 @@
+{{- $a := .Values.agent }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-agent
+  namespace: {{ $a.namespace }}
+  labels: { app.kubernetes.io/name: otel-agent, app.kubernetes.io/part-of: sft-observability }
+data:
+  config.yaml: |
+    receivers:
+      # Spans from the pods on this node (architecture 5.5): OTLP/HTTP only.
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+      # Every container's log file on this node, but the agent's own (a loop). The container parser reads the CRI
+      # format and takes the namespace, pod and container from the file's path, so no Kubernetes API is needed.
+      filelog:
+        include: [/var/log/pods/*/*/*.log]
+        exclude: [/var/log/pods/{{ $a.namespace }}_otel-agent-*/*/*.log]
+        start_at: end
+        include_file_path: false
+        include_file_name: false
+        storage: file_storage
+        operators:
+          - type: container
+            id: container-parser
+    processors:
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      resource/cluster:
+        attributes:
+          - { key: k8s.cluster.name, value: {{ include "collectors.cluster" . }}, action: upsert }
+      batch: {}
+    exporters:
+      # Every span of a trace to one gateway, chosen by trace ID, so tail sampling sees the whole trace.
+      loadbalancing:
+        routing_key: traceID
+        protocol:
+          otlp:
+            timeout: 5s
+            tls: { insecure: true }
+        resolver:
+          dns:
+            hostname: otel-gateway-headless.{{ .Release.Namespace }}.svc.cluster.local
+            port: 4317
+      otlphttp/loki:
+        endpoint: http://loki-push.{{ .Release.Namespace }}.svc.cluster.local:3100/otlp
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+      # Where each file was read up to, so a restarted container neither repeats nor skips lines.
+      file_storage:
+        directory: /var/lib/otelcol
+    service:
+      extensions: [health_check, file_storage]
+      telemetry:
+        logs: { encoding: json }
+        metrics:
+          readers:
+            - pull: { exporter: { prometheus: { host: 0.0.0.0, port: 8888 } } }
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource/cluster, batch]
+          exporters: [loadbalancing]
+        logs:
+          receivers: [filelog]
+          processors: [memory_limiter, resource/cluster, batch]
+          exporters: [otlphttp/loki]

@@ -341,6 +341,7 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
     seed_dlp_should(db, tenant_id, rows)
     seed_data_keys(db, tenant_id, marker)
     seed_sso(db, tenant_id, marker, rows)
+    seed_purgeable(db, tenant_id, marker, rows)
     return Seeded(tenant_id, marker, rows)
 
 
@@ -788,6 +789,34 @@ def seed_data_keys(db: Sql, tenant_id: uuid.UUID, marker: str) -> None:
                 marker=marker,
                 retired=retired,
             )
+
+
+def seed_purgeable(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:
+    """The metadata purge (#224): a transfer and an upload request that ended 400 days ago with no
+    file left, so a purge in the wrong scope has something of theirs to delete. The marker is in
+    the transfer's message and the request's address."""
+    for key in ("ended_transfer", "ended_request"):
+        rows[key] = uuid.uuid4()
+    db.sql(
+        "INSERT INTO transfers (id, tenant_id, created_by, state, expires_in, message_ct, "
+        "submitted_at, expires_at, ended_at) VALUES (:id, :tenant, :user, 'expired', "
+        "interval '7 days', convert_to(:marker, 'UTF8'), now() - interval '407 days', "
+        "now() - interval '400 days', now() - interval '400 days')",
+        id=rows["ended_transfer"],
+        tenant=tenant_id,
+        user=rows["user"],
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO upload_requests (id, tenant_id, created_by, state, uploader_email, "
+        "email_normalized, locale, expires_at, ended_at, delivery_state) VALUES (:id, :tenant, "
+        ":user, 'expired', :email, :email, 'en', now() - interval '400 days', "
+        "now() - interval '400 days', 'sent')",
+        id=rows["ended_request"],
+        tenant=tenant_id,
+        user=rows["user"],
+        email=f"ended-{marker}@uploader.test",
+    )
 
 
 def snapshot(admin: Admin, tenants: Sequence[Seeded]) -> list[tuple[object, ...]]:

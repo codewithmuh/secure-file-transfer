@@ -253,6 +253,32 @@ class AuditEvent(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'"))
 
 
+class AuditArchiveCursor(Base):
+    """How far the audit archive job has got (#183, revision 0034; data model 2.5). Written
+    through `sft.data.archive_cursor`.
+
+    One row. The job archives every event with `archived_up_to_tx <= tx_id < claimed_up_to_tx`
+    under `g<generation>/`, then moves `archived_up_to_tx` on and clears the claim. No tenant:
+    `sft_archive` uses it in system scope, `sft_recovery` in recovery scope, where it starts a new
+    generation after a restore or failover.
+    """
+
+    __tablename__ = "audit_archive_cursor"
+    __table_args__ = (
+        CheckConstraint("id", name="one_row"),
+        CheckConstraint("generation >= 1", name="generation"),
+        CheckConstraint(
+            "claimed_up_to_tx IS NULL OR claimed_up_to_tx > archived_up_to_tx", name="claim"
+        ),
+    )
+
+    id: Mapped[bool] = mapped_column(primary_key=True, server_default=true())
+    generation: Mapped[int] = mapped_column(server_default=text("1"))
+    archived_up_to_tx: Mapped[int] = mapped_column(Xid8)
+    claimed_up_to_tx: Mapped[int | None] = mapped_column(Xid8)
+    archived_at: Mapped[datetime | None]
+
+
 class Outbox(TenantOwned, Base):
     """A message to hand to a worker, written with the change that causes it (data model 2.5).
 
@@ -838,6 +864,8 @@ class Transfer(TenantOwned, Base):
             ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
         ),
         Index("transfers_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
+        # The metadata purge's find (#224, revision 0034; data model 5, 6).
+        Index("transfers_ended_at_idx", "ended_at", postgresql_where=text("ended_at IS NOT NULL")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
@@ -1449,7 +1477,8 @@ class UploadRequest(TenantOwned, Base):
     and lockout columns work as a recipient's: `link_token_hash` is the SHA-256 of the token the
     notification worker derives from `link_issued_at` under the `link-hmac` key `link_key_id`, the
     three set together or not at all; `failed_attempts` and `locked_at` are the lockout of data
-    model 2.4. `purge_after` stays empty until the purge job exists.
+    model 2.4. `purge_after` is never set: the purge computes it when it looks for work (#224,
+    data model 6), and a later contract release drops the column.
 
     An uploader's link session reaches its own request only; a recipient's none."""
 
@@ -1494,6 +1523,12 @@ class UploadRequest(TenantOwned, Base):
             ["tenant_data_keys.tenant_id", "tenant_data_keys.key_version"],
         ),
         Index("upload_requests_tenant_id_data_key_version_idx", "tenant_id", "data_key_version"),
+        # The metadata purge's find (#224, revision 0034; data model 5, 6).
+        Index(
+            "upload_requests_ended_at_idx",
+            "ended_at",
+            postgresql_where=text("ended_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True)

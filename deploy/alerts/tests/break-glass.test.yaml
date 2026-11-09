@@ -22,6 +22,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: page
+              security: "true"
             exp_annotations:
               summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -48,6 +49,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: page
+              security: "true"
             exp_annotations:
               summary: A self-approved break-glass grant is active; no second operator approved it (FR-35, R-08).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -56,6 +58,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: page
+              security: "true"
             exp_annotations:
               summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -87,6 +90,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: page
+              security: "true"
             exp_annotations:
               summary: The break-glass sweep hasn't completed for 5 minutes; grant expiry isn't being recorded (FR-35).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -100,3 +104,22 @@ tests:
       - eval_time: 2m
         alertname: BreakGlassSweepStalled
         exp_alerts: []
+
+  # FR-35: a break-glass record that didn't reach the tenant's log pages at once, never inhibited (security).
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_tenant_records_missed_total{job="operator-api"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BreakGlassTenantRecordsMissed
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: BreakGlassTenantRecordsMissed
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+            exp_annotations:
+              summary: A break-glass record wasn't written to a tenant's audit log; the tenant can't see the access (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md

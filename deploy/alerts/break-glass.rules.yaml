@@ -1,13 +1,15 @@
 # Alerts of the service's break-glass grants (FR-35, authn-authz 8.3; #232), in Prometheus rule format. Each links to
-# its runbook (NFR-17). Like scanning.rules.yaml, these are the reviewed, tested source until M7's alerting as code
-# loads them (`promtool test rules`, deploy/alerts/tests, run in CI's deploy job).
+# its runbook (NFR-17), tested by deploy/alerts/tests/break-glass.test.yaml (`promtool test rules`, CI's deploy job).
+# Prometheus loads every deploy/alerts/*.rules.yaml file (ADR-0009, #243).
 #
 # The series come from the operator API's /metrics (sft.api.operator). Its sweep runs every 30 s, marks grants that
 # reached their end as expired, and then sets:
 # - sft_break_glass_active_grants{self_approved="true"|"false"}: the grants active now, both label values made at zero
 #   when the operator API starts, so the first grant shows as a change;
-# - sft_break_glass_sweep_last_success_timestamp_seconds: the Unix time of the last sweep that ran to the end.
+# - sft_break_glass_sweep_last_success_timestamp_seconds: the Unix time of the last sweep that ran to the end;
+# - sft_break_glass_tenant_records_missed_total: grant records the sweep couldn't write to a tenant's audit log.
 # The database stops a grant's reads at its end on its own (break_glass_tenants()); the sweep writes the records.
+# Every alert here carries `security: "true"`, so Alertmanager never inhibits it during a drill (alertmanager.yaml).
 #
 # AWS-side uses (an assumption of sft-<env>-break-glass-db, the BreakGlass permission set's assignment and sign-in)
 # page through EventBridge, not Prometheus (infra/modules/break-glass-role, authn-authz 8.3).
@@ -20,6 +22,7 @@ groups:
         expr: sum(sft_break_glass_active_grants) > 0
         labels:
           severity: page
+          security: "true"
         annotations:
           summary: A break-glass grant is active; an operator can read named tenants' data (FR-35).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -30,6 +33,7 @@ groups:
         expr: sum(sft_break_glass_active_grants{self_approved="true"}) > 0
         labels:
           severity: page
+          security: "true"
         annotations:
           summary: A self-approved break-glass grant is active; no second operator approved it (FR-35, R-08).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
@@ -41,6 +45,18 @@ groups:
         expr: time() - max(sft_break_glass_sweep_last_success_timestamp_seconds) > 300
         labels:
           severity: page
+          security: "true"
         annotations:
           summary: The break-glass sweep hasn't completed for 5 minutes; grant expiry isn't being recorded (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md
+
+      # FR-35: a break-glass record didn't reach a tenant's audit log, so the tenant can't see that its data was read.
+      # It should never happen; the grant's own record and CloudTrail still hold it.
+      - alert: BreakGlassTenantRecordsMissed
+        expr: sum(increase(sft_break_glass_tenant_records_missed_total[5m])) > 0
+        labels:
+          severity: page
+          security: "true"
+        annotations:
+          summary: A break-glass record wasn't written to a tenant's audit log; the tenant can't see the access (FR-35).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass.md

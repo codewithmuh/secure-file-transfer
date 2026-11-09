@@ -1,0 +1,13 @@
+apiVersion: v2
+name: sft-loki
+description: >-
+  Loki for one cluster (ADR-0009): the logs the node agents collect, in this Region's Loki bucket under the logs key,
+  through Pod Identity. Single binary in dev and staging, simple scalable in prod (capacity 4.3).
+type: application
+version: 0.1.0
+# The upstream chart, pinned, vendored in charts/ so Argo CD renders it from Git alone and no cluster ever reaches a
+# chart repository (ADR-0005, ADR-0007). Its checksum is in deploy/observability/charts/SHA256SUMS.
+dependencies:
+  - name: loki
+    version: 7.5.0
+    repository: https://grafana.github.io/helm-charts

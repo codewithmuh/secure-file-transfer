@@ -1,0 +1,19 @@
+{{- /*
+Every rule file in deploy/alerts (this chart's alerts/ is a link to it) becomes a PrometheusRule, so a new file needs no
+wiring here (#243). Its unit tests stay where they are (deploy/alerts/test.sh). The rule files hold only groups.
+*/}}
+{{- range $path, $_ := .Files.Glob "alerts/*.rules.yaml" }}
+{{- $rules := $.Files.Get $path | fromYaml }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ base $path | trimSuffix ".rules.yaml" }}
+  labels:
+    {{- include "prom.labels" $ | nindent 4 }}
+  annotations:
+    sft.io/source: deploy/{{ $path }}
+spec:
+  groups:
+    {{- toYaml (required (printf "%s has no groups" $path) $rules.groups) | nindent 4 }}
+{{- end }}

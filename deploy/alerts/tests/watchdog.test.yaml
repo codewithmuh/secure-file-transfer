@@ -1,0 +1,43 @@
+# Unit tests of watchdog.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../watchdog.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ADR-0009: the Watchdog fires from the first evaluation, with no input at all.
+  - interval: 1m
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels:
+              severity: heartbeat
+            exp_annotations:
+              summary: The alerting pipeline is working; this alert always fires and feeds the CloudWatch heartbeat.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/watchdog.md
+      - eval_time: 0m
+        alertname: DrillInProgress
+        exp_alerts: []
+
+  # NFR-1: a drill's marker fires DrillInProgress while it is 1, and stops once the drill deletes it.
+  - interval: 1m
+    input_series:
+      - series: 'sft_drill_active{drill="regional-failover", job="drill"}'
+        values: '0 1 1 1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: DrillInProgress
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: DrillInProgress
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              drill: regional-failover
+            exp_annotations:
+              summary: A drill is in progress (regional-failover); the alerts it sets off are inhibited and its window is left out of the SLOs.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/drill-in-progress.md
+      - eval_time: 10m
+        alertname: DrillInProgress
+        exp_alerts: []

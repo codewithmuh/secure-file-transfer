@@ -579,9 +579,9 @@ data "aws_iam_policy_document" "audit" {
 
   source_policy_documents = [data.aws_iam_policy_document.common.json]
 
-  # Writers only generate data keys. The archive job writes batches in Tokyo; the API and the operator API write
-  # security-critical records to both Regions (architecture 5.2), and the lifecycle jobs rewrite a download grant's
-  # committed record there (#181).
+  # Writers only generate data keys. The archive job writes its batches to both Regions before it moves its cursor
+  # (#183); the API and the operator API write security-critical records to both Regions (architecture 5.2), and the
+  # lifecycle jobs rewrite a download grant's committed record there (#181).
   statement {
     sid       = "WritersPutArchiveObjectsThroughS3"
     actions   = ["kms:GenerateDataKey"]
@@ -595,10 +595,7 @@ data "aws_iam_policy_document" "audit" {
     condition {
       test     = "ArnEquals"
       variable = "aws:PrincipalArn"
-      values = concat(
-        local.primary ? [local.role_arns["archive"]] : [],
-        [local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]],
-      )
+      values   = [local.role_arns["archive"], local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]]
     }
 
     condition {
@@ -1004,12 +1001,12 @@ data "aws_iam_policy_document" "secrets" {
         secrets = [local.secret_arns.platform]
       }
       # The API's and the notification worker's keyrings and this Region's client, as the store role's IAM allows
-      # (modules/eks-cluster); code-hmac and link-hmac too since #178 and #179 (#185).
+      # (modules/eks-cluster); code-hmac and link-hmac too since #178 and #179 (#185); the probe's API key (#248).
       ApplicationSecretStoreReadsApiSecrets = {
         roles = [local.role_arns["external-secrets-app"]]
         secrets = [
           local.secret_arns.email_hmac, local.secret_arns.csrf_hmac, local.secret_arns.code_hmac,
-          local.secret_arns.link_hmac, local.secret_arns.idp_here,
+          local.secret_arns.link_hmac, local.secret_arns.idp_here, local.secret_arns.probe_key,
         ]
       }
       BreakGlassReadsTheMasterPassword = {
@@ -1363,6 +1360,31 @@ data "aws_iam_policy_document" "platform" {
       test     = "ArnLike"
       variable = "aws:SourceArn"
       values   = ["arn:aws:cloudwatch:${local.region}:${var.account_id}:alarm:sft-${var.environment}-*"]
+    }
+  }
+
+  # Alertmanager pages, files tickets and sends its heartbeat through this Region's alert topics (ADR-0009, #243;
+  # modules/observability).
+  statement {
+    sid       = "AlertmanagerPublishesToAlertTopics"
+    actions   = ["kms:GenerateDataKey*", "kms:Decrypt"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.account_root]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.role_arns["alertmanager"]]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = [local.via["sns"]]
     }
   }
 

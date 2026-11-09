@@ -1,6 +1,6 @@
 # Alerts of the scan pipeline (abuse and rate limits 8.2; #175, #176), in Prometheus rule format. Each links to its
-# runbook (NFR-17). Full alerting as code, Alertmanager's routing and the dashboards, arrive with M7; until then these
-# rules are the reviewed, tested source (`promtool test rules`, deploy/alerts/tests, run in CI's deploy job).
+# runbook (NFR-17), tested by deploy/alerts/tests/scanning.test.yaml (`promtool test rules`, CI's deploy job).
+# Prometheus loads every deploy/alerts/*.rules.yaml file and Alertmanager routes them (alertmanager.yaml, ADR-0009).
 #
 # The series come from the scan worker (sft.workers.scan) and the scan sweep (sft.workers.scan_sweep):
 # scan_results_total{state,reason}, dlp_inspection_results_total{state,reason} and dlp_inspector_failures_total{kind},

@@ -1,0 +1,56 @@
+# Alerts of the platform the application depends on inside the cluster (architecture 6, "Egress proxy down"; ADR-0004,
+# ADR-0021, encryption 6.4; #245), tested by deploy/alerts/tests/platform.test.yaml.
+#
+# The series: envoy_server_live from the egress proxy's /stats/prometheus on its health port 9902 (cluster-bootstrap's
+# egress-proxy chart); argocd_app_info{name,health_status,sync_status} from Argo CD's application controller; and
+# sft_keyring_refresh_failures_total{keyring} from every pod that reads a keyring from Secrets Manager
+# (sft.runtime.secrets). The observability stack scrapes all three (the OBS track's scrape config).
+groups:
+  - name: platform
+    rules:
+      # Architecture 6: no live proxy replica for 5 minutes. New member sign-ins fail, Argo CD stops syncing, and
+      # Alertmanager can't reach SNS, so this page may never leave: the CloudWatch heartbeat alarm is the backstop
+      # (ADR-0009). Sending, downloads and uploads use VPC endpoints and continue.
+      - alert: EgressProxyDown
+        expr: absent(envoy_server_live == 1)
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: No egress proxy replica is live; member sign-in and Argo CD syncs fail (ADR-0021).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/egress-proxy.md
+
+      # An Argo CD Application degraded or missing for 15 minutes. Suspended is normal: invite-backlog is a CronJob
+      # that is always suspended, and Osaka's pilot light suspends every job.
+      - alert: ArgoCdApplicationUnhealthy
+        expr: max by (name) (argocd_app_info{health_status!~"Healthy|Progressing|Suspended"}) == 1
+        for: 15m
+        labels:
+          severity: ticket
+          condition: health
+        annotations:
+          summary: The Argo CD Application {{ $labels.name }} is not healthy; what runs differs from Git (ADR-0005).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/argocd-sync.md
+
+      # Out of sync with Git for 30 minutes: a sync is failing, so a fix, a promotion or a fencing commit isn't
+      # reaching the cluster (ADR-0005, T-78).
+      - alert: ArgoCdApplicationUnhealthy
+        expr: max by (name) (argocd_app_info{sync_status!="Synced"}) == 1
+        for: 30m
+        labels:
+          severity: ticket
+          condition: sync
+        annotations:
+          summary: The Argo CD Application {{ $labels.name }} has been out of sync with Git for 30 minutes (ADR-0005).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/argocd-sync.md
+
+      # Encryption 6.4: pods re-read their keyrings every 5 minutes; every read failing for 15 minutes means a rotation
+      # won't reach them. They keep the keyring they have, so nothing breaks until a key they lack is needed.
+      - alert: KeyringRefreshFailing
+        expr: sum by (keyring) (increase(sft_keyring_refresh_failures_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Pods have failed to re-read the {{ $labels.keyring }} keyring from Secrets Manager for 15 minutes (encryption 6.4).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-refresh.md

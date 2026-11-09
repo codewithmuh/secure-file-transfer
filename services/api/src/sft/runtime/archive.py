@@ -90,7 +90,9 @@ class S3AuditArchive:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, functools.partial(fn, **kwargs))
 
-    async def put_once(self, region: Region, key: str, body: bytes) -> bool:
+    async def put_once(
+        self, region: Region, key: str, body: bytes, *, content_type: str = "application/json"
+    ) -> bool:
         client = self._clients.get(region)
         if client is None:
             raise ArchiveWriteError("NoArchiveInRegion")
@@ -100,7 +102,7 @@ class S3AuditArchive:
                 Bucket=self._buckets[region],
                 Key=key,
                 Body=body,
-                ContentType="application/json",
+                ContentType=content_type,
                 IfNoneMatch="*",
                 ChecksumAlgorithm="SHA256",
             )

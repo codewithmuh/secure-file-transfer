@@ -750,6 +750,50 @@ class JobSettings(ClockSettings):
         return self
 
 
+class ArchiveJobSettings(_Base):
+    """The audit archive job's settings (#183; architecture 5.2, data model 2.5): its database
+    role, both regions' archive buckets, and where it pushes its metrics. A one-shot command, run
+    every minute."""
+
+    app_version: str = Field(default="0.0.0", description="Set by the image build.")
+    database_url: PostgresUrl = Field(
+        description="The `sft_archive` login role: it reads audit events and moves the archive "
+        "cursor, nothing else.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    audit_archive_tokyo_bucket: str = Field(
+        pattern=_BUCKET, description="The audit archive bucket in Tokyo."
+    )
+    audit_archive_osaka_bucket: str | None = Field(
+        default=None,
+        pattern=_BUCKET,
+        description="The audit archive bucket in Osaka. Unset in dev, which has no Osaka.",
+    )
+    audit_archive_tokyo_endpoint_url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
+    )
+    audit_archive_osaka_endpoint_url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
+    )
+    metrics_pushgateway_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Where a run pushes its metrics, a one-shot job having no port to scrape. "
+        "Unset: the run logs them only (the local stack).",
+    )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection (encryption and keys "
+        "6.3). Off locally.",
+    )
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        return self
+
+
 class OperatorSettings(ServerSettings):
     """The operator API's settings (FR-34, authentication and authorization 8.2).
 

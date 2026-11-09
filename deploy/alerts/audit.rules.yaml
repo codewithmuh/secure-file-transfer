@@ -1,0 +1,69 @@
+# Alerts of the audit trail's own health (NFR-15; architecture 5.2 and 6, "Osaka archive unreachable"; data model 6;
+# #245), tested by deploy/alerts/tests/audit.test.yaml. The archive job's lag and runs are the lifecycle file's
+# (lifecycle.rules.yaml: AuditArchiveLagging, AuditArchiveJobNotRunning, #183).
+#
+# The series: audit_archive_write_failures_total{region}, each security-critical record's write to one Region's archive
+# that failed, from the API and the operator API (sft.service.audit_archive), both labels made at zero at start; and the
+# audit partition step's gauges (sft.service.audit_partitions), which the lifecycle jobs push to the Pushgateway.
+groups:
+  - name: audit
+    rules:
+      # Architecture 6: writes of security-critical records to one Region's archive keep failing for 5 minutes. New
+      # download grants fail closed (503) and revocations answer "done, archive record not yet confirmed" (4.4); a
+      # retry or the archive job completes the record when the Region returns (NFR-10, NFR-15, T-81). The archive job
+      # counts its batch writes in the same counter, pushed with job="audit-archive": left out here, since its lag and
+      # runs have their own alerts (lifecycle.rules.yaml), and a failed batch fails no grant.
+      - alert: AuditArchiveWriteFailing
+        expr: sum by (region) (increase(audit_archive_write_failures_total{job!="audit-archive"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Security-critical audit records can't be written to the {{ $labels.region }} archive; new download grants fail (NFR-15).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-writes.md
+
+      # Data model 6: audit events in the default partition, whose month had no partition. The step leaves that month
+      # blocked until an operator moves the rows.
+      - alert: AuditPartitions
+        expr: max(sft_audit_default_partition_rows) > 0
+        labels:
+          severity: ticket
+          condition: default_rows
+        annotations:
+          summary: Audit events are in the default partition because their month had no partition (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+      # Next month has no partition, within a month's last 7 days.
+      - alert: AuditPartitions
+        expr: |
+          max(sft_audit_partition_months_covered) < 2
+          and on() day_of_month() > days_in_month() - 7
+        labels:
+          severity: ticket
+          condition: next_month_missing
+        annotations:
+          summary: Next month has no audit partition and this month ends within 7 days (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+      # The step hasn't succeeded for 26 hours: a job that keeps failing, or no longer runs, shows before the months
+      # run out (it makes 3 months ahead).
+      - alert: AuditPartitions
+        expr: time() - max(sft_audit_partition_last_success_timestamp_seconds) > 26 * 3600
+        labels:
+          severity: ticket
+          condition: stale
+        annotations:
+          summary: The audit partition step hasn't succeeded for 26 hours (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+      # The step has never reported in 26 hours: the job isn't running at all, so the alert above can't fire. The
+      # Pushgateway keeps a job's last push, so this is a job that never pushed, not one that stopped.
+      - alert: AuditPartitions
+        expr: absent(sft_audit_partition_last_success_timestamp_seconds)
+        for: 26h
+        labels:
+          severity: ticket
+          condition: never_reported
+        annotations:
+          summary: The audit partition step has never reported its metrics (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md

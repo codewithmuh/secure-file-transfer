@@ -16,6 +16,10 @@ locals {
   retained_replication     = "sft-prod-retained-s3-replication"
   admin_patterns           = [module.conventions.sso_role_arn_patterns.admin]
   break_glass_patterns     = [module.conventions.sso_role_arn_patterns.break_glass]
+
+  # The key-admin role may repair the audit key's policy while prod runs; the teardown apply takes it out, because the
+  # bootstrap stack's destroy removes the role and KMS refuses a policy that names a role that no longer exists (8.4).
+  key_admin_role_arn = var.teardown ? null : module.conventions.bootstrap_role_arns.key_admin
 }
 
 module "audit_key" {
@@ -32,7 +36,7 @@ module "audit_key" {
   deploy_role_arn                    = local.retained_deploy_role_arn
   extra_administrator_arn_patterns   = local.admin_patterns
   plan_role_arn                      = module.conventions.bootstrap_role_arns.terraform_plan
-  key_admin_role_arn                 = module.conventions.bootstrap_role_arns.key_admin
+  key_admin_role_arn                 = local.key_admin_role_arn
   break_glass_principal_arn_patterns = local.break_glass_patterns
   replication_role_name              = local.retained_replication
 }
@@ -55,7 +59,7 @@ module "audit_key_osaka" {
   deploy_role_arn                    = local.retained_deploy_role_arn
   extra_administrator_arn_patterns   = local.admin_patterns
   plan_role_arn                      = module.conventions.bootstrap_role_arns.terraform_plan
-  key_admin_role_arn                 = module.conventions.bootstrap_role_arns.key_admin
+  key_admin_role_arn                 = local.key_admin_role_arn
   break_glass_principal_arn_patterns = local.break_glass_patterns
   replication_role_name              = local.retained_replication
 }

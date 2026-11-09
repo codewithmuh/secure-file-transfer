@@ -1,0 +1,21 @@
+{{- /*
+The two names everyone else uses, whatever the deployment mode: loki-push for the node agents and loki-query for
+Grafana. Single binary serves both; simple scalable splits them between its write and read pods.
+*/}}
+{{- $single := eq .Values.loki.deploymentMode "SingleBinary" }}
+{{- range $name, $component := dict "loki-push" (ternary "single-binary" "write" $single) "loki-query" (ternary "single-binary" "read" $single) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels: { app.kubernetes.io/name: loki, app.kubernetes.io/part-of: sft-observability }
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $component }}
+  ports:
+    - { name: http, port: 3100, targetPort: http-metrics, protocol: TCP }
+{{- end }}

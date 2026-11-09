@@ -33,6 +33,7 @@ from sft.data.models import (
     ScanDetail,
     ScanEngine,
     StorageClass,
+    Transfer,
 )
 from sft.data.scope import ScopeKind
 
@@ -386,6 +387,42 @@ async def counted_states(session: AsyncSession, transfer_id: UUID) -> list[Count
 
 
 @dataclass(frozen=True, slots=True)
+class ShareableTiming:
+    """When NFR-5's clock started for a transfer, and its largest counted file (#242)."""
+
+    started_at: datetime | None
+    """The later of the transfer's submission and its counted files' last upload completion."""
+    largest: int | None
+
+
+async def shareable_timing(session: AsyncSession, transfer_id: UUID) -> ShareableTiming:
+    """What `time_to_shareable_seconds` needs of a transfer about to be sent (`sft.service.sli`):
+    read in the evaluation's transaction, under the transfer's row lock."""
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(
+                func.greatest(Transfer.submitted_at, func.max(File.completion_started_at)),
+                func.max(func.coalesce(File.actual_size, File.declared_size)),
+            )
+            .select_from(Transfer)
+            .join(File, and_(File.tenant_id == Transfer.tenant_id, File.transfer_id == Transfer.id))
+            .where(
+                Transfer.id == transfer_id,
+                File.state != FileState.REJECTED.value,
+                File.removed_at.is_(None),
+                in_scope(Transfer, session),
+                in_scope(File, session),
+            )
+            .group_by(Transfer.submitted_at)
+        )
+    ).first()
+    if row is None:
+        return ShareableTiming(None, None)
+    return ShareableTiming(row[0], None if row[1] is None else int(row[1]))
+
+
+@dataclass(frozen=True, slots=True)
 class ScanTarget:
     """What the scan worker needs of a file: where its recorded version is, and its state."""
 
@@ -402,6 +439,8 @@ class ScanTarget:
     """A received file's request (#213): its notices, not a transfer's evaluation, follow."""
     dlp_blocked: bool = False
     """A received file a DLP rule blocked (FR-51, #221): its tag says so."""
+    completion_started_at: datetime | None = None
+    """When its upload completed: NFR-5's clock for a received file (#242)."""
 
 
 async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
@@ -420,6 +459,7 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
                 File.inspection_state,
                 File.upload_request_id,
                 File.dlp_blocked,
+                File.completion_started_at,
             ).where(File.id == file_id, in_scope(File, session))
         )
     ).first()
@@ -437,6 +477,7 @@ async def scan_target(session: AsyncSession, file_id: UUID) -> ScanTarget:
         inspection_state=InspectionState(row.inspection_state),
         upload_request_id=row.upload_request_id,
         dlp_blocked=row.dlp_blocked,
+        completion_started_at=row.completion_started_at,
     )
 
 

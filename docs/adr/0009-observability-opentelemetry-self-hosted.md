@@ -70,3 +70,32 @@ only the AWS-service alarms (A34), EKS control-plane logs (A19) and an out-of-cl
 When to revisit: if running the stack takes more of the maintainer's time than the slices it supports; if managed
 Prometheus and Grafana are confirmed in Osaka and price below the self-hosted line; or if the operating period needs
 metrics older than 30 days, which would add a long-term store.
+
+## Amendment: building the stack (2026-11-09, [#243](https://github.com/codewithmuh/secure-file-transfer/issues/243))
+
+Building the stack settled what the decision left open. The decision stands; these are its details, described in
+[docs/operations/observability.md](../operations/observability.md):
+
+- **Tempo runs as a single binary in every environment, prod included**, not distributed in prod. Tempo 3's
+  distributed mode puts Kafka between its distributors and its stores, a moving part this design has nowhere else.
+  Traces are for diagnosis, not an SLO, and the write-ahead log on its volume keeps what a restart would lose. Prod's
+  Tempo takes the requests capacity 4.3 gave its five components (0.5 vCPU, 1.5 GiB).
+- **No node exporter.** The kubelets' own metrics give container CPU and memory and volume usage, and the node agent's
+  one host access is reading the pods' log files, read-only. Node-level metrics beyond those are left to CloudWatch's
+  EC2 metrics.
+- **Cluster-wide parts come from Terraform, the rest from Git.** The Prometheus Operator with its CRDs, kube-state-
+  metrics, the namespaces, the storage class and Prometheus' discovery role are installed by cluster-bootstrap, like the
+  other controllers, because they need cluster-wide RBAC. Argo CD syncs everything else into its own project,
+  `observability`, which may create no cluster-scoped kind, Secret or Role, from a second root Application.
+- **Osaka's pilot light has no stack**: the observability Applications exist only where the cluster's values file has
+  `pilotLight: false`, so the failover's fencing commit starts the stack in Osaka. The operator and kube-state-metrics
+  sit idle on the system node there, so the failover needs no Terraform apply.
+- **Grafana has no accounts.** No admin, no login form and no basic auth; every visitor is an anonymous Viewer, and
+  reaching it at all takes the port-forward that only `ReadOnly` and `Operator` have. Data sources and dashboards come
+  only from Git.
+- **Alertmanager's routing is an `AlertmanagerConfig`** in Git, not a Secret, publishing to the topics
+  `sft-<env>-<region-short>-alerts-page`, `-alerts-ticket` and `-heartbeat`, whose platform key admits Alertmanager's
+  role through SNS. The CloudWatch exporter reads AWS's series through the same proxy listener.
+- **Loki's and Tempo's buckets** are made with the cluster-bootstrap layer, which runs after the cluster exists, so
+  their Pod Identity associations have a cluster. They have no versioning, so nothing outlives the retention, and an
+  environment's teardown removes them with their contents.

@@ -38,8 +38,8 @@ variable "replicate_to_osaka" {
 variable "mirror_repositories" {
   description = <<-EOT
     Third-party images mirrored by digest into mirror/<name> (ADR-0007): every image modules/cluster-bootstrap/images.tf
-    pins, clamd's (deploy/charts/sft), and KEDA's for ADR-0004's autoscaling. deploy/tests checks that the first two
-    are all here. The mirror workflow's issue keeps this list.
+    pins (the observability stack's among them, #243), clamd's (deploy/charts/sft), and KEDA's for ADR-0004's
+    autoscaling. deploy/tests checks that the first two are all here. The mirror workflow's issue keeps this list.
   EOT
   type        = list(string)
   default = [
@@ -50,9 +50,13 @@ variable "mirror_repositories" {
     "eks/aws-load-balancer-controller",
     "envoyproxy/envoy",
     "external-secrets/external-secrets",
+    "grafana/grafana",
+    "grafana/loki",
+    "grafana/tempo",
     "karpenter/controller",
     "kedacore/keda",
     "kedacore/keda-metrics-apiserver",
+    "kube-state-metrics/kube-state-metrics",
     "kyverno/background-controller",
     "kyverno/cleanup-controller",
     "kyverno/kyverno",
@@ -60,5 +64,12 @@ variable "mirror_repositories" {
     "kyverno/kyvernopre",
     "kyverno/readiness-checker",
     "kyverno/reports-controller",
+    "otel/opentelemetry-collector-contrib",
+    "prom/cloudwatch-exporter",
+    "prometheus-operator/prometheus-config-reloader",
+    "prometheus-operator/prometheus-operator",
+    "prometheus/alertmanager",
+    "prometheus/prometheus",
+    "prometheus/pushgateway",
   ]
 }

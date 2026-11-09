@@ -1,0 +1,206 @@
+# Unit tests of lifecycle.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../lifecycle.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # #183: the archive falls more than 2 minutes behind and stays there: it pages after 2 minutes, and stops once it
+  # catches up.
+  - interval: 1m
+    input_series:
+      - series: 'audit_archive_lag_seconds{job="audit-archive"}'
+        values: '30 40 200 260 320 380 20 10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AuditArchiveLagging
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AuditArchiveLagging
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: The audit archive is more than 2 minutes behind the database (NFR-15).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-lag.md
+      - eval_time: 7m
+        alertname: AuditArchiveLagging
+        exp_alerts: []
+
+  # #183: the job succeeds every minute until 5m, then stops: its lag gauge would stay stale, so its last success
+  # pages once it is more than 5 minutes old, for 2 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_job_last_success_timestamp_seconds{job="audit-archive"}'
+        values: '0 60 120 180 240 300 300 300 300 300 300 300 300 300 300 300'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuditArchiveJobNotRunning
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: AuditArchiveJobNotRunning
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: AuditArchiveJobNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: The audit archive job hasn't finished a run for 5 minutes (NFR-15).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-lag.md
+
+  # #224: a run found a transfer due for the purge with a file not deleted: a ticket, at once.
+  - interval: 1m
+    input_series:
+      - series: 'metadata_purge_blocked{job="purge", kind="transfer"}'
+        values: '0 0 1 1'
+      - series: 'metadata_purge_blocked{job="purge", kind="upload_request"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MetadataPurgeBlocked
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MetadataPurgeBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: The purge skipped metadata past its retention because a file isn't deleted yet (data model 6).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+  # #224: a run left purgeable metadata a day and more past its purge_after: a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'metadata_purge_lag_seconds{job="purge"}'
+        values: '0 3600 90000 90000'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: MetadataPurgeBehind
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MetadataPurgeBehind
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Metadata past its retention is more than a day overdue for the purge (NFR-9).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+  # #224: the daily purge last succeeded at time 0 and never again: quiet for 26 hours, then a ticket after 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_job_last_success_timestamp_seconds{job="purge"}'
+        values: '0x1700'
+    alert_rule_test:
+      - eval_time: 1560m
+        alertname: MetadataPurgeNotRunning
+        exp_alerts: []
+      - eval_time: 1620m
+        alertname: MetadataPurgeNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: The metadata purge hasn't finished a run for 26 hours (NFR-9).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/metadata-purge.md
+
+  # NFR-8: files past 7 days page after 15 minutes, and stop once deleted.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_overdue_deletions{job="deletion"}'
+        values: '0 0 2x20 0x5'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FileDeletionOverdue
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: FileDeletionOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: Files are still not deleted 7 days after their trigger (NFR-8).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+      - eval_time: 25m
+        alertname: FileDeletionOverdue
+        exp_alerts: []
+
+  # The oldest due deletion passes 6 days (518,400 s): a ticket after 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_deletion_lag_seconds{job="deletion"}'
+        values: '500000x5 520000x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FileDeletionLagging
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: FileDeletionLagging
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: A file's deletion has been due for more than 6 days, a day short of NFR-8's 7.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+  # NFR-15: grants without their committed record for 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_unarchived_grants{job="reconciliation"}'
+        values: '0 3x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: UnarchivedGrants
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: UnarchivedGrants
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Download grants have waited over 15 minutes for their committed audit record (NFR-15).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+  # The deletion job stops after its run at 0 s: 30 minutes later its last success is stale, and 5 minutes on it
+  # tickets, by job. The cleanup, daily, ran at 0 s too, but has 26 hours.
+  - interval: 1m
+    input_series:
+      - series: 'lifecycle_job_last_success_timestamp_seconds{job="deletion"}'
+        values: '0x40'
+      - series: 'lifecycle_job_last_success_timestamp_seconds{job="cleanup"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 33m
+        alertname: LifecycleJobNotRunning
+        exp_alerts: []
+      - eval_time: 37m
+        alertname: LifecycleJobNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: every_5_minutes
+              job: deletion
+            exp_annotations:
+              summary: A lifecycle job that runs every 5 minutes hasn't finished a run for 30 minutes (NFR-8).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+  # The daily cleanup's last success passes 26 hours (93,600 s): a ticket 15 minutes later.
+  - interval: 5m
+    input_series:
+      - series: 'lifecycle_job_last_success_timestamp_seconds{job="cleanup"}'
+        values: '0x340'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: LifecycleJobNotRunning
+        exp_alerts: []
+      - eval_time: 26h30m
+        alertname: LifecycleJobNotRunning
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: daily
+              job: cleanup
+            exp_annotations:
+              summary: A daily lifecycle job hasn't finished a run for 26 hours.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md

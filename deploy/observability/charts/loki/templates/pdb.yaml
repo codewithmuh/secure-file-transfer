@@ -1,0 +1,16 @@
+{{- /* The chart has budgets for its read and write pods; these cover the rest, one pod at a time like every workload. */}}
+{{- $components := ternary (list "single-binary") (list "backend") (eq .Values.loki.deploymentMode "SingleBinary") }}
+{{- range $components }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: loki-{{ . }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+      app.kubernetes.io/component: {{ . }}
+{{- end }}

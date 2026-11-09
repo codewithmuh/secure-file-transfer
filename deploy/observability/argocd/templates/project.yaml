@@ -1,0 +1,37 @@
+# What the observability Applications may do: this repository only, their three namespaces only, and only the kinds
+# the charts render. Nothing cluster-scoped: the namespaces, the storage class, the Prometheus Operator and its CRDs,
+# kube-state-metrics and Prometheus' discovery role are cluster-bootstrap's (observability.tf). No Secrets and no Roles;
+# one RoleBinding, Grafana's port-forward binding to cluster-bootstrap's sft:portforward (authn-authz 8.1).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: observability
+  namespace: argocd
+  # Deleting the project before its Applications would orphan them.
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  description: The observability stack in {{ .Values.environment }}, {{ .Values.region }} (ADR-0009)
+  sourceRepos: [{{ .Values.repoURL | quote }}]
+  destinations:
+    - { server: https://kubernetes.default.svc, namespace: monitoring }
+    - { server: https://kubernetes.default.svc, namespace: grafana }
+    - { server: https://kubernetes.default.svc, namespace: node-agents }
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - { group: apps, kind: Deployment }
+    - { group: apps, kind: StatefulSet }
+    - { group: apps, kind: DaemonSet }
+    - { group: "", kind: Service }
+    - { group: "", kind: ServiceAccount }
+    - { group: "", kind: ConfigMap }
+    - { group: policy, kind: PodDisruptionBudget }
+    - { group: networking.k8s.io, kind: NetworkPolicy }
+    - { group: rbac.authorization.k8s.io, kind: RoleBinding } # Grafana's port-forward binding (authn-authz 8.1)
+    - { group: monitoring.coreos.com, kind: Prometheus }
+    - { group: monitoring.coreos.com, kind: Alertmanager }
+    - { group: monitoring.coreos.com, kind: AlertmanagerConfig }
+    - { group: monitoring.coreos.com, kind: PrometheusRule }
+    - { group: monitoring.coreos.com, kind: PodMonitor }
+    - { group: monitoring.coreos.com, kind: ServiceMonitor }
+  # Nobody syncs, changes or rolls back an Application by hand: every change comes from Git (ADR-0004, ADR-0005).
+  roles: []

@@ -101,7 +101,7 @@ def test_metrics_use_the_route_template(client: TestClient, metrics: HttpMetrics
     client.get("/v1/things/2")
     labels = {"method": "GET", "route": "/v1/things/{thing_id}"}
     assert sample(metrics, "http_requests_total", **labels, status="200") == 2
-    assert sample(metrics, "http_request_duration_seconds_count", **labels) == 2
+    assert sample(metrics, "http_request_duration_seconds_count", **labels, status="200") == 2
 
 
 def test_unknown_paths_and_methods_cannot_add_label_values(

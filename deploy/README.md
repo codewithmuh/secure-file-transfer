@@ -14,6 +14,8 @@ this directory owns everything inside the clusters that belongs to the applicati
 deploy/
   argocd/                              the apps chart: AppProject `sft` and the Applications `sft` and `sft-operator`
   charts/sft/                          the application chart: the API and every worker from one image
+  observability/                       the observability stack (ADR-0009): its apps chart, its charts, their sizes
+                                       per environment, the dashboards, and their tests (docs/operations/observability.md)
   environments/<env>/<region>/values.yaml   one file per cluster: the image digest, the pilot light, the network, sizes
   check.sh, render.sh                  the static checks and the renderer they use
   policies.sh                          the cluster's Kyverno policies (#104) against every rendered pod
@@ -64,12 +66,18 @@ after a failover.
 | `dlp-inspector-{small,large}` | Deployment per pool, scan nodes, port 8070, its own protocol; probes on 8001 | `python -m sft.dlp.inspector` | none | Nothing at all |
 | `signature-mirror` | Deployment, 1 | freshclam, and `python -m http.server` from our image | none | Its proxy listener (ClamAV's database) |
 | `operator-api` | Deployment in `sft-operator`, port-forward only | `python -m sft.api.operator` | `operator-api`, sft_operator | Endpoints (STS), Aurora, Valkey |
-| `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `audit-partitions` | CronJobs | `python -m sft.workers.<job>` | `jobs`, sft_jobs | Endpoints, Aurora; S3 for deletion, reconciliation and the storage audit (both Regions' files buckets outside dev, and the audit archive for reconciliation, #181) |
-| `audit-archive` | CronJob, every minute | `python -m sft.workers.audit_archive` | `audit-archive`, sft_archive | Endpoints, Aurora, S3 |
+| `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `purge`, `audit-partitions` | CronJobs | `python -m sft.workers.<job>` | `jobs`, sft_jobs | Endpoints, Aurora, the Pushgateway; S3 for deletion, reconciliation and the storage audit (both Regions' files buckets outside dev, and the audit archive for reconciliation, #181). The purge deletes metadata 372 days after its end (#224) |
+| `audit-archive` | CronJob, every minute | `python -m sft.workers.audit_archive` | `audit-archive`, sft_archive | Endpoints, Aurora, the Pushgateway, S3: both Regions' audit archive outside dev (#183) |
 | `key-rotation` | CronJob, hourly, Tokyo only | `python -m sft.workers.key_rotation` | `key-rotation`, no database; the one projected Kubernetes token | Its proxy listener (Cognito; Osaka's Secrets Manager and Cognito outside dev), endpoints (Secrets Manager), the cluster API |
 | `field-keys` | CronJob, daily, Tokyo only | `python -m sft.workers.field_keys` (`FIELD_KEY_STEPS=rotate,backfill,purge`, #236) | `api`, sft_api: it acts as the API, the only role that unwraps field data keys | The database and the endpoints (KMS) |
 | `invite-backlog` | CronJob, always suspended, run by hand | `python -m sft.workers.invite_backlog` | `notifier`, sft_notify | As the notifier |
 | `migrate` | Job, PreSync hook | `python -m sft.data.migrate` | `migrate`, sft_migrate | Endpoints, Aurora |
+| `synthetic-probe` | CronJob, every 5 minutes, off until `probe.enabled` (#248) | `python -m sft.probe` | `synthetic-probe`, no database | Its proxy listener (the public API, the web app, CloudWatch), S3 (the probe mailbox), the Pushgateway |
+
+The API, the operator API and the workers also send spans to their node's OpenTelemetry agent (`telemetry` in the
+chart's values). A regional failover's hold, `failover.holdWorkers` (docs/runbooks/regional-failover.md), keeps the
+relay, the notifier, the scan trios and the signature mirror at zero and every CronJob suspended while the API, the
+operator API and the migration job run.
 
 Each scan node runs one trio: a worker, a clamd pod and an inspector, held together by required pod affinity. The
 `clamd` and `dlp-inspector` Services keep traffic on the node (`internalTrafficPolicy: Local`), so a worker streams
@@ -157,14 +165,26 @@ and checked on every rendered container by `tests/test_rendered.py`:
 `alerts/` holds alert rules in Prometheus rule format, each with its runbook and a `promtool test rules` unit test in
 `alerts/tests/` (`alerts/test.sh`, CI's deploy job): `ScanFailed` (#175) and `DlpInspectorFailing` (#176), and
 `BreakGlassActive`, `BreakGlassSelfApproved` and `BreakGlassSweepStalled` from the operator API's metrics (#232). The
-chart doesn't load them yet: nothing in the clusters evaluates rules before ADR-0009's monitoring stack and M7's
-alerting as code, which take them from here.
+observability stack loads every `alerts/*.rules.yaml` file into Prometheus as a PrometheusRule, by glob, so a new file
+needs no wiring (`observability/charts/prometheus`, #243).
+
+## The observability stack
+
+`observability/` is the rest of each cluster: Prometheus and Alertmanager (the Prometheus Operator's resources), the
+Pushgateway the lifecycle jobs push to (`http://pushgateway.monitoring.svc.cluster.local:9091`), the CloudWatch
+exporter, Loki, Tempo, the OpenTelemetry collectors and Grafana with its dashboards. Terraform's second root
+Application, `observability`, renders `observability/argocd` with the cluster's facts and its values file from
+`environments/`, and makes one Application per chart in its own AppProject, unless the cluster is a pilot light. The
+application's pods send spans to `http://otel-agent.node-agents.svc.cluster.local:4318`, their node's agent.
+[docs/operations/observability.md](../docs/operations/observability.md) has the whole of it; `render.sh`, `check.sh`
+and `policies.sh` render and check it with the application.
 
 ## Checks
 
 ```bash
 make deploy-check   # helm lint, template and kubeconform per cluster, the runtime-contract test, the admission policies,
                     # the alert rules' unit tests
+uv run --project services/api --locked pytest deploy/observability/tests   # the observability stack and dashboards
 ```
 
 It needs helm 3, kubeconform and Docker, at the versions pinned in `.github/workflows/ci.yml` and `policies.sh`.
@@ -179,8 +199,6 @@ the charts with `tests/trivy-values.yaml`.
 ## Not here yet
 
 - KEDA ScaledObjects (ADR-0004). Replica counts are fixed per cluster until KEDA is installed.
-- Prometheus scrape configuration: ADR-0009's issue adds the PodMonitors. The network policies already admit
-  `monitoring` on 8001.
 - A PriorityClass for the API (capacity 4.2), which is cluster-scoped and so belongs to the cluster bootstrap.
 - The RDS certificate bundle in the image. `sslmode=verify-full` needs the CA that signed Aurora's certificate
   (`rds-ca-ecc384-g1`, infra/modules/aurora), which isn't in the system's trust store: the image needs the bundle and

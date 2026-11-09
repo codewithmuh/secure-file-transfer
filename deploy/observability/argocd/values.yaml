@@ -1,0 +1,24 @@
+# Set by the observability root Application (cluster-bootstrap stack). Nothing account-specific is committed.
+environment: "" # dev | staging | prod
+region: "" # ap-northeast-1 | ap-northeast-3
+cluster:
+  registry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com
+  accountId: "" # this environment's account, quoted
+
+# From the cluster's values file (deploy/environments/<env>/<region>/values.yaml), which the root Application passes
+# as a value file: Osaka's pilot light runs no observability stack (architecture 3.2, ADR-0009), and the failover's
+# fencing commit that turns it off there starts the stack with it.
+pilotLight: false
+
+repoURL: https://github.com/codewithmuh/secure-file-transfer.git
+# Argo CD syncs only reviewed main (ADR-0005, T-72).
+targetRevision: main
+
+# One Application per chart in deploy/observability/charts. The namespaces are cluster-bootstrap's (observability.tf):
+# monitoring and grafana at Pod Security restricted, node-agents for the node agents' host paths.
+applications:
+  prometheus: { namespace: monitoring }
+  loki: { namespace: monitoring }
+  tempo: { namespace: monitoring }
+  collectors: { namespace: monitoring } # the agents in node-agents, the gateways in monitoring
+  grafana: { namespace: grafana }

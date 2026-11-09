@@ -1,0 +1,31 @@
+# dev's observability stack (capacity 4.3, A28): prod's charts cut down, one of each, 3 days of metrics, Loki and Tempo
+# single binary, 50 GB of volumes in all. Every chart reads this file after the cluster's values file; each takes only
+# its own keys.
+
+prometheus:
+  replicas: 1
+  retention: 3d
+  storage: 20Gi
+  retentionSize: 18GB
+  resources:
+    requests: { cpu: 500m, memory: 2Gi }
+    limits: { memory: 3Gi }
+
+alertmanager:
+  replicas: 1
+
+loki:
+  deploymentMode: SingleBinary
+  loki:
+    limits_config: { retention_period: 168h } # 7 days
+  singleBinary:
+    replicas: 1
+    persistence: { size: 15Gi }
+
+tempo:
+  persistence: { size: 15Gi }
+  tempo:
+    retention: 72h # 3 days
+
+gateway:
+  replicas: 1

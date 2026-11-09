@@ -1,0 +1,19 @@
+# Alerts of the operator API's own records (FR-34, authn-authz 8.2; #245), tested by
+# deploy/alerts/tests/operator.test.yaml. Break-glass has its own file (break-glass.rules.yaml).
+#
+# The series come from the operator API's /metrics (sft.api.operator): sft_operator_platform_audit_failures_total{action},
+# an operator call whose change committed but whose platform audit event wasn't written. The change's own record is in
+# the tenant's log, so nothing is unrecorded, but the platform's view of what operators did has a hole.
+groups:
+  - name: operator
+    rules:
+      # Any missing platform record pages: an operator's action without its platform audit event is what an insider
+      # would want (T-64), and it should never happen.
+      - alert: OperatorAuditFailing
+        expr: sum by (action) (increase(sft_operator_platform_audit_failures_total[5m])) > 0
+        labels:
+          severity: page
+          security: "true"
+        annotations:
+          summary: An operator's {{ $labels.action }} committed without its platform audit event (FR-34).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/operator-audit.md

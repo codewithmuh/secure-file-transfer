@@ -281,8 +281,8 @@ ALL = (
 LINK_STEP = (A_IP, A_NOT_FOUND, A_FAILED_CODES)
 """Before the token lookup, so a `429` reveals nothing about a token (abuse design 2.4)."""
 REQUEST_CODE = (A_SUBJECT_GAP, A_SUBJECT_DAY, A_EMAIL_HOUR, A_EMAIL_DAY, A_TENANT)
-"""`requestVerificationCode`, after the token lookup and the lockout. The probe mailbox's
-addresses on the synthetic tenant's links leave out the two per-address limits (NFR-1)."""
+"""`requestVerificationCode`, after the token lookup and the lockout. The synthetic probe needs no
+exemption: it sends each run to a fresh address, so no per-address limit counts it twice (#248)."""
 
 CODE_ATTEMPT = LINK_STEP
 """`createLinkSession`: the per-IP link limits before the token lookup. Its code's own attempts

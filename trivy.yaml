@@ -8,9 +8,13 @@ scan:
   # The Kyverno CLI test's fixtures: pods that break the admission policies on purpose (privileged, host namespaces,
   # hostPath, unpinned or foreign images, the system pool's toleration), so `kyverno test` can show each is refused
   # (infra/modules/cluster-bootstrap, threat model T-52). They are never applied to a cluster, and every check Trivy
-  # would run on them is one the policies themselves enforce. Only this one file is skipped.
+  # would run on them is one the policies themselves enforce.
   skip-files:
     - "**/charts/kyverno-policies/tests/resources.yaml"
+    # The upstream charts the observability stack vendors (#243), as their vendors publish them: alone, with their
+    # own defaults, they are not what runs. CI's deploy job scans what they render with our values instead
+    # (deploy/render.sh), and their checksums are pinned (deploy/observability/charts/SHA256SUMS).
+    - "**/deploy/observability/charts/*/charts/*.tgz"
 
 misconfiguration:
   helm:

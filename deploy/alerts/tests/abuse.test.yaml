@@ -1,0 +1,221 @@
+# Unit tests of abuse.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../abuse.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # Abuse 4.5: 5 % of the store's calls fail for over 2 minutes: a page. The fallback limiter alone pages too.
+  - interval: 1m
+    input_series:
+      - series: 'rate_limit_store_errors_total{job="api"}'
+        values: '0+5x10'
+      - series: 'rate_limit_store_latency_seconds_count{job="api"}'
+        values: '0+100x10'
+      - series: 'rate_limit_fallback_active{job="api"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RateLimitStoreUnavailable
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: RateLimitStoreUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              condition: errors
+            exp_annotations:
+              summary: The rate-limit store fails more than 1 % of calls; link steps and sign-in answer 503 (NFR-14).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/rate-limit-store-unavailable.md
+  - interval: 1m
+    input_series:
+      - series: 'rate_limit_fallback_active{job="api", instance="a"}'
+        values: '0 1 1 1 1 1'
+      - series: 'rate_limit_fallback_active{job="api", instance="b"}'
+        values: '0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RateLimitStoreUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              condition: fallback
+            exp_annotations:
+              summary: Pods are on the per-pod fallback limiter because the rate-limit store can't be reached (NFR-14).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/rate-limit-store-unavailable.md
+
+  # Abuse 8.2: 300 unknown links a minute for 5 minutes opens a ticket; 100 a minute doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'link_lookups_total{result="not_found", job="api"}'
+        values: '0+300x15'
+      - series: 'link_lookups_total{result="found", job="api"}'
+        values: '0+1000x15'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LinkProbing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: LinkProbing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: More than 200 lookups a minute are for links that don't exist; someone may be probing for links.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/link-enumeration.md
+  - interval: 1m
+    input_series:
+      - series: 'link_lookups_total{result="not_found", job="api"}'
+        values: '0+100x15'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: LinkProbing
+        exp_alerts: []
+
+  # Abuse 8.2: wrong codes at 1 a minute for ten hours (15 in any 15 minutes, under the floor of 20), then 60 a
+  # minute: over 5 times the baseline, a page.
+  - interval: 1m
+    input_series:
+      - series: 'verification_attempts_total{result="mismatch", job="api"}'
+        values: '0+1x600 600+60x60'
+    alert_rule_test:
+      - eval_time: 590m
+        alertname: VerificationGuessing
+        exp_alerts: []
+      - eval_time: 640m
+        alertname: VerificationGuessing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              condition: mismatches
+            exp_annotations:
+              summary: Wrong verification codes are arriving at over 5 times their usual rate; someone may be guessing codes.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/verification-abuse.md
+
+  # A quiet baseline and 4 wrong codes in 15 minutes is a spike, but too few to page.
+  - interval: 1m
+    input_series:
+      - series: 'verification_attempts_total{result="mismatch", job="api"}'
+        values: '0x120 0+1x4 4x30'
+    alert_rule_test:
+      - eval_time: 140m
+        alertname: VerificationGuessing
+        exp_alerts: []
+
+  # NFR-14: 12 lockouts (recipients and uploaders) within an hour page.
+  - interval: 1m
+    input_series:
+      - series: 'recipient_lockouts_total{job="api"}'
+        values: '0 0 4 8 8 8'
+      - series: 'uploader_lockouts_total{job="api"}'
+        values: '0 0 2 4 4 4'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: VerificationGuessing
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: VerificationGuessing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              condition: lockouts
+            exp_annotations:
+              summary: More than 10 recipients or uploaders were locked out within an hour (NFR-14).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/verification-abuse.md
+
+  # Abuse 8.2: 30 per-address cap hits in an hour, or 150 code requests refused: a ticket either way.
+  - interval: 1m
+    input_series:
+      - series: 'email_caps_hit_total{cap="address_link_emails_all", job="notifier"}'
+        values: '0 10 20 30 30'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: EmailBombing
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: EmailBombing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Per-address email caps or code request limits are hit far more than usual; someone may be flooding mailboxes.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-abuse.md
+  - interval: 1m
+    input_series:
+      - series: 'verification_codes_total{result="rate_limited", job="api"}'
+        values: '0 50 100 150 150'
+      - series: 'verification_codes_total{result="requested", job="api"}'
+        values: '0+1000x4'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: EmailBombing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: Per-address email caps or code request limits are hit far more than usual; someone may be flooding mailboxes.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-abuse.md
+
+  # Abuse 5.7: three pods at 80, 80 and 60 of their 100 streams (73 %) for 10 minutes: a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'download_streams_active{instance="a"}'
+        values: '80x20'
+      - series: 'download_streams_active{instance="b"}'
+        values: '80x20'
+      - series: 'download_streams_active{instance="c"}'
+        values: '60x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DownloadCapacity
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: DownloadCapacity
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: streams
+            exp_annotations:
+              summary: Download streams are above 70 % of what the API pods can serve; scale the API out.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/download-capacity.md
+  - interval: 1m
+    input_series:
+      - series: 'download_streams_active{instance="a"}'
+        values: '50x20'
+      - series: 'http_requests_total{method="GET", route="/session/downloads/{grant_id}/content", status="503"}'
+        values: '0 0 1 1'
+      - series: 'http_requests_total{method="POST", route="/v1/links/{token}/downloads", status="503"}'
+        values: '0 5 10 15'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: DownloadCapacity
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DownloadCapacity
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: refused
+            exp_annotations:
+              summary: Downloads were refused with 503 because the API pods' stream slots were full.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/download-capacity.md
+
+  # Abuse 8.2: an API key held at its limit for 10 minutes; other keys' rejections don't count.
+  - interval: 1m
+    input_series:
+      - series: 'rate_limit_rejections_total{group="J", key_type="api_key", job="api"}'
+        values: '0+5x20'
+      - series: 'rate_limit_rejections_total{group="A", key_type="ip", job="api"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ApiKeyMisuse
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ApiKeyMisuse
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: API key requests have been held at their rate limits for 10 minutes; a key may be misused or leaked.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md

@@ -24,6 +24,18 @@ kubectl logs deploy/<service> --tail=100    # JSON logs; filter by request_id
 3. **Dependency down?** Readiness will fail by design; fix or fail over the dependency.
 4. **Overloaded?** Scale out, then look for the expensive endpoint in the latency metrics.
 
+## The load balancer's alarms
+
+Two CloudWatch alarms page here too, from outside the cluster
+([`infra/modules/alarms/load-balancer.tf`](../../infra/modules/alarms/load-balancer.tf)):
+
+- `sft-<env>-<rs>-api-lb-5xx`: the load balancer answered more than 10 5xx of its own a minute for 5 minutes. Requests
+  aren't reaching a pod: no healthy target, a target group or listener changed, or the pods refuse TLS.
+- `sft-<env>-<rs>-api-no-healthy-targets`: no healthy API target for 3 minutes. Check the TargetGroupBinding and the
+  Load Balancer Controller (`kubectl -n sft describe targetgroupbinding api`, `kubectl -n kube-system logs
+  deploy/aws-load-balancer-controller`), then the pods' readiness. In Osaka's pilot light the group is empty by design
+  and the alarm doesn't notify.
+
 ## Escalate
 
 If not mitigated within 30 minutes, escalate to the owner in [CODEOWNERS](../../.github/CODEOWNERS).

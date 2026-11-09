@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sft-prometheus
+description: >-
+  Prometheus and Alertmanager for one cluster (ADR-0009), as the Prometheus Operator's resources: every rule file in
+  deploy/alerts as a PrometheusRule, the scrape targets, the Pushgateway the lifecycle jobs push to and the CloudWatch
+  exporter for the AWS series.
+type: application
+version: 0.1.0

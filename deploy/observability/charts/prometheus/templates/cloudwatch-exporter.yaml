@@ -1,0 +1,110 @@
+{{- $c := .Values.cloudwatchExporter }}
+{{- $prefix := include "prom.prefix" . }}
+{{- /*
+The CloudWatch exporter (ADR-0009): the AWS series the alerts and dashboards use, read with its Pod Identity role
+(sft-<env>-cloudwatch-exporter: ListMetrics and GetMetricData only, infra/modules/observability) through the egress
+proxy's platform listener, since CloudWatch has no endpoint here (ADR-0021). Each metric is narrowed to this
+environment and Region's resources.
+*/}}
+{{- $select := dict
+  "queues" (list (printf "%s-.+" $prefix))
+  "database" (list (printf "%s-aurora" $prefix))
+  "buckets" (list (printf "%s-.+" $prefix))
+  "loadBalancer" (list (printf "app/%s-api/.+" $prefix))
+}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudwatch-exporter
+  labels: { app.kubernetes.io/name: cloudwatch-exporter, app.kubernetes.io/part-of: sft-observability }
+data:
+  config.yml: |
+    region: {{ .Values.global.sft.region }}
+    # One-minute periods, read two minutes late so CloudWatch has them, without the data points' own timestamps.
+    period_seconds: 60
+    delay_seconds: 120
+    set_timestamp: false
+    metrics:
+      {{- range $c.metrics }}
+      - aws_namespace: {{ .namespace }}
+        aws_metric_name: {{ .name }}
+        aws_dimensions: {{ toJson .dimensions }}
+        aws_statistics: {{ toJson .statistics }}
+        aws_dimension_select_regex:
+          {{- range $dimension, $kind := .select }}
+          {{ $dimension }}: {{ toJson (index $select $kind) }}
+          {{- end }}
+      {{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudwatch-exporter
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudwatch-exporter
+  labels: { app.kubernetes.io/name: cloudwatch-exporter, app.kubernetes.io/part-of: sft-observability }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cloudwatch-exporter }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cloudwatch-exporter, app.kubernetes.io/part-of: sft-observability }
+      annotations:
+        checksum/config: {{ $c.metrics | toJson | sha256sum }}
+    spec:
+      serviceAccountName: cloudwatch-exporter
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        {{- toYaml .Values.pools.main | nindent 8 }}
+      securityContext:
+        {{- include "prom.podSecurity" . | nindent 8 }}
+      containers:
+        - name: cloudwatch-exporter
+          image: {{ include "prom.image" (list . .Values.images.cloudwatchExporter) }}
+          env:
+            # The AWS SDK for Java reads the proxy from these properties; the Pod Identity agent stays direct.
+            - name: JAVA_TOOL_OPTIONS
+              value: >-
+                -Dhttps.proxyHost={{ .Values.network.egressProxy.host }}
+                -Dhttps.proxyPort={{ .Values.network.egressProxy.platformPort }}
+                -Dhttp.nonProxyHosts=169.254.170.23|localhost|127.0.0.1
+                -XX:MaxRAMPercentage=75
+            - { name: AWS_REGION, value: {{ .Values.global.sft.region }} }
+          ports:
+            - { name: http, containerPort: 9106, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /-/healthy, port: http }
+            initialDelaySeconds: 30
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            initialDelaySeconds: 30
+          resources:
+            {{- toYaml $c.resources | nindent 12 }}
+          securityContext:
+            {{- include "prom.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            # The image's own command serves on 9106 with /config/config.yml.
+            - { name: config, mountPath: /config, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap: { name: cloudwatch-exporter }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudwatch-exporter
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cloudwatch-exporter }

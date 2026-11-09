@@ -73,9 +73,21 @@ sft.io/scan-pool: {{ . }}
 {{ .Values.cluster.registry }}/{{ .Values.clamav.repository }}@{{ .Values.clamav.digest }}
 {{- end -}}
 
-{{/* Replicas: zero in the pilot light (architecture 3.2). Call with (dict "root" $ "replicas" n). */}}
+{{/*
+Replicas: zero in the pilot light (architecture 3.2), and for a worker (`held`) while a failover holds the workers
+(failover.holdWorkers, docs/runbooks/regional-failover.md). Call with (dict "root" $ "replicas" n ["held" true]).
+*/}}
 {{- define "sft.replicas" -}}
-{{- if .root.Values.pilotLight }}0{{ else }}{{ .replicas }}{{ end -}}
+{{- if or .root.Values.pilotLight (and .held .root.Values.failover.holdWorkers) }}0{{ else }}{{ .replicas }}{{ end -}}
+{{- end -}}
+
+{{/*
+Whether the CronJobs are suspended: in the pilot light, where the database is a read-only replica, and while a
+failover holds the workers, so no job acts before the recovery job has re-applied the security-critical changes
+(architecture 7). Call with the root context.
+*/}}
+{{- define "sft.cronSuspended" -}}
+{{- if or .Values.pilotLight .Values.failover.holdWorkers }}true{{ else }}false{{ end -}}
 {{- end -}}
 
 {{/* Pod-level security, PSA `restricted` (ADR-0004). Call with the user and group ID. */}}
@@ -222,7 +234,8 @@ readinessProbe:
 {{/*
 A container of our image running `python -m <module>`, with the internal port and its probes. Optional: publicPort
 (served with TLS), databaseRole and valkeyUser (each signed in with IAM tokens), proxyListener, env, secretEnv, preStop,
-volumeMounts; ports (YAML) for an entry point with a port of its own beside the internal one (the DLP inspector); job
+volumeMounts; traced for a workload that exports its spans (sft.core.settings._Traced: the API, the operator API and
+the workers); ports (YAML) for an entry point with a port of its own beside the internal one (the DLP inspector); job
 for a run-to-completion entry point with no listener, so no internal port and no probes (the invitation backlog).
 */}}
 {{- define "sft.appContainer" -}}
@@ -262,8 +275,12 @@ for a run-to-completion entry point with no listener, so no internal port and no
     {{- with .proxyListener }}
     {{- include "sft.proxyEnv" (dict "root" $.root "listener" .) | nindent 4 }}
     {{- end }}
+    {{- if and .traced .root.Values.telemetry.otlpEndpoint }}
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT # the node's OpenTelemetry agent (ADR-0009)
+      value: {{ .root.Values.telemetry.otlpEndpoint | quote }}
+    {{- end }}
     {{- with .env }}
-    {{- $reserved := concat (list "LOG_LEVEL" "AWS_REGION" "BIND_HOST" "PUBLIC_TLS" "DATABASE_URL" "DATABASE_IAM_AUTH" "VALKEY_URL" "VALKEY_IAM_CACHE" "HTTPS_PROXY" "NO_PROXY") (keys (default (dict) $.secretEnv)) }}
+    {{- $reserved := concat (list "LOG_LEVEL" "AWS_REGION" "BIND_HOST" "PUBLIC_TLS" "DATABASE_URL" "DATABASE_IAM_AUTH" "VALKEY_URL" "VALKEY_IAM_CACHE" "HTTPS_PROXY" "NO_PROXY" "OTEL_EXPORTER_OTLP_ENDPOINT") (keys (default (dict) $.secretEnv)) }}
     {{- include "sft.extraEnv" (dict "env" . "reserved" $reserved) | trim | nindent 4 }}
     {{- end }}
     {{- with .secretEnv }}

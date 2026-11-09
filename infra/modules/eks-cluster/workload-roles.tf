@@ -19,6 +19,7 @@ locals {
     archive          = { namespace = "sft", service_accounts = ["audit-archive"], description = "Audit archive job" }
     migrate          = { namespace = "sft", service_accounts = ["migrate"], description = "Migrations job" }
     key_rotation     = { namespace = "sft", service_accounts = ["key-rotation"], description = "Key rotation job" }
+    synthetic_probe  = { namespace = "sft", service_accounts = ["synthetic-probe"], description = "Synthetic probe" }
     operator         = { namespace = "sft-operator", service_accounts = ["operator-api"], description = "Operator API" }
     karpenter        = { namespace = "karpenter", service_accounts = ["karpenter"], description = "Karpenter controller" }
     lb_controller    = { namespace = "kube-system", service_accounts = ["aws-load-balancer-controller"], description = "AWS Load Balancer Controller" }
@@ -107,10 +108,17 @@ locals {
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
   ]
-  # What the application store gives the sft namespace as environment variables: only the API's user pool client of
-  # its Region (#106). The API and the notification worker read their keyrings themselves, as their own roles, every 5
-  # minutes (encryption 6.4, #184).
-  api_store_secrets = local.idp_client_secrets
+  # The synthetic tenant's API key, which the probe reads as an environment variable (#248, encryption 6.4).
+  probe_secrets = [
+    for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/app/probe-api-key-??????"
+  ]
+  # What the application store gives the sft namespace as environment variables: the API's user pool client of its
+  # Region (#106) and the probe's API key (#248). The API and the notification worker read their keyrings themselves,
+  # as their own roles, every 5 minutes (encryption 6.4, #184).
+  api_store_secrets = concat(local.idp_client_secrets, local.probe_secrets)
+
+  # The probe mailbox (#248): SES's receipt rule writes each email under probe/ in this bucket, in each Region.
+  probe_mailboxes = [for r, p in local.regional_prefixes : "arn:aws:s3:::${p}-probe-mailbox-${var.account_id}"]
 
   valkey_caches = [for r, p in local.regional_prefixes : "arn:aws:elasticache:${r}:${var.account_id}:serverlesscache:${p}-valkey"]
 
@@ -425,6 +433,39 @@ locals {
     ]
 
     migrate = [local.database["migrate"]]
+
+    # The synthetic probe (#248): no database, no counter store, no queue. Its result to CloudWatch, in its own
+    # namespace only, and its emails from the probe mailbox, read once and deleted (docs/runbooks/synthetic-probe.md).
+    # Everything else it does goes through the public API, as the synthetic tenant's API key.
+    synthetic_probe = [
+      {
+        Sid       = "PutProbeMetric"
+        Effect    = "Allow"
+        Action    = ["cloudwatch:PutMetricData"]
+        Resource  = ["*"]
+        Condition = { StringEquals = { "cloudwatch:namespace" = "SecureFileTransfer/Probe" } }
+      },
+      {
+        Sid       = "ListProbeMailbox"
+        Effect    = "Allow"
+        Action    = ["s3:ListBucket"]
+        Resource  = local.probe_mailboxes
+        Condition = { StringLike = { "s3:prefix" = ["probe/*"] } }
+      },
+      {
+        Sid      = "ReadAndDeleteProbeMail"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:DeleteObject"]
+        Resource = [for b in local.probe_mailboxes : "${b}/probe/*"]
+      },
+      {
+        Sid       = "MailboxKeyThroughS3"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { StringEquals = { "kms:ViaService" = local.via["s3"], "kms:EncryptionContext:aws:s3:arn" = local.probe_mailboxes } }
+      },
+    ]
 
     # Writes the four keyrings and both pools' client secrets, first versions included (encryption 6.4, 6.5, #185):
     # the only writer of their values. Tokyo only; it reaches Osaka's idp-client through the Osaka endpoint.

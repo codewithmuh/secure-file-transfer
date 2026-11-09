@@ -36,7 +36,8 @@ Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
   because ClamAV can't scan files over 2 GB ([ADR-0019](0019-malware-scanning-clamav-guardduty.md)). Everything below
   about "the files buckets" applies to both pairs.
 - **Audit archive.** One bucket per region with versioning and **Object Lock**: compliance mode with 365-day retention
-  in prod, governance mode with 1 day in dev and staging. Batches replicate from Tokyo to Osaka, without RTC. The API
+  in prod, governance mode with 1 day in dev and staging. The archive job writes each batch to both regions and moves
+  its cursor only once both hold it (#183); replication from Tokyo to Osaka, without RTC, is a second copy. The API
   also writes security-critical records straight to both regions before it answers, or answers `503` (architecture
   5.2). These are revocations of transfers, upload requests and API keys, user deactivations and demotions, lockouts
   and unlocks, sign-in resets and download grants, and they never depend on this rule.
@@ -83,16 +84,17 @@ Use **S3 Standard in Tokyo and Osaka** for file contents and the audit archive.
 - **Archive.** Object Lock has to be on in both archive buckets for replication of locked objects, and replicas keep
   their retention. In prod the buckets, their replication rule and role sit in the retained stack, so an environment
   teardown can't reach them (encryption and keys 8.4).
-- **Disaster-recovery gaps**, open in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42), not
-  settled here:
+- **Disaster-recovery gaps** (#42), each now decided in
+  [disaster-recovery.md](../operations/disaster-recovery.md) section 5, with the drill step that proves it:
   - **Archive cursor.** Archive replication has no time bound, but the archive cursor travels with the database, so
-    after a failover the cursor can be past batches that never reached Osaka. The fix is RTC on the archive, or
-    rewinding the cursor to the newest batch in Osaka.
+    after a failover the cursor can be past batches that never reached Osaka. Decided: the archive job writes both
+    regions before the cursor moves (#183), and the recovery job rewinds the cursor at the new generation (gap 1).
   - **Failback.** Replication runs one way, Tokyo to Osaka. After a failover nothing copies Osaka's new objects back,
-    so failing back needs reverse replication.
+    so failing back needs reverse replication. Decided: a reverse rule at failback and S3 Batch Replication for what
+    Osaka wrote since the failover (gap 4).
   - **Osaka-only outage.** Security-critical records must reach both archives before the API answers. While Osaka's
-    archive can't be written, new download grants and the other security-critical changes answer `503`. The degraded
-    mode for that case, and its effect on NFR-1, are not designed yet.
+    archive can't be written, new download grants and the other security-critical changes answer `503`. Decided: no
+    degraded mode; the `503`s count against NFR-1 and are reported, not excluded (gap 5).
 
 ## When to revisit
 

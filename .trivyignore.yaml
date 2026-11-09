@@ -131,3 +131,27 @@ misconfigurations:
       milliseconds and keeps no state. Its JSON logs go to its own log group under the logs key, every refusal is
       counted and logged by limit ID, and every attempt and success reaches the audit log through the signin-events
       queue (NFR-15), which is what an investigation of sign-ins reads (T-89, authn-authz 2.4).
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/modules/observability/buckets.tf"
+    statement: >-
+      Loki's and Tempo's buckets (#243) are written and read only by their own Pod Identity roles, whose boundary
+      allows no other use, and hold derived logs and traces kept 90 and 14 days. Server access logs would need another
+      log bucket under SSE-S3 (encryption 3.1); the organization trail records every change to the buckets and the
+      logs key's use as KMS events (T-75).
+  - id: AVD-AWS-0090 # S3 bucket versioning
+    paths:
+      - "**/modules/observability/buckets.tf"
+    statement: >-
+      Loki and Tempo write each object once and delete it at the end of their retention (ADR-0009). A kept version
+      would hold logs, which are customer data under NFR-21, past the PRD's 90 days and past an environment's
+      teardown until it expired, and nothing restores telemetry from a version: a lost object is a gap in history,
+      not lost customer data (#243).
+  - id: AVD-AWS-0342 # iam:PassRole
+    paths:
+      - "**/modules/terraform-oidc-roles/permissions-observability.tf"
+    statement: >-
+      The cluster-bootstrap layer passes the four observability roles it creates (#243), by exact ARN, only to Pod
+      Identity (iam:PassedToService = pods.eks.amazonaws.com), which can't associate a role without it. Each carries
+      the observability boundary, which allows no IAM change and no sts:AssumeRole, so passing one gains nothing
+      beyond telemetry storage, alert publishing and metric reads (T-71).

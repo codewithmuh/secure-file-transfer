@@ -50,6 +50,14 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
   multipart upload over 24 hours old that no `uploading` or `completing` file holds is aborted.
   The report (NFR-8) counts what it removed, and files still not deleted 7 days after their
   trigger.
+- **Purge** (`purge_metadata`, #224), daily: transfers and upload requests 372 days past their
+  end, as data model 6 computes it (`sft.data.purge`), are deleted with their child rows, in each
+  tenant's scope, at most `PURGE_CHUNK` a transaction, each with one `retention.rows_deleted`
+  event that counts the rows and names no transfer. One with a file not yet deleted is skipped and
+  counted (`metadata_purge_blocked`), since deleting it would orphan the object. Audit events are
+  never touched.
+- **Audit partitions** (`maintain_partitions`), daily: `sft.service.audit_partitions`, which keeps
+  three months of partitions ahead and exports what its alerts watch.
 - **Cleanup** (`clean_up`), daily: expired verification codes, link sessions (their grants go
   with them) and grants are deleted, each batch with one `retention.rows_deleted` event; so are
   retired DLP rule revisions no decision refers to (#219), retired detector revisions that a later
@@ -62,8 +70,8 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
 
 Metrics, for NFR-8 and the jobs (`JobMetrics`): items done per job and result, the age of the
 oldest file whose deletion is due and not done (`lifecycle_deletion_lag_seconds`), the files past
-7 days (`lifecycle_overdue_deletions`), and each job's last success. Their alert rules come with
-M7's alerting as code.
+7 days (`lifecycle_overdue_deletions`), and each job's last success. The purge adds its own
+(`PurgeMetrics`). docs/operations/metrics.md lists them with the alerts that read them.
 """
 
 from __future__ import annotations
@@ -93,6 +101,7 @@ from sft.data import (
     upload_requests,
     usage,
 )
+from sft.data import purge as purges
 from sft.data.access import NotFoundError
 from sft.data.audit import Actor, Target
 from sft.data.database import Database
@@ -109,6 +118,7 @@ from sft.data.outbox import DLP_APPROVAL_EXPIRED, enqueue
 from sft.data.scope import Scope
 from sft.service import api_keys, scan_timing
 from sft.service.audit_archive import AuditArchive
+from sft.service.audit_partitions import AuditPartitionMetrics, maintain_audit_partitions
 from sft.service.dlp_decision import KNOWN_FOR
 from sft.service.downloads import committed_record
 from sft.service.evaluation import APPROVAL_REQUEST, evaluate
@@ -135,6 +145,10 @@ GRANT_UNARCHIVED: Final = timedelta(minutes=1)
 ORPHAN_AGE: Final = timedelta(hours=24)
 OVERDUE: Final = timedelta(days=7)
 """NFR-8: a file's contents leave every copy within 7 days of its trigger."""
+PURGE_AFTER: Final = timedelta(days=7 + 365)
+"""Data model 6: a parent's metadata goes 7 days (NFR-8) plus 365 days (NFR-9) after its end."""
+PURGE_CHUNK: Final = 100
+"""Parents purged in one transaction: their child rows go with them, so fewer than `BATCH`."""
 SYSTEM: Final = Actor(ActorType.SYSTEM)
 TRANSFER: Final = "transfer"
 FILE: Final = "file"
@@ -148,6 +162,7 @@ class SystemActor(StrEnum):
     RECONCILIATION_JOB = "reconciliation_job"
     STORAGE_AUDIT_JOB = "storage_audit_job"
     CLEANUP_JOB = "cleanup_job"
+    PURGE_JOB = "purge_job"
 
 
 class Job(StrEnum):
@@ -156,6 +171,8 @@ class Job(StrEnum):
     RECONCILIATION = "reconciliation"
     STORAGE_AUDIT = "storage-audit"
     CLEANUP = "cleanup"
+    PURGE = "purge"
+    AUDIT_PARTITIONS = "audit-partitions"
 
 
 class Reason(StrEnum):
@@ -188,6 +205,19 @@ class Table(StrEnum):
     DLP_RULES = "dlp_rules"
     DLP_DETECTORS = "dlp_detectors"
     DLP_KNOWN_DOMAINS = "dlp_known_domains"
+    TRANSFERS = "transfers"
+    UPLOAD_REQUESTS = "upload_requests"
+
+
+def last_success_gauge(registry: CollectorRegistry) -> Gauge:
+    """`lifecycle_job_last_success_timestamp_seconds{job}`: every scheduled job's, the audit
+    archive's included, so one alert rule watches them all (deploy/alerts/lifecycle.rules.yaml)."""
+    return Gauge(
+        "lifecycle_job_last_success_timestamp_seconds",
+        "When each lifecycle job last finished without an error.",
+        ["job"],
+        registry=registry,
+    )
 
 
 @dataclass(frozen=True)
@@ -223,17 +253,54 @@ class JobMetrics:
                 "reconciliation retries them and the cleanup keeps them (NFR-15).",
                 registry=registry,
             ),
-            Gauge(
-                "lifecycle_job_last_success_timestamp_seconds",
-                "When each lifecycle job last finished without an error.",
-                ["job"],
-                registry=registry,
-            ),
+            last_success_gauge(registry),
         )
 
     def count(self, job: Job, result: str, n: int = 1) -> None:
         if n:
             self.items.labels(job.value, result).inc(n)
+
+
+class PurgeKind(StrEnum):
+    """What the purge deletes, in its metrics' `kind` label."""
+
+    TRANSFER = "transfer"
+    UPLOAD_REQUEST = "upload_request"
+
+
+@dataclass(frozen=True)
+class PurgeMetrics:
+    """The purge's metrics (#224): every label set exists at zero from the start."""
+
+    rows: Counter
+    blocked: Gauge
+    lag: Gauge
+
+    @classmethod
+    def create(cls, registry: CollectorRegistry) -> PurgeMetrics:
+        rows = Counter(
+            "metadata_purge_rows_total",
+            "Transfers and upload requests the purge deleted, with their child rows (NFR-9).",
+            ["kind"],
+            registry=registry,
+        )
+        blocked = Gauge(
+            "metadata_purge_blocked",
+            "Transfers and upload requests due for the purge but skipped, because a file of "
+            "theirs isn't deleted yet (data model 6; should be 0).",
+            ["kind"],
+            registry=registry,
+        )
+        lag = Gauge(
+            "metadata_purge_lag_seconds",
+            "How long past its purge_after the oldest purgeable transfer or request still is "
+            "after a run (0 when the purge is up to date).",
+            registry=registry,
+        )
+        for kind in PurgeKind:
+            rows.labels(kind.value)
+            blocked.labels(kind.value)
+        return cls(rows, blocked, lag)
 
 
 @dataclass
@@ -251,6 +318,10 @@ class Jobs:
     """ADR-0019's split between the scan pools: SCAN_SMALL_POOL_MAX_BYTES, as the API has it."""
     sweep: Callable[[], Awaitable[int]] | None = None
     """The scan sweep, which reconciliation runs (`sft.workers.scan_sweep.sweep`)."""
+    purge_metrics: PurgeMetrics | None = None
+    """The purge's own metrics (#224), made only for its runs."""
+    partition_metrics: AuditPartitionMetrics | None = None
+    """The audit partition step's metrics, made only for its runs."""
     report: dict[str, int] = field(default_factory=dict)
 
     def done(self, key: str, n: int = 1) -> None:
@@ -932,6 +1003,119 @@ async def clean_up(jobs: Jobs) -> dict[str, int]:
     return jobs.report
 
 
+# ---- the metadata purge (#224) ----
+
+
+async def _purge_kind(
+    jobs: Jobs,
+    kind: PurgeKind,
+    find: Callable[..., Awaitable[list[purges.Due]]],
+    delete: Callable[..., Awaitable[int]],
+    table: Table,
+    cutoff: datetime,
+) -> int:
+    """Find due parents across tenants, then purge them in each tenant's scope, a chunk a
+    transaction, each chunk with its `retention.rows_deleted`."""
+    database = jobs.database
+
+    async def find_due() -> list[purges.Due]:
+        async with database.transaction(Scope.system()) as session:
+            return await find(session, cutoff=cutoff, limit=BATCH)
+
+    total = 0
+    while True:
+        found = await find_due()
+        by_tenant: dict[UUID, list[UUID]] = {}
+        for item in found:
+            by_tenant.setdefault(item.tenant_id, []).append(item.id)
+        deleted = 0
+        for tenant_id, ids in by_tenant.items():
+            for start in range(0, len(ids), PURGE_CHUNK):
+                async with database.transaction(Scope.tenant(tenant_id)) as session:
+                    n = await delete(session, ids[start : start + PURGE_CHUNK], cutoff=cutoff)
+                    if n:
+                        await audit.record(
+                            session,
+                            action="retention.rows_deleted",
+                            actor=SYSTEM,
+                            details=_details(SystemActor.PURGE_JOB, table=table, rows=n),
+                        )
+                deleted += n
+        total += deleted
+        if len(found) < BATCH or not deleted:
+            break  # what the find saw and the tenant's scope kept: never loop on it
+    if jobs.purge_metrics is not None and total:
+        jobs.purge_metrics.rows.labels(kind.value).inc(total)
+    jobs.metrics.count(Job.PURGE, f"{table.value}_purged", total)
+    jobs.done(f"{table.value}_purged", total)
+    return total
+
+
+async def purge_metadata(jobs: Jobs) -> dict[str, int]:
+    """The purge (module docstring; data model 6): transfers, then upload requests, then what is
+    left, measured even when a step failed."""
+    cutoff = jobs.now() - PURGE_AFTER
+    try:
+        await _purge_kind(
+            jobs,
+            PurgeKind.TRANSFER,
+            purges.due_transfers,
+            purges.purge_transfers,
+            Table.TRANSFERS,
+            cutoff,
+        )
+        await _purge_kind(
+            jobs,
+            PurgeKind.UPLOAD_REQUEST,
+            purges.due_upload_requests,
+            purges.purge_upload_requests,
+            Table.UPLOAD_REQUESTS,
+            cutoff,
+        )
+    finally:
+        await measure_purge_backlog(jobs, cutoff)
+    return jobs.report
+
+
+async def measure_purge_backlog(jobs: Jobs, cutoff: datetime) -> purges.Backlog:
+    """The purge's gauges: due parents blocked by an undeleted file, and how far past due the
+    oldest purgeable one still is."""
+    async with jobs.database.transaction(Scope.system()) as session:
+        found = await purges.backlog(session, cutoff=cutoff)
+    lag = 0.0 if found.oldest_due_from is None else (cutoff - found.oldest_due_from).total_seconds()
+    if jobs.purge_metrics is not None:
+        jobs.purge_metrics.blocked.labels(PurgeKind.TRANSFER.value).set(found.blocked_transfers)
+        jobs.purge_metrics.blocked.labels(PurgeKind.UPLOAD_REQUEST.value).set(
+            found.blocked_upload_requests
+        )
+        jobs.purge_metrics.lag.set(max(0.0, lag))
+    jobs.report["blocked_transfers"] = found.blocked_transfers
+    jobs.report["blocked_upload_requests"] = found.blocked_upload_requests
+    if found.blocked_transfers or found.blocked_upload_requests:
+        log.error(
+            "purge skipped transfers or requests with files not deleted",
+            extra={
+                "transfers": found.blocked_transfers,
+                "upload_requests": found.blocked_upload_requests,
+            },
+        )
+    return found
+
+
+# ---- audit partitions ----
+
+
+async def maintain_partitions(jobs: Jobs) -> dict[str, int]:
+    """The audit partition step (`sft.service.audit_partitions`), as a lifecycle job."""
+    metrics = jobs.partition_metrics or AuditPartitionMetrics.create()
+    status = await maintain_audit_partitions(jobs.database, metrics)
+    jobs.report["default_rows"] = status.default_rows
+    jobs.report["months_covered"] = status.months_covered
+    if status.failed:
+        raise RuntimeError(f"audit partitions not created: {', '.join(status.failed)}")
+    return jobs.report
+
+
 RUNS: Final[dict[Job, Callable[[Jobs], Awaitable[object]]]] = {}
 
 
@@ -950,5 +1134,7 @@ RUNS.update(
         Job.RECONCILIATION: reconcile,
         Job.STORAGE_AUDIT: audit_storage,
         Job.CLEANUP: clean_up,
+        Job.PURGE: purge_metadata,
+        Job.AUDIT_PARTITIONS: maintain_partitions,
     }
 )
