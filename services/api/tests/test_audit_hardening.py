@@ -198,7 +198,21 @@ def test_column_grants_follow_the_table_rules(migrated_db: ScratchDatabase) -> N
         if role == "sft_lookup":
             # The credential lookups read their columns through lookup_read (data model 4.2).
             assert (table, privilege) in LOOKUP_GRANTS, f"sft_lookup may {privilege} {table}"
-        if table == "audit_events":
+        if table == "audit_events" and (role, privilege) == ("sft_recovery", "SELECT"):
+            # The one read: a restore rewinds the archive cursor from the newest transaction it
+            # re-imported (revision 0035), so it reads the ordering columns, nothing an event says.
+            columns = migrated_db.sql(
+                """
+                SELECT a.attname FROM pg_attribute a, aclexplode(a.attacl) g
+                 WHERE a.attrelid = 'audit_events'::regclass
+                   AND g.grantee = 'sft_recovery'::regrole AND g.privilege_type = 'SELECT'
+                 ORDER BY 1
+                """
+            )
+            assert columns == [("occurred_at",), ("tx_id",)], (
+                f"sft_recovery reads {columns} of audit_events"
+            )
+        elif table == "audit_events":
             assert privilege == "INSERT", f"{role} may {privilege} columns of audit_events"
         policies = migrated_db.sql(
             """

@@ -10,10 +10,12 @@ import { MIB, signIn, unique } from './support/stack';
  * new one, as a dropped link does. Parts are watched passively (`request`, `requestfinished`, `requestfailed`), never
  * routed: a routed request is fetched by Playwright, outside the browser's network, so the throttle wouldn't apply.
  *
- * Scaled down for CI by default: 40 MiB (8 parts of 5 MiB) at 40 Mbit/s with a 5-second outage. The full measure, a
- * 5 GB file at 100 Mbit/s, is a manual run with the same spec (docs/operations/performance.md):
+ * Opt-in (E2E_UPLOAD_RESUME=1), not part of CI's e2e run until #267 makes it reliable there: its 40 MiB of words
+ * held the local stack's one small-pool scan worker for minutes, which starved the specs running beside it, and in CI
+ * the outage cut no part in flight. Scaled down by default: 40 MiB (8 parts of 5 MiB) at 40 Mbit/s with a 5-second
+ * outage. The full measure, a 5 GB file at 100 Mbit/s, uses the same spec (docs/operations/performance.md):
  *
- *   E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
+ *   E2E_UPLOAD_RESUME=1 E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
  *
  * Time: the upload must finish within NFR-3's line rate plus 10 %, plus the outage and the engine's retry wait after it
  * (at most 8 s, then a fresh `listUploadedParts`), which the allowance below names.
@@ -87,6 +89,8 @@ function watchPartPuts(page: Page) {
   });
   return { sent, landed, landedAt, failed: () => failed, firstPut: () => firstPut };
 }
+
+test.skip(env.E2E_UPLOAD_RESUME !== '1', 'opt-in: E2E_UPLOAD_RESUME=1 (#267)');
 
 test('a throttled upload survives a dropped connection without sending a completed part again', async ({ page }) => {
   const parts = Math.ceil(SIZE / (5 * MIB));

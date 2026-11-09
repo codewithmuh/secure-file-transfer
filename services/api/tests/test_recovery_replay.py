@@ -253,7 +253,7 @@ def seed_pool_member(db: ScratchDatabase, tenant_id: uuid.UUID) -> dict[str, uui
     db.sql(
         "INSERT INTO member_sessions (id, tenant_id, user_id, identity_id, session_hash, "
         "auth_time, auth_method, expires_at, created_at) VALUES (:id, :tenant, :user, "
-        ":identity, sha256(convert_to(CAST(:id AS text), 'UTF8')), now(), 'password', "
+        ":identity, sha256(convert_to(CAST(:id AS text), 'UTF8')), now(), 'password_totp', "
         "now() + interval '12 hours', :created)",
         id=ids["session"],
         tenant=tenant_id,

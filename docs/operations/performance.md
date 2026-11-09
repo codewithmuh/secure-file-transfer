@@ -148,8 +148,8 @@ window so the engines share the node as they do at design load.
 
 ## 3. The NFR-3 upload test in the browser (#251)
 
-[`web/e2e/upload-resume.e2e.ts`](../../web/e2e/upload-resume.e2e.ts), one of the browser flows of `make web-e2e` (and
-CI's Local stack job). A member uploads a large file of words through the web app's upload engine over a link Chromium
+[`web/e2e/upload-resume.e2e.ts`](../../web/e2e/upload-resume.e2e.ts), a browser flow of `make web-e2e` that runs only
+with `E2E_UPLOAD_RESUME=1`; it is out of CI's Local stack job until #267 makes it reliable there. A member uploads a large file of words through the web app's upload engine over a link Chromium
 throttles through the DevTools protocol (`Network.emulateNetworkConditions`); when half the parts have landed the link
 goes offline, failing every request in flight, and comes back after the outage. It passes when:
 
@@ -160,12 +160,12 @@ goes offline, failing every request in flight, and comes back after the outage. 
 
 | Run | File | Link | Outage |
 |---|---|---|---|
-| CI (default) | 40 MiB, 8 parts | 40 Mbit/s | 5 s |
+| Scaled (default) | 40 MiB, 8 parts | 40 Mbit/s | 5 s |
 | NFR-3 (manual) | 5 GB (`E2E_UPLOAD_MIB=4769`) | 100 Mbit/s (`E2E_UPLOAD_MBITS=100`) | 5 s, or `E2E_UPLOAD_OUTAGE_SECONDS` |
 
 ```bash
 make up && make seed
-E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
+E2E_UPLOAD_RESUME=1 E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
 ```
 
 The full run writes the 5 GB file to the Playwright container's temporary directory and needs that much free disk. The

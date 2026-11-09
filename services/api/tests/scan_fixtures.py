@@ -250,7 +250,10 @@ class FakeInspector:
                 payload = json.dumps(raw).encode()
                 writer.write(struct.pack(">I", len(payload)) + payload)
             elif self.mode == "detect":
-                writer.write(encode_frame(detect(data, request)))
+                # In a thread: loading the engine and detecting are CPU work, which on the event
+                # loop held up the fake clamd beside it until the worker's clamd timeout fired
+                # (test_dlp_received, flaky in CI).
+                writer.write(encode_frame(await asyncio.to_thread(detect, data, request)))
             else:
                 writer.write(encode_frame(self.answer))
             await writer.drain()

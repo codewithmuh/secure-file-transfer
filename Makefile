@@ -96,6 +96,7 @@ web-e2e: ## Web app: browser flows and the M3 journey against the running local 
 	docker run --rm --init --ipc=host $(E2E_NETWORK) --volume "$(CURDIR)/web:/src/web:ro" \
 	  --volume "$$jobs:/jobs" --env E2E_JOBS_DIR=/jobs --volume "$(CURDIR)/web/test-results:/out" \
 	  --env HOST_IDS="$$(id -u):$$(id -g)" --workdir /web \
+	  --env E2E_UPLOAD_RESUME --env E2E_UPLOAD_MIB --env E2E_UPLOAD_MBITS --env E2E_UPLOAD_OUTAGE_SECONDS \
 	  $(PLAYWRIGHT_IMAGE) bash -euo pipefail -c 'tar -C /src/web --exclude=./node_modules --exclude=./dist \
 	    --exclude=./test-results -cf - . | tar -xf - \
 	    && npm ci --ignore-scripts \
