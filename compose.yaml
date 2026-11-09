@@ -229,8 +229,8 @@ services:
     stop_grace_period: 35s
 
   # ---- The lifecycle jobs (#181): one-shot commands, never started by `make up` ----
-  # `make jobs JOB=expiry|deletion|reconciliation|storage-audit|cleanup` runs one, as M4's CronJobs
-  # will (architecture 4.5). CLOCK_OFFSET_SECONDS is the clock's test hook (#182), refused outside
+  # `make jobs JOB=expiry|deletion|reconciliation|storage-audit|cleanup|purge|audit-partitions` runs one, as the
+  # chart's CronJobs do (architecture 4.5). CLOCK_OFFSET_SECONDS is the clock's test hook (#182), refused outside
   # ENVIRONMENT=local or test; the journey test sets it to move a transfer past its expiry.
   jobs:
     <<: [*hardening, *api-image]
@@ -253,6 +253,30 @@ services:
       S3_FILES_BUCKET: sft-local-files
       S3_LARGE_FILES_BUCKET: sft-local-large-files
       # Reconciliation rewrites a download grant's committed record in both archives (#180).
+      AUDIT_ARCHIVE_TOKYO_BUCKET: sft-local-audit-archive
+      AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL: http://s3:9090
+      AUDIT_ARCHIVE_OSAKA_BUCKET: sft-local-audit-archive-osaka
+      AUDIT_ARCHIVE_OSAKA_ENDPOINT_URL: http://s3:9090
+      AWS_ACCESS_KEY_ID: local-fake
+      AWS_SECRET_ACCESS_KEY: local-fake
+    depends_on:
+      <<: *database-ready
+      s3-init: { condition: service_completed_successfully }
+
+  # ---- The audit archive job (#183): one-shot, never started by `make up` ----
+  # `make audit-archive` runs one pass, as the chart's every-minute CronJob does: committed audit events to both
+  # archive buckets of the S3 stand-in, as gzipped JSON lines under g<generation>/. Its own login role reads audit
+  # events and moves the archive cursor, nothing else (revision 0034).
+  audit-archive:
+    <<: [*hardening, *api-image]
+    profiles: [jobs]
+    restart: "no"
+    entrypoint: ["python", "-m", "sft.workers.audit_archive"]
+    command: []
+    healthcheck: { disable: true } # the image's check is the API's probe port
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://sft_archive:test-only-password@postgres:5432/sft
       AUDIT_ARCHIVE_TOKYO_BUCKET: sft-local-audit-archive
       AUDIT_ARCHIVE_TOKYO_ENDPOINT_URL: http://s3:9090
       AUDIT_ARCHIVE_OSAKA_BUCKET: sft-local-audit-archive-osaka

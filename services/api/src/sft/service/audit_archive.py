@@ -91,9 +91,12 @@ class ArchiveStore(Protocol):
         """The regions this environment archives to: both, or Tokyo alone in dev."""
         ...
 
-    async def put_once(self, region: Region, key: str, body: bytes) -> bool:
+    async def put_once(
+        self, region: Region, key: str, body: bytes, *, content_type: str = "application/json"
+    ) -> bool:
         """Write `body` at `key` unless an object is there already: True if this call wrote it,
-        False if it was there. Raises `ArchiveWriteError`."""
+        False if it was there. Raises `ArchiveWriteError`. The archive job's batches (#183,
+        `sft.service.archive_job`) are gzipped JSON lines; a record is JSON."""
         ...
 
     async def close(self) -> None: ...
@@ -132,7 +135,8 @@ class ArchiveMetrics:
     def create(cls, registry: CollectorRegistry) -> ArchiveMetrics:
         failures = Counter(
             "audit_archive_write_failures_total",
-            "Writes of a security-critical record to one region's audit archive that failed.",
+            "Writes to one region's audit archive that failed: a security-critical record, or "
+            "a batch of the archive job (#183).",
             ["region"],
             registry=registry,
         )

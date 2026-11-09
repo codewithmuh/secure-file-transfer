@@ -1,0 +1,36 @@
+# Grafana for one cluster (ADR-0009). The Application (deploy/observability/argocd) adds the cluster's facts under
+# `global`; deploy/observability/environments/<env>.yaml sizes it.
+#
+# Nobody signs in: Grafana has no admin, no login form and no basic auth, and every visitor is an anonymous Viewer. Who
+# can reach it at all is decided outside it: only ReadOnly and Operator may port-forward to this namespace through the
+# cluster tunnel (authn-authz 8.1, T-63), and it has no Service a load balancer could reach (T-05). Dashboards and data
+# sources come only from Git, so the UI can't change them.
+
+global:
+  imageRegistry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com, from the Application
+  sft:
+    environment: ""
+    region: ""
+    accountId: ""
+
+# Under one key, apart from the cluster's values file that the Application passes too (its `image` is the
+# application's).
+grafana:
+  image:
+    repository: mirror/grafana/grafana # ADR-0007: our mirror, by digest
+    tag: 13.3.0-distroless
+    digest: sha256:540b8afb775bf34aefce417e4329039daa5d44b6f2fbda6881397b1b247ca7df
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+pools:
+  main: { sft.io/pool: main }
+
+# Where the data sources are, in the monitoring namespace.
+monitoringNamespace: monitoring
+
+# The Identity Center groups that may port-forward here (cluster-bootstrap rbac.tf): sft:readonly, which Operator has
+# too.
+portForwardGroups: ["sft:readonly"]

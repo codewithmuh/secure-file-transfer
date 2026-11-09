@@ -197,7 +197,9 @@ synthetic tenant's links (NFR-1). The recipient-page challenge is on the web app
 **As built (#179).** `resolveLink` and `createLinkSession` apply the per-IP rows; `requestVerificationCode` also the
 per-link, per-address and per-tenant code limits, after the lockout and the suppression list. A code check doesn't
 count against the code-request limits: its own attempts, and the lockout, are PostgreSQL's, and a mismatch adds to
-the IP's failed attempts. The probe mailbox's exemption comes with NFR-1's probe (M7).
+the IP's failed attempts. The probe mailbox's exemption is met without code (#248): each probe run sends to a fresh
+address in the mailbox, `probe+<run>@probe.<domain>`, so no per-address cap counts the probe twice and no request path
+tests for the synthetic tenant (runbooks/synthetic-probe.md).
 
 **B. Member sign-in:** `/v1/auth/sign-in` and `/v1/auth/callback` (defined in #23), `startInvitationSignIn`, and
 Cognito managed login. Fail closed.

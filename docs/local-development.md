@@ -25,7 +25,8 @@ journey runs again against real AWS in M4 ([delivery plan](delivery-plan.md), se
 | `make up` | Builds the API, starts the stack, runs the database jobs (section 3), then starts the API and waits until every service is healthy (under a minute once images are pulled) |
 | `make smoke` | One real round trip to each stack service, from the host ([`local/smoke.py`](../local/smoke.py)), and a check that `sft_api` reads no tenant's rows without a scope |
 | `make seed` | Writes a tenant, an admin and a member who sign in through Keycloak, and prints how (section 7). Idempotent |
-| `make jobs JOB=<job>` | Runs one lifecycle job once: `expiry`, `deletion`, `reconciliation`, `storage-audit` or `cleanup` (section 7) |
+| `make jobs JOB=<job>` | Runs one lifecycle job once: `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `purge` (#224) or `audit-partitions` (section 7) |
+| `make audit-archive` | Runs the audit archive job once, as `sft_archive`: committed audit events to both local archive buckets, as gzipped JSON lines under `g<generation>/` (#183) |
 | `make field-keys STEP=<step>` | Runs one field key job step as the API: `backfill`, `rotate`, `rewrap` or `purge` (#236, section 4) |
 | `make e2e` | The M2 journey test against the running, seeded stack (section 7) |
 | `make web-e2e` | The web app's browser flows against the running, seeded stack, in the pinned Playwright image (section 8) |
@@ -315,7 +316,12 @@ runs `python -m sft.workers.jobs expiry` in the `jobs` service, which `make up` 
 file, and any unfinished upload of it, in the local buckets; `reconciliation` rejects uploads with no part for 24
 hours, finishes completions left for 15 minutes, runs the scan sweep and rewrites missing grant records;
 `storage-audit` deletes orphan objects and stale uploads over 24 hours old and reports what is left; `cleanup` deletes
-expired codes, link sessions and grants. Each logs its report as one JSON line. The local buckets have no Osaka
+expired codes, link sessions and grants; `purge` deletes transfers and upload requests 372 days past their end, with
+their child rows (#224; the clock's test hook stops at 366 days, so locally it finds nothing to do unless rows are
+backdated); `audit-partitions` keeps the audit
+partitions three months ahead. Each logs its report as one JSON line. `make audit-archive` runs the audit archive job
+(#183) once, as `sft_archive`, in its own `audit-archive` service: it copies committed audit events to
+`sft-local-audit-archive` and `sft-local-audit-archive-osaka`, and moves the archive cursor. The local buckets have no Osaka
 replicas, so "every copy" means every object version in `sft-local-files` and `sft-local-large-files`; the Osaka copies
 are checked when the journey runs against AWS in M4.
 

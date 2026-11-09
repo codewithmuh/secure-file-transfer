@@ -146,6 +146,10 @@ database. Within a minute the operator API's sweep (every 30 s) marks it `expire
 
 ## The alerts
 
+Every Prometheus alert below is labelled `security: "true"`
+([`deploy/alerts/break-glass.rules.yaml`](../../deploy/alerts/break-glass.rules.yaml)), so Alertmanager never inhibits
+it, not even while a drill runs ([drill-in-progress.md](drill-in-progress.md)).
+
 ### BreakGlassActive
 
 A grant is active (`sft_break_glass_active_grants > 0`). It pages for as long as one is.
@@ -174,6 +178,17 @@ wrong.
   catches up.
 - **Mitigate:** fix the cause (the database, the operator API's role); the next sweep records every grant that ended
   meanwhile, with its real end time. If the operator API is down, service-unavailable's runbook applies first.
+
+### BreakGlassTenantRecordsMissed
+
+A break-glass record wasn't written to a named tenant's audit log (`sft_break_glass_tenant_records_missed_total`), so
+that tenant's admins can't see that its data was, or may be, read (UC-4). It should never happen; it pages at once.
+
+- **Confirm:** `kubectl -n sft-operator logs deploy/operator-api --since=30m` for the failed write, the grant and the
+  tenant. The grant's own platform record and CloudTrail still hold what happened.
+- **Mitigate:** fix the cause (usually the database); then tell the tenant's admins directly about the grant, its
+  incident and its times, and note it in the after-action review. If the grant is still active and the record can't be
+  written, end it (`endBreakGlass`) until it can.
 
 ### The EventBridge alert on `sft-<env>-break-glass-db`
 

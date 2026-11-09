@@ -21,6 +21,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: page
+              security: "true"
             exp_annotations:
               summary: A sealed value didn't open with the caller's tenant's key, a possible isolation breach (NFR-12).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/field-keys.md

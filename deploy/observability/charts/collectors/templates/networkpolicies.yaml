@@ -1,0 +1,73 @@
+{{- /*
+Network policies (ADR-0021). node-agents denies everything by default, like every namespace of ours; this chart owns
+that namespace's policies. The agent takes spans from the application's pods and scrapes from Prometheus, and sends
+only to the gateways and Loki. The gateway takes spans from the agents and sends only to Tempo.
+*/}}
+{{- $ns := .Release.Namespace }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ .Values.agent.namespace }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-agent
+  namespace: {{ .Values.agent.namespace }}
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: otel-agent }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - { key: kubernetes.io/metadata.name, operator: In, values: {{ toJson .Values.agent.clientNamespaces }} }
+      ports:
+        - { port: 4318, protocol: TCP }
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns }} } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: prometheus } }
+      ports:
+        - { port: 8888, protocol: TCP }
+  egress:
+    {{- include "collectors.dns" . | nindent 4 }}
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns }} } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: otel-gateway } }
+      ports:
+        - { port: 4317, protocol: TCP }
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $ns }} } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: loki } }
+      ports:
+        - { port: 3100, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: otel-gateway
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: otel-gateway }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.agent.namespace }} } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: otel-agent } }
+      ports:
+        - { port: 4317, protocol: TCP }
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: prometheus } }
+      ports:
+        - { port: 8888, protocol: TCP }
+  egress:
+    {{- include "collectors.dns" . | nindent 4 }}
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: tempo } }
+      ports:
+        - { port: 4317, protocol: TCP }

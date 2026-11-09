@@ -67,8 +67,9 @@ class HttpMetrics:
         )
         duration = Histogram(
             "http_request_duration_seconds",
-            "Time from the request to the end of its response, on the public port.",
-            ["method", "route"],
+            "Time from the request to the end of its response, on the public port, by route "
+            "template and status (NFR-2's SLI, #242).",
+            ["method", "route", "status"],
             buckets=LATENCY_BUCKETS,
             registry=registry,
         )
@@ -137,7 +138,7 @@ class RequestContextMiddleware:
                 elapsed = time.perf_counter() - start
                 route = _route_label(scope)
                 self.metrics.requests.labels(method, route, str(status)).inc()
-                self.metrics.duration.labels(method, route).observe(elapsed)
+                self.metrics.duration.labels(method, route, str(status)).observe(elapsed)
                 if route != "unmatched":
                     span.update_name(f"{span_name} {route}")
                     span.set_attribute("http.route", route)

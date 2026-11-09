@@ -24,12 +24,14 @@ locals {
   account_root = "arn:aws:iam::${var.account_id}:root"
   alias_prefix = "alias/sft/${var.environment}"
 
-  # Workload roles of authn-authz and encryption 4.3, created by the cluster layer: sft-<env>-<name>, path /.
+  # Workload roles of authn-authz and encryption 4.3, created by the cluster layer, and loki, tempo and alertmanager by
+  # the cluster-bootstrap layer (modules/observability): sft-<env>-<name>, path /.
   role_arns = {
     for name in [
       "api", "scan", "notify", "relay", "jobs", "archive", "operator", "recovery", "key-rotation", "db-bootstrap",
       "s3-replication", "malware-protection", "events-delivery", "signin-trigger", "karpenter", "ebs-csi",
       "external-secrets", "external-secrets-platform", "external-secrets-app", "eks-cluster", "loki", "tempo",
+      "alertmanager",
     ] :
     name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
   }
@@ -89,6 +91,7 @@ locals {
     csrf_hmac  = "${local.secret_arn_prefix}app/csrf-hmac-??????"
     idp_here   = "${local.secret_arn_prefix}app/idp-client/${local.region}-??????"
     idp_all    = "${local.secret_arn_prefix}app/idp-client/ap-northeast-?-??????"
+    probe_key  = "${local.secret_arn_prefix}app/probe-api-key-??????" # the synthetic tenant's API key (#248)
     db_master  = "${local.secret_arn_prefix}db/master-??????"
     platform   = "${local.secret_arn_prefix}platform/*"
   }

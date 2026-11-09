@@ -1,0 +1,28 @@
+# The alerting pipeline's own alerts (ADR-0009, #245, #246), tested by deploy/alerts/tests/watchdog.test.yaml.
+#
+# - Watchdog fires all the time. Alertmanager sends it to the Region's heartbeat topic every minute
+#   (alertmanager.yaml), and the CloudWatch alarm sft-<env>-<rs>-heartbeat-missing pages when five minutes pass
+#   without one (infra/modules/alarms/heartbeat.tf). So a dead Prometheus, Alertmanager, node or egress proxy still
+#   pages, from outside the cluster. Its severity is `heartbeat`, the one alert that is neither page nor ticket.
+# - DrillInProgress fires while a drill runs: the drill pushes sft_drill_active{drill} = 1 to the Pushgateway when it
+#   starts and deletes it when it ends (ops/, the DR track). Alertmanager uses it to inhibit the alerts that a drill
+#   sets off on purpose, and the SLO report leaves the window out (NFR-1, slo.rules.yaml). It is a ticket, so a drill
+#   marker left behind after a drill is noticed rather than hiding real alerts for days.
+groups:
+  - name: watchdog
+    rules:
+      - alert: Watchdog
+        expr: vector(1)
+        labels:
+          severity: heartbeat
+        annotations:
+          summary: The alerting pipeline is working; this alert always fires and feeds the CloudWatch heartbeat.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/watchdog.md
+
+      - alert: DrillInProgress
+        expr: max by (drill) (sft_drill_active) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: A drill is in progress ({{ $labels.drill }}); the alerts it sets off are inhibited and its window is left out of the SLOs.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/drill-in-progress.md

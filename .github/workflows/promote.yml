@@ -96,6 +96,7 @@ jobs:
     timeout-minutes: 35 # the health checks wait up to 30 minutes (ADR-0005)
     permissions:
       contents: read
+      id-token: write # OIDC into the previous environment's plan role, to read the probe's result (T-71)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,16 +152,67 @@ jobs:
           done
           exit 1
 
-      # TODO(ADR-0005, needs AWS): assume the previous environment's plan role through OIDC (it trusts pull requests
-      # only, T-71; add `id-token: write` to this job then) and read the synthetic probe's CloudWatch metric for the
-      # digest; pass when the probe has passed against it. The role ARN comes from a repository variable.
-      - name: Previous environment probed on the digest
+      # The synthetic probe (#248) runs the send, verify and download journey every 5 minutes in each environment and
+      # writes SecureFileTransfer/Probe ProbeSuccess to CloudWatch in Tokyo, by Environment and by Environment and
+      # ImageDigest (the digest its pod runs): 1 for a run that passed, 0 for one that failed. The gate reads it as the previous environment's plan role, which trusts pull
+      # requests from this repository only and reads, never changes (T-71); its ARN is the repository variable
+      # TF_PLAN_ROLE_ARN_DEV or TF_PLAN_ROLE_ARN_STAGING (docs/runbooks/apply-staging-and-prod.md).
+      #
+      # The gate reads the series of the digest it promotes, counting only runs since the digest landed in that
+      # environment's deploy config on main and in the last 20 minutes, so an old pass never counts. It passes when
+      # the three most recent periods (15 minutes) all passed. It waits up to 30 minutes for that (ADR-0005), and
+      # fails closed: no data, a failed run among the last three, or no role, and the promotion waits.
+      - name: Which environment to read
+        id: prev
         if: ${{ !cancelled() && steps.gate.outputs.promotions != '' }}
         env:
           PROMOTIONS: ${{ steps.gate.outputs.promotions }}
         run: |
-          for p in $PROMOTIONS; do
-            IFS=: read -r env prev digest <<< "$p"
-            echo "::error::promotion-gate can't yet read $prev's synthetic probe result for $digest (TODO, ADR-0005); $env not promoted."
+          # promotion.sh refuses a pull request that changes more than one environment's digest, so there is one.
+          read -r first rest <<< "$PROMOTIONS"
+          if [[ -n $rest ]]; then echo "::error::one promotion per pull request"; exit 1; fi
+          IFS=: read -r env prev digest <<< "$first"
+          {
+            echo "env=$env"
+            echo "prev=$prev"
+            echo "digest=$digest"
+          } >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: ${{ !cancelled() && steps.prev.outputs.prev != '' }}
+        with:
+          role-to-assume: ${{ steps.prev.outputs.prev == 'dev' && vars.TF_PLAN_ROLE_ARN_DEV || vars.TF_PLAN_ROLE_ARN_STAGING }}
+          role-session-name: promotion-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+      - name: Previous environment probed on the digest
+        if: ${{ !cancelled() && steps.prev.outputs.prev != '' }}
+        env:
+          ENV: ${{ steps.prev.outputs.env }}
+          PREV: ${{ steps.prev.outputs.prev }}
+          DIGEST: ${{ steps.prev.outputs.digest }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # When the digest landed in the previous environment's deploy config on main: its oldest commit there.
+          landed=$(git log --format=%ct --reverse -S"$DIGEST" "$BASE" -- "deploy/environments/$PREV/ap-northeast-1/values.yaml" | head -n 1)
+          if [[ -z $landed ]]; then
+            echo "::error::$DIGEST never landed in $PREV on main; $ENV not promoted."
+            exit 1
+          fi
+          query='[{"Id":"probe","MetricStat":{"Metric":{"Namespace":"SecureFileTransfer/Probe","MetricName":"ProbeSuccess","Dimensions":[{"Name":"Environment","Value":"'"$PREV"'"},{"Name":"ImageDigest","Value":"'"$DIGEST"'"}]},"Period":300,"Stat":"Minimum"}}]'
+          for attempt in $(seq 1 30); do
+            recent=$(( $(date -u +%s) - 1200 ))
+            start=$(date -u -d "@$(( landed > recent ? landed : recent ))" +%Y-%m-%dT%H:%M:%SZ)
+            # Newest first; a period's minimum is 0 if any run in it failed.
+            values=$(aws cloudwatch get-metric-data --metric-data-queries "$query" \
+              --start-time "$start" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --scan-by TimestampDescending \
+              --query 'MetricDataResults[0].Values' --output json)
+            runs=$(jq length <<< "$values")
+            last=$(jq -c '.[:3]' <<< "$values")
+            echo "attempt $attempt: $runs probe periods since $start; newest three: $last"
+            if (( runs >= 3 )) && [[ $(jq '.[:3] | all(. == 1)' <<< "$values") == true ]]; then
+              echo "- $PREV: the synthetic probe passed its last three runs on \`$DIGEST\`." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 60
           done
+          echo "::error::$PREV's synthetic probe hasn't passed three runs in a row on $DIGEST within 30 minutes; $ENV not promoted."
           exit 1

@@ -1,0 +1,121 @@
+# Prometheus and Alertmanager for one cluster (ADR-0009), with what feeds them: the rule files in deploy/alerts, the
+# scrape targets, the Pushgateway the lifecycle jobs push to and the CloudWatch exporter for the AWS series. The
+# Prometheus Operator, its CRDs and kube-state-metrics are cluster-wide controllers that cluster-bootstrap installs
+# (infra/modules/cluster-bootstrap/observability.tf); this chart holds only namespaced objects.
+#
+# The Application (deploy/observability/argocd) adds the cluster's facts under `global` and the cluster's values file
+# (deploy/environments/<env>/<region>/values.yaml) for its network; deploy/observability/environments/<env>.yaml
+# sizes it.
+
+global:
+  imageRegistry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com, from the Application
+  sft:
+    environment: ""
+    region: ""
+    accountId: ""
+
+# From the cluster's values file; the defaults are the parts every cluster shares.
+network:
+  vpcCidr: ""
+  endpointSubnetsCidr: "" # the interface endpoints and the cluster API's network interfaces, 443
+  podIdentityAgent: 169.254.170.23/32
+  egressProxy: # the platform listener: SNS and CloudWatch have no endpoint here (ADR-0009, ADR-0021)
+    namespace: egress-proxy
+    host: egress-proxy.egress-proxy.svc.cluster.local
+    podLabels: { app.kubernetes.io/name: egress-proxy }
+    platformPort: 3132
+
+# Third-party images from our mirror, by digest (ADR-0007); the same digests are in cluster-bootstrap's images.tf,
+# which the mirror workflow copies and Kyverno admits.
+images:
+  prometheus:
+    repository: mirror/prometheus/prometheus
+    tag: v3.15.1-distroless
+    digest: sha256:451a845bae1d51622b41af1780eb2ad911bbb79a9855bc8e9bb67fabbc03f934
+  alertmanager:
+    repository: mirror/prometheus/alertmanager
+    tag: v0.34.2
+    digest: sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
+  pushgateway:
+    repository: mirror/prometheus/pushgateway
+    tag: v1.11.4
+    digest: sha256:91a56b89b97dd8a5e1e4fa8b5bbbd86dd57a87a2a3cee3a3ce3368b40ef158ef
+  cloudwatchExporter:
+    repository: mirror/prom/cloudwatch-exporter
+    tag: v0.16.0
+    digest: sha256:71c2e988af061257ecec8dadf7ff1c98831bc82842e97a893b3eb7ede383b59f
+
+pools:
+  main: { sft.io/pool: main }
+
+prometheus:
+  replicas: 1
+  # ADR-0009: 30 days in prod, so NFR-1's 28-day window is computed from local data; 3 (dev) and 7 (staging) elsewhere.
+  retention: 30d
+  storage: 200Gi
+  # Stop short of a full volume: Prometheus deletes the oldest blocks past this size.
+  retentionSize: 180GB
+  scrapeInterval: 30s
+  evaluationInterval: 30s
+  resources:
+    requests: { cpu: "1", memory: 3584Mi }
+    limits: { memory: 5Gi }
+
+alertmanager:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+  # Alertmanager pages and files tickets through SNS in its own Region (ADR-0009), on the topics the alarms module
+  # makes: sft-<env>-<region-short>-<suffix>. The heartbeat topic carries the always-firing Watchdog alert every
+  # minute; a CloudWatch alarm that treats missing data as breaching pages when it stops (#246).
+  topics:
+    page: alerts-page
+    ticket: alerts-ticket
+    heartbeat: heartbeat
+
+pushgateway:
+  # The lifecycle jobs push their run's metrics here (sft.workers.jobs, METRICS_PUSHGATEWAY_URL), at
+  # http://pushgateway.monitoring.svc.cluster.local:9091. A small volume keeps the last push across a restart, so a
+  # job's last-success time doesn't vanish until its next run.
+  storage: 1Gi
+  resources:
+    requests: { cpu: 20m, memory: 32Mi }
+    limits: { memory: 128Mi }
+  # Who may push: every pod of the application's namespace (its jobs and the synthetic probe).
+  clientNamespaces: [sft]
+
+cloudwatchExporter:
+  resources:
+    requests: { cpu: 50m, memory: 384Mi }
+    limits: { memory: 512Mi }
+  # CloudWatch publishes these at one-minute periods at best, and every series read is a GetMetricData charge, so
+  # Prometheus asks every 2 minutes (capacity A34).
+  scrapeInterval: 2m
+  # The AWS series the alerts and dashboards use. Each becomes aws_<namespace>_<metric>_<statistic> in snake case,
+  # with a dimension_<Name> label per dimension, the exporter's own naming (deploy/alerts/scanning.rules.yaml relies on
+  # it). `select` narrows each to this environment's resources, so another environment's never shows here.
+  metrics:
+    # Queue age and depth, dead-letter queues included (architecture 6).
+    - { namespace: AWS/SQS, name: ApproximateAgeOfOldestMessage, dimensions: [QueueName], statistics: [Maximum], select: { QueueName: queues } }
+    - { namespace: AWS/SQS, name: ApproximateNumberOfMessagesVisible, dimensions: [QueueName], statistics: [Maximum], select: { QueueName: queues } }
+    # Aurora: the global database's replication lag to Osaka (NFR-10), and the writer's load.
+    - { namespace: AWS/RDS, name: AuroraGlobalDBReplicationLag, dimensions: [DBClusterIdentifier], statistics: [Maximum], select: { DBClusterIdentifier: database } }
+    - { namespace: AWS/RDS, name: CPUUtilization, dimensions: [DBClusterIdentifier], statistics: [Average], select: { DBClusterIdentifier: database } }
+    - { namespace: AWS/RDS, name: DatabaseConnections, dimensions: [DBClusterIdentifier], statistics: [Average], select: { DBClusterIdentifier: database } }
+    # S3 replication of the files buckets and the audit archive to Osaka (NFR-10, RTC's metrics).
+    - { namespace: AWS/S3, name: ReplicationLatency, dimensions: [SourceBucket, DestinationBucket, RuleId], statistics: [Maximum], select: { SourceBucket: buckets } }
+    - { namespace: AWS/S3, name: OperationsPendingReplication, dimensions: [SourceBucket, DestinationBucket, RuleId], statistics: [Maximum], select: { SourceBucket: buckets } }
+    # The load balancer: requests and 5xx, for NFR-1's availability alongside the API's own counts.
+    - { namespace: AWS/ApplicationELB, name: RequestCount, dimensions: [LoadBalancer], statistics: [Sum], select: { LoadBalancer: loadBalancer } }
+    - { namespace: AWS/ApplicationELB, name: HTTPCode_ELB_5XX_Count, dimensions: [LoadBalancer], statistics: [Sum], select: { LoadBalancer: loadBalancer } }
+    - { namespace: AWS/ApplicationELB, name: HTTPCode_Target_5XX_Count, dimensions: [LoadBalancer], statistics: [Sum], select: { LoadBalancer: loadBalancer } }
+
+# What Prometheus scrapes in the application's namespaces: the internal port (8001) of each server of ours, never the
+# public one (architecture 8). These are the components whose network policy admits Prometheus (deploy/charts/sft).
+# clamd and the DLP inspector serve no metrics there, and one-shot jobs push to the Pushgateway instead.
+application:
+  scraped:
+    sft: [api, relay, notifier, scan-worker]
+    sft-operator: [operator-api]
+  port: internal

@@ -37,10 +37,10 @@ fewer (ADR-0019), and the fields key's alias, whose policy lets this role unwrap
   "INSPECTOR_PORT" (toString $.Values.dlpInspector.port)
   "SCAN_LARGE_POOL_SIZE" (toString $.Values.scanPools.large.replicas)
   "FIELDS_KMS_KEY_ID" (printf "alias/sft/%s/fields" $.Values.environment)) $w.env }}
-{{- $containers := include "sft.appContainer" (dict "root" $ "name" "scan-worker" "module" $w.module "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $workerEnv "resources" $w.resources) }}
+{{- $containers := include "sft.appContainer" (dict "root" $ "name" "scan-worker" "traced" true "module" $w.module "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $workerEnv "resources" $w.resources) }}
 {{- $affinity := include "sft.onePerNode" (dict "component" "scan-worker") }}
 ---
-{{ include "sft.deployment" (dict "root" $ "name" (printf "scan-worker-%s" $pool) "component" "scan-worker" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds "containers" $containers "affinity" $affinity) }}
+{{ include "sft.deployment" (dict "root" $ "name" (printf "scan-worker-%s" $pool) "held" true "component" "scan-worker" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds "containers" $containers "affinity" $affinity) }}
 ---
 {{ include "sft.pdb" (dict "root" $ "name" (printf "scan-worker-%s" $pool) "component" "scan-worker" "pool" $pool) }}
 {{- /* clamd: the clamav image, no identity; signatures seeded from the image, then kept current from the mirror. */}}
@@ -50,7 +50,7 @@ fewer (ADR-0019), and the fields key's alias, whose policy lets this role unwrap
 {{- $volumes := printf "- name: config\n  configMap: { name: clamd-config }\n- name: signatures\n  emptyDir: { sizeLimit: 1Gi }\n- name: run\n  emptyDir: { sizeLimit: 16Mi }\n- name: scratch\n  emptyDir: { sizeLimit: %s }" $c.scratch }}
 {{- $affinity = include "sft.besideWorker" (dict "component" "clamd" "pool" $pool) }}
 ---
-{{ include "sft.deployment" (dict "root" $ "name" (printf "clamd-%s" $pool) "component" "clamd" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "clamd" "grace" $c.terminationGracePeriodSeconds "user" 1000 "containers" $clamd "initContainers" $seed "volumes" $volumes "affinity" $affinity "checksum" $checksum) }}
+{{ include "sft.deployment" (dict "root" $ "name" (printf "clamd-%s" $pool) "held" true "component" "clamd" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "clamd" "grace" $c.terminationGracePeriodSeconds "user" 1000 "containers" $clamd "initContainers" $seed "volumes" $volumes "affinity" $affinity "checksum" $checksum) }}
 ---
 {{ include "sft.pdb" (dict "root" $ "name" (printf "clamd-%s" $pool) "component" "clamd" "pool" $pool) }}
 {{- /*
@@ -67,7 +67,7 @@ and would wait behind the file being inspected. Liveness says the process runs, 
 {{- $volumes = printf "- name: scratch\n  emptyDir: { sizeLimit: %s }" $d.scratch }}
 {{- $affinity = include "sft.besideWorker" (dict "component" "dlp-inspector" "pool" $pool) }}
 ---
-{{ include "sft.deployment" (dict "root" $ "name" (printf "dlp-inspector-%s" $pool) "component" "dlp-inspector" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "dlp-inspector" "grace" $d.terminationGracePeriodSeconds "containers" $containers "volumes" $volumes "affinity" $affinity) }}
+{{ include "sft.deployment" (dict "root" $ "name" (printf "dlp-inspector-%s" $pool) "held" true "component" "dlp-inspector" "pool" $pool "nodePool" "scan" "replicas" $replicas "serviceAccount" "dlp-inspector" "grace" $d.terminationGracePeriodSeconds "containers" $containers "volumes" $volumes "affinity" $affinity) }}
 ---
 {{ include "sft.pdb" (dict "root" $ "name" (printf "dlp-inspector-%s" $pool) "component" "dlp-inspector" "pool" $pool) }}
 {{- end }}

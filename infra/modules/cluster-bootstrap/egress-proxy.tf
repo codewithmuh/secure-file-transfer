@@ -35,6 +35,14 @@ locals {
       clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "key-rotation" } }]
     },
     {
+      # The synthetic probe (#248, NFR-1): the API and the web app the way a customer reaches them, from outside, and
+      # CloudWatch for its ProbeSuccess metric. S3 (its uploads and the probe mailbox) is the gateway endpoint's.
+      name    = "synthetic-probe"
+      port    = local.proxy_ports["synthetic-probe"]
+      domains = ["api.${var.service_domain}", "app.${var.service_domain}", "monitoring.${var.region}.amazonaws.com"]
+      clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "synthetic-probe" } }]
+    },
+    {
       # The signature mirror: ClamAV's database (ADR-0019).
       name    = "signature-mirror"
       port    = local.proxy_ports["signature-mirror"]
@@ -53,7 +61,8 @@ locals {
     },
     {
       # The platform: AWS APIs with no endpoint here, for Karpenter (Bottlerocket's AMI parameters), the Load Balancer
-      # Controller, Alertmanager (ADR-0009), and ECR's layer bucket for Kyverno's signature reads.
+      # Controller, Alertmanager (SNS) and the CloudWatch exporter (CloudWatch) (ADR-0009), and ECR's layer bucket for
+      # Kyverno's signature reads.
       name = "platform"
       port = local.proxy_ports["platform"]
       domains = [
@@ -70,6 +79,7 @@ locals {
         { namespace = "kyverno", podLabels = { "app.kubernetes.io/component" = "admission-controller" } },
         { namespace = "kyverno", podLabels = { "app.kubernetes.io/component" = "reports-controller" } },
         { namespace = "monitoring", podLabels = { "app.kubernetes.io/name" = "alertmanager" } },
+        { namespace = "monitoring", podLabels = { "app.kubernetes.io/name" = "cloudwatch-exporter" } },
       ]
     },
   ]

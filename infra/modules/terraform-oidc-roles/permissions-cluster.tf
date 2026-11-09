@@ -25,7 +25,7 @@ locals {
     for r in [
       "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
       "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
-      "external-secrets-platform", "external-secrets-app", "key-rotation",
+      "external-secrets-platform", "external-secrets-app", "key-rotation", "synthetic-probe",
     ] : "${local.cluster_env_prefix}-${r}"
   ]
   cluster_role_arns = [for n in local.cluster_role_names : "arn:aws:iam::${var.account_id}:role/${n}"]
@@ -333,15 +333,16 @@ data "aws_iam_policy_document" "cluster_deploy_iam" {
 data "aws_iam_policy_document" "workload_boundary" {
   count = local.cluster_enabled ? 1 : 0
 
-  # The services the cluster, its nodes, its controllers and its workloads use (architecture 3.1, ADR-0004), and
-  # sns:Publish for the data layer's EventBridge delivery role, which carries this boundary too: no IAM change, no
-  # sts:AssumeRole but into the secret stores' roles, no Organizations, CloudTrail, Config or GuardDuty.
+  # The services the cluster, its nodes, its controllers and its workloads use (architecture 3.1, ADR-0004),
+  # cloudwatch:PutMetricData for the synthetic probe's result (#248), and sns:Publish for the data layer's EventBridge
+  # delivery role, which carries this boundary too: no IAM change, no sts:AssumeRole but into the secret stores' roles,
+  # no Organizations, CloudTrail, Config or GuardDuty.
   statement {
     sid = "WorkloadServices"
     actions = [
-      "autoscaling:*", "cognito-idp:*", "ec2:*", "ec2messages:*", "ecr:*", "eks:*", "eks-auth:*",
-      "elasticache:Connect", "elasticloadbalancing:*", "kms:*", "rds-db:connect", "secretsmanager:*", "ses:*",
-      "sns:Publish", "sqs:*", "ssm:GetParameter", "ssm:UpdateInstanceInformation", "ssmmessages:*",
+      "autoscaling:*", "cloudwatch:PutMetricData", "cognito-idp:*", "ec2:*", "ec2messages:*", "ecr:*", "eks:*",
+      "eks-auth:*", "elasticache:Connect", "elasticloadbalancing:*", "kms:*", "rds-db:connect", "secretsmanager:*",
+      "ses:*", "sns:Publish", "sqs:*", "ssm:GetParameter", "ssm:UpdateInstanceInformation", "ssmmessages:*",
       # S3 by action: only the object and listing calls the workloads make (architecture 3.1), never a bucket
       # setting, policy or ACL.
       "s3:AbortMultipartUpload", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:GetObject",

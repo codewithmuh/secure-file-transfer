@@ -5,8 +5,11 @@
 # Its state lives in its own bucket, never the environment's.
 #
 # Skeleton from #54. #102 adds the audit key, its Osaka replica and the archive buckets in both Regions (archive.tf),
-# through the ap-northeast-3 provider alias below. Still to come: its own state bucket, deploy role, trail, EventBridge
-# rules with the alert topic, and the budget.
+# through the ap-northeast-3 provider alias below. #254 adds the teardown apply (TF_VAR_teardown=true): the key-admin
+# role leaves the key policy, and the NFR-19 budget (budget.tf). Still to come: its own state bucket, deploy role,
+# trail, EventBridge rules with the alert topic; and, in modules/kms-keys and modules/audit-archive, the teardown
+# inputs that take the environment's workload roles out of the key and bucket policies and turn rotation off
+# (docs/runbooks/teardown.md lists them as the open prerequisites of a prod teardown).
 
 terraform {
   required_version = "~> 1.17.0"

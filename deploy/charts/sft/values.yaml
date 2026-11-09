@@ -47,6 +47,14 @@ part: application
 # it to false here and true in Tokyo.
 pilotLight: false
 
+# A regional failover's hold (architecture 7, docs/runbooks/regional-failover.md): with holdWorkers true, the relay, the
+# notifier, the scan trios and the signature mirror run at zero replicas and every CronJob is suspended, while the API,
+# the operator API and the migration job run. The fencing commit (ops/failover-values.sh) sets it with pilotLight false
+# in the region taking over; a second commit releases the workers once the recovery job has re-applied the
+# security-critical changes.
+failover:
+  holdWorkers: false
+
 # The application image: one image for the API and every worker (architecture 2). The digest is the only line the
 # promotion workflow edits, in each cluster's values file (ADR-0005, #107).
 image:
@@ -61,6 +69,16 @@ clamav:
   digest: sha256:c21aa18cc0a358678255a3dfb343a4555b58f71b97d7b869df8fdf7ea0a5b4b1
 
 logLevel: info
+
+# Traces (ADR-0009, #243): the API, the operator API and the workers send spans over OTLP/HTTP to the node's own
+# OpenTelemetry agent (deploy/observability/charts/collectors), whose Service keeps traffic on the node. Their network
+# policies admit the agent on `port`. An empty `otlpEndpoint` leaves OTEL_EXPORTER_OTLP_ENDPOINT unset: spans are
+# still made for the logs' trace IDs, but not exported.
+telemetry:
+  otlpEndpoint: http://otel-agent.node-agents.svc.cluster.local:4318
+  namespace: node-agents
+  podLabels: { app.kubernetes.io/name: otel-agent }
+  port: 4318
 
 database:
   port: 5432
@@ -213,8 +231,10 @@ operatorApi: # namespace sft-operator, port-forward only, never on a load balanc
 # ---- Scheduled jobs (architecture 4.5, 5.2). Times are UTC. Each run is a fresh pod that exits; a run never overlaps
 # the one before it. ----
 
-# The lifecycle jobs (#181, sft.service.lifecycle) read JobSettings: `s3` gives a job the files buckets of this region
-# and of Osaka's replicas (staging and prod), `archive` both regions' audit archive, `lifecycle` ENVIRONMENT.
+# The lifecycle jobs (#181, sft.service.lifecycle) read JobSettings: `lifecycle` gives a job ENVIRONMENT and this
+# region's files buckets, `s3` the egress to S3 and, outside dev, Osaka's replicas, `archive` both regions' audit
+# archive. The audit archive job reads ArchiveJobSettings (#183): `archive` alone. Every job pushes its metrics to the
+# Pushgateway after its run (metricsPushgateway below).
 lifecycleJobs:
   expiry: # records expiry of transfers past expires_at, and cancels drafts idle for 7 days
     schedule: "*/5 * * * *"
@@ -257,20 +277,30 @@ lifecycleJobs:
     lifecycle: true
     s3: false
     activeDeadlineSeconds: 900
-  audit-archive: # copies new audit rows to the Object Lock bucket at least every minute (NFR-15)
+  audit-archive: # every minute: committed audit events to both regions' Object Lock archive (#183, NFR-15)
     schedule: "* * * * *"
     module: sft.workers.audit_archive
     serviceAccount: audit-archive
     databaseRole: sft_archive
     s3: true
+    archive: true
     activeDeadlineSeconds: 300
-  audit-partitions: # daily: keeps three months of partitions ahead and drops expired ones (data model, 5.2)
+  audit-partitions: # daily: keeps three months of audit partitions ahead and exports their gauges (data model 6)
     schedule: "41 2 * * *"
     module: sft.workers.audit_partitions
     serviceAccount: jobs
     databaseRole: sft_jobs
+    lifecycle: true
     s3: false
     activeDeadlineSeconds: 900
+  purge: # daily: transfers and upload requests 372 days past their end, with their child rows (#224, NFR-9)
+    schedule: "53 3 * * *"
+    module: sft.workers.purge
+    serviceAccount: jobs
+    databaseRole: sft_jobs
+    lifecycle: true
+    s3: false
+    activeDeadlineSeconds: 3600
 
 # The key rotation job (encryption 6.4, 6.5; #185): Tokyo only, hourly, the only writer of the sft/<env>/app/* secrets.
 # The workloads read the keyrings themselves every 5 minutes (#184); after a new user pool client secret, which the API
@@ -312,6 +342,17 @@ inviteBacklog:
 # reconciliation when it finishes a completion (#181). One value, so the two never differ.
 scanSmallPoolMaxBytes: "100000000"
 
+# Where the scheduled jobs and the synthetic probe push their metrics after each run (#242, #248, ADR-0009): a one-shot
+# pod has no port to scrape. The Pushgateway is the observability stack's (#243,
+# deploy/observability/charts/prometheus/templates/pushgateway.yaml), scraped with honor_labels so each push keeps its
+# own job label. Their network policies admit it on `port`. An empty `url` leaves METRICS_PUSHGATEWAY_URL unset, and
+# the jobs only log their metrics.
+metricsPushgateway:
+  url: http://pushgateway.monitoring.svc.cluster.local:9091
+  namespace: monitoring
+  podLabels: { app.kubernetes.io/name: pushgateway }
+  port: 9091
+
 lifecycleJobResources: # capacity 4.1
   requests: { cpu: 500m, memory: 1Gi }
   limits: { memory: 1Gi }
@@ -326,3 +367,21 @@ migration:
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { memory: 512Mi }
+
+# The synthetic probe (#248, NFR-1, NFR-4; templates/probe.yaml, docs/runbooks/synthetic-probe.md): every 5 minutes, the
+# whole journey through the public API as the synthetic tenant. Off until an environment's values file turns it on,
+# once its AWS side exists (the runbook's setup list): the Pod Identity role sft-<env>-synthetic-probe for this service
+# account, the proxy listener on proxyPort, the secret sft/<env>/app/probe-api-key and the probe mailbox.
+probe:
+  enabled: false
+  schedule: "*/5 * * * *"
+  module: sft.probe
+  serviceAccount: synthetic-probe # Pod Identity: sft-<env>-synthetic-probe
+  activeDeadlineSeconds: 285 # inside the 5 minutes, so runs never overlap; the probe stops itself at timeoutSeconds
+  timeoutSeconds: 240
+  proxyPort: 3134 # its own listener (ADR-0021): api.<serviceDomain>, app.<serviceDomain>, monitoring.<region>
+  mailboxDomain: "" # probe.<serviceDomain> when empty; SES receives it into <prefix>-probe-mailbox-<account>
+  mailboxPrefix: probe/
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 256Mi }

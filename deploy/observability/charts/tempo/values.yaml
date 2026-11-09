@@ -1,0 +1,92 @@
+# Tempo for one cluster (ADR-0009). The Application (deploy/observability/argocd) adds the cluster's facts under
+# `global` and its network from the cluster's values file; deploy/observability/environments/<env>.yaml sizes it.
+#
+# Single binary everywhere: Tempo 3's distributed mode needs Kafka between its distributors and its stores, a moving
+# part this design doesn't otherwise have (CLAUDE.md). Traces are for diagnosis, not an SLO; the write-ahead log on
+# its volume keeps what a restart would otherwise lose (ADR-0009, amended by #243).
+
+global:
+  imageRegistry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com, from the Application
+  sft:
+    environment: ""
+    region: ""
+    accountId: ""
+
+# The cluster's network (deploy/environments/<env>/<region>/values.yaml), for the network policy's S3 rule.
+network:
+  vpcCidr: ""
+  podIdentityAgent: 169.254.170.23/32
+
+tempo:
+  fullnameOverride: tempo
+  replicas: 1
+  serviceAccount:
+    create: true
+    name: tempo # Pod Identity binds sft-<env>-tempo to monitoring/tempo (infra/modules/observability)
+    automountServiceAccountToken: false
+  nodeSelector: { sft.io/pool: main }
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile: { type: RuntimeDefault }
+  persistence:
+    enabled: true
+    size: 15Gi
+    storageClassName: observability # cluster-bootstrap: gp3, encrypted with the account's default key
+  extraVolumes:
+    - { name: tmp, emptyDir: {} }
+  tempo:
+    repository: mirror/grafana/tempo # ADR-0007: our mirror, by digest; the registry is global.imageRegistry
+    tag: 3.1.1@sha256:64e2fbd56d9c2b3412a4b430a58ea59e91a670b1e75f920a0c702213ad145044
+    reportingEnabled: false # no usage reports leave the cluster (ADR-0021)
+    # Traces kept: 14 days in prod (capacity A33), less in dev and staging.
+    retention: 336h
+    resources:
+      requests: { cpu: 250m, memory: 768Mi }
+      limits: { memory: 1Gi }
+    securityContext:
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities: { drop: [ALL] }
+    extraVolumeMounts:
+      - { name: tmp, mountPath: /tmp }
+  # The chart's own config template, written out: OTLP over gRPC from the gateway collectors only (nothing speaks Jaeger
+  # or Zipkin here), and the bucket, endpoint and Region from the cluster's facts.
+  config: |
+    {{- $rs := ternary "apne1" "apne3" (eq .Values.global.sft.region "ap-northeast-1") }}
+    stream_over_http_enabled: false
+    multitenancy_enabled: false
+    usage_report:
+      reporting_enabled: {{ .Values.tempo.reportingEnabled }}
+    backend_scheduler:
+      provider:
+        compaction:
+          compaction:
+            block_retention: {{ .Values.tempo.retention }}
+    backend_worker:
+      compaction:
+        block_retention: {{ .Values.tempo.retention }}
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+    server:
+      http_listen_port: 3200
+    storage:
+      trace:
+        # The bucket's default encryption is the logs key (encryption 3.1); Pod Identity supplies the credentials.
+        backend: s3
+        s3:
+          bucket: {{ printf "sft-%s-%s-tempo-%s" .Values.global.sft.environment $rs .Values.global.sft.accountId }}
+          endpoint: s3.{{ .Values.global.sft.region }}.amazonaws.com
+          region: {{ .Values.global.sft.region }}
+        wal:
+          path: /var/tempo/wal
+    querier: {}
+    query_frontend: {}
+    overrides:
+      per_tenant_override_config: /conf/overrides.yaml

@@ -1,5 +1,5 @@
-# Argo CD (ADR-0004, ADR-0005) on the system nodes, and the root Application that installs the application from
-# deploy/argocd on main (#106).
+# Argo CD (ADR-0004, ADR-0005) on the system nodes, and the root Applications that install the application from
+# deploy/argocd (#106) and the observability stack from deploy/observability/argocd (#243), both on main.
 #
 # - Git is the only way in: auto-sync with prune and self-heal, the local admin off, exec off, and Identity Center
 #   groups mapped to read-only, so nobody changes an Application's source, revision, parameters or sync by hand.
@@ -226,8 +226,40 @@ resource "helm_release" "argocd_root" {
           retry     = { limit = 10, backoff = { duration = "30s", factor = 2, maxDuration = "10m" } }
         }
       }
+      # The observability stack's project and Applications (ADR-0009, #243), apart from the application's so each
+      # project holds only its own namespaces and kinds. The cluster's values file comes along for its pilotLight: a
+      # pilot light runs no stack, and the fencing commit that ends it starts the stack.
+      observability = {
+        namespace = "argocd"
+        project   = "bootstrap"
+        source = {
+          repoURL        = local.repository_url
+          targetRevision = "main"
+          path           = "deploy/observability/argocd"
+          helm = {
+            valueFiles = ["../../environments/${var.environment}/${var.region}/values.yaml"]
+            valuesObject = {
+              environment = var.environment
+              region      = var.region
+              cluster = {
+                registry  = local.registry
+                accountId = var.account_id
+              }
+            }
+          }
+        }
+        destination = { server = "https://kubernetes.default.svc", namespace = "argocd" }
+        syncPolicy = {
+          automated = { prune = true, selfHeal = true }
+          retry     = { limit = 10, backoff = { duration = "30s", factor = 2, maxDuration = "10m" } }
+        }
+      }
     }
   })]
 
-  depends_on = [helm_release.argocd]
+  # The observability Applications need the operator's CRDs, their namespaces and the storage class first.
+  depends_on = [
+    helm_release.argocd, helm_release.prometheus_operator, kubernetes_namespace_v1.observability,
+    kubernetes_storage_class_v1.observability, kubernetes_cluster_role_binding_v1.prometheus,
+  ]
 }

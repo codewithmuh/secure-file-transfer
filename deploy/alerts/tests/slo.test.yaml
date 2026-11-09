@@ -1,0 +1,159 @@
+# Unit tests of slo.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../slo.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # NFR-1: about 9 % of requests fail for over an hour, 90 times the 0.1 % budget: the fast burn pages, and the slow
+  # one opens a ticket too (Alertmanager inhibits the ticket while the page fires).
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="200", job="api"}'
+        values: '0+600x120'
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="500", job="api"}'
+        values: '0+60x120'
+    alert_rule_test:
+      - eval_time: 2m # the burn has started, but not yet for the alert's 2 minutes
+        alertname: ErrorBudgetBurn
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: ErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: availability
+            exp_annotations:
+              summary: The availability objective is burning its error budget fast enough to empty it within days.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+          - exp_labels:
+              severity: ticket
+              slo: availability
+            exp_annotations:
+              summary: The availability objective is burning its error budget faster than 28 days allow.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+
+  # NFR-1: 0.05 % of requests fail, inside the budget: nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="200", job="api"}'
+        values: '0+2000x200'
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="503", job="api"}'
+        values: '0+1x200'
+    alert_rule_test:
+      - eval_time: 190m
+        alertname: ErrorBudgetBurn
+        exp_alerts: []
+
+  # NFR-2: half the API calls take over 300 ms but all finish within 1 s: p95's budget burns (6 times over 6 h and
+  # 30 m), p99's doesn't. The download stream is slow on every request and doesn't count.
+  - interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{method="GET", route="/v1/transfers", le="0.3"}'
+        values: '0+50x120'
+      - series: 'http_request_duration_seconds_bucket{method="GET", route="/v1/transfers", le="1.0"}'
+        values: '0+100x120'
+      - series: 'http_request_duration_seconds_count{method="GET", route="/v1/transfers"}'
+        values: '0+100x120'
+      - series: 'http_request_duration_seconds_bucket{method="GET", route="/session/downloads/{grant_id}/content", le="0.3"}'
+        values: '0x120'
+      - series: 'http_request_duration_seconds_bucket{method="GET", route="/session/downloads/{grant_id}/content", le="1.0"}'
+        values: '0x120'
+      - series: 'http_request_duration_seconds_count{method="GET", route="/session/downloads/{grant_id}/content"}'
+        values: '0+500x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: ErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: latency-p95
+            exp_annotations:
+              summary: The latency-p95 objective is burning its error budget fast enough to empty it within days.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+          - exp_labels:
+              severity: ticket
+              slo: latency-p95
+            exp_annotations:
+              summary: The latency-p95 objective is burning its error budget faster than 28 days allow.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+
+  # NFR-5: three slow small transfers in a quiet hour are below the 10 events an alert needs; nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'time_to_shareable_seconds_bucket{kind="transfer", size_class="small", le="120.0"}'
+        values: '0x120'
+      - series: 'time_to_shareable_seconds_count{kind="transfer", size_class="small"}'
+        values: '0x20 1x20 2x20 3x60'
+    alert_rule_test:
+      - eval_time: 110m
+        alertname: ErrorBudgetBurn
+        exp_alerts: []
+
+  # NFR-5 and NFR-23: most small files take over 2 minutes to become shareable, and over 60 s to scan, steadily:
+  # both objectives page. Large files are fast, so theirs stay quiet.
+  - interval: 1m
+    input_series:
+      - series: 'time_to_shareable_seconds_bucket{kind="transfer", size_class="small", le="120.0"}'
+        values: '0+1x120'
+      - series: 'time_to_shareable_seconds_count{kind="transfer", size_class="small"}'
+        values: '0+4x120'
+      - series: 'time_to_shareable_seconds_bucket{kind="request_file", size_class="large", le="900.0"}'
+        values: '0+1x120'
+      - series: 'time_to_shareable_seconds_count{kind="request_file", size_class="large"}'
+        values: '0+1x120'
+      - series: 'scan_pass_duration_seconds_bucket{pool="small", le="60.0"}'
+        values: '0+1x120'
+      - series: 'scan_pass_duration_seconds_bucket{pool="small", le="180.0"}'
+        values: '0+4x120'
+      - series: 'scan_pass_duration_seconds_count{pool="small"}'
+        values: '0+4x120'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: ErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              slo: time-to-shareable-small
+            exp_annotations:
+              summary: The time-to-shareable-small objective is burning its error budget fast enough to empty it within days.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+          - exp_labels:
+              severity: page
+              slo: scan-pass-small-p95
+            exp_annotations:
+              summary: The scan-pass-small-p95 objective is burning its error budget fast enough to empty it within days.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+          - exp_labels:
+              severity: ticket
+              slo: time-to-shareable-small
+            exp_annotations:
+              summary: The time-to-shareable-small objective is burning its error budget faster than 28 days allow.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+          - exp_labels:
+              severity: ticket
+              slo: scan-pass-small-p95
+            exp_annotations:
+              summary: The scan-pass-small-p95 objective is burning its error budget faster than 28 days allow.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+
+  # NFR-1, drills: errors during a drill (sft_drill_active = 1) are left out of the 28-day figure; outside it, none.
+  - interval: 1m
+    input_series:
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="200", job="api"}'
+        values: '0+600x240'
+      - series: 'http_requests_total{method="GET", route="/v1/transfers", status="500", job="api"}'
+        values: '0+60x60 3600x180'
+      - series: 'sft_drill_active{drill="regional-failover", job="drill"}'
+        values: '1x75'
+    promql_expr_test:
+      - expr: slo:sli_error:ratio_28d{slo="availability"}
+        eval_time: 240m
+        exp_samples:
+          - labels: 'slo:sli_error:ratio_28d{slo="availability"}'
+            value: 0
+      - expr: slo:error_budget_remaining:ratio_28d{slo="availability"}
+        eval_time: 240m
+        exp_samples:
+          - labels: 'slo:error_budget_remaining:ratio_28d{slo="availability"}'
+            value: 1

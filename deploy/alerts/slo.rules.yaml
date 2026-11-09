@@ -1,0 +1,1013 @@
+# The service level objectives' recording rules and their multi-window burn-rate alerts (NFR-1, NFR-2, NFR-5,
+# NFR-23; #245), in Prometheus rule format, tested by deploy/alerts/tests/slo.test.yaml. docs/operations/slos.md
+# explains each objective, its indicator and its error budget; docs/runbooks/slo-burn.md is the runbook.
+#
+# Generated shape, written out in full so a reviewer reads exactly what Prometheus runs. For every objective (label
+# `slo`) and window (5m to 3d):
+# - slo:sli_error:ratio_rate<w>, the share of bad events in the window: errors, slow requests, slow files;
+# - slo:sli_events:rate<w>, the events per second, so an alert needs enough of them to mean something;
+# - slo:error_budget, the share of bad events the objective allows over its 28 days.
+#
+# Burn rate is the bad share divided by the budget: 1 spends the budget in exactly 28 days. The alerts follow the
+# multi-window, multi-burn-rate pattern of the Google SRE workbook (chapter 5), at 28 days:
+# - page:   14.4 over 1 h and 5 m (2 % of the budget in an hour), or 6 over 6 h and 30 m (5 % in six hours);
+# - ticket: 3 over 1 d and 2 h (10 % in a day), or 1 over 3 d and 6 h (10 % in three days).
+# The short window makes an alert stop soon after the burn stops. Each also needs 10 events in the long window, so
+# one slow file in a quiet hour of staging doesn't page.
+#
+# NFR-10's recovery point is watched by CloudWatch alarms on replication instead (database-rpo-lag and the files
+# buckets' replication alarms, infra/modules/alarms), where the signals live.
+#
+# Drill windows (NFR-1: "logged and reported separately, not counted"): a drill pushes sft_drill_active{drill} = 1 to
+# the Pushgateway when it starts and deletes it when it ends (ops/, the DR track). While it is 1, Alertmanager
+# inhibits these alerts (alertmanager.yaml), and the 28-day report rules at the end of this file leave the window out.
+#
+# time_to_shareable_seconds and scan_pass_duration_seconds come from the API and the scan worker (#242). Their buckets
+# must include each objective's threshold (120 and 900 s; 60, 180 and 600 s), as the `le` matchers below assume.
+groups:
+  - name: slo-budgets
+    rules:
+      # NFR-1: 99.9 % of valid requests to the API and the download path succeed. A 5xx is a failure; a timeout
+      # reaches the client as the load balancer's 5xx, which the api-lb-5xx alarm watches (infra/modules/alarms).
+      - record: slo:error_budget
+        expr: vector(0.001)
+        labels:
+          slo: availability
+      # NFR-2: p95 ≤ 300 ms. Routes that move file bytes are left out (the download stream and the audit export);
+      # uploads go straight to S3 and never pass here.
+      - record: slo:error_budget
+        expr: vector(0.05)
+        labels:
+          slo: latency-p95
+      # NFR-2: p99 ≤ 1 s, on the same routes.
+      - record: slo:error_budget
+        expr: vector(0.01)
+        labels:
+          slo: latency-p99
+      # NFR-5: p95 ≤ 2 minutes from the last upload completing to shareable, for transfers whose largest file is
+      # up to 100 MB, and for each such file of an upload request.
+      - record: slo:error_budget
+        expr: vector(0.05)
+        labels:
+          slo: time-to-shareable-small
+      # NFR-5: p95 ≤ 15 minutes for anything larger, up to the 20 GB limit.
+      - record: slo:error_budget
+        expr: vector(0.05)
+        labels:
+          slo: time-to-shareable-large
+      # NFR-23: from a file's scan starting to its malware and inspection results recorded, p95 ≤ 60 s for files up
+      # to 100 MB (the small pool, ADR-0019).
+      - record: slo:error_budget
+        expr: vector(0.05)
+        labels:
+          slo: scan-pass-small-p95
+      # NFR-23: p99 ≤ 3 minutes for the same files.
+      - record: slo:error_budget
+        expr: vector(0.01)
+        labels:
+          slo: scan-pass-small-p99
+      # NFR-23: p95 ≤ 10 minutes for files up to 2,000,000,000 bytes (the large pool's ClamAV files; GuardDuty's
+      # files over 2 GB are outside NFR-23 and inside NFR-5's 15 minutes).
+      - record: slo:error_budget
+        expr: vector(0.05)
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-5m
+    rules:
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          sum(rate(http_requests_total[5m]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(http_requests_total[5m]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[5m]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[5m]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[5m]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[5m]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[5m]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[5m]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[5m]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate5m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[5m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[5m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[5m]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate5m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[5m]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-30m
+    rules:
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[30m]))
+            /
+          sum(rate(http_requests_total[30m]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(http_requests_total[30m]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[30m]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[30m]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[30m]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[30m]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[30m]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[30m]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[30m]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[30m]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[30m]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate30m
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[30m]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[30m]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[30m]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate30m
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[30m]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-1h
+    rules:
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1h]))
+            /
+          sum(rate(http_requests_total[1h]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(http_requests_total[1h]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[1h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[1h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[1h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[1h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[1h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[1h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[1h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[1h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate1h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[1h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[1h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[1h]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate1h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[1h]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-2h
+    rules:
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[2h]))
+            /
+          sum(rate(http_requests_total[2h]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(http_requests_total[2h]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[2h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[2h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[2h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[2h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[2h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[2h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[2h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[2h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[2h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate2h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[2h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[2h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[2h]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate2h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[2h]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-6h
+    rules:
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[6h]))
+            /
+          sum(rate(http_requests_total[6h]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(http_requests_total[6h]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[6h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[6h]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[6h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[6h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[6h]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[6h]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[6h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[6h]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[6h]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate6h
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[6h]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[6h]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[6h]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate6h
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[6h]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-1d
+    rules:
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[1d]))
+            /
+          sum(rate(http_requests_total[1d]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(http_requests_total[1d]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[1d]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[1d]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[1d]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[1d]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[1d]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[1d]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[1d]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[1d]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[1d]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate1d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[1d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[1d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[1d]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate1d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[1d]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-sli-3d
+    rules:
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[3d]))
+            /
+          sum(rate(http_requests_total[3d]))
+        labels:
+          slo: availability
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(http_requests_total[3d]))
+        labels:
+          slo: availability
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[3d]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+        labels:
+          slo: latency-p95
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+              - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[3d]))
+        labels:
+          slo: latency-p99
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="small"}[3d]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[3d]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="small"}[3d]))
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(time_to_shareable_seconds_count{size_class="large"}[3d]))
+              - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[3d]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(time_to_shareable_seconds_count{size_class="large"}[3d]))
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="small"}[3d]))
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_error:ratio_rate3d
+        expr: |
+          (
+            sum(rate(scan_pass_duration_seconds_count{pool="large"}[3d]))
+              - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[3d]))
+          )
+            /
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[3d]))
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events:rate3d
+        expr: sum(rate(scan_pass_duration_seconds_count{pool="large"}[3d]))
+        labels:
+          slo: scan-pass-large-p95
+
+  - name: slo-burn
+    rules:
+      # Fast or steady burn: at this pace the budget is gone in 2 days (14.4) or 5 days (6).
+      - alert: ErrorBudgetBurn
+        expr: |
+          (
+            slo:sli_error:ratio_rate1h > on(slo) group_left() (14.4 * slo:error_budget)
+            and slo:sli_error:ratio_rate5m > on(slo) group_left() (14.4 * slo:error_budget)
+            or
+            slo:sli_error:ratio_rate6h > on(slo) group_left() (6 * slo:error_budget)
+            and slo:sli_error:ratio_rate30m > on(slo) group_left() (6 * slo:error_budget)
+          )
+          and on(slo) slo:sli_events:rate6h * 21600 >= 10
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: The {{ $labels.slo }} objective is burning its error budget fast enough to empty it within days.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+
+      # Slow burn: at this pace the budget is gone before the 28 days are (3 or 1).
+      - alert: ErrorBudgetBurn
+        expr: |
+          (
+            slo:sli_error:ratio_rate1d > on(slo) group_left() (3 * slo:error_budget)
+            and slo:sli_error:ratio_rate2h > on(slo) group_left() (3 * slo:error_budget)
+            or
+            slo:sli_error:ratio_rate3d > on(slo) group_left() (1 * slo:error_budget)
+            and slo:sli_error:ratio_rate6h > on(slo) group_left() (1 * slo:error_budget)
+          )
+          and on(slo) slo:sli_events:rate3d * 259200 >= 10
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The {{ $labels.slo }} objective is burning its error budget faster than 28 days allow.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/slo-burn.md
+
+  # The 28-day report (NFR-1's rolling window, Grafana's SLO dashboard): bad and all events every 5 minutes outside
+  # drill windows, then their sums over 28 days. Evaluated every 5 minutes, which is enough for a 28-day figure.
+  - name: slo-report
+    interval: 5m
+    rules:
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: availability
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(http_requests_total[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: availability
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+            - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"0\\.3"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: latency-p95
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: latency-p95
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+            - sum(rate(http_request_duration_seconds_bucket{route!~".*/content|/v1/audit/exports", le=~"1(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: latency-p99
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(http_request_duration_seconds_count{route!~".*/content|/v1/audit/exports"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: latency-p99
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[5m]))
+            - sum(rate(time_to_shareable_seconds_bucket{size_class="small", le=~"120(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(time_to_shareable_seconds_count{size_class="small"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: time-to-shareable-small
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[5m]))
+            - sum(rate(time_to_shareable_seconds_bucket{size_class="large", le=~"900(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(time_to_shareable_seconds_count{size_class="large"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: time-to-shareable-large
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+            - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"60(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-small-p95
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+            - sum(rate(scan_pass_duration_seconds_bucket{pool="small", le=~"180(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="small"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-small-p99
+      - record: slo:sli_bad_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[5m]))
+            - sum(rate(scan_pass_duration_seconds_bucket{pool="large", le=~"600(\\.0)?"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_events_outside_drills:rate5m
+        expr: |
+          sum(rate(scan_pass_duration_seconds_count{pool="large"}[5m]))
+          unless on() (max(sft_drill_active) > 0)
+        labels:
+          slo: scan-pass-large-p95
+      - record: slo:sli_error:ratio_28d
+        expr: |
+          sum by (slo) (sum_over_time(slo:sli_bad_outside_drills:rate5m[28d]))
+            /
+          sum by (slo) (sum_over_time(slo:sli_events_outside_drills:rate5m[28d]))
+      # 1 is a full budget, 0 an empty one, below 0 an objective missed over the 28 days.
+      - record: slo:error_budget_remaining:ratio_28d
+        expr: 1 - slo:sli_error:ratio_28d / on(slo) slo:error_budget

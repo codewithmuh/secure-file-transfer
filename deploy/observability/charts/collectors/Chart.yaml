@@ -1,0 +1,8 @@
+apiVersion: v2
+name: sft-collectors
+description: >-
+  The OpenTelemetry collectors of one cluster (ADR-0009): an agent on every node, which takes the pods' spans over
+  OTLP/HTTP and tails their log files into Loki, and the gateway, which keeps every error and slow trace and 10 % of
+  the rest (tail sampling) and sends them to Tempo.
+type: application
+version: 0.1.0

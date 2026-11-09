@@ -149,15 +149,20 @@ smoke: ## One round trip to every local stack service, and sft_api's row-level s
 
 # The local seed (#182): the local-keycloak connection, a tenant, an admin and a member who sign in
 # through the stack's Keycloak. Idempotent; refuses anything but the local stack.
-.PHONY: seed jobs field-keys e2e
+.PHONY: seed jobs audit-archive field-keys e2e
 seed: ## Seed the local stack with a tenant, an admin and a member, and print how to sign in (after make up)
 	uv run --script local/seed.py
 
-# The lifecycle jobs (#181), one-shot as M4's CronJobs: JOB=expiry|deletion|reconciliation|storage-audit|cleanup.
+# The lifecycle jobs (#181, #224), one-shot as the chart's CronJobs:
+# JOB=expiry|deletion|reconciliation|storage-audit|cleanup|purge|audit-partitions.
 # --build: `make up` builds only the services it starts, so the jobs' image would otherwise be stale.
 JOB ?= reconciliation
 jobs: ## Run one lifecycle job against the local stack: make jobs JOB=deletion (after make up)
 	docker compose --profile jobs run --build --rm --no-deps jobs $(JOB)
+
+# The audit archive job (#183), one pass as the every-minute CronJob: both archive buckets of the S3 stand-in.
+audit-archive: ## Copy committed audit events to the local archive buckets, once (after make up)
+	docker compose --profile jobs run --build --rm --no-deps audit-archive
 
 # The field key job (#236), as the API's workload: STEP=backfill|rotate|rewrap|purge.
 STEP ?= backfill
@@ -166,8 +171,8 @@ field-keys: ## Run one field key job step against the local stack: make field-ke
 
 # The M2 journey test (#182) against `make up` and `make seed`: one test, steps 1 to 9 of the M2 exit
 # criterion, through the public API, Mailpit's API, S3's API, the job commands and the clock hook.
-e2e: ## The M2 end-to-end journey test against the local stack (after make up and make seed)
-	cd $(PY) && SFT_E2E=1 uv run pytest -m e2e --no-cov -p no:cacheprovider tests/test_journey.py
+e2e: ## The end-to-end journey test and the synthetic probe against the local stack (after make up and make seed)
+	cd $(PY) && SFT_E2E=1 uv run pytest -m e2e --no-cov -p no:cacheprovider tests/test_journey.py tests/test_probe_local.py
 
 logs: ## Follow logs of all services
 	docker compose logs --follow
@@ -188,6 +193,6 @@ infra-check: ## Check infra/: conventions, fmt, validate, tflint, Trivy and terr
 .PHONY: deploy-check
 deploy-check: ## Check deploy/: helm lint, template and kubeconform per cluster, the runtime contract, the admission policies, the alert rules (same as CI)
 	deploy/check.sh
-	uv run --project $(PY) --locked pytest -p no:cacheprovider deploy/tests
+	uv run --project $(PY) --locked pytest -p no:cacheprovider deploy/tests deploy/observability/tests
 	deploy/policies.sh
 	deploy/alerts/test.sh

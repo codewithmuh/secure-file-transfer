@@ -1,0 +1,124 @@
+# The abuse alerts of abuse and rate limits 8.2 (NFR-14; #245) that the service's own metrics can show, tested by
+# deploy/alerts/tests/abuse.test.yaml. The table in docs/operations/slos.md ("Alert coverage") lists the rest of 8.2:
+# the ones CloudWatch watches (SesReputation, Cognito sign-in triggers) and the ones still waiting for a metric.
+#
+# The series: rate_limit_store_errors_total, rate_limit_store_latency_seconds and rate_limit_fallback_active from every
+# pod that counts (sft.data.counters); link_lookups_total{result}, verification_attempts_total{result},
+# verification_codes_total{result}, recipient_lockouts_total and uploader_lockouts_total from the API (sft.service.links);
+# email_caps_hit_total{cap} from the notification worker; download_streams_active from each API pod; and
+# rate_limit_rejections_total{group,key_type}. None carries a tenant, an address or a link: per-tenant views come from
+# the logs (abuse 8.1).
+groups:
+  - name: abuse
+    rules:
+      # Abuse 4.5, architecture 6: the counter store fails more than 1 % of its calls for 2 minutes. Link steps and
+      # sign-in answer 503 and the pre-authentication trigger denies sign-in, so it pages.
+      - alert: RateLimitStoreUnavailable
+        expr: |
+          sum(rate(rate_limit_store_errors_total[2m]))
+            /
+          clamp_min(sum(rate(rate_limit_store_latency_seconds_count[2m])), 1e-9)
+          > 0.01
+        for: 2m
+        labels:
+          severity: page
+          condition: errors
+        annotations:
+          summary: The rate-limit store fails more than 1 % of calls; link steps and sign-in answer 503 (NFR-14).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/rate-limit-store-unavailable.md
+
+      # Any pod on its per-pod fallback limiter (each limit divided by 3) for 2 minutes.
+      - alert: RateLimitStoreUnavailable
+        expr: max(rate_limit_fallback_active) == 1
+        for: 2m
+        labels:
+          severity: page
+          condition: fallback
+        annotations:
+          summary: Pods are on the per-pod fallback limiter because the rate-limit store can't be reached (NFR-14).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/rate-limit-store-unavailable.md
+
+      # Abuse 8.2: more than 200 lookups of links that don't exist a minute, for 5 minutes. Someone is guessing link
+      # tokens (128 bits, NFR-14) or replaying a list; the per-IP limit and WAF slow them.
+      - alert: LinkProbing
+        expr: sum(rate(link_lookups_total{result="not_found"}[5m])) * 60 > 200
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: More than 200 lookups a minute are for links that don't exist; someone may be probing for links.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/link-enumeration.md
+
+      # Abuse 8.2: wrong verification codes at more than 5 times their 7-day rate, and at least 20 in 15 minutes, so a
+      # quiet week doesn't make a handful of typos page.
+      - alert: VerificationGuessing
+        expr: |
+          sum(rate(verification_attempts_total{result="mismatch"}[15m]))
+            > 5 * sum(rate(verification_attempts_total{result="mismatch"}[7d]))
+          and
+          sum(increase(verification_attempts_total{result="mismatch"}[15m])) >= 20
+        for: 15m
+        labels:
+          severity: page
+          condition: mismatches
+        annotations:
+          summary: Wrong verification codes are arriving at over 5 times their usual rate; someone may be guessing codes.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/verification-abuse.md
+
+      # More than 10 recipients or uploaders locked out within an hour (20 failed attempts each, NFR-14).
+      - alert: VerificationGuessing
+        expr: sum(increase({__name__=~"recipient_lockouts_total|uploader_lockouts_total"}[1h])) > 10
+        labels:
+          severity: page
+          condition: lockouts
+        annotations:
+          summary: More than 10 recipients or uploaders were locked out within an hour (NFR-14).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/verification-abuse.md
+
+      # Abuse 8.2: per-address link-email caps hit more than 20 times in an hour (no metric carries an address, so this
+      # counts hits rather than distinct addresses), or more than 100 code requests refused by their limits. Someone
+      # is using the service to flood mailboxes.
+      - alert: EmailBombing
+        expr: |
+          sum(increase(email_caps_hit_total{cap="address_link_emails_all"}[1h])) > 20
+          or
+          sum(increase(verification_codes_total{result="rate_limited"}[1h])) > 100
+        labels:
+          severity: ticket
+        annotations:
+          summary: Per-address email caps or code request limits are hit far more than usual; someone may be flooding mailboxes.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-abuse.md
+
+      # Abuse 5.7, 8.2: download streams above 70 % of what the pods serve for 10 minutes. Each pod serves
+      # DOWNLOAD_STREAMS_PER_POD streams (100, the setting's default, which the chart keeps) and answers the next with
+      # 503. Change the 100 here with the setting.
+      - alert: DownloadCapacity
+        expr: sum(download_streams_active) > 0.7 * 100 * count(download_streams_active)
+        for: 10m
+        labels:
+          severity: ticket
+          condition: streams
+        annotations:
+          summary: Download streams are above 70 % of what the API pods can serve; scale the API out.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/download-capacity.md
+
+      # Any download refused because every stream slot of its pod was taken.
+      - alert: DownloadCapacity
+        expr: sum(increase(http_requests_total{route=~".*/content", status="503"}[10m])) > 0
+        labels:
+          severity: ticket
+          condition: refused
+        annotations:
+          summary: Downloads were refused with 503 because the API pods' stream slots were full.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/download-capacity.md
+
+      # Abuse 8.2 (ApiKeyMisuse, its second half): requests on API keys refused by their limits for 10 minutes on end.
+      # The first half, bearer authentication failures, waits for a metric (docs/operations/slos.md).
+      - alert: ApiKeyMisuse
+        expr: sum(rate(rate_limit_rejections_total{key_type="api_key"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: API key requests have been held at their rate limits for 10 minutes; a key may be misused or leaked.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md

@@ -1,0 +1,26 @@
+# Unit tests of operator.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../operator.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # FR-34: one operator change without its platform record pages at once, never inhibited (security).
+  - interval: 1m
+    input_series:
+      - series: 'sft_operator_platform_audit_failures_total{action="tenant.created", job="operator-api"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: OperatorAuditFailing
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: OperatorAuditFailing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+              action: tenant.created
+            exp_annotations:
+              summary: An operator's tenant.created committed without its platform audit event (FR-34).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/operator-audit.md

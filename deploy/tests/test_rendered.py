@@ -7,6 +7,7 @@ the repository root: `uv run --project services/api --locked pytest deploy/tests
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -18,6 +19,7 @@ import pytest
 import yaml
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
+    ArchiveJobSettings,
     InspectorSettings,
     JobSettings,
     KeyRotationSettings,
@@ -28,6 +30,7 @@ from sft.core.settings import (
     ScanSettings,
     Settings,
 )
+from sft.probe.settings import ProbeSettings
 
 ROOT = Path(__file__).resolve().parents[2]
 CLUSTERS = [
@@ -47,7 +50,13 @@ INTERNAL_PORT = 8001
 # Workloads that hold no AWS identity and never touch the database (ADR-0019, ADR-0022).
 NO_IDENTITY = {"clamd", "dlp-inspector", "signature-mirror"}
 # Only these reach the internet, through their own egress proxy listener (ADR-0021).
-PROXIED = {"api": 3128, "notifier": 3129, "invite-backlog": 3129, "key-rotation": 3133}
+PROXIED = {
+    "api": 3128,
+    "notifier": 3129,
+    "invite-backlog": 3129,
+    "key-rotation": 3133,
+    "synthetic-probe": 3134,
+}
 # The DLP inspector speaks its own framed protocol, one file per connection, on a port of its own (ADR-0022); its
 # probes are on the internal port like everyone's (#184).
 OWN_PORT = {"dlp-inspector": "inspector"}
@@ -68,6 +77,10 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.reconciliation": JobSettings,
     "sft.workers.storage_audit": JobSettings,
     "sft.workers.cleanup": JobSettings,
+    "sft.workers.purge": JobSettings,  # #224
+    "sft.workers.audit_partitions": JobSettings,
+    "sft.workers.audit_archive": ArchiveJobSettings,  # #183
+    "sft.probe": ProbeSettings,  # #248, rendered on here (the fixture)
 }
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 
@@ -79,8 +92,13 @@ def rendered(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> dict[tuple[str, str, str], list[Manifest]]:
     out = tmp_path_factory.mktemp("rendered")
+    # The synthetic probe is off by default until each environment's AWS side exists (#248): rendered on here, so its
+    # pod, policy and identity are checked like every other workload's before a values file turns it on.
     subprocess.run(
-        [str(ROOT / "deploy" / "render.sh"), str(out)], check=True, capture_output=True
+        [str(ROOT / "deploy" / "render.sh"), str(out)],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "SFT_RENDER_SET": "probe.enabled=true"},
     )
     result = {}
     for env, region in CLUSTERS:
@@ -363,9 +381,12 @@ def test_identities_and_settings(
                 if name in PROXIED:
                     assert settings["HTTPS_PROXY"].endswith(f":{PROXIED[name]}")
                     assert "cognito" not in settings["NO_PROXY"]
-                    assert f"sqs.{region}.amazonaws.com" in settings["NO_PROXY"].split(
-                        ","
-                    )
+                    # The probe calls no AWS service through an interface endpoint: S3 by its gateway, CloudWatch
+                    # through its listener, everything else through the public API (#248).
+                    if name != "synthetic-probe":
+                        assert f"sqs.{region}.amazonaws.com" in settings[
+                            "NO_PROXY"
+                        ].split(",")
                 else:
                     assert "HTTPS_PROXY" not in settings, (env, region, name)
 
@@ -603,7 +624,8 @@ def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_
     rendered: dict[tuple[str, str, str], list[Manifest]],
 ) -> None:
     """The API and the notification worker read their keyrings from Secrets Manager themselves, every 5 minutes, so a
-    rotation needs no restart (encryption 6.4, #184); only the API's user pool client comes through External Secrets."""
+    rotation needs no restart (encryption 6.4, #184); only the API's user pool client comes through External Secrets,
+    and the synthetic tenant's API key for the probe (#248)."""
     for env, region in CLUSTERS:
         objects = rendered[(env, region, "application")]
         externals = {
@@ -611,7 +633,14 @@ def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_
             for o in objects
             if o["kind"] == "ExternalSecret"
         }
-        assert set(externals) == {"api-secrets"}
+        assert set(externals) == {"api-secrets", "probe-secrets"}
+        assert externals["probe-secrets"]["secretStoreRef"] == {
+            "kind": "ClusterSecretStore",
+            "name": "application-secrets",
+        }
+        assert [d["remoteRef"] for d in externals["probe-secrets"]["data"]] == [
+            {"key": f"sft/{env}/app/probe-api-key", "property": "api_key"}
+        ]
         spec = externals["api-secrets"]
         assert spec["secretStoreRef"] == {
             "kind": "ClusterSecretStore",

@@ -1,0 +1,80 @@
+{{- $a := .Values.agent }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-agent
+  namespace: {{ $a.namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otel-agent
+  namespace: {{ $a.namespace }}
+  labels: { app.kubernetes.io/name: otel-agent, app.kubernetes.io/part-of: sft-observability }
+spec:
+  selector:
+    matchLabels: { app.kubernetes.io/name: otel-agent }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: otel-agent, app.kubernetes.io/part-of: sft-observability }
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/agent-config.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: otel-agent
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        supplementalGroups: [0] # reads the runtime's 0640 root-group log files, nothing else
+        seccompProfile: { type: RuntimeDefault }
+      tolerations:
+        {{- toYaml $a.tolerations | nindent 8 }}
+      containers:
+        - name: otel-agent
+          image: {{ include "collectors.image" . }}
+          args: [--config=/conf/config.yaml]
+          env:
+            - { name: GOMEMLIMIT, value: {{ $a.goMemLimit | quote }} } # under the memory limit, so the GC works first
+          ports:
+            - { name: otlp-http, containerPort: 4318, protocol: TCP }
+            - { name: metrics, containerPort: 8888, protocol: TCP }
+            - { name: health, containerPort: 13133, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /, port: health }
+          readinessProbe:
+            httpGet: { path: /, port: health }
+          resources:
+            {{- toYaml $a.resources | nindent 12 }}
+          securityContext:
+            {{- include "collectors.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /conf, readOnly: true }
+            - { name: pod-logs, mountPath: /var/log/pods, readOnly: true }
+            - { name: offsets, mountPath: /var/lib/otelcol }
+      volumes:
+        - name: config
+          configMap: { name: otel-agent }
+        - name: pod-logs
+          hostPath: { path: /var/log/pods, type: Directory }
+        - name: offsets
+          emptyDir: { sizeLimit: 64Mi }
+---
+# The node's own agent only (internalTrafficPolicy: Local), so spans never cross nodes before the gateway.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-agent
+  namespace: {{ $a.namespace }}
+  labels: { app.kubernetes.io/name: otel-agent, app.kubernetes.io/part-of: sft-observability }
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector: { app.kubernetes.io/name: otel-agent }
+  ports:
+    - { name: otlp-http, port: 4318, targetPort: otlp-http, protocol: TCP }

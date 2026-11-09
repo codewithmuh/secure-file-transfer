@@ -45,6 +45,13 @@ locals {
       chart      = "aws-load-balancer-controller"
       version    = "3.6.2"
     }
+    # The Prometheus Operator, its CRDs and kube-state-metrics only (observability.tf); the rest of the stack is
+    # deploy/observability, from Git through Argo CD (#243).
+    kube_prometheus_stack = {
+      repository = "https://prometheus-community.github.io/helm-charts"
+      chart      = "kube-prometheus-stack"
+      version    = "92.17.0" # Prometheus Operator v0.94.2
+    }
   }
 
   # upstream: where the mirror workflow copies from. repository: the path under our registry.
@@ -132,6 +139,75 @@ locals {
       repository = "mirror/envoyproxy/envoy"
       tag        = "distroless-v1.40.2"
       digest     = "sha256:09ca6f2140a61ad8df11779a4a30d52b48433d444466328494f9188c9c35eded"
+    }
+
+    # The observability stack (ADR-0009, #243). The operator and kube-state-metrics run from this module
+    # (observability.tf); the rest from deploy/observability, whose charts name the same digests (its tests check).
+    prometheus_operator = {
+      upstream   = "quay.io/prometheus-operator/prometheus-operator"
+      repository = "mirror/prometheus-operator/prometheus-operator"
+      tag        = "v0.94.2"
+      digest     = "sha256:c7edf0379b7271ef1705dce258d2bb73820e299cc95559369e9f6fc3321639ec"
+    }
+    prometheus_config_reloader = {
+      upstream   = "quay.io/prometheus-operator/prometheus-config-reloader"
+      repository = "mirror/prometheus-operator/prometheus-config-reloader"
+      tag        = "v0.94.2"
+      digest     = "sha256:a1897c67478bc23434534e91ad3855280771196b1daf17144db9dbcb655bef71"
+    }
+    kube_state_metrics = {
+      upstream   = "registry.k8s.io/kube-state-metrics/kube-state-metrics"
+      repository = "mirror/kube-state-metrics/kube-state-metrics"
+      tag        = "v2.20.0"
+      digest     = "sha256:42cfe3723a5f058171c627537fb57a3ea0f26e4380fa18555a95cb1a1b4cfc5b"
+    }
+    prometheus = {
+      upstream   = "quay.io/prometheus/prometheus"
+      repository = "mirror/prometheus/prometheus"
+      tag        = "v3.15.1-distroless"
+      digest     = "sha256:451a845bae1d51622b41af1780eb2ad911bbb79a9855bc8e9bb67fabbc03f934"
+    }
+    alertmanager = {
+      upstream   = "quay.io/prometheus/alertmanager"
+      repository = "mirror/prometheus/alertmanager"
+      tag        = "v0.34.2"
+      digest     = "sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b"
+    }
+    pushgateway = {
+      upstream   = "quay.io/prometheus/pushgateway"
+      repository = "mirror/prometheus/pushgateway"
+      tag        = "v1.11.4"
+      digest     = "sha256:91a56b89b97dd8a5e1e4fa8b5bbbd86dd57a87a2a3cee3a3ce3368b40ef158ef"
+    }
+    cloudwatch_exporter = {
+      upstream   = "docker.io/prom/cloudwatch-exporter"
+      repository = "mirror/prom/cloudwatch-exporter"
+      tag        = "v0.16.0"
+      digest     = "sha256:71c2e988af061257ecec8dadf7ff1c98831bc82842e97a893b3eb7ede383b59f"
+    }
+    grafana = {
+      upstream   = "docker.io/grafana/grafana"
+      repository = "mirror/grafana/grafana"
+      tag        = "13.3.0-distroless"
+      digest     = "sha256:540b8afb775bf34aefce417e4329039daa5d44b6f2fbda6881397b1b247ca7df"
+    }
+    loki = {
+      upstream   = "docker.io/grafana/loki"
+      repository = "mirror/grafana/loki"
+      tag        = "3.6.16"
+      digest     = "sha256:79f3fbf2a3eca97dd735e2aa0871a2fc15365a81c68dea67f639b092c301f454"
+    }
+    tempo = {
+      upstream   = "docker.io/grafana/tempo"
+      repository = "mirror/grafana/tempo"
+      tag        = "3.1.1"
+      digest     = "sha256:64e2fbd56d9c2b3412a4b430a58ea59e91a670b1e75f920a0c702213ad145044"
+    }
+    otel_collector = {
+      upstream   = "docker.io/otel/opentelemetry-collector-contrib"
+      repository = "mirror/otel/opentelemetry-collector-contrib"
+      tag        = "0.163.2"
+      digest     = "sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849"
     }
   }
 

@@ -1,0 +1,182 @@
+{{- if and (eq .Values.part "application") .Values.probe.enabled }}
+{{- /*
+The synthetic probe (NFR-1, NFR-4; #248; docs/runbooks/synthetic-probe.md): every 5 minutes, the whole send, verify and
+download journey through the public API, as the synthetic tenant's API key and as a recipient in the probe mailbox.
+
+- Its own service account, `synthetic-probe`, whose Pod Identity role (sft-<env>-synthetic-probe) may only put
+  `ProbeSuccess` in the `SecureFileTransfer/Probe` namespace and read and delete under `probe/` in this region's
+  mailbox bucket, which SES's receipt rule writes. It has no database login and no counter store user.
+- The API key comes from Secrets Manager through External Secrets, as the API's user pool client does: the Secret
+  `probe-secrets`, read as an environment variable, never a value in Git or in these values.
+- It reaches the API and the web app the way a customer does, from outside: through its own egress proxy listener,
+  whose allowlist is api.<serviceDomain>, app.<serviceDomain> and CloudWatch's monitoring endpoint (ADR-0021). S3 (part
+  uploads, the mailbox) goes straight to the gateway endpoint; the result to the Pushgateway in `monitoring`
+  (metricsPushgateway, the same one the scheduled jobs push to).
+- Suspended in the pilot light, like every CronJob: after a failover, Osaka's runs instead.
+
+Off by default (`probe.enabled`): each environment's values file turns it on once its AWS side exists (the Pod Identity
+role and association, the proxy listener, the secret and the mailbox; the runbook's setup list).
+*/}}
+{{- $p := .Values.probe }}
+{{- $gw := .Values.metricsPushgateway }}
+{{- $c := .Values.cluster }}
+{{- $prefix := include "sft.namePrefix" . }}
+{{- $ctx := dict "root" $ "component" "synthetic-probe" "serviceAccount" $p.serviceAccount }}
+{{- $proxy := .Values.network.egressProxy }}
+{{- $region := .Values.region }}
+{{- $noProxy := list "localhost" "127.0.0.1" "169.254.170.23" ".svc" ".cluster.local" (printf "s3.%s.amazonaws.com" $region) (printf ".s3.%s.amazonaws.com" $region) }}
+{{- $mailboxDomain := $p.mailboxDomain | default (printf "probe.%s" $c.serviceDomain) }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: synthetic-probe
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  schedule: {{ $p.schedule | quote }}
+  timeZone: Etc/UTC
+  suspend: {{ include "sft.cronSuspended" . }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # the next run, 5 minutes later, is the retry; the alerts count failed runs (NFR-1)
+      activeDeadlineSeconds: {{ $p.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sft.labels" $ctx | nindent 12 }}
+        spec:
+          {{- include "sft.podCommon" $ctx | nindent 10 }}
+          restartPolicy: Never
+          securityContext:
+            {{- include "sft.podSecurityContext" 10001 | nindent 12 }}
+          containers:
+            - name: synthetic-probe
+              image: {{ include "sft.appImage" . }}
+              imagePullPolicy: IfNotPresent
+              command: [python, -m, {{ $p.module }}]
+              env:
+                - name: LOG_LEVEL
+                  value: {{ .Values.logLevel | quote }}
+                - name: AWS_REGION
+                  value: {{ $region | quote }}
+                - name: ENVIRONMENT
+                  value: {{ .Values.environment | quote }}
+                - name: PROBE_API_URL
+                  value: {{ printf "https://api.%s" $c.serviceDomain | quote }}
+                - name: PROBE_WEB_ORIGIN
+                  value: {{ printf "https://app.%s" $c.serviceDomain | quote }}
+                - name: PROBE_MAILBOX
+                  value: "s3"
+                - name: PROBE_MAILBOX_DOMAIN
+                  value: {{ $mailboxDomain | quote }}
+                - name: PROBE_MAILBOX_BUCKET
+                  value: {{ printf "%s-probe-mailbox-%s" $prefix (toString $c.accountId) | quote }}
+                - name: PROBE_MAILBOX_PREFIX
+                  value: {{ $p.mailboxPrefix | quote }}
+                - name: PROBE_TIMEOUT_SECONDS
+                  value: {{ $p.timeoutSeconds | quote }}
+                - name: PROBE_CLOUDWATCH
+                  value: "true"
+                # The promotion gate reads ProbeSuccess for the digest it promotes (ADR-0005).
+                - name: PROBE_IMAGE_DIGEST
+                  value: {{ .Values.image.digest | quote }}
+                {{- with $gw.url }}
+                - name: METRICS_PUSHGATEWAY_URL
+                  value: {{ . | quote }}
+                {{- end }}
+                - name: HTTPS_PROXY
+                  value: {{ printf "http://%s:%v" $proxy.host $p.proxyPort | quote }}
+                - name: NO_PROXY
+                  value: {{ join "," $noProxy | quote }}
+                {{- include "sft.secretEnv" (dict "PROBE_API_KEY" "probe-secrets") | nindent 16 }}
+              resources:
+                {{- toYaml $p.resources | nindent 16 }}
+              securityContext:
+                {{- include "sft.containerSecurityContext" . | nindent 16 }}
+              volumeMounts:
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            {{- include "sft.tmpVolume" . | nindent 12 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $p.serviceAccount }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+automountServiceAccountToken: false
+---
+# The synthetic tenant's API key (encryption 6.4): one secret per environment, replicated to Osaka, which the
+# application store may read (infra/modules/eks-cluster). One sync wave early, so the Secret exists before a run.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: probe-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  refreshInterval: {{ .Values.secrets.refreshInterval }}
+  secretStoreRef: { kind: ClusterSecretStore, name: {{ .Values.secrets.store }} }
+  target:
+    name: probe-secrets
+    creationPolicy: Owner
+    deletionPolicy: Retain
+  data:
+    - secretKey: PROBE_API_KEY
+      remoteRef: { key: {{ printf "sft/%s/app/probe-api-key" .Values.environment }}, property: api_key }
+---
+# Default deny holds (templates/networkpolicies.yaml): DNS, the Pod Identity agent, S3 through the gateway endpoint, its
+# own proxy listener and the Pushgateway; nothing reaches the probe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: synthetic-probe
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sft.selectorLabels" $ctx | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.network.dns.namespace }} } }
+          podSelector: { matchLabels: {{ toJson .Values.network.dns.podLabels }} }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - to:
+        - ipBlock: { cidr: {{ .Values.network.podIdentityAgent }} }
+      ports:
+        - { port: 80, protocol: TCP }
+    - to:
+        - ipBlock: { cidr: 0.0.0.0/0, except: [{{ .Values.network.vpcCidr }}, 169.254.0.0/16] }
+      ports:
+        - { port: 443, protocol: TCP }
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $proxy.namespace }} } }
+          podSelector: { matchLabels: {{ toJson $proxy.podLabels }} }
+      ports:
+        - { port: {{ $p.proxyPort }}, protocol: TCP }
+    {{- if $gw.url }}
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $gw.namespace }} } }
+          podSelector: { matchLabels: {{ toJson $gw.podLabels }} }
+      ports:
+        - { port: {{ $gw.port }}, protocol: TCP }
+    {{- end }}
+{{- end }}

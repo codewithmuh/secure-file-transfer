@@ -1,0 +1,115 @@
+{{- $p := .Values.prometheus }}
+{{- /*
+Prometheus (ADR-0009): it reads every PrometheusRule, PodMonitor and ServiceMonitor in this namespace, and sends alerts
+to Alertmanager. Its service account's ClusterRole, which lets it discover targets, is cluster-bootstrap's
+(observability.tf): this project holds no RBAC beyond Grafana's port-forward binding.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: sft
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+spec:
+  replicas: {{ $p.replicas }}
+  image: {{ include "prom.image" (list . .Values.images.prometheus) }}
+  serviceAccountName: prometheus
+  # The one token here: service discovery reads pods, endpoints and nodes from the cluster API, and the kubelet scrape
+  # presents it (scrapeClasses below).
+  automountServiceAccountToken: true
+  podMetadata:
+    labels:
+      {{- include "prom.labels" . | nindent 6 }}
+  nodeSelector:
+    {{- toYaml .Values.pools.main | nindent 4 }}
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: { app.kubernetes.io/name: prometheus }
+  securityContext:
+    {{- include "prom.podSecurity" . | nindent 4 }}
+  containers:
+    - name: prometheus
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+    - name: config-reloader
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+  initContainers:
+    - name: init-config-reloader
+      securityContext:
+        {{- include "prom.containerSecurity" . | nindent 8 }}
+  resources:
+    {{- toYaml $p.resources | nindent 4 }}
+  retention: {{ $p.retention }}
+  retentionSize: {{ $p.retentionSize }}
+  walCompression: true
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: observability # cluster-bootstrap: gp3, encrypted with the account's default key
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ $p.storage }}
+  scrapeInterval: {{ $p.scrapeInterval }}
+  evaluationInterval: {{ $p.evaluationInterval }}
+  # Each replica scrapes alone; Alertmanager deduplicates their alerts by this label.
+  replicaExternalLabelName: replica
+  externalLabels:
+    cluster: {{ include "prom.prefix" . }}
+  enableAdminAPI: false
+  # This namespace's rules and monitors only: nothing outside the observability project feeds it.
+  ruleSelector: {}
+  podMonitorSelector: {}
+  serviceMonitorSelector: {}
+  probeSelector: {}
+  scrapeConfigSelector: {}
+  alerting:
+    alertmanagers:
+      - namespace: {{ .Release.Namespace }}
+        name: alertmanager-operated
+        port: web
+        apiVersion: v2
+  # The kubelets serve their metrics with the service account's token, on certificates the nodes sign themselves.
+  scrapeClasses:
+    - name: kubelet
+      authorization:
+        credentialsFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        insecureSkipVerify: true
+---
+# A stable name for Grafana's data source, whichever replica answers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels:
+    {{- include "prom.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+    operator.prometheus.io/name: sft
+  ports:
+    - { name: web, port: 9090, targetPort: web, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: prometheus
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: prometheus, operator.prometheus.io/name: sft }

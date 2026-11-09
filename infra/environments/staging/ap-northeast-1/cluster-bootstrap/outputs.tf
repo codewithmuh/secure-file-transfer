@@ -19,3 +19,11 @@ output "argocd" {
   description = "Argo CD's URL and the root Application's source."
   value       = module.cluster_bootstrap.argocd
 }
+
+output "observability" {
+  description = "Loki's and Tempo's buckets in this Region and the observability roles bound in this cluster (#243)."
+  value = {
+    buckets = module.observability.bucket_names
+    roles   = module.observability.role_arns
+  }
+}

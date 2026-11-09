@@ -53,7 +53,10 @@ While a message is in hand, the loop extends its visibility every half visibilit
 long scan isn't handed to a second worker. Metrics (abuse 8.1): `scan_results_total{state,reason}`,
 `scan_deferrals_total`, `dlp_inspection_seconds`, `dlp_inspection_results_total{state,reason}`,
 `dlp_inspector_failures_total{kind}` and `guardduty_results_total{outcome}`: detector IDs and counts
-never appear in a label, and no value anywhere (NFR-26).
+never appear in a label, and no value anywhere (NFR-26). For the SLOs (#242):
+`scan_pass_duration_seconds{pool}`, NFR-23's time from an attempt starting to both results
+recorded, and `time_to_shareable_seconds` (`sft.service.sli`) for a received file found clean and
+for a transfer the evaluation sends.
 """
 
 from __future__ import annotations
@@ -108,7 +111,7 @@ from sft.dlp.protocol import (
 )
 from sft.runtime.kms import open_field_keys
 from sft.runtime.s3 import S3Objects
-from sft.service import fields, guardduty, scan_timing, scans
+from sft.service import fields, guardduty, scan_timing, scans, sli
 from sft.service.dlp_definitions import inspector_spec, open_definition
 from sft.service.evaluation import evaluate
 from sft.service.objects import SCAN_TAG, ObjectStoreError, ScannedObjects
@@ -165,6 +168,12 @@ FAILURE_KINDS: Final = (
 """The kinds of `dlp_inspector_failures_total`: the inspector's error codes, then the worker's."""
 
 
+POOLS: Final = ("small", "large")
+"""The `pool` label of `scan_pass_duration_seconds`: the ClamAV pools (ADR-0019)."""
+SCAN_PASS_BUCKETS: Final = (1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0, 900.0, 1800.0)
+"""Edges at 60 s, 180 s and 600 s: NFR-23's p95 and p99 for small files and p95 for large ones."""
+
+
 class AttemptFailedError(Exception):
     """An engine failed this attempt, and attempts are left: SQS delivers the message again."""
 
@@ -176,10 +185,13 @@ class ScanMetrics:
     inspection_seconds: Histogram
     inspection_results: Counter
     inspector_failures: Counter
+    scan_pass: Histogram
 
     @classmethod
     def create(cls, registry: CollectorRegistry) -> ScanMetrics:
         metrics = cls._create(registry)
+        for pool in POOLS:
+            metrics.scan_pass.labels(pool)
         # The alerts' series exist at zero from the start, so a first failure shows as an
         # increase (deploy/alerts/scanning.rules.yaml).
         for detail in ScanDetail:
@@ -221,6 +233,14 @@ class ScanMetrics:
                 "Failed inspection attempts, by kind: the inspector's error code, malformed, "
                 "protocol, timeout, connection or read.",
                 ["kind"],
+                registry=registry,
+            ),
+            scan_pass=Histogram(
+                "scan_pass_duration_seconds",
+                "NFR-23: from a scan attempt starting to its malware and inspection results "
+                "recorded, by pool (small: up to 100 MB; large: up to 2,000,000,000 bytes).",
+                ["pool"],
+                buckets=SCAN_PASS_BUCKETS,
                 registry=registry,
             ),
         )
@@ -450,6 +470,7 @@ class ScanConsumer(Consumer):
     """The scan pipeline of the module docstring, for one pool."""
 
     topic: ClassVar[Topic]
+    pool: ClassVar[str]
 
     def __init__(
         self,
@@ -498,6 +519,7 @@ class ScanConsumer(Consumer):
         ttl = scan_timing.attempt_timeout(size) + LEASE_MARGIN
         if not await self.leases.acquire(message.tenant_id, member, ttl):
             return await self._defer(scope, str(message.id), file_id)
+        started = time.monotonic()
         try:
             answers = await self._read_once(target, size, detectors.specs)
         finally:
@@ -520,6 +542,15 @@ class ScanConsumer(Consumer):
             )
         if recorded:
             self._count(scan, inspection, answers)
+            self.metrics.scan_pass.labels(self.pool).observe(time.monotonic() - started)
+            if target.upload_request_id is not None and scan.state is FileState.CLEAN:
+                # A received file is available to its member from here (NFR-5, #242).
+                sli.observe_shareable(
+                    sli.ShareableKind.REQUEST_FILE,
+                    started_at=target.completion_started_at,
+                    now=datetime.now(UTC),
+                    largest=target.actual_size,
+                )
             log.info(
                 "scan recorded",
                 extra={
@@ -724,12 +755,14 @@ class SmallScanConsumer(ScanConsumer):
     name = "scan-small"
     queue = Queue.SCAN_SMALL
     topic = FILE_SCAN
+    pool = "small"
 
 
 class LargeScanConsumer(ScanConsumer):
     name = "scan-large"
     queue = Queue.SCAN_LARGE
     topic = FILE_SCAN_LARGE
+    pool = "large"
 
 
 class ResultTooEarlyError(Exception):
@@ -857,6 +890,14 @@ class GuardDutyConsumer(Consumer):
             self._outcome("late")
             return Outcome.PROCESSED
         self._outcome("recorded")
+        if target.upload_request_id is not None and scan.state is FileState.CLEAN:
+            # A received file over 2 GB is available to its member from here (NFR-5, #242).
+            sli.observe_shareable(
+                sli.ShareableKind.REQUEST_FILE,
+                started_at=target.completion_started_at,
+                now=datetime.now(UTC),
+                largest=target.actual_size,
+            )
         self.metrics.results.labels(
             scan.state.value, scan.detail.value if scan.detail else "none"
         ).inc()
@@ -911,6 +952,8 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         purposes=frozenset({fields.KeyPurpose.DLP}),
     )
     previous_keys = fields.install(keys)
+    # Time to shareable (#242): a received file's result, and a transfer the evaluation sends.
+    previous_sli = sli.install(sli.SliMetrics.create(process.registry))
     objects = S3Objects.create(
         region=settings.aws_region,
         files_bucket=settings.s3_files_bucket,
@@ -982,6 +1025,7 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         for close in closers:
             await close()
         fields.install(previous_keys)
+        sli.install(previous_sli)
         await keys.close()
 
 

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: sft-observability-apps
+description: >-
+  The Argo CD AppProject and Applications of one cluster's observability stack (ADR-0009, #243). The observability
+  root Application, which Terraform's cluster-bootstrap stack makes beside the application's, renders this chart with
+  the cluster's environment, region, registry and account, and the cluster's values file, whose pilotLight decides
+  whether the stack runs.
+type: application
+version: 0.1.0

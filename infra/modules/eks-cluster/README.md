@@ -69,7 +69,8 @@ name them exactly (#101, #102), and every one carries the workload permissions b
 | `sft-<env>-scan` | `sft` / `scan-worker` | Read untagged objects in the files bucket; read and write tags in both pairs; consume the scan and GuardDuty result queues; Valkey; `sft_scan`; files key (files bucket only), fields key (`dlp-dek` only), platform key through SQS |
 | `sft-<env>-notify` | `sft` / `notifier` | Consume the notify, sign-in events, SES events and tenant status queues; send email through SES; create, delete, disable, read, update and sign out Cognito users and set their temporary password (#193); its three secrets; Valkey; `sft_notify` |
 | `sft-<env>-jobs` | `sft` / `jobs` | List, delete object versions and abort uploads in both files bucket pairs, the only role that deletes; `sft_jobs`. No key |
-| `sft-<env>-archive` | `sft` / `audit-archive` | Write the audit archive; `sft_archive`; audit key through S3 |
+| `sft-<env>-archive` | `sft` / `audit-archive` | Write the audit archive in both Regions (#183); `sft_archive`; audit key through S3 |
+| `sft-<env>-synthetic-probe` | `sft` / `synthetic-probe` | Put `ProbeSuccess` in the `SecureFileTransfer/Probe` namespace only; list, read and delete under `probe/` in the probe mailbox buckets, decrypting through S3 for them alone (#248). No database, no Valkey, no queue: everything else through the public API |
 | `sft-<env>-migrate` | `sft` / `migrate` | `sft_migrate` only |
 | `sft-<env>-key-rotation` | `sft` / `key-rotation` | Read and write the four keyrings and both Regions' `idp-client`, the secrets key through Secrets Manager for those; add, list and delete the app clients' secrets in Cognito. No database, no other secret (encryption 6.4, #185) |
 | `sft-<env>-operator` | `sft-operator` / `operator-api` | Write its audit records to the archive; Valkey as `sft-<env>-operator`, for its rate limits; `sft_operator`; audit key through S3 |
@@ -77,7 +78,7 @@ name them exactly (#101, #102), and every one carries the workload permissions b
 | `sft-<env>-lb-controller` | `kube-system` / `aws-load-balancer-controller` | TargetGroupBinding only: describe, and register and deregister targets in the environment's target groups. The edge layer owns the load balancer, its target groups and the security group rule |
 | `sft-<env>-external-secrets` | `external-secrets` / `external-secrets` | No secret read: only assume the two store roles below (encryption 6.4) |
 | `sft-<env>-external-secrets-platform` | none: assumed by the External Secrets role only | Read `sft/<env>/platform/*`, for the `platform-secrets` store (argocd, monitoring, grafana) |
-| `sft-<env>-external-secrets-app` | none: assumed by the External Secrets role only | Read its Region's `idp-client`, for the `application-secrets` store (`sft` only, #106). The API and the notification worker read their keyrings as their own roles (#184) |
+| `sft-<env>-external-secrets-app` | none: assumed by the External Secrets role only | Read its Region's `idp-client` and the probe's `probe-api-key` (#248), for the `application-secrets` store (`sft` only, #106). The API and the notification worker read their keyrings as their own roles (#184) |
 | `sft-<env>-kyverno` | `kyverno` / `kyverno-admission-controller`, `kyverno-reports-controller` | Read images and signatures in the organization's `sft/` and `mirror/` repositories; the registry key through ECR |
 | `sft-<env>-vpc-cni`, `sft-<env>-ebs-csi` | `kube-system`, through their EKS add-ons | AWS's managed policies for the two drivers; the EBS driver also the platform key through EC2 |
 | `sft-<env>-eks-cluster` | (EKS) | `AmazonEKSClusterPolicy`; the secrets key through EKS |

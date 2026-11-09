@@ -49,7 +49,7 @@ data:
   (include "sft.clamavImage" .) (toYaml $m.resources.freshclam | nindent 4) (include "sft.containerSecurityContext" . | nindent 4)
   (include "sft.appImage" .) $m.port $m.port (toYaml $m.resources.server | nindent 4) (include "sft.containerSecurityContext" . | nindent 4) }}
 {{- $volumes := "- name: config\n  configMap: { name: signature-mirror-config }\n- name: signatures\n  emptyDir: { sizeLimit: 1Gi }" }}
-{{ include "sft.deployment" (dict "root" $ "name" "signature-mirror" "component" "signature-mirror" "replicas" $m.replicas "serviceAccount" "signature-mirror" "grace" $m.terminationGracePeriodSeconds "user" 1000 "containers" (trim $containers) "initContainers" (include "sft.seedSignatures" .) "volumes" $volumes "checksum" (sha256sum $config)) }}
+{{ include "sft.deployment" (dict "root" $ "name" "signature-mirror" "held" true "component" "signature-mirror" "replicas" $m.replicas "serviceAccount" "signature-mirror" "grace" $m.terminationGracePeriodSeconds "user" 1000 "containers" (trim $containers) "initContainers" (include "sft.seedSignatures" .) "volumes" $volumes "checksum" (sha256sum $config)) }}
 ---
 apiVersion: v1
 kind: Service

@@ -1,0 +1,160 @@
+{{- $mon := .Values.monitoringNamespace }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-config
+  labels: { app.kubernetes.io/name: grafana, app.kubernetes.io/part-of: sft-observability }
+data:
+  grafana.ini: |
+    [server]
+    http_port = 3000
+    root_url = http://localhost:3000/
+
+    [paths]
+    data = /var/lib/grafana
+    provisioning = /etc/grafana/provisioning
+
+    [log]
+    mode = console
+
+    [log.console]
+    format = json
+
+    [database]
+    # Nothing here is worth keeping: dashboards and data sources come from Git on every start.
+    type = sqlite3
+
+    # Nobody signs in (values.yaml). Without the initial admin there is no account to guess or reset.
+    [security]
+    disable_initial_admin_creation = true
+    disable_gravatar = true
+    cookie_samesite = strict
+
+    [auth]
+    disable_login_form = true
+    disable_signout_menu = true
+
+    [auth.basic]
+    enabled = false
+
+    [auth.anonymous]
+    enabled = true
+    org_name = Main Org.
+    org_role = Viewer
+
+    [users]
+    allow_sign_up = false
+    allow_org_create = false
+    # Viewers may open Explore to search logs and traces, and change a dashboard in the browser, never save one.
+    viewers_can_edit = true
+
+    # Alerts are Prometheus' and Alertmanager's, as code in deploy/alerts (NFR-17).
+    [unified_alerting]
+    enabled = false
+
+    # Nothing leaves the cluster (ADR-0021): no usage reports, update checks, news, snapshots or plugin downloads.
+    [analytics]
+    reporting_enabled = false
+    check_for_updates = false
+    check_for_plugin_updates = false
+    feedback_links_enabled = false
+
+    [news]
+    news_feed_enabled = false
+
+    [snapshots]
+    enabled = false
+    external_enabled = false
+
+    [plugins]
+    plugin_admin_enabled = false
+    public_key_retrieval_disabled = true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  labels: { app.kubernetes.io/name: grafana, app.kubernetes.io/part-of: sft-observability }
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    deleteDatasources: []
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.{{ $mon }}.svc.cluster.local:9090
+        isDefault: true
+        editable: false
+        jsonData:
+          timeInterval: 30s
+          exemplarTraceIdDestinations: []
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki-query.{{ $mon }}.svc.cluster.local:3100
+        editable: false
+        jsonData:
+          # A log line's trace_id (architecture 5.5) opens its trace in Tempo.
+          derivedFields:
+            - name: trace_id
+              matcherType: label
+              matcherRegex: trace_id
+              datasourceUid: tempo
+              url: "$${__value.raw}"
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        access: proxy
+        url: http://tempo.{{ $mon }}.svc.cluster.local:3200
+        editable: false
+        jsonData:
+          tracesToLogsV2:
+            datasourceUid: loki
+            filterByTraceID: true
+            spanStartTimeShift: -5m
+            spanEndTimeShift: 5m
+          nodeGraph:
+            enabled: true
+      - name: Alertmanager
+        uid: alertmanager
+        type: alertmanager
+        access: proxy
+        url: http://alertmanager-operated.{{ $mon }}.svc.cluster.local:9093
+        editable: false
+        jsonData:
+          implementation: prometheus
+          handleGrafanaManagedAlerts: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  labels: { app.kubernetes.io/name: grafana, app.kubernetes.io/part-of: sft-observability }
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: secure-file-transfer
+        folder: secure-file-transfer
+        type: file
+        disableDeletion: true
+        allowUiUpdates: false
+        editable: false
+        updateIntervalSeconds: 60
+        options:
+          path: /etc/grafana/dashboards
+---
+# Every dashboard in dashboards/, as Git has it (NFR-17, #244). deploy/observability/tests checks each one.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  labels: { app.kubernetes.io/name: grafana, app.kubernetes.io/part-of: sft-observability }
+data:
+  {{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+  {{ base $path }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}

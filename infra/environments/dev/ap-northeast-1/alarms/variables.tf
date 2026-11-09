@@ -1,0 +1,20 @@
+variable "account_id" {
+  description = "ID of the dev AWS account. Supplied at plan time (TF_VAR_account_id), never committed."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.account_id))
+    error_message = "account_id must be a 12-digit AWS account ID."
+  }
+}
+
+variable "alert_emails" {
+  description = "Who the alerts reach: the pager's and every operator's address. TF_VAR_alert_emails, as a JSON list, at apply time; never committed."
+  type        = list(string)
+}
+
+variable "probe_enabled" {
+  description = "Whether the synthetic probe runs here (probe.enabled in deploy/environments, #248): creates its CloudWatch alarm. False until the probe's AWS side exists."
+  type        = bool
+  default     = false
+}

@@ -620,8 +620,8 @@ sequenceDiagram
 
 - **The revocation commits first**, so it takes effect at once: new downloads and uploads fail, and running streams
   stop within 60 s (4.2). Then the record goes to the audit archive in both regions before the `200`, so a failover
-  can re-apply every confirmed revocation from Osaka's archive (NFR-10). The failover and restore gaps that remain are
-  tracked in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42).
+  can re-apply every confirmed revocation from Osaka's archive (NFR-10). The failover and restore gaps (#42) each have
+  a decision and the drill that proves it in [disaster-recovery.md](operations/disaster-recovery.md) section 5.
 - **A `503` means "done, not yet confirmed"**, never "failed". The revocation stands. A retry finds it already made,
   writes the missing archive record and returns `200`, and the archive job copies the record within a minute anyway
   (5.2). The web app shows the transfer as revoked and retries the confirmation; it never tells the member the
@@ -970,8 +970,9 @@ across tenants fails to decrypt.
 1. The API writes the audit record in the same database transaction as the change it describes, so a change can't
    happen without its record. The application's database role can insert audit rows but not update or delete them.
 2. For downloads, the audit record is committed before the grant is returned (4.2).
-3. The archive job copies new audit rows to the Object Lock bucket at least every minute (NFR-15), and the bucket
-   replicates to Osaka. **Security-critical records** are also written straight to both regions, and the call that
+3. The archive job copies new audit rows to the Object Lock bucket in both regions at least every minute (NFR-15), and
+   moves its cursor only once both hold a batch (#183, data model 2.5); the bucket's replication to Osaka is a second,
+   untimed copy. **Security-critical records** are also written straight to both regions, and the call that
    makes one answers `2xx` only once both regions have it, `503` otherwise:
    - revocations of transfers and of upload requests;
    - API key revocations;
@@ -1071,7 +1072,7 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 | One AZ lost | AWS health events, error rate | PostgreSQL fails over to another AZ, typically within a minute; pods are rescheduled in the other two AZs. | NFR-11: ≤ 5 min |
 | Tokyo region lost | Route 53 health checks, alarms | An operator decides and runs the regional failover (section 7). | NFR-11: ≤ 1 h |
 | Audit archive behind | Archive lag | Records are safe in PostgreSQL; the job catches up. | NFR-15 |
-| Osaka archive unreachable: S3 in Osaka, or the cross-region S3 endpoint to it, while Tokyo is healthy | Errors and latency on the cross-region write | New download grants fail closed: `503`, nothing counted. Streams under existing grants continue. The other security-critical changes (5.2) commit first and stand; their `503` means "done, archive record not yet confirmed" (4.4), and a retry or the archive job completes the record when Osaka returns. Sign-in, sending and uploads don't wait on Osaka. A degraded mode for grants is a disaster-recovery gap tracked in [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42) ([THREAT] T-81, R-11). | NFR-10, NFR-15 |
+| Osaka archive unreachable: S3 in Osaka, or the cross-region S3 endpoint to it, while Tokyo is healthy | Errors and latency on the cross-region write | New download grants fail closed: `503`, nothing counted. Streams under existing grants continue. The other security-critical changes (5.2) commit first and stand; their `503` means "done, archive record not yet confirmed" (4.4), and a retry or the archive job completes the record when Osaka returns. Sign-in, sending and uploads don't wait on Osaka. There is no degraded mode for grants: their `503`s count against NFR-1 and are reported, not excluded ([disaster-recovery.md](operations/disaster-recovery.md) section 5, gap 5; [THREAT] T-81, R-11). | NFR-10, NFR-15 |
 | Egress proxy down: both replicas | Proxy health, sign-in errors, Argo CD sync alerts | No new member sign-ins (code exchanges and Cognito admin calls fail) and Argo CD stops syncing. Sending, downloads, uploads and the Osaka writes use VPC endpoints and continue; existing sessions keep working. | NFR-1 |
 | Rate-limit counters unavailable | Errors from the store; `RateLimitStoreUnavailable` pages | Link steps answer `503` and the sign-in routes too; the pre-authentication trigger denies sign-in. Every other call falls back to a per-pod limiter at each limit divided by 3, the minimum pod count. Download counts and grants live in PostgreSQL and are unaffected; existing sessions keep working ([ABUSE] 4.5). | NFR-14 |
 | Cognito unavailable in Tokyo | Sign-in errors, trigger alarms | No new member sign-ins; existing sessions, recipients, uploaders and API keys keep working. If the whole region is lost, the Osaka standby pool takes over (section 7). | NFR-1, NFR-11 |
@@ -1081,17 +1082,19 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 
 ## 7. Disaster recovery outline
 
-Losing the Tokyo region, in the order the runbook (phase 6) will follow. The minutes are a budget to check in the first
-drill, not measurements.
+Losing the Tokyo region, in the order of the [regional failover runbook](runbooks/regional-failover.md), which
+`ops/regional-failover.sh` runs and times step by step. The minutes are a budget to check in the first drill, not
+measurements; [disaster-recovery.md](operations/disaster-recovery.md) holds the drills, their results and the
+decisions below.
 
 | Step | Budget |
 |---|---|
 | Confirm the regional failure and decide to fail over | 10 min |
-| Fence Tokyo through Git: set Tokyo's Argo CD applications to zero replicas in the desired state, so a returning Tokyo cluster converges to no workloads. The same commit takes Osaka out of pilot-light mode. This doesn't need Tokyo to answer. | 2 min |
-| Promote the Osaka PostgreSQL replica to primary, and set the audit archive generation to one more than the highest in the archive, so reused transaction IDs never overwrite or hide an archived record (data model 2.5) | 5 min |
+| Fence Tokyo through Git: set Tokyo's Argo CD applications to zero replicas in the desired state, so a returning Tokyo cluster converges to no workloads. The same commit takes Osaka out of pilot-light mode with its workers held (`failover.holdWorkers`). This doesn't need Tokyo to answer. | 2 min |
+| Promote the Osaka PostgreSQL replica to primary | 5 min |
 | Scale the Osaka `system` node group from its one node to two; Karpenter adds the main and scan nodes, and Argo CD deploys the current versions with every worker scaled to zero. Turn on the GuardDuty plan for the Osaka large-files bucket and the Osaka heartbeat alarm, which is off during the pilot light. | 20 min |
 | Sign-in: the Osaka API signs members in through the standby user pool, where SSO members sign in as usual. Create every active member without SSO in that pool and record each new identity; their re-enrolment emails go out once the workers scale up ([AUTH] 2.6). | Alongside the next two steps |
-| Re-apply security-critical changes from the Osaka audit archive with the `sft_recovery` role: every record of 5.2, and only the grants that have a committed record or a database row (4.2) | 5 min |
+| Start the audit archive generation after the highest in the archive, so reused transaction IDs never overwrite or hide an archived record, with the cursor rewound an hour (data model 2.5). Then re-import the archived events and re-apply security-critical changes from the Osaka audit archive with the `sft_recovery` role: every record of 5.2 that takes access away, and only the grants that have a committed record or a database row (4.2) | 5 min |
 | Re-publish unprocessed outbox messages from the last 24 hours, then scale the workers up | 5 min |
 | Switch DNS and the CDN origin to Osaka | 5 min |
 | Verify with the synthetic probe, including a real email from Osaka, and a sign-in through the standby pool | 5 min |
@@ -1100,11 +1103,15 @@ drill, not measurements.
 Workers stay at zero until the security-critical changes are back, so no worker acts on a revocation the replica hadn't
 received. DLP policies, decisions and approval requests travel with the database; an approval or a policy change in the
 replication lag can be lost with Tokyo, which leaves the transfer waiting, never sent without a decision. Files uploaded
-in the last minutes before the failure may not have reached Osaka; the service shows them as unavailable (NFR-10). This
-outline is not yet a proven recovery: the gaps that matter only in a failover, a restore or failback (the archive cursor
-after a failover, backups in Osaka, intake-queue events lost with Tokyo, failback replication, grant byte counters
-within the replication lag, scans in flight) are tracked in
-[#42](https://github.com/codewithmuh/secure-file-transfer/issues/42), with the phase 6 runbooks and drills.
+in the last minutes before the failure may not have reached Osaka; the service shows them as unavailable (NFR-10). The
+recovery job re-applies what takes access away and leaves unlocks out: an unlock's new link needs an email the job
+can't send, so the member unlocks again. The gaps that matter only in a failover, a restore or failback (the archive
+cursor after a failover, backups in Osaka, intake-queue events lost with Tokyo, failback replication, the degraded mode
+for grants, Cognito enrolment, grant byte counters within the replication lag, scans in flight) were tracked in
+[#42](https://github.com/codewithmuh/secure-file-transfer/issues/42); each now has a decision and the drill that proves
+it in [disaster-recovery.md](operations/disaster-recovery.md) section 5. Failing back is a planned switchover with no
+data loss ([regional-failback.md](runbooks/regional-failback.md)). The outline is a proven recovery only once the first
+drill has run, pending the AWS run.
 
 **Fencing assumes Tokyo may come back** ([THREAT] T-78). Failover is always an operator's decision, so health checks
 never move API traffic on their own. Git is the desired state for both clusters, so Tokyo is fenced without being

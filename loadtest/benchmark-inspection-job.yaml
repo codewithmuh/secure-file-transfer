@@ -1,0 +1,74 @@
+# The NFR-23 benchmark in staging (#250; services/api/tools/benchmark_inspection.py; docs/operations/performance.md):
+# one Job on a scan node, beside that node's clamd and DLP inspector, which it reaches through their node-local
+# Services as a scan worker does. It runs the application image staging runs, with the tool mounted from a ConfigMap,
+# so nothing new is built or pulled; it has no service account token, no AWS identity and no database login.
+#
+# Its pods carry the scan worker's component label, so the namespace's network policies treat it as one: it may reach
+# clamd and the inspector, and they accept it. Created by hand during a staging test window, never by Argo CD, and
+# deleted afterwards (ttlSecondsAfterFinished):
+#
+#   kubectl -n sft create configmap benchmark-inspection --from-file=services/api/tools/benchmark_inspection.py
+#   IMAGE=<registry>/sft/app@<staging digest> CONCURRENCY=1 LARGE=10 envsubst < loadtest/benchmark-inspection-job.yaml \
+#     | kubectl -n sft apply -f -
+#   kubectl -n sft logs -f job/benchmark-inspection
+#
+# CONCURRENCY is the scans at once on the node: 1, its one trio (ADR-0019). For the pool at design load, run one Job per
+# scan node at once; each holds at most CONCURRENCY files in memory, up to 2 GB each.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: benchmark-inspection
+  namespace: sft
+  labels:
+    app.kubernetes.io/name: sft
+    app.kubernetes.io/component: benchmark-inspection
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sft
+        app.kubernetes.io/component: scan-worker # the scan worker's network policy, in and out
+        sft.io/scan-pool: benchmark
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      serviceAccountName: default
+      nodeSelector: { sft.io/pool: scan }
+      tolerations: [{ key: sft.io/pool, operator: Equal, value: scan, effect: NoSchedule }]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: benchmark
+          image: ${IMAGE}
+          command:
+            - python
+            - /bench/benchmark_inspection.py
+            - --clamd=clamd:3310
+            - --inspector=dlp-inspector:8070
+            - --files=300
+            - --large=${LARGE}
+            - --max-bytes=100000000
+            - --max-large-bytes=2000000000
+            - --concurrency=${CONCURRENCY}
+          resources:
+            requests: { cpu: 500m, memory: 3Gi } # one 2 GB file in memory at a time per concurrent scan
+            limits: { memory: 6Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: bench, mountPath: /bench, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: bench
+          configMap: { name: benchmark-inspection }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }

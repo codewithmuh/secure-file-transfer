@@ -31,3 +31,8 @@ signatureMirror:
 operatorApi:
   env:
     BREAK_GLASS_SELF_APPROVAL: "true"
+
+# The synthetic probe (#248, docs/runbooks/synthetic-probe.md) runs here too: staging's promotion gate reads dev's
+# ProbeSuccess (ADR-0005). Off until dev's AWS side exists (the runbook's setup list); then this line becomes true.
+probe:
+  enabled: false

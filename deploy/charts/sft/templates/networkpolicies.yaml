@@ -2,7 +2,9 @@
 Network policies (ADR-0021): default deny in the namespace, then one policy per workload naming everything it may
 reach, never the whole VPC. Every workload may reach CoreDNS, its own proxy listener, the endpoint subnets on 443,
 the data stores it uses on their ports, and the Pod Identity agent; those that use S3 may reach addresses outside the
-VPC on 443, which the node security groups narrow to S3's prefix list. The DLP inspector gets no egress at all.
+VPC on 443, which the node security groups narrow to S3's prefix list. The API, the operator API and the workers may
+also reach the node's OpenTelemetry agent, and the scheduled jobs the Pushgateway in the monitoring namespace. The DLP
+inspector gets no egress at all.
 */}}
 {{- $n := .Values.network }}
 {{- $rules := dict
@@ -28,13 +30,20 @@ VPC on 443, which the node security groups narrow to S3's prefix list. The DLP i
   "fromClamd" (printf "- from:\n    - podSelector: { matchLabels: { app.kubernetes.io/name: sft, app.kubernetes.io/component: clamd } }\n  ports:\n    - { port: %v, protocol: TCP }" .Values.signatureMirror.port)
 }}
 {{- $base := list $rules.dns $rules.endpoints $rules.postgres $rules.podIdentity }}
+{{- /* The traced workloads (the API, the operator API and the workers) send spans to the node's OpenTelemetry agent. */}}
+{{- $traced := $base }}
+{{- with .Values.telemetry }}
+{{- if .otlpEndpoint }}
+{{- $traced = append $base (printf "- to:\n    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: %s } }\n      podSelector: { matchLabels: %s }\n  ports:\n    - { port: %v, protocol: TCP }" .namespace (toJson .podLabels) .port) }}
+{{- end }}
+{{- end }}
 {{- $policies := list }}
 {{- if eq .Values.part "application" }}
 {{- $policies = list
-  (dict "component" "api" "ingress" (list $rules.fromLoadBalancer $rules.fromMonitoring) "egress" (concat $base (list $proxy.api $rules.valkey $rules.s3)))
-  (dict "component" "relay" "ingress" (list $rules.fromMonitoring) "egress" $base)
-  (dict "component" "notifier" "ingress" (list $rules.fromMonitoring) "egress" (concat $base (list $proxy.notifier $rules.valkey)))
-  (dict "component" "scan-worker" "ingress" (list $rules.fromMonitoring) "egress" (concat $base (list $rules.valkey $rules.s3 $pods.toClamd $pods.toInspector)))
+  (dict "component" "api" "ingress" (list $rules.fromLoadBalancer $rules.fromMonitoring) "egress" (concat $traced (list $proxy.api $rules.valkey $rules.s3)))
+  (dict "component" "relay" "ingress" (list $rules.fromMonitoring) "egress" $traced)
+  (dict "component" "notifier" "ingress" (list $rules.fromMonitoring) "egress" (concat $traced (list $proxy.notifier $rules.valkey)))
+  (dict "component" "scan-worker" "ingress" (list $rules.fromMonitoring) "egress" (concat $traced (list $rules.valkey $rules.s3 $pods.toClamd $pods.toInspector)))
   (dict "component" "clamd" "ingress" (list $pods.fromWorkerToClamd) "egress" (list $rules.dns $pods.toMirror))
   (dict "component" "dlp-inspector" "ingress" (list $pods.fromWorkerToInspector) "egress" (list))
   (dict "component" "signature-mirror" "ingress" (list $pods.fromClamd) "egress" (list $rules.dns $proxy.signatureMirror))
@@ -47,12 +56,19 @@ VPC on 443, which the node security groups narrow to S3's prefix list. The DLP i
 {{- /* The field key job (#236): the database and KMS through its endpoint, as the API, nothing else. */}}
 {{- $policies = append $policies (dict "component" "field-keys" "ingress" (list) "egress" $base) }}
 {{- end }}
+{{- /* The scheduled jobs push their metrics to the Pushgateway after each run (#242), when it has a URL. */}}
+{{- $jobBase := $base }}
+{{- with .Values.metricsPushgateway }}
+{{- if .url }}
+{{- $jobBase = append $base (printf "- to:\n    - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: %s } }\n      podSelector: { matchLabels: %s }\n  ports:\n    - { port: %v, protocol: TCP }" .namespace (toJson .podLabels) .port) }}
+{{- end }}
+{{- end }}
 {{- range $name := keys .Values.lifecycleJobs | sortAlpha }}
 {{- $job := index $.Values.lifecycleJobs $name }}
-{{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $base $rules.s3) $base $job.s3)) }}
+{{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $jobBase $rules.s3) $jobBase $job.s3)) }}
 {{- end }}
 {{- else }}
-{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (append $base $rules.valkey)) }}
+{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (append $traced $rules.valkey)) }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

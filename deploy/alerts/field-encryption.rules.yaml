@@ -3,7 +3,8 @@
 #
 # The series come from the API and the scan worker (sft.service.fields): field_decrypt_scope_mismatch_total{purpose}, a
 # sealed value that didn't open with the caller's tenant's keys, and field_key_unwraps_total{purpose,result}, KMS
-# calls for data keys. A mismatch is a possible isolation breach (the third isolation layer, data model 4.2).
+# calls for data keys. A mismatch is a possible isolation breach (the third isolation layer, data model 4.2), so its
+# alert carries `security: "true"` and is never inhibited during a drill (alertmanager.yaml).
 groups:
   - name: field-encryption
     rules:
@@ -12,6 +13,7 @@ groups:
         expr: sum(increase(field_decrypt_scope_mismatch_total[5m])) > 0
         labels:
           severity: page
+          security: "true"
         annotations:
           summary: A sealed value didn't open with the caller's tenant's key, a possible isolation breach (NFR-12).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/field-keys.md

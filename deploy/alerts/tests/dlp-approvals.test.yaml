@@ -1,0 +1,43 @@
+# Unit tests of dlp-approvals.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../dlp-approvals.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # FR-43: a no-eligible-approver notice opens a ticket; other emails don't.
+  - interval: 1m
+    input_series:
+      - series: 'emails_sent_total{type="dlp_no_eligible_approver", job="notifier"}'
+        values: '0 0 1 1 1'
+      - series: 'emails_sent_total{type="transfer_link", job="notifier"}'
+        values: '0+10x4'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: DlpApprovalBacklog
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: DlpApprovalBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: no_eligible_approver
+            exp_annotations:
+              summary: A tenant's DLP rules need approval but it has no eligible approver; its transfers wait (FR-43).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md
+
+  # The notice was capped (the tenant's admins were told within the cap's window): still a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'email_caps_hit_total{cap="tenant_no_eligible_approver", job="notifier"}'
+        values: '0 0 2 2'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: DlpApprovalBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: no_eligible_approver
+            exp_annotations:
+              summary: A tenant's DLP rules need approval but it has no eligible approver; its transfers wait (FR-43).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md

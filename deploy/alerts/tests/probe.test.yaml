@@ -1,0 +1,49 @@
+# Unit tests of probe.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../probe.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # NFR-1: one failed run (5 minutes) doesn't page; failing for 10 minutes does; a passing run ends it.
+  - interval: 1m
+    input_series:
+      - series: 'synthetic_probe_success{job="probe"}'
+        values: '1x5 0x15 1x5'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SyntheticProbeFailing
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: SyntheticProbeFailing
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: The synthetic probe's send, verify and download journey has failed for 10 minutes (NFR-1).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/synthetic-probe.md
+      - eval_time: 24m
+        alertname: SyntheticProbeFailing
+        exp_alerts: []
+
+  # A probe that stops reporting: the last success, at 0 s, ages past 15 minutes (900 s) at 15m, and the alert waits
+  # 5 minutes more. A run that passes again (a new timestamp at 25m) ends it.
+  - interval: 1m
+    input_series:
+      - series: 'synthetic_probe_last_success_timestamp_seconds{job="sft-synthetic-probe"}'
+        values: '0x24 1500x5'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: SyntheticProbeStale
+        exp_alerts: []
+      - eval_time: 22m
+        alertname: SyntheticProbeStale
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: The synthetic probe hasn't passed for over 15 minutes, or has stopped reporting (NFR-1).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/synthetic-probe.md
+      - eval_time: 27m
+        alertname: SyntheticProbeStale
+        exp_alerts: []

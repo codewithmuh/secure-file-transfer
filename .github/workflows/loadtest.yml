@@ -1,0 +1,112 @@
+name: loadtest
+
+# The design-load test against staging, by hand only (#249; NFR-2, NFR-5, NFR-16; docs/operations/performance.md).
+#
+# Never prod: there is no input for the environment, the role it assumes is staging's load-test role, and
+# loadtest/run.sh refuses any API that isn't https://api.staging.<domain>. It runs only from main, through the
+# `loadtest-staging` environment, whose deployment rule allows main alone.
+#
+# The load is split across `shards` jobs, each a k6 execution segment on its own GitHub-hosted runner, so each shard
+# comes from its own address: NFR-14's per-IP limits (60 link steps a minute, 300 download grants an hour) would
+# otherwise cap the recipients' side of the load far below the design load. 20 shards carry 1x; 2x needs 40, which
+# GitHub runs at once only on plans with 40 concurrent jobs (the performance page says what to do otherwise).
+#
+# Variables: LOADTEST_ROLE_ARN (staging's load-test role: read the keys secret, read and delete under loadtest/ in the
+# mailbox bucket), STAGING_SERVICE_DOMAIN (staging.sft.<domain>), LOADTEST_MAILBOX_BUCKET. The keys come from the
+# secret sft/staging/loadtest/api-keys into a file only the job reads; nothing prints them.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Load (loadtest/profiles)
+        type: choice
+        options: [staging-1x, staging-2x]
+        required: true
+      shards:
+        description: Parallel jobs, each from its own address (20 for 1x, 40 for 2x)
+        type: number
+        default: 20
+
+permissions: {}
+
+concurrency:
+  group: loadtest-staging
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the shards
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          if ! [[ $SHARDS =~ ^[0-9]+$ ]] || ((SHARDS < 1 || SHARDS > 40)); then
+            echo "::error::shards must be 1 to 40"
+            exit 1
+          fi
+          echo "shards=$(seq -s, 0 $((SHARDS - 1)) | sed 's/^/[/; s/$/]/')" >> "$GITHUB_OUTPUT"
+
+  run:
+    name: Shard ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350 # GitHub's 6 hours, less the setup; the 1x profile runs 5 hours
+    environment: loadtest-staging
+    permissions:
+      contents: read
+      id-token: write # OIDC into the load-test role
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      PROFILE: ${{ inputs.profile }}
+      SHARDS: ${{ inputs.shards }}
+      SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.LOADTEST_ROLE_ARN }}
+          aws-region: ap-northeast-1
+      - name: Read the load-test keys
+        run: |
+          umask 077
+          aws secretsmanager get-secret-value --secret-id sft/staging/loadtest/api-keys \
+            --query SecretString --output text > "$RUNNER_TEMP/keys.json"
+          python3 -c 'import json, sys; k = json.load(open(sys.argv[1])); print(f"{len(k)} keys")' "$RUNNER_TEMP/keys.json"
+      - name: Start the mailbox bridge
+        env:
+          BUCKET: ${{ vars.LOADTEST_MAILBOX_BUCKET }}
+        run: |
+          uv run --project services/api --locked python loadtest/mailbox_bridge.py \
+            --bucket "$BUCKET" --prefix loadtest/ --shard "$SHARD" --port 8025 &
+          for _ in $(seq 30); do curl -fs 'http://127.0.0.1:8025/api/v1/search?query=to:%22x%22' >/dev/null && exit 0; sleep 1; done
+          echo "::error::the mailbox bridge didn't start"
+          exit 1
+      - name: Run k6
+        env:
+          DOMAIN: ${{ vars.STAGING_SERVICE_DOMAIN }}
+        run: |
+          API_URL="https://api.$DOMAIN" WEB_ORIGIN="https://app.$DOMAIN" MAIL_DOMAIN="loadtest.$DOMAIN" \
+            loadtest/run.sh "$PROFILE" "$RUNNER_TEMP/keys.json" "$RUNNER_TEMP/results" "$SHARD/$SHARDS"
+      - name: Keep the summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: loadtest-${{ inputs.profile }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: warn
+      - name: Remove the keys
+        if: always()
+        run: rm -f "$RUNNER_TEMP/keys.json"

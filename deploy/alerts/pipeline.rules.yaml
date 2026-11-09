@@ -1,0 +1,48 @@
+# Alerts of the outbox and the notification worker (architecture 6, "Outbox relay stopped" and "Email provider failing
+# or throttling"; ADR-0013, ADR-0015; #245), tested by deploy/alerts/tests/pipeline.test.yaml.
+#
+# The series come from the outbox relay (sft.workers.relay): outbox_oldest_unpublished_age_seconds, the age of the
+# oldest row not yet sent to SQS, 0 when there is none; and from every queue consumer (sft.workers.consumer):
+# worker_messages_total{consumer,outcome}. How long messages wait in SQS itself, and the dead-letter queues, are
+# CloudWatch alarms (infra/modules/alarms/queues.tf), which keep working when the cluster doesn't.
+groups:
+  - name: pipeline
+    rules:
+      # NFR-5: a row older than 2 minutes means the relay is stopped or failing, and every file, link email and
+      # verification code behind it waits. Nothing is lost: the rows stay in PostgreSQL (architecture 6).
+      - alert: OutboxBacklog
+        expr: max(outbox_oldest_unpublished_age_seconds) > 120
+        for: 5m
+        labels:
+          severity: page
+          condition: backlog
+        annotations:
+          summary: The oldest unsent outbox message is over 2 minutes old; scans and emails wait behind it (NFR-5).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/outbox-backlog.md
+
+      # No relay reports at all for 10 minutes: it is down or not scraped, so the alert above can't fire.
+      - alert: OutboxBacklog
+        expr: absent(outbox_oldest_unpublished_age_seconds)
+        for: 10m
+        labels:
+          severity: page
+          condition: relay_missing
+        annotations:
+          summary: No outbox relay has reported for 10 minutes; nothing is being sent to the queues (NFR-5).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/outbox-backlog.md
+
+      # NFR-7: more than 5 % of the notification worker's messages fail for 10 minutes. A failed message is retried
+      # with backoff and then lands in the dead-letter queue (its CloudWatch alarm); a verification code that can't be
+      # sent within NFR-7's 10 s leaves the recipient unable to download.
+      - alert: EmailDeliveryFailing
+        expr: |
+          sum(rate(worker_messages_total{consumer="notify", outcome="failed"}[10m]))
+            /
+          clamp_min(sum(rate(worker_messages_total{consumer="notify"}[10m])), 1e-9)
+          > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: More than 5 % of email messages fail; verification codes and link emails are late or lost (NFR-7).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-delivery.md

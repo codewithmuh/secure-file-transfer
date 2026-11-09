@@ -1,0 +1,82 @@
+{{- $g := .Values.gateway }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-gateway
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-gateway
+  labels: { app.kubernetes.io/name: otel-gateway, app.kubernetes.io/part-of: sft-observability }
+spec:
+  replicas: {{ $g.replicas }}
+  selector:
+    matchLabels: { app.kubernetes.io/name: otel-gateway }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: otel-gateway, app.kubernetes.io/part-of: sft-observability }
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: otel-gateway
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        {{- toYaml .Values.pools.main | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: otel-gateway }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: otel-gateway
+          image: {{ include "collectors.image" . }}
+          args: [--config=/conf/config.yaml]
+          env:
+            - { name: GOMEMLIMIT, value: {{ $g.goMemLimit | quote }} } # under the memory limit, so the GC works first
+          ports:
+            - { name: otlp-grpc, containerPort: 4317, protocol: TCP }
+            - { name: metrics, containerPort: 8888, protocol: TCP }
+            - { name: health, containerPort: 13133, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /, port: health }
+          readinessProbe:
+            httpGet: { path: /, port: health }
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+          securityContext:
+            {{- include "collectors.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /conf, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: otel-gateway }
+---
+# The agents resolve every gateway pod through this name (the load-balancing exporter's DNS resolver).
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-gateway-headless
+  labels: { app.kubernetes.io/name: otel-gateway, app.kubernetes.io/part-of: sft-observability }
+spec:
+  clusterIP: None
+  selector: { app.kubernetes.io/name: otel-gateway }
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc, protocol: TCP }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-gateway
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: otel-gateway }

@@ -446,7 +446,7 @@ nothing of a transfer; a recipient's reaches no upload request.
 | Table | Key columns | Notes |
 |---|---|---|
 | `audit_events` | `id`, `tenant_id` (null for platform events), `tx_id`, `occurred_at`, `actor_type` (member, admin, recipient, uploader, api_key, operator, system), `actor_id`, `action`, `target_type`, `target_id`, `outcome` (success, failure), `source_ip`, `user_agent`, `request_id`, `trace_id`, `security_critical`, `details` (JSON) | Partitioned by UTC month on `occurred_at`; primary key `(id, occurred_at)`, because a partitioned table's keys must include the partition key. The database sets `tx_id` (`pg_current_xact_id()`) and `occurred_at` (`now()`, the transaction's start, which also serves as `created_at`), so code can't backdate an event. The tenant comes from the transaction's scope, and the request and trace IDs from the log context. The application roles can only insert, and their grant leaves out `tx_id` and `occurred_at`; only `sft_recovery`, re-importing archived events, sets them. Events are inserted in tenant or resource scope (a recipient's download) or platform scope, and read by `sft_api` in tenant scope only, so a link session can't read the log. `action` is a dotted code (`transfer.revoked`), `target_type` a code (`transfer`), and actor and target are IDs. `details` holds IDs, enums, numbers, flags and times only, never free text, so no file name, message, address, token or code can reach it (FR-27, NFR-15). `user_agent` is cut to 512 characters. |
-| `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `archived_at` | One row: the current archive generation, and how far the archive job has got in it. |
+| `audit_archive_cursor` | `generation`, `archived_up_to_tx`, `claimed_up_to_tx`, `archived_at` | One row: the current archive generation, how far the archive job has got in it, and the end of the range a run is writing (#183, revision 0034). `sft_archive` moves the cursor in system scope; only `sft_recovery`, in recovery scope, changes the generation. After a restore or a failover the recovery job starts the next generation, rewinds `archived_up_to_tx` to the oldest event written since a time the runbook names (an hour before the failure), and drops any claim, so batches that never reached the surviving region are archived again; readers drop duplicates by `id` (#42, `sft.service.recovery_replay`). |
 | `outbox` | `id`, `tenant_id`, `topic`, `payload` (IDs only), `trace_context`, `delay_seconds`, `published_at`, `attempts`, `next_attempt_at`, `last_error` | Unpublished rows are found through a partial index on `published_at IS NULL` (architecture 5.3). `payload` maps names to UUIDs or lists of UUIDs and nothing else, so no token, code, address or file name can reach a queue (threat model T-49). `delay_seconds` (0 to 900) asks the relay to send with an SQS delay, as the scan worker does when it re-sends a scan over its tenant's cap (abuse and rate limits 6.4); it counts from `created_at`, so the relay sends what is left of it and a late relay doesn't delay the message twice. A send SQS refuses adds one to `attempts`, records SQS's error code in `last_error` and moves `next_attempt_at` on (2 s doubling to 5 minutes), so one refused row can't hold up the rows behind it. The API, the operator API, the scan worker and the lifecycle jobs insert in their tenant's scope; only `sft_relay` reads and marks rows, in system scope (ADR-0013). |
 | `processed_messages` | `consumer`, `message_id`, `tenant_id`, `processed_at` | Primary key `(consumer, message_id)`; makes every consumer idempotent. A consumer records the message in the transaction that does its work, in the message's tenant scope, first: a second copy handled at the same time waits on the first one's row and is skipped once it commits. `message_id` is text, because intake queues use their source's event ID. The consumers may only insert, with `ON CONFLICT DO NOTHING` and no conflict target, and learn of a duplicate from the row count, so none of them can read another consumer's records. That includes a **deferral**: when a consumer puts work off by writing a new outbox row with `delay_seconds` (a scan over its tenant's cap), the same transaction records the received message, so a redelivered copy doesn't defer the work a second time. For **SES events** (consumer `ses-events`, #185), `message_id` is a UUID derived (version 5) from the sending tenant, `mail.messageId`, the event type and the event's timestamp, not the SQS message ID, because SES can publish one event more than once. A bounce that names several recipients is one event, handled in one transaction. |
 | `idempotency_keys` | `tenant_id`, `caller_type`, `caller_id`, `key`, `request_fingerprint`, `response_status`, `resource_type`, `resource_id`, `expires_at` | Primary key `(caller_type, caller_id, key)` (architecture 5.4). `request_fingerprint` is the SHA-256 of the method, the path with its resource IDs, and the body. Written in the same transaction as the resource it created. It keeps the status and a reference to the resource, never the response body, so no secret, file name or message is stored here. A retry gets the response rebuilt from the resource as it is now. Calls whose response holds a secret, such as API key creation, take no idempotency key. `caller_id` is a member's user (so a key survives a new sign-in), an API key or a link session. While a request runs, its transaction holds an advisory lock on the key, so a second request with it gets `409 idempotency_in_progress` instead of waiting. An expired row is overwritten by the next use of its key. `sft_api` reads and writes rows in the tenant's scope; the daily job (`sft_jobs`) finds the tenants with expired rows in system scope and deletes them in each tenant's. Not audited: the change it records is. |
@@ -479,14 +479,34 @@ re-apply them from the archive through `sft_recovery` (4.2).
 (`If-None-Match: *`), keyed by its event's ID, so a retry rewrites nothing:
 `security-critical/v1/<tenant ID or platform>/<yyyy>/<mm>/<dd>/<event ID>.json`, dated by `occurred_at` in UTC. A
 record holds the event's IDs, enums, times and `details`, never the source IP or user agent. It needs no generation,
-because an event ID never repeats after a restore, unlike a transaction ID; when the archive job arrives it writes
-under `g<generation>/` with the same tenant and date parts, and readers drop duplicates by `id`. A retry of a change
+because an event ID never repeats after a restore, unlike a transaction ID; the archive job writes under
+`g<generation>/` (below), and readers drop duplicates by `id`. A retry of a change
 already made reads its newest security-critical event and writes that record again; a call that doesn't make the change
 itself (an `updateUser` that keeps the role `member`) completes an earlier record only as best effort, so an archive
 outage never fails it. Each API process remembers the records it has seen confirmed in both regions and doesn't write
 them again. Dev has no Osaka, so its records
-go to Tokyo's archive alone. The every-minute archive job, its cursor and its generations aren't built yet: no
-milestone places them before M7.
+go to Tokyo's archive alone.
+
+**As built (#183, revision 0034): the archive job.** `python -m sft.workers.audit_archive` runs every minute as
+`sft_archive` (`sft.service.archive_job`, `sft.data.archive_cursor`). Each run claims the next range, from the cursor
+up to the oldest running transaction (below), cut at a transaction's end after about 5,000 events, and records the
+range's end in `claimed_up_to_tx` in the same short transaction that reads its events. With no transaction open, it
+writes one gzipped JSON-lines object per UTC day of `occurred_at` to the archive bucket of every region, Tokyo and
+Osaka (Tokyo alone in dev), each write conditional, at
+`g<generation>/<yyyy>/<mm>/<dd>/<first tx>-<end tx>.jsonl.gz` with the transaction IDs zero-padded to 20 digits.
+Only when every region holds every object does a second short transaction move `archived_up_to_tx` to the range's end
+and clear the claim. A run that dies, or a region that refuses a write, leaves the claim: the next run takes the same
+range, reads the same committed rows, makes the same bytes (sorted keys, gzip's header time fixed) and writes them
+again, which S3 keeps once. So no event is missed and none is duplicated within a generation. A line holds every
+column of the event, the source IP, user agent and request and trace IDs included. One object per run and day, not
+per tenant, keeps the archive at about 1,440 objects a day in each region at design load (capacity A14); a reader of
+one tenant filters by `tenant_id`. Writing Osaka directly, rather than waiting for the bucket's replication, means the
+cursor never runs ahead of what Osaka holds, the archive-cursor gap of
+[#42](https://github.com/codewithmuh/secure-file-transfer/issues/42); replication stays as a second copy. The job
+exports `audit_archive_lag_seconds`, the age of the oldest committed event at or past the cursor, and
+`audit_archive_events_total{region}` ([metrics](../operations/metrics.md)); `AuditArchiveLagging` fires above 2
+minutes and `AuditArchiveJobNotRunning` when no run has succeeded for 5
+([runbook](../runbooks/audit-archive-lag.md)).
 
 **Archiving without gaps.** IDs and `occurred_at` follow insert time, not commit time, so a row from a slow transaction
 can commit after a row with a later ID. A cursor on either would skip it for good. The archive job therefore works by
@@ -1074,9 +1094,9 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
        `getTenant`). It is the operator API's only read across tenants.
      - Suppressions aren't among them: every `email_suppressions` row has a tenant (2.5), under the tenant policy.
    - **One login role per workload**, through IAM database authentication: `sft_api`, `sft_operator`, `sft_scan`,
-     `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events only), `sft_recovery` and
-     `sft_migrate`; plus two roles nobody logs in as, `sft_owner`, which owns the tables, and `sft_lookup`, which owns
-     the lookup functions. The authentication and authorization design (7.3) lists each role's scopes and policies.
+     `sft_notify`, `sft_relay` (the outbox only), `sft_jobs`, `sft_archive` (audit events, and the archive cursor it
+     moves), `sft_recovery` and `sft_migrate`; plus two roles nobody logs in as, `sft_owner`, which owns the tables,
+     and `sft_lookup`, which owns the lookup functions. The authentication and authorization design (7.3) lists each role's scopes and policies.
      The bootstrap job creates every role (encryption and keys 6.3); migrations only grant tables and write policies.
      `sft_migrate` is a member of `sft_owner` with `INHERIT FALSE`, so it has no privileges until it runs
      `SET ROLE sft_owner`, and only the login roles may connect to the database.
@@ -1089,12 +1109,18 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
    - **`sft_recovery`** (IAM role `sft-{env}-recovery`) is used only by the restore and failover jobs that the runbooks
      start (architecture 7), never by a running service. Its `recovery_reapply` policies apply only in recovery scope
      (`app_scope() = 'recovery'`) and let it read and update, across tenants, exactly the rows a security-critical
-     record changes: `transfers` (revocations), `upload_requests` (revocations, lockouts, unlocks),
-     `transfer_recipients` (lockouts, unlocks), `users` (deactivations, demotions), `api_keys`, `member_sessions` and
-     `link_sessions` (revocations), `user_identities` (deleted by a sign-in reset), and `download_counters` and
-     `download_grants` (grants, inserted if missing). It may insert into `audit_events` the archived rows it
-     re-imports, and it starts the new archive generation in `audit_archive_cursor` (2.5). It has no column grant on
-     `display_name_ct` or `message_ct`, and no other table.
+     record changes: `transfers` (revocations), `upload_requests` (revocations, lockouts), `transfer_recipients`
+     (lockouts), `users` (deactivations, demotions), `api_keys`, `member_sessions` and `link_sessions` (revocations),
+     `user_identities` (deleted by a sign-in reset), `download_counters` (a committed grant's count; `download_grants`
+     read only, to see whether the grant's row survived), `files (delete_after)` so a re-applied revocation sends the
+     files to deletion (NFR-8), `idp_connections (id, tenant_id)` read, to tell pool identities from SSO ones, and the
+     outbox's publish columns, to re-publish (architecture 7). Unlocks aren't re-applied: an unlock gives access back
+     and sends a new link, an outbox message this role can't write, so the recipient stays locked and the member
+     unlocks again (#253). It may insert into `audit_events` the archived rows it re-imports and read their
+     `tx_id` and `occurred_at`, and it starts the new archive generation in `audit_archive_cursor`, rewinding the
+     cursor (2.5). Revisions 0002, 0034 and 0035 hold the grants, column by column
+     ([disaster recovery](../operations/disaster-recovery.md) 4). It has no column grant on `display_name_ct` or
+     `message_ct`, and no other table.
    - **No `BYPASSRLS`.** Only the master user, used under break-glass alone, bypasses row-level security.
      `sft_lookup` reads the credential tables through `lookup_read` policies and column grants of its own. No workload
      role is granted `TRUNCATE` or privileges on `audit_events` partitions, and views use `security_invoker`.
@@ -1148,7 +1174,7 @@ The decision and its trade-offs are recorded in [ADR-0003](../adr/0003-multi-ten
 | Grants without a confirmed committed record | partial `download_grants (created_at) WHERE archived_at IS NULL` |
 | Deletion job | partial `files (delete_after) WHERE deleted_at IS NULL` |
 | Reconciliation | unique `files (storage_key)` |
-| Purge job | partial `transfers (purge_after)`, `upload_requests (purge_after)` |
+| Purge job | partial `transfers (ended_at)`, `upload_requests (ended_at)`, both `WHERE ended_at IS NOT NULL` (#224, revision 0034); the files of each through `files (tenant_id, transfer_id)` and `files (tenant_id, upload_request_id)` |
 | Expired rows (daily job) | `verification_codes (expires_at)`, `link_sessions (expires_at)`, `member_sessions (expires_at)`, `download_grants (expires_at)`, `operator_sessions (expires_at)`, `idempotency_keys (expires_at)`; partial `users (invitation_expires_at) WHERE invitation_token_hash IS NOT NULL`, partial `user_identities (expires_at) WHERE expires_at IS NOT NULL` |
 | Audit search by time, target or actor | per partition: `(tenant_id, occurred_at DESC)`, `(tenant_id, target_type, target_id)`, `(tenant_id, actor_id, occurred_at DESC)` |
 | Audit archive | per partition: `(tx_id, id)` |
@@ -1224,7 +1250,7 @@ which routes by the same `SCAN_SMALL_POOL_MAX_BYTES`. `files.deleted_at` records
 unfinished upload it lists under the file's key, rather than the recorded upload ID alone, and lists the key again to
 confirm nothing is left before it marks the file. The reservation is released at deletion unless a rejection or removal
 released it. `sft_jobs` reads no name, message or grant byte count; the API's role still deletes nothing but its
-idempotency keys. The purge after 365 days is a later issue.
+idempotency keys. The purge after 365 days arrived with #224 (below).
 
 **As built (#213, revision 0020).** Received files: the deletion job deletes a received file at its `delete_after`,
 which its upload's acceptance set to `retention_until` or the member's early delete moved to now, exactly as a
@@ -1234,6 +1260,25 @@ In the transaction that marks any file deleted it also clears its findings' `det
 moves a received file's retention. Reconciliation rejects an upload with no part for 24 hours and finishes a stuck
 completion under the request's row lock, writing `retention_until` from the tenant's policy, which `sft_jobs` may read;
 the storage audit compares every object with every file row, whichever its owner.
+
+**As built (#224, revision 0034): the purge.** `python -m sft.workers.purge` runs daily as `sft_jobs`
+(`sft.service.lifecycle.purge_metadata`, `sft.data.purge`). It computes `purge_after` when it looks for work, from
+the bounds above, rather than storing it: a transfer is due when `ended_at` is 372 days past (7 days for its files,
+then 365 for its audit records), an upload request when the later of its `ended_at` and its last received file's
+`retention_until` is. The `purge_after` column of `upload_requests` is never set, and a later contract release drops
+it; `transfers` never got one. It finds due parents across tenants in system scope, oldest first, up to 1,000 at a
+time, and deletes them in each tenant's scope, at most 100 a transaction, because their child rows go with them:
+recipients, files, download counters, codes, link sessions, grants, findings, DLP decisions, confirmations, approval
+requests and their decisions, all through `ON DELETE CASCADE`, which PostgreSQL runs as the tables' owner. Each
+transaction writes one `retention.rows_deleted` event naming the table (`transfers` or `upload_requests`) and the
+count, never a transfer, which the child tables' audit trigger requires. The delete checks every condition again, so
+a find that went stale deletes nothing. A due parent with a file whose `deleted_at` is still empty is skipped and
+counted in `metadata_purge_blocked{kind}`, which alerts (`MetadataPurgeBlocked`); `metadata_purge_lag_seconds` shows
+how far past due the oldest purgeable one still is after a run (`MetadataPurgeBehind`), and the job's last success
+`MetadataPurgeNotRunning` ([runbook](../runbooks/metadata-purge.md)). `sft_jobs` gets `DELETE` on `transfers` and
+`upload_requests` only, and reads `upload_requests.ended_at`; audit events have no foreign keys, no role may delete
+one, and the purge never touches them. The isolation suite runs its finds and its deletes with the other tenant's
+IDs.
 
 **Jobs work in small transactions.** Every job deletes or purges in batches of at most 1,000 rows, one transaction per
 batch, and never has a transaction open while it calls S3. The deletion job, for example, deletes the objects first
@@ -1264,6 +1309,10 @@ the default partition.
   `sft_audit_partition_months_covered` (alert below 2 in a month's last 7 days). It measures even when creation fails,
   and exports `sft_audit_partition_last_success_timestamp_seconds`, the last run that made every month it had to, so a
   job that keeps failing or stops running shows too.
+- As built (#224's chart work): `python -m sft.workers.audit_partitions`, a lifecycle job (`audit-partitions`) as
+  `sft_jobs`, runs the step daily and pushes those gauges with its `lifecycle_job_last_success_timestamp_seconds`; a
+  month that failed fails the run. Deleting audit rows older than 365 days and dropping empty partitions (the table
+  above) isn't built yet.
 
 Database backups keep 14 days of point-in-time recovery, so deleted rows age out of backups within 14 days. File
 contents are never in database backups.

@@ -1,0 +1,28 @@
+# The synthetic probe's alerts (NFR-1, #248, #245), tested by deploy/alerts/tests/probe.test.yaml.
+#
+# The probe (sft.probe, the PERF track) runs the full send → verify → download journey every 5 minutes from the
+# synthetic tenant, and sets synthetic_probe_success to 1 or 0 after each run. Two failed runs in a row (10 minutes)
+# page: the journey a recipient takes is broken, whatever the other indicators say. A probe that stops reporting at all
+# (the CronJob suspended or failing to start, the Pushgateway unreachable) leaves its last success behind:
+# synthetic_probe_last_success_timestamp_seconds, pushed only by a run that passed, more than 15 minutes old pages too.
+# The probe also writes SecureFileTransfer/Probe ProbeSuccess to CloudWatch, which the promotion gate and the
+# probe-failing alarm read (promote.yml, infra/modules/alarms/probe.tf).
+groups:
+  - name: probe
+    rules:
+      - alert: SyntheticProbeFailing
+        expr: min(synthetic_probe_success) == 0
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: The synthetic probe's send, verify and download journey has failed for 10 minutes (NFR-1).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/synthetic-probe.md
+      - alert: SyntheticProbeStale
+        expr: time() - max(synthetic_probe_last_success_timestamp_seconds) > 900
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: The synthetic probe hasn't passed for over 15 minutes, or has stopped reporting (NFR-1).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/synthetic-probe.md

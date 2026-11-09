@@ -1,0 +1,104 @@
+# Unit tests of platform.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../platform.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ADR-0021: one of two proxy replicas live is fine; none live for 5 minutes pages.
+  - interval: 1m
+    input_series:
+      - series: 'envoy_server_live{namespace="egress-proxy", pod="egress-proxy-a"}'
+        values: '1 1 1 0 0 0 0 0 0 0 0 0'
+      - series: 'envoy_server_live{namespace="egress-proxy", pod="egress-proxy-b"}'
+        values: '1 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: EgressProxyDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: EgressProxyDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: No egress proxy replica is live; member sign-in and Argo CD syncs fail (ADR-0021).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/egress-proxy.md
+
+  # A proxy that isn't scraped at all pages the same way.
+  - interval: 1m
+    input_series:
+      - series: 'argocd_app_info{name="sft", health_status="Healthy", sync_status="Synced"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: EgressProxyDown
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: No egress proxy replica is live; member sign-in and Argo CD syncs fail (ADR-0021).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/egress-proxy.md
+      - eval_time: 6m
+        alertname: ArgoCdApplicationUnhealthy
+        exp_alerts: []
+
+  # ADR-0005: degraded for 15 minutes opens a ticket; out of sync for 30 another; Suspended never.
+  - interval: 1m
+    input_series:
+      - series: 'argocd_app_info{name="sft", health_status="Degraded", sync_status="OutOfSync"}'
+        values: '1x40'
+      - series: 'argocd_app_info{name="sft-operator", health_status="Suspended", sync_status="Synced"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ArgoCdApplicationUnhealthy
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: ArgoCdApplicationUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: health
+              name: sft
+            exp_annotations:
+              summary: The Argo CD Application sft is not healthy; what runs differs from Git (ADR-0005).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/argocd-sync.md
+      - eval_time: 35m
+        alertname: ArgoCdApplicationUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: health
+              name: sft
+            exp_annotations:
+              summary: The Argo CD Application sft is not healthy; what runs differs from Git (ADR-0005).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/argocd-sync.md
+          - exp_labels:
+              severity: ticket
+              condition: sync
+              name: sft
+            exp_annotations:
+              summary: The Argo CD Application sft has been out of sync with Git for 30 minutes (ADR-0005).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/argocd-sync.md
+
+  # Encryption 6.4: a keyring read failing every 5 minutes for over 15 opens a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'sft_keyring_refresh_failures_total{keyring="email", job="api"}'
+        values: '0 0 0 0 0 1 1 1 1 1 2 2 2 2 2 3 3 3 3 3 4 4 4 4 4 5 5 5 5 5 6 6 6 6 6 7'
+      - series: 'sft_keyring_refresh_failures_total{keyring="CSRF", job="api"}'
+        values: '0x35'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KeyringRefreshFailing
+        exp_alerts: []
+      - eval_time: 33m
+        alertname: KeyringRefreshFailing
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              keyring: email
+            exp_annotations:
+              summary: Pods have failed to re-read the email keyring from Secrets Manager for 15 minutes (encryption 6.4).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-refresh.md

@@ -163,3 +163,21 @@ module "cluster_bootstrap" {
   ses_configuration_set = data.terraform_remote_state.identity.outputs.ses_configuration_set
   cognito_app_client_id = data.terraform_remote_state.identity.outputs.app_client_id
 }
+
+# The AWS side of the observability stack (ADR-0009, #243): Loki's and Tempo's buckets in this Region under the logs
+# key, and the Pod Identity associations of the stack's roles in this cluster. Argo CD runs the stack itself from
+# deploy/observability; the module above installs its operator, namespaces and storage class.
+module "observability" {
+  source = "../../../../modules/observability"
+
+  environment  = "dev"
+  region       = module.conventions.region
+  regions      = ["ap-northeast-1"]
+  account_id   = var.account_id
+  cluster_name = local.cluster.cluster_name
+  logs_key_arn = data.terraform_remote_state.data.outputs.kms_key_arns["logs"]
+
+  # The account's observability roles are made here, in Tokyo; Osaka's stack binds the same roles.
+  create_iam               = true
+  permissions_boundary_arn = "arn:aws:iam::${var.account_id}:policy${module.conventions.bootstrap_iam_path}${module.conventions.global_name_prefix}-observability-boundary"
+}

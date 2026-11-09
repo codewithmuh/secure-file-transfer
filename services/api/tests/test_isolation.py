@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from isolation import Cases, Seeded, Tenants
 from sft.data import (
     api_keys,
+    archive_cursor,
     audit,
     audit_reads,
     codes,
@@ -33,6 +34,7 @@ from sft.data import (
     link_subjects,
     member_sessions,
     notice_windows,
+    purge,
     recipients,
     sso,
     suppressions,
@@ -982,6 +984,43 @@ async def delete_another_tenants_expired_rows(session: AsyncSession, tenants: Te
     )
     await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
     return deleted
+
+
+# ---- the metadata purge (#224) and the audit archive job (#183) ----
+
+# What the purge counts as due: everything that ended before now, so their rows qualify.
+PURGE_CUTOFF = datetime.now(UTC) + timedelta(days=1)
+
+
+@cases.add(scopes={JOBS: [SYSTEM, TENANT]})
+async def find_due_purges(session: AsyncSession, tenants: Tenants) -> object:
+    # The purge's finds read across tenants in system scope, by design, and change nothing; in
+    # tenant scope the data layer refuses them before any row.
+    return (
+        await purge.due_transfers(session, cutoff=PURGE_CUTOFF, limit=10),
+        await purge.due_upload_requests(session, cutoff=PURGE_CUTOFF, limit=10),
+        await purge.backlog(session, cutoff=PURGE_CUTOFF),
+    )
+
+
+@cases.add(scopes={JOBS: [TENANT]})
+async def purge_another_tenants_metadata(session: AsyncSession, tenants: Tenants) -> object:
+    theirs = tenants.theirs.rows
+    purged = (
+        await purge.purge_transfers(session, [theirs["ended_transfer"]], cutoff=PURGE_CUTOFF),
+        await purge.purge_upload_requests(session, [theirs["ended_request"]], cutoff=PURGE_CUTOFF),
+    )
+    await audit.record(session, action="retention.rows_deleted", actor=Actor(ActorType.SYSTEM))
+    return purged
+
+
+@cases.add(scopes={ARCHIVE: [SYSTEM]})
+async def read_every_event_for_the_archive(session: AsyncSession, tenants: Tenants) -> object:
+    # The archive job reads every tenant's audit events in system scope, by design (data model
+    # 2.5); the harness checks it changes no tenant's row. Its cursor has no tenant.
+    claimed = await archive_cursor.claim(session, max_rows=10)
+    found = [] if claimed is None else await archive_cursor.events(session, claimed)
+    return claimed, found, await archive_cursor.unarchived_age(session)
 
 
 # ---- upload requests (#212) ----

@@ -16,7 +16,8 @@ been applied (infra/README.md).
 | `external-secrets.tf` | External Secrets and its two Secrets Manager stores (`charts/secret-stores`), each assuming its own role: `platform-secrets` (`sft-<env>-external-secrets-platform`, `sft/<env>/platform/*`, platform namespaces) and `application-secrets` (`sft-<env>-external-secrets-app`, the API's secrets, the `sft` namespace only). The controller's own role reads no secret (encryption 6.4) |
 | `load-balancer-controller.tf` | The AWS Load Balancer Controller |
 | `rbac.tf` | Operator and read-only RBAC for Identity Center roles |
-| `argocd.tf` | Argo CD, SAML sign-in through Identity Center, notifications, and the root Application |
+| `argocd.tf` | Argo CD, SAML sign-in through Identity Center, notifications, and the two root Applications: `root` (the application, `deploy/argocd`) and `observability` (`deploy/observability/argocd`, #243) |
+| `observability.tf` | The observability stack's cluster-wide part (ADR-0009, #243): the namespaces `monitoring` and `grafana` (restricted) and `node-agents` (the node agents' host path), the `observability` storage class, the Prometheus Operator with its CRDs and kube-state-metrics, and Prometheus' read-only discovery role. The stack itself is `deploy/observability`; its buckets and roles are [`modules/observability`](../observability/README.md), called by each root |
 
 ## What the acceptance criteria rest on
 
@@ -38,6 +39,15 @@ still checks the cluster's own name. The deploy role may start that session and 
 (`terraform-oidc-roles/permissions-cluster-bootstrap.tf`), and the cluster admits it through the cluster layer's
 access entry. The root also reads the cluster layer's outputs and the data layer's `aurora_endpoint`,
 `valkey_endpoint` and `kms_key_arns` from their states. That job is not written yet; no workflow opens the tunnel today.
+
+## The observability stack
+
+`observability.tf` installs only what needs cluster-wide RBAC or is cluster-scoped; Argo CD syncs the rest from
+`deploy/observability` into the AppProject `observability`, which may create no cluster-scoped kind
+([docs/operations/observability.md](../../../docs/operations/observability.md)). `node-agents` is always among
+Kyverno's host-access and system-pool namespaces (`host_access_namespaces` adds others), because its agents read every
+node's pod logs; privileged containers stay refused there. The CloudWatch exporter joins Alertmanager on the egress
+proxy's platform listener (CloudWatch and SNS have no endpoint here).
 
 ## What the root Application hands the application
 

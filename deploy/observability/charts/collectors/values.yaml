@@ -1,0 +1,51 @@
+# The OpenTelemetry collectors of one cluster (ADR-0009, architecture 5.5). The Application
+# (deploy/observability/argocd) adds the cluster's facts under `global` and its network from the cluster's values file;
+# deploy/observability/environments/<env>.yaml sizes them.
+
+global:
+  imageRegistry: "" # <shared account>.dkr.ecr.<region>.amazonaws.com, from the Application
+  sft:
+    environment: ""
+    region: ""
+    accountId: ""
+
+network:
+  vpcCidr: ""
+
+# The contrib distribution: it has the file log receiver, tail sampling and the load-balancing exporter. Our mirror,
+# by digest (ADR-0007).
+collectorImage:
+  repository: mirror/otel/opentelemetry-collector-contrib
+  tag: 0.163.2
+  digest: sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+
+# The agent: a DaemonSet in node-agents, on every node of every pool. It reads the pods' log files from the node, so
+# its namespace is the one that may use host paths (cluster-bootstrap's host_access_namespaces); it runs as a non-root
+# user in the root group, which may read the files the container runtime writes (0640), and has no capability.
+agent:
+  namespace: node-agents
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+  goMemLimit: 200MiB
+  # Every pool's taint: main (none), scan and system.
+  tolerations:
+    - { key: sft.io/pool, operator: Equal, value: scan, effect: NoSchedule }
+    - { key: sft.io/pool, operator: Equal, value: system, effect: NoSchedule }
+  # Who may send spans to the node's agent: the application's namespaces (OTEL_EXPORTER_OTLP_ENDPOINT in the chart).
+  clientNamespaces: [sft, sft-operator]
+
+# The gateway: a Deployment in monitoring. Every span of a trace must reach the same gateway for tail sampling, so the
+# agents route by trace ID across the gateways' pod addresses (the load-balancing exporter on the headless Service).
+gateway:
+  replicas: 1
+  resources:
+    requests: { cpu: 200m, memory: 400Mi }
+    limits: { memory: 800Mi }
+  goMemLimit: 640MiB
+  # ADR-0009: every error and every slow trace, and 10 % of the rest. Slow is NFR-2's p99, 1 s.
+  slowTraceMs: 1000
+  samplePercent: 10
+
+pools:
+  main: { sft.io/pool: main }

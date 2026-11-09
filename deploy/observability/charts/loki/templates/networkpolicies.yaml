@@ -1,0 +1,27 @@
+{{- /*
+Loki's pods (ADR-0021): written to by the node agents, read by Grafana, scraped by Prometheus, and talking to each other
+(memberlist and gRPC); out only to CoreDNS, its credentials and its bucket in S3.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: loki
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: loki }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "obs.from" (dict "namespace" "node-agents" "name" "otel-agent" "ports" (list 3100)) | nindent 4 }}
+    {{- include "obs.from" (dict "namespace" "grafana" "name" "grafana" "ports" (list 3100)) | nindent 4 }}
+    {{- include "obs.from" (dict "namespace" .Release.Namespace "name" "prometheus" "ports" (list 3100)) | nindent 4 }}
+    {{- include "obs.from" (dict "namespace" .Release.Namespace "name" "loki" "ports" (list 3100 9095 7946)) | nindent 4 }}
+  egress:
+    {{- include "obs.dns" . | nindent 4 }}
+    {{- include "obs.podIdentity" . | nindent 4 }}
+    {{- include "obs.s3" . | nindent 4 }}
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: loki } }
+      ports:
+        - { port: 3100, protocol: TCP }
+        - { port: 9095, protocol: TCP }
+        - { port: 7946, protocol: TCP }

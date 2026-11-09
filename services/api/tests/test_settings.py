@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings
 from api_settings import API_ENV
 from sft.core import settings as settings_module
 from sft.core.settings import (
+    ArchiveJobSettings,
     BootstrapSettings,
     JobSettings,
     MigrationSettings,
@@ -371,7 +372,15 @@ def test_job_settings_name_the_replica_buckets_together() -> None:
 
 
 @pytest.mark.parametrize(
-    "model", [Settings, OperatorSettings, MigrationSettings, BootstrapSettings, JobSettings]
+    "model",
+    [
+        Settings,
+        OperatorSettings,
+        MigrationSettings,
+        BootstrapSettings,
+        JobSettings,
+        ArchiveJobSettings,
+    ],
 )
 def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
     assert secret_fields_with_defaults(model) == []
@@ -395,6 +404,7 @@ def test_secrets_have_no_defaults(model: type[BaseSettings]) -> None:
         (MigrationSettings, ["migration_database_url"]),
         (BootstrapSettings, ["bootstrap_database_url"]),
         (JobSettings, ["database_url"]),
+        (ArchiveJobSettings, ["database_url"]),
     ],
 )
 def test_secret_settings_are_secret_strings(model: type[BaseSettings], secrets: list[str]) -> None:

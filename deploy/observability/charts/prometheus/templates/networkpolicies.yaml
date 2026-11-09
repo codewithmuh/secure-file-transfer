@@ -1,0 +1,150 @@
+{{- /*
+Network policies (ADR-0021). monitoring denies everything by default; this chart owns that namespace's default and
+the policies of what it runs, and of the two controllers cluster-bootstrap installs here (the Prometheus Operator and
+kube-state-metrics). Loki, Tempo and the gateway collectors bring their own.
+
+Prometheus scrapes on each target's metrics port only: the application's internal port, the stack's pods, the egress
+proxy's health port, Argo CD's application controller and the kubelets (on node addresses, inside the VPC). Alertmanager and the CloudWatch exporter
+reach AWS only through the egress proxy's platform listener.
+*/}}
+{{- $ns := .Release.Namespace }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: prometheus }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "prom.fromGrafana" (list 9090) | nindent 4 }}
+    {{- include "prom.fromPrometheus" (list 9090 8080) | nindent 4 }}
+  egress:
+    {{- include "prom.dns" . | nindent 4 }}
+    {{- include "prom.clusterApi" . | nindent 4 }}
+    # The stack in this namespace: Alertmanager, Prometheus itself, Loki, Tempo, the gateways, the Pushgateway, the
+    # CloudWatch exporter, the operator, kube-state-metrics and the config reloaders.
+    - to:
+        - podSelector: {}
+      ports:
+        {{- range list 9090 9093 8080 8081 3100 3200 8888 9091 9106 }}
+        - { port: {{ . }}, protocol: TCP }
+        {{- end }}
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: node-agents } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: otel-agent } }
+      ports:
+        - { port: 8888, protocol: TCP }
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: grafana } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: grafana } }
+      ports:
+        - { port: 3000, protocol: TCP }
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.network.egressProxy.namespace }} } }
+          podSelector: { matchLabels: {{ toJson .Values.network.egressProxy.podLabels }} }
+      ports:
+        - { port: 9902, protocol: TCP }
+    # Argo CD's application controller, for argocd_app_info.
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: argocd } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: argocd-application-controller } }
+      ports:
+        - { port: 8082, protocol: TCP }
+    {{- range $namespace, $_ := .Values.application.scraped }}
+    - to:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ $namespace }} } }
+          podSelector: { matchLabels: { app.kubernetes.io/name: sft } }
+      ports:
+        - { port: 8001, protocol: TCP }
+    {{- end }}
+    # The kubelets, on the nodes' addresses.
+    - to:
+        - ipBlock: { cidr: {{ required "network.vpcCidr is required" .Values.network.vpcCidr }} }
+      ports:
+        - { port: 10250, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: alertmanager }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "prom.fromPrometheus" (list 9093 8080) | nindent 4 }}
+    {{- include "prom.fromGrafana" (list 9093) | nindent 4 }}
+    # The replicas gossip silences and notifications to each other.
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: alertmanager } }
+      ports:
+        - { port: 9094, protocol: TCP }
+        - { port: 9094, protocol: UDP }
+  egress:
+    {{- include "prom.dns" . | nindent 4 }}
+    {{- include "prom.podIdentity" . | nindent 4 }}
+    {{- include "prom.platformProxy" . | nindent 4 }}
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: alertmanager } }
+      ports:
+        - { port: 9094, protocol: TCP }
+        - { port: 9094, protocol: UDP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pushgateway
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: pushgateway }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "prom.fromPrometheus" (list 9091) | nindent 4 }}
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - { key: kubernetes.io/metadata.name, operator: In, values: {{ toJson .Values.pushgateway.clientNamespaces }} }
+          podSelector: { matchLabels: { app.kubernetes.io/name: sft } }
+      ports:
+        - { port: 9091, protocol: TCP }
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloudwatch-exporter
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: cloudwatch-exporter }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "prom.fromPrometheus" (list 9106) | nindent 4 }}
+  egress:
+    {{- include "prom.dns" . | nindent 4 }}
+    {{- include "prom.podIdentity" . | nindent 4 }}
+    {{- include "prom.platformProxy" . | nindent 4 }}
+---
+# The two controllers cluster-bootstrap installs in this namespace: they read the cluster API and are scraped.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: controllers
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app.kubernetes.io/name, operator: In, values: [kube-prometheus-stack-prometheus-operator, kube-state-metrics] }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- include "prom.fromPrometheus" (list 8080 8081) | nindent 4 }}
+  egress:
+    {{- include "prom.dns" . | nindent 4 }}
+    {{- include "prom.clusterApi" . | nindent 4 }}

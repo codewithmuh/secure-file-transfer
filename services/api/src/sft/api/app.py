@@ -77,7 +77,7 @@ from sft.runtime.content import S3Content
 from sft.runtime.kms import open_field_keys
 from sft.runtime.s3 import S3Objects
 from sft.runtime.secrets import Keyrings
-from sft.service import fields
+from sft.service import fields, sli
 from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
 from sft.service.audit_search import ExportLeases
 from sft.service.csrf import CsrfKeyring
@@ -130,6 +130,8 @@ def _lifespan(
             key_id=settings.fields_kms_key_id, region=settings.aws_region, registry=registry
         )
         previous_keys = fields.install(field_keys)
+        # Time to shareable (#242): a transfer this API's evaluation sends (sft.service.sli).
+        previous_sli = sli.install(sli.SliMetrics.create(registry))
         # The same for the counters: an outage applies each limit's failure mode instead.
         metrics = CounterMetrics.create(registry)
         valkey_iam = ValkeyIam.of(settings.valkey_iam_cache, settings.aws_region)
@@ -198,6 +200,7 @@ def _lifespan(
             await store.close()
             await database.dispose()
             fields.install(previous_keys)
+            sli.install(previous_sli)
             await field_keys.close()
 
     return lifespan
