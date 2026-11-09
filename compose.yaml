@@ -188,8 +188,13 @@ services:
     <<: [*hardening, *api-image]
     command: ["python", "-m", "sft.workers.guardduty_standin"]
     # It serves no probe port, so the image's check (the internal port's /healthz) would mark it unhealthy and stop
-    # `make up`'s wait (#241).
-    healthcheck: { disable: true }
+    # `make up`'s wait (#241), and `--wait` refuses a long-running service with no check at all. The process being
+    # alive is all there is to check: a crash exits the container, which the wait sees.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ENVIRONMENT: local # it refuses to start anywhere else
