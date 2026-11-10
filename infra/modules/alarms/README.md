@@ -15,7 +15,7 @@ the scan dead-letter queues are the in-cluster `ScanFailed` alert's, so they are
 
 | Topic | Region | Who publishes | Who subscribes |
 |---|---|---|---|
-| `sft-<env>-<rs>-alerts-page` | Each | CloudWatch alarms named `sft-<env>-*`; Alertmanager's role `sft-<env>-alertmanager` | `TF_VAR_alert_emails` |
+| `sft-<env>-<rs>-alerts-page` | Each | CloudWatch alarms named `sft-<env>-*`; Alertmanager's role `sft-<env>-alertmanager`; the security rules through `sft-<env>-events-delivery` | `TF_VAR_alert_emails` |
 | `sft-<env>-<rs>-alerts-ticket` | Each | The same | `TF_VAR_alert_emails` |
 | `sft-<env>-<rs>-heartbeat` | Each | Alertmanager only, once a minute, for the always-firing `Watchdog` alert | Nobody: the heartbeat alarm counts its messages |
 | `sft-<env>-<rs>-break-glass-alerts` | Each | Made by [`break-glass-role`](../break-glass-role/README.md) | `TF_VAR_alert_emails`, subscribed here |
@@ -60,6 +60,37 @@ Not here, and why:
 - **A KMS throttle count**: KMS publishes none; usage against the quota warns before throttling.
 - **The egress proxy**: it runs in the cluster, so its health is a Prometheus alert; the NAT gateways under it are here.
 
+## Security events (#256)
+
+Alerts that come from AWS events, not metrics: EventBridge rules on CloudTrail's events, in each Region, into the
+Region's page topic through `sft-<env>-events-delivery` ([`security-events.tf`](security-events.tf); encryption 4.4
+rule 7, authn-authz 8.3 and 8.4; T-61, T-64, T-74, T-75). Each message is an input transformer's JSON with the alert,
+`severity: page`, a summary, the runbook's URL and who, what, where and when from the event: never `requestParameters`
+or `responseElements`, which can hold a key policy, a session's access key ID or a token.
+
+| Rule | Fires on | Runbook |
+|---|---|---|
+| `kms-key-changed` | A KMS key's policy, state, rotation, grants, imported material or replicas changed by anyone but a deploy role (the environment's; in prod also the retained stack's), and any refused attempt | [kms-key-change](../../../docs/runbooks/kms-key-change.md) |
+| `kms-key-destroyed` (prod) | A deploy role disabling a key or its rotation, or scheduling its deletion: in dev and staging that is the teardown, only logged (rule 7) | [kms-key-change](../../../docs/runbooks/kms-key-change.md) |
+| `key-admin-used` | Any assumption of `sft-<env>-keyadmin`, and every call it makes, reads included | [key-admin-role](../../../docs/runbooks/key-admin-role.md) |
+| `human-sign-in` | Root, the emergency user, `Admin` and `BreakGlass` signing in (`ConsoleLogin`, `AssumeRoleWithSAML`), and any call by root or the emergency user | [privileged-sign-in](../../../docs/runbooks/privileged-sign-in.md) |
+| `security-service-off` | CloudTrail, GuardDuty or Config turned off or changed by anyone but a deploy role, and any refused attempt | [security-service-off](../../../docs/runbooks/security-service-off.md) |
+| `alerting-or-endpoint-changed` | An `sft-<env>-*` rule deleted, disabled or emptied by anyone but a deploy role, any refused attempt, and the cluster's public endpoint turned on, by anyone (apart from `security-service-off` only because a pattern holds at most 4,096 characters) | [security-service-off](../../../docs/runbooks/security-service-off.md) |
+
+The rules that must see reads (`key-admin-used`, `human-sign-in`) are `ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS`:
+EventBridge delivers CloudTrail's read-only events only to rules that ask.
+
+**us-east-1.** Root and IAM user sign-ins and calls to STS's global endpoint are recorded there. Tokyo's stack makes
+`sft-<env>-apne1-global-events` in us-east-1, which forwards exactly those (sign-ins, `AssumeRole*` into the key-admin,
+break-glass database and Identity Center roles, anything root or the emergency user does) to Tokyo's default event bus,
+where the rules above and the break-glass database role's see them. Osaka's stack makes its own once out of the pilot
+light, so a failover keeps them; in the pilot light Osaka's rules match Osaka's own events only (`region`), so nothing
+pages twice. SCP 1 allows EventBridge in us-east-1 for this (infra/organization/scps.tf).
+
+The alarms module's `terraform test` checks that every rule targets the page topic through the delivery role, names a
+runbook that exists, and carries no request or response fields. Whether each fires on a real event, and the exact event
+names Identity Center records in a member account, are pending the AWS run.
+
 ## The pilot light and a failover
 
 Osaka's stack makes every alarm, so a failover only switches them on. During the pilot light,
@@ -68,7 +99,8 @@ observability stack runs there (ADR-0009), and `TF_VAR_pilot_light` (default `tr
 target alarm, whose target group is empty by design. The failover runbook applies Osaka's `alarms` stack with
 `TF_VAR_heartbeat_enabled=true TF_VAR_pilot_light=false`, and the failback applies it with the defaults again.
 Osaka's database alarms follow its role: the writer's CPU and memory alarms need `database.role` to say it is no longer
-the secondary.
+the secondary. The staging and prod roots take it as `TF_VAR_database_role` (#261): the failover applies Osaka's with
+`primary` (and, in a drill, Tokyo's with `secondary`), the failback both back to their defaults.
 
 **The synthetic probe's alarm** (`probe.tf`, #248): `probe-failing` pages when `SecureFileTransfer/Probe`
 `ProbeSuccess` for the environment has no 1 for two 5-minute periods, missing data included. It exists only with

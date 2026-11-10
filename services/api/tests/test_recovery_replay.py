@@ -254,7 +254,9 @@ def seed_pool_member(db: ScratchDatabase, tenant_id: uuid.UUID) -> dict[str, uui
         "INSERT INTO member_sessions (id, tenant_id, user_id, identity_id, session_hash, "
         "auth_time, auth_method, expires_at, created_at) VALUES (:id, :tenant, :user, "
         ":identity, sha256(convert_to(CAST(:id AS text), 'UTF8')), now(), 'password_totp', "
-        "now() + interval '12 hours', :created)",
+        # The check allows at most 12 hours after created_at, which is an hour in the past:
+        # the session stays live for about 11 more hours.
+        "CAST(:created AS timestamptz) + interval '12 hours', :created)",
         id=ids["session"],
         tenant=tenant_id,
         user=ids["user"],
@@ -285,6 +287,14 @@ async def test_replay_reimports_events_and_reapplies_what_takes_access_away(
         "UPDATE transfers SET state = 'sent', expires_at = now() + interval '7 days', "
         "submitted_at = now(), sent_at = now() WHERE id = :id",
         id=rows["transfer"],
+    )
+    # Everything in a restored database predates the restore point, the member's session
+    # included; replay ends only the sessions that existed when the event happened.
+    db.sql(
+        "UPDATE member_sessions SET created_at = :created, auth_time = :created, "
+        "expires_at = CAST(:created AS timestamptz) + interval '12 hours' WHERE id = :id",
+        id=rows["session"],
+        created=RESTORE_POINT,
     )
     pool = seed_pool_member(db, tenant)
     before = counted(db, seeded)

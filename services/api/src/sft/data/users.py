@@ -404,6 +404,21 @@ async def invited_everywhere(
     return [(row[0], row[1]) for row in rows]
 
 
+async def active_everywhere(
+    session: AsyncSession, *, after: UUID | None = None, limit: int = MAX_PAGE
+) -> Sequence[tuple[UUID, UUID]]:
+    """`(tenant ID, user ID)` of up to `limit` active users, in every tenant, after the user
+    `after`, oldest first: the standby enrolment after a regional failover (#258, authn and authz
+    2.6), as the notification worker, through revision 0017's `notify_find` policy. System scope,
+    read only."""
+    require_scope(session, ScopeKind.SYSTEM)
+    statement = select(User.tenant_id, User.id).where(User.status == UserStatus.ACTIVE.value)
+    if after is not None:
+        statement = statement.where(User.id > after)
+    rows = await session.execute(statement.order_by(User.id).limit(limit))
+    return [(row[0], row[1]) for row in rows]
+
+
 async def invite_again(session: AsyncSession, user_id: UUID) -> UUID:
     """A new `member.invited` message for a user left `invited` (#193): the notifier invites
     them through the pool as it does any new member. In the user's tenant scope."""

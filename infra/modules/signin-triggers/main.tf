@@ -43,10 +43,10 @@ data "aws_kms_alias" "logs" {
 
 locals {
   env_prefix    = "sft-${var.environment}"
-  role_name     = "${local.env_prefix}-signin-trigger"
+  role_name     = var.conventions.workload_role_names["signin-trigger"]
   role_arn      = "arn:aws:iam::${var.account_id}:role/${local.role_name}"
   function_name = "${var.name_prefix}-signin-trigger"
-  region_short  = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+  region_short  = var.conventions.region_shorts
 
   # Every Region's resources by name, so one global role serves both Regions' functions.
   queue_arns = [

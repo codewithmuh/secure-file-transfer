@@ -9,8 +9,9 @@ locals {
 
   standalone = var.cluster_role == "standalone"
   primary    = var.cluster_role == "primary"
-  secondary  = var.cluster_role == "secondary"
-  has_master = !local.secondary
+  # The master secret lives where the caller passes it: Tokyo's data stack, whatever its cluster's role, so a Tokyo
+  # cluster made again as Osaka's secondary at a failback keeps the secret and its Osaka replica (#261).
+  has_master = var.master_secret != null
 
   writer_availability_zone_id  = var.instance_availability_zone_ids[0]
   reader_availability_zone_ids = toset(slice(var.instance_availability_zone_ids, 1, length(var.instance_availability_zone_ids)))
@@ -175,6 +176,14 @@ ephemeral "aws_secretsmanager_secret_version" "master" {
 # The global database (primary only) and the cluster
 # ---------------------------------------------------------------------------------------------------------------------
 
+# The cluster's role at creation. Changing it replaces the cluster and its instances (lifecycle below): that is the
+# failback after a detach, where Tokyo's old cluster goes, with its final snapshot, and a new one joins Osaka's global
+# database as its secondary (#261, docs/runbooks/regional-failback.md). Only Tokyo's role ever changes; who writes is
+# decided by Aurora's failover and switchover, never by this input. A planned create of this resource triggers nothing.
+resource "terraform_data" "cluster_role" {
+  input = var.cluster_role
+}
+
 resource "aws_rds_global_cluster" "this" {
   count = local.primary ? 1 : 0
 
@@ -256,7 +265,7 @@ resource "aws_rds_cluster" "global_member" {
   # The secondary takes its database and its master user from the primary.
   database_name              = local.primary ? var.database_name : null
   master_username            = local.primary ? var.master_username : null
-  master_password_wo         = local.master_password
+  master_password_wo         = local.primary ? local.master_password : null
   master_password_wo_version = local.primary ? var.master_password_version : null
 
   iam_database_authentication_enabled = true
@@ -292,8 +301,12 @@ resource "aws_rds_cluster" "global_member" {
 
   lifecycle {
     # engine_version: the global cluster upgrades its members. replication_source_identifier: set by RDS on the
-    # secondary, and swapped by a managed failover or switchover.
-    ignore_changes = [engine_version, replication_source_identifier]
+    # secondary, and swapped by a managed failover or switchover. global_cluster_identifier: membership changes by
+    # Aurora's own actions (a detach, or a new global database made from Osaka's cluster at a failback, #261); the
+    # input names the global database a new cluster joins.
+    ignore_changes = [engine_version, replication_source_identifier, global_cluster_identifier]
+
+    replace_triggered_by = [terraform_data.cluster_role]
 
     precondition {
       condition     = var.global_cluster_identifier != null
@@ -301,8 +314,8 @@ resource "aws_rds_cluster" "global_member" {
     }
 
     precondition {
-      condition     = local.primary == (var.master_secret != null)
-      error_message = "master_secret must be set for the primary and null for the secondary."
+      condition     = !local.primary || var.master_secret != null
+      error_message = "The primary needs master_secret; a secondary keeps one only in Tokyo (#261)."
     }
 
     precondition {
@@ -337,6 +350,11 @@ resource "aws_rds_cluster_instance" "writer" {
   performance_insights_enabled          = true
   performance_insights_kms_key_id       = var.kms_key_arn
   performance_insights_retention_period = 7
+
+  # Replaced with the cluster when its role changes (#261): RDS deletes no cluster that still has instances.
+  lifecycle {
+    replace_triggered_by = [terraform_data.cluster_role]
+  }
 }
 
 resource "aws_rds_cluster_instance" "reader" {
@@ -363,6 +381,10 @@ resource "aws_rds_cluster_instance" "reader" {
 
   # The first instance becomes the writer, so readers wait for it.
   depends_on = [aws_rds_cluster_instance.writer]
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.cluster_role]
+  }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------

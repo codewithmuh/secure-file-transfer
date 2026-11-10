@@ -1,13 +1,13 @@
 """Checks every rendered manifest against the runtime contract (architecture 8) and the pod rules of ADR-0004.
 
-Renders every cluster with deploy/render.sh (helm on PATH), the way Argo CD will, then inspects the objects. Run from
-the repository root: `uv run --project services/api --locked pytest deploy/tests` (`make deploy-check` does it all).
+Inspects every cluster as deploy/render.sh renders it, the way Argo CD will (the `rendered` fixture, deploy/conftest.py;
+helm on PATH). Run from the repository root: `uv run --project services/api --locked pytest deploy/tests`
+(`make deploy-check` does it all).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -26,6 +26,7 @@ from sft.core.settings import (
     MigrationSettings,
     NotifySettings,
     OperatorSettings,
+    RecoverySettings,
     RelaySettings,
     ScanSettings,
     Settings,
@@ -54,6 +55,7 @@ PROXIED = {
     "api": 3128,
     "notifier": 3129,
     "invite-backlog": 3129,
+    "standby-enrolment": 3129,  # #258, as the notification worker: Cognito through its listener
     "key-rotation": 3133,
     "synthetic-probe": 3134,
 }
@@ -70,6 +72,8 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,
     "sft.workers.invite_backlog": NotifySettings,  # the notification worker's one-off pass (#193)
+    "sft.workers.standby_enrolment": NotifySettings,  # #258
+    "sft.workers.recovery": RecoverySettings,  # #258
     "sft.workers.key_rotation": KeyRotationSettings,
     # The lifecycle jobs (#181), one module per CronJob, all reading JobSettings.
     "sft.workers.expiry": JobSettings,
@@ -80,32 +84,11 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.purge": JobSettings,  # #224
     "sft.workers.audit_partitions": JobSettings,
     "sft.workers.audit_archive": ArchiveJobSettings,  # #183
-    "sft.probe": ProbeSettings,  # #248, rendered on here (the fixture)
+    "sft.probe": ProbeSettings,  # #248, rendered on (deploy/tests/cluster-facts.sh)
 }
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 
 Manifest = dict[str, Any]
-
-
-@pytest.fixture(scope="session")
-def rendered(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> dict[tuple[str, str, str], list[Manifest]]:
-    out = tmp_path_factory.mktemp("rendered")
-    # The synthetic probe is off by default until each environment's AWS side exists (#248): rendered on here, so its
-    # pod, policy and identity are checked like every other workload's before a values file turns it on.
-    subprocess.run(
-        [str(ROOT / "deploy" / "render.sh"), str(out)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "SFT_RENDER_SET": "probe.enabled=true"},
-    )
-    result = {}
-    for env, region in CLUSTERS:
-        for part in [*PARTS, "argocd"]:
-            text = (out / f"{env}-{region}-{part}.yaml").read_text()
-            result[(env, region, part)] = [d for d in yaml.safe_load_all(text) if d]
-    return result
 
 
 def chart_objects(
@@ -457,8 +440,12 @@ def test_pilot_light(rendered: dict[tuple[str, str, str], list[Manifest]]) -> No
                 region,
                 obj["metadata"]["name"],
             )
-        if obj["kind"] == "CronJob" and obj["metadata"]["name"] == "invite-backlog":
-            assert obj["spec"]["suspend"] is True  # run by hand, once (#193)
+        if obj["kind"] == "CronJob" and obj["metadata"]["name"] in {
+            "invite-backlog",
+            "recovery",
+            "standby-enrolment",
+        }:
+            assert obj["spec"]["suspend"] is True  # run by hand (#193, #258)
         elif obj["kind"] == "CronJob":
             assert obj["spec"]["suspend"] is osaka
             assert obj["spec"]["concurrencyPolicy"] == "Forbid"
@@ -835,12 +822,9 @@ def test_the_key_rotation_job_runs_in_tokyo_with_a_token_for_the_reload_only(
         assert [c["region"] for c in clients] == (
             ["ap-northeast-1"] if env == "dev" else ["ap-northeast-1", OSAKA]
         )
-    for objects in rendered.values():
-        for obj in objects:
-            if obj["kind"] in POD_KINDS and component(obj) != "key-rotation":
-                assert not any(
-                    "projected" in v for v in pod_spec(obj).get("volumes", [])
-                )
+    for _, _, _, obj in pods(rendered):
+        if component(obj) != "key-rotation":
+            assert not any("projected" in v for v in pod_spec(obj).get("volumes", []))
 
 
 def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cognito(
@@ -852,11 +836,12 @@ def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cogni
             if obj["kind"] in POD_KINDS and component(obj) in {
                 "notifier",
                 "invite-backlog",
+                "standby-enrolment",
             }:
                 container = pod_spec(obj)["containers"][0]
                 settings = env_of(container)
-                if component(obj) == "invite-backlog":
-                    # A run-to-completion pass with no listener: no port and no probes (#193).
+                if component(obj) in {"invite-backlog", "standby-enrolment"}:
+                    # Run-to-completion passes with no listener: no port and no probes (#193, #258).
                     assert not {
                         "ports",
                         "startupProbe",
@@ -901,3 +886,18 @@ def test_only_the_api_identity_unwraps_field_data_keys_and_never_the_stand_in(
         if component(obj) == "field-keys"
     ]
     assert len(jobs) == len({env for env, _ in CLUSTERS})
+
+
+def test_trivy_values_are_the_one_source_of_facts() -> None:
+    """Trivy renders the charts with trivy-values.yaml (trivy.yaml), which holds dev's cluster facts and switches in
+    Tokyo exactly as deploy/tests/cluster-facts.sh writes them, the one source render.sh and check.sh use (#186)."""
+    facts = yaml.safe_load(
+        subprocess.run(
+            [str(ROOT / "deploy/tests/cluster-facts.sh"), "dev", "ap-northeast-1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    trivy = yaml.safe_load((ROOT / "deploy/tests/trivy-values.yaml").read_text())
+    assert {key: trivy.get(key) for key in facts} == facts

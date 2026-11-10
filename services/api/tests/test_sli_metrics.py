@@ -22,8 +22,10 @@ from prometheus_client.metrics import MetricWrapperBase
 import sft
 from member_fixtures import seed_tenant
 from pg import ScratchDatabase
+from sft.api.auth_failures import AuthFailures
 from sft.api.observability import HttpMetrics
 from sft.api.operator.app import BreakGlassMetrics
+from sft.api.operator.jobs import DriftMetrics
 from sft.data.audit import Actor
 from sft.data.counters import CounterMetrics
 from sft.data.database import Database
@@ -39,12 +41,13 @@ from sft.service.audit_partitions import AuditPartitionMetrics
 from sft.service.downloads import DownloadMetrics
 from sft.service.evaluation import Outcome
 from sft.service.fields import FieldMetrics
-from sft.service.lifecycle import JobMetrics, PurgeMetrics
+from sft.service.lifecycle import ApprovalBacklogMetrics, JobMetrics, PurgeMetrics
 from sft.service.links import LinkMetrics
 from sft.service.notifications import NotifyMetrics
+from sft.service.sso_drift import PoolRegion
 from sft.workers.consumer import ConsumerMetrics
 from sft.workers.relay import RelayMetrics
-from sft.workers.scan import GuardDutyMetrics, ScanMetrics
+from sft.workers.scan import GuardDutyMetrics, ScanMetrics, SignatureMetrics
 from transfer_fixtures import seed_file, seed_transfer
 
 pytestmark = pytest.mark.anyio
@@ -69,12 +72,14 @@ ALLOWED_LABELS = frozenset(
         "method",
         "outcome",
         "pool",
+        "problem",
         "purpose",
         "queue",
         "reason",
         "region",
         "result",
         "route",
+        "scheme",
         "self_approved",
         "size_class",
         "state",
@@ -94,7 +99,9 @@ def every_metric(registry: CollectorRegistry) -> list[object]:
     """Every metrics object of the service, each made once, as the processes make them."""
     return [
         HttpMetrics.create(),
+        AuthFailures.create(registry),
         BreakGlassMetrics.create(registry),
+        DriftMetrics.create(registry, tuple(PoolRegion)),
         CounterMetrics.create(registry),
         KeyringMetrics.create(registry),
         ArchiveJobMetrics.create(registry),
@@ -103,12 +110,14 @@ def every_metric(registry: CollectorRegistry) -> list[object]:
         FieldMetrics.create(registry),
         JobMetrics.create(registry),
         PurgeMetrics.create(registry),
+        ApprovalBacklogMetrics.create(registry),
         LinkMetrics.create(registry),
         NotifyMetrics.create(registry),
         ConsumerMetrics.create(registry),
         RelayMetrics.create(registry),
         ScanMetrics.create(registry),
         GuardDutyMetrics.create(registry),
+        SignatureMetrics.create(registry),
         sli.SliMetrics.create(registry),
     ]
 

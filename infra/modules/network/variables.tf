@@ -178,3 +178,14 @@ variable "flow_log_destination_arn" {
     error_message = "flow_log_destination_arn must be an S3 bucket ARN, optionally followed by /prefix/."
   }
 }
+
+variable "service_domain" {
+  description = "The environment's service domain: sft.<domain> in prod, <env>.sft.<domain> elsewhere. DNS Firewall answers api. and app. under it, which the synthetic probe calls through the egress proxy (#248, #259). Null leaves them out."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.service_domain == null || can(regex("^[a-z0-9.-]+$", var.service_domain))
+    error_message = "service_domain must be a lowercase domain name."
+  }
+}

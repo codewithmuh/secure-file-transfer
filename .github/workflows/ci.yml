@@ -485,7 +485,8 @@ jobs:
           echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum --check --strict
           tar --extract --gzip --file kubeconform.tar.gz --directory bin kubeconform
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: helm lint and helm template for every cluster, kubeconform on the output
+      # Renders every cluster once (#186): the steps below all read this directory, the tests through SFT_RENDERED.
+      - name: helm lint and helm template for every cluster, kubeconform on the output, the operator's CRDs
         run: deploy/check.sh "$RUNNER_TEMP/rendered"
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -493,6 +494,8 @@ jobs:
           enable-cache: true
           cache-dependency-glob: services/api/uv.lock
       - name: Every rendered container meets the runtime contract (architecture 8)
+        env:
+          SFT_RENDERED: ${{ runner.temp }}/rendered
         run: uv run --project services/api --locked pytest -p no:cacheprovider deploy/tests
       - name: Every rendered pod passes the cluster's admission policies (Kyverno CLI, ADR-0004)
         run: deploy/policies.sh "$RUNNER_TEMP/rendered"
@@ -505,5 +508,7 @@ jobs:
           exit-code: "1"
       - name: The alert rules pass their unit tests (promtool from the pinned Prometheus image, deploy/alerts)
         run: deploy/alerts/test.sh
-      - name: The observability stack and its dashboards pass their tests (deploy/observability, #243, #244)
+      - name: The observability stack, its dashboards and CRDs pass their tests (deploy/observability, #243, #244, #264)
+        env:
+          SFT_RENDERED: ${{ runner.temp }}/rendered
         run: uv run --project services/api --locked pytest -p no:cacheprovider deploy/observability/tests

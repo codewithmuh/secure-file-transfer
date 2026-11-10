@@ -34,6 +34,13 @@ ArchivedEvent`), never a token, code, address, file name, message, IP address or
 The store is a thin adapter (`ArchiveStore`): `sft.runtime.archive.S3AuditArchive` in AWS and
 against S3Mock, a fake in the unit tests. Failed writes are counted per region in
 `audit_archive_write_failures_total{region}`.
+
+**A regional loss** (#257; architecture 7). If Tokyo is lost, its archive can't confirm a record,
+so in Osaka every grant would answer `503` and every other change "done, not confirmed" until
+Tokyo returned. The failover's toggle (`AUDIT_ARCHIVE_SURVIVING_REGION`, the chart's
+`auditArchive.survivingRegionOnly`) names the region left, and the store is then `SurvivingRegion`:
+records go to that region alone and `2xx` means it holds them. At failback the archive job writes
+the window's records to the lost region from the database (`sft.service.archive_job`).
 """
 
 from __future__ import annotations
@@ -100,6 +107,32 @@ class ArchiveStore(Protocol):
         ...
 
     async def close(self) -> None: ...
+
+
+class SurvivingRegion:
+    """A store that writes `region` alone, the region left after a regional loss (module
+    docstring): every record confirmed there is confirmed. Writing another region is refused, so
+    nothing reaches the lost region by mistake."""
+
+    def __init__(self, store: ArchiveStore, region: Region) -> None:
+        if region not in store.regions:
+            raise ValueError(f"the store has no archive in {region.value}")
+        self._store = store
+        self._region = region
+
+    @property
+    def regions(self) -> tuple[Region, ...]:
+        return (self._region,)
+
+    async def put_once(
+        self, region: Region, key: str, body: bytes, *, content_type: str = "application/json"
+    ) -> bool:
+        if region is not self._region:
+            raise ArchiveWriteError("NotTheSurvivingRegion")
+        return await self._store.put_once(region, key, body, content_type=content_type)
+
+    async def close(self) -> None:
+        await self._store.close()
 
 
 class RecordNotConfirmed(ServiceUnavailable):

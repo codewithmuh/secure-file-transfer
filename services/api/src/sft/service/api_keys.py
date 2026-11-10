@@ -43,7 +43,6 @@ expires: once per notice, recorded on the key, so a second run asks nothing agai
 
 from __future__ import annotations
 
-import hashlib
 import re
 import secrets
 import zlib
@@ -59,6 +58,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import FieldError, InvalidRequest, NotFound, Unprocessable, json_pointer
 from sft.core.ids import uuid7
+from sft.core.tokens import token_hash
 from sft.data import api_keys, audit
 from sft.data.audit import Actor, ArchivedEvent, Origin, Target
 from sft.data.database import Database
@@ -157,7 +157,7 @@ def parse_key(raw: str, environment: KeyEnvironment) -> str | None:
 
 
 def key_hash(key: str) -> bytes:
-    return hashlib.sha256(key.encode()).digest()
+    return token_hash(key)
 
 
 def key_prefix(key: str) -> str:

@@ -3,3 +3,6 @@
 !uv.lock
 !README.md
 !src/
+# Only to make the bank code list in the build stage; the runtime image never holds tools/.
+!tools/__init__.py
+!tools/bank_codes.py

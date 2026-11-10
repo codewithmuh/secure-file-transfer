@@ -12,15 +12,19 @@ data, bundled in `bank_codes.txt` beside this module and loaded once per process
 
 Header lines start with `#`; `source`, `licence` and `retrieved` are required, `none` when nothing
 is bundled. Every other line is one 7-digit code, the bank code then the branch code, in ascending
-order, each once. `tools/bank_codes.py` writes the file from a licensed CSV, and the refresh steps
-are in the service README ("DLP bank and branch codes").
+order, each once.
 
-**Nothing is bundled yet** (#146): no source whose licence allows redistribution could be
-confirmed, so the file holds the header with `none` and no codes, and `jp_bank_account` stays at
-medium. Tests and the accuracy corpus use a synthetic list instead (`tests/bank_codes_fixture.txt`).
+**Git holds only the header** (#146): no licence for the data could be confirmed, so the image
+build fetches the list, pinned by commit and digest, and writes this file before the package is
+built (`tools/bank_codes.py`, the Dockerfile; the service README has the refresh steps). From a
+checkout, or in an image built with `BANK_CODES=none`, the list is empty and `jp_bank_account`
+stays at medium. Tests and the accuracy corpus use a synthetic list
+(`tests/bank_codes_fixture.txt`).
 
-The list is a frozen set of 7-character strings: about 2 MB of memory for the 30,000 or so branches
-of Japan, parsed in tens of milliseconds, well inside the inspector's start-up and memory budgets.
+The list is a frozen set of 7-character strings. Japan's 31,229 codes (2026-08-24) take 250 KB on
+disk, parse in about 10 ms and add about 5 MiB to a process, read once when the inspector starts
+and once in each file's child ([DLP] 4.4 has the measurements and the limits). A malformed list
+raises `BankCodeError` at import, which stops the inspector at start (`sft.dlp.engine`).
 """
 
 from __future__ import annotations

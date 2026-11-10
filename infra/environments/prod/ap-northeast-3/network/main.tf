@@ -60,4 +60,7 @@ module "network" {
   peer_region           = "ap-northeast-1"
 
   flow_log_destination_arn = var.flow_log_destination_arn
+
+  # The API's and the web app's names, for the synthetic probe (#259).
+  service_domain = "sft.${var.domain}"
 }

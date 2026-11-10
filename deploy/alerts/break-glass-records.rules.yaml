@@ -1,0 +1,49 @@
+# Alerts of the service's record of Identity Center break-glass grants (FR-35, authn-authz 8.3; #239), in Prometheus
+# rule format. Each links to its runbook (NFR-17), tested by deploy/alerts/tests/break-glass-records.test.yaml
+# (`promtool test rules`, CI's deploy job). Prometheus loads every deploy/alerts/*.rules.yaml file (ADR-0009, #243).
+#
+# The series come from the operator API's /metrics (sft.api.operator.jobs). Its reconciliation job runs every 15
+# minutes where the environment configures BREAK_GLASS_TRAIL_ROLE_ARN, reads the BreakGlass assignments of the last day
+# from CloudTrail, records any that `recordBreakGlassGrant` didn't, and then sets:
+# - sft_break_glass_unrecorded_assignments: assignments it couldn't record that started an hour or more ago;
+# - sft_break_glass_records_reconciled_total: grants it recorded because the break-glass tool didn't;
+# - sft_break_glass_reconciliation_last_success_timestamp_seconds: the Unix time of the last run that ran to the end.
+# A record missing from a tenant's log counts in the sweep's sft_break_glass_tenant_records_missed_total, whose alert
+# is in break-glass.rules.yaml. Every alert here carries `security: "true"`, so Alertmanager never inhibits it during a
+# drill (alertmanager.yaml). The assignment itself pages through EventBridge (authn-authz 8.3), not Prometheus.
+groups:
+  - name: break-glass-records
+    rules:
+      # Authn-authz 8.3: a BreakGlass assignment is still without a service record an hour after it started, so the
+      # tenants it names can't see it in their audit logs (UC-4).
+      - alert: BreakGlassGrantUnrecorded
+        expr: max(sft_break_glass_unrecorded_assignments) > 0
+        labels:
+          severity: page
+          security: "true"
+        annotations:
+          summary: A BreakGlass assignment has no service record an hour after it started; tenants can't see it (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md
+
+      # The reconciliation hasn't run to the end for 45 minutes (three runs), so a grant made now could be unrecorded
+      # for more than an hour without BreakGlassGrantUnrecorded knowing. Only while the series exists: an operator
+      # API that is down is service-unavailable's alert, and an environment without a trail has no series.
+      - alert: BreakGlassReconciliationStalled
+        expr: time() - max(sft_break_glass_reconciliation_last_success_timestamp_seconds) > 2700
+        labels:
+          severity: page
+          security: "true"
+        annotations:
+          summary: The break-glass reconciliation hasn't completed for 45 minutes; grants may go unrecorded (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md
+
+      # The job recorded a grant the break-glass tool should have: the record is there now, but find out why the
+      # tool's call failed, and check the grant was expected.
+      - alert: BreakGlassRecordedByReconciliation
+        expr: sum(increase(sft_break_glass_records_reconciled_total[30m])) > 0
+        labels:
+          severity: ticket
+          security: "true"
+        annotations:
+          summary: A break-glass grant was recorded from CloudTrail, not by the break-glass tool (FR-35).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md

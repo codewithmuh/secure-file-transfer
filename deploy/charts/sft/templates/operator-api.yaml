@@ -4,10 +4,21 @@ The operator API (FR-34, authn-authz 8.2): namespace sft-operator, which runs no
 balancer: operators reach it with `kubectl port-forward`, which only the Operator group may do here.
 */}}
 {{- $w := .Values.operatorApi }}
+{{- /*
+The audit archive of both regions, as the API's (#177), for `recoverTenantAdmin`'s security-critical record (#239), and
+the surviving region's alone during a regional loss (#257). The break-glass reconciliation and the SSO drift check
+(#239) start only when `operatorApi.env` names their AWS side (BREAK_GLASS_TRAIL_ROLE_ARN, BREAK_GLASS_PERMISSION_SET_ARN,
+IDENTITY_STORE_ID, SSO_DRIFT_POOLS); until then they are off.
+*/}}
+{{- $archive := dict "AUDIT_ARCHIVE_TOKYO_BUCKET" (printf "sft-%s-apne1-audit-archive-%s" .Values.environment (toString .Values.cluster.accountId)) }}
+{{- if ne .Values.environment "dev" }}
+{{- $_ := set $archive "AUDIT_ARCHIVE_OSAKA_BUCKET" (printf "sft-%s-apne3-audit-archive-%s" .Values.environment (toString .Values.cluster.accountId)) }}
+{{- end }}
+{{- $archive = merge $archive (include "sft.survivingRegionEnv" . | fromJson) }}
 {{- $env := merge (dict
   "OPERATOR_ENVIRONMENT" .Values.environment
   "OPERATOR_AWS_ACCOUNT_ID" (toString .Values.cluster.accountId)
-  "OPERATOR_ROLE_NAME" .Values.cluster.operatorRoleName) $w.env }}
+  "OPERATOR_ROLE_NAME" .Values.cluster.operatorRoleName) $archive $w.env }}
 {{- $containers := include "sft.appContainer" (dict "root" $ "name" "operator-api" "traced" true "module" $w.module "publicPort" 8000 "databaseRole" $w.databaseRole "valkeyUser" $w.valkeyUser "env" $env "preStop" true "resources" $w.resources) }}
 {{ include "sft.deployment" (dict "root" $ "name" "operator-api" "component" "operator-api" "replicas" $w.replicas "serviceAccount" $w.serviceAccount "grace" $w.terminationGracePeriodSeconds "containers" $containers) }}
 ---

@@ -171,6 +171,8 @@ module "cluster_bootstrap" {
 module "observability" {
   source = "../../../../modules/observability"
 
+  conventions = module.conventions
+
   environment  = "prod"
   region       = module.conventions.region
   regions      = ["ap-northeast-1", "ap-northeast-3"]

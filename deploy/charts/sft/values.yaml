@@ -55,6 +55,15 @@ pilotLight: false
 failover:
   holdWorkers: false
 
+# The audit archive during a regional loss (#257, docs/runbooks/regional-failover.md): every security-critical record
+# and every archive batch goes to both regions' archive (architecture 5.2), so with one region lost, grants would fail.
+# The failover runbook names the region that is left (ap-northeast-3 when Tokyo is lost): the API, the operator API,
+# the lifecycle jobs and the archive job then write its archive alone (AUDIT_ARCHIVE_SURVIVING_REGION), and the archive job records what
+# the other region lacks. Failback sets it back to empty, and the archive job back-fills the other region with the same
+# objects. Never set in dev, which has Tokyo alone.
+auditArchive:
+  survivingRegionOnly: ""
+
 # The application image: one image for the API and every worker (architecture 2). The digest is the only line the
 # promotion workflow edits, in each cluster's values file (ADR-0005, #107).
 image:
@@ -336,6 +345,27 @@ fieldKeys:
 # invite-backlog invite-backlog-1 (deploy/README.md). It runs as the notification worker, with its settings.
 inviteBacklog:
   module: sft.workers.invite_backlog
+  activeDeadlineSeconds: 3600
+
+# The recovery job (#258; sft.workers.recovery, docs/operations/disaster-recovery.md 4): a CronJob that is always
+# suspended, run by hand by the restore, failover and failback runbooks, which render a Job from it with their steps
+# and times (ops/lib/common.sh). It runs as sft_recovery with its own service account (Pod Identity: sft-<env>-recovery,
+# which lists and reads this region's audit archive) and reads that archive (AUDIT_ARCHIVE_BUCKET).
+recovery:
+  module: sft.workers.recovery
+  serviceAccount: recovery # Pod Identity: sft-<env>-recovery
+  databaseRole: sft_recovery
+  activeDeadlineSeconds: 3600
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 2Gi } # the replay holds the window's records in memory
+
+# The standby enrolment (#258; authn-authz 2.6): after a regional failover, every active local member gets a user in
+# this region's pool and a re-enrolment invitation. Always suspended, run by hand once by the failover runbook after the
+# recovery job's replay: kubectl create job --from=cronjob/standby-enrolment. It runs as the notification worker, with
+# its settings, its service account and its proxy listener, like invite-backlog.
+standbyEnrolment:
+  module: sft.workers.standby_enrolment
   activeDeadlineSeconds: 3600
 
 # ADR-0019's split between the scan pools, in bytes: the API routes a completed file by it, and so does

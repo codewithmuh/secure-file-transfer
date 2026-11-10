@@ -35,3 +35,19 @@ variable "malware_protection_enabled" {
   type        = bool
   default     = false
 }
+
+variable "aurora_global_generation" {
+  description = <<-EOT
+    The global database's generation: 1 (sft-<env>-aurora) from the build on. A failback after a detach makes a new
+    global database from Osaka's cluster, sft-<env>-aurora-2, and both data roots take 2 from then on
+    (docs/runbooks/regional-failback.md, #261).
+  EOT
+  type        = number
+  default     = 1
+}
+
+variable "replicate_to_tokyo" {
+  description = "At a failback only: replicate Osaka's files buckets back to Tokyo's (rule to-tokyo, with RTC), from the failback's step 2 until Osaka is back in its pilot light in step 8 (docs/runbooks/regional-failback.md, #262)."
+  type        = bool
+  default     = false
+}

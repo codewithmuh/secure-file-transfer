@@ -54,3 +54,18 @@ groups:
         annotations:
           summary: Pods have failed to re-read the {{ $labels.keyring }} keyring from Secrets Manager for 15 minutes (encryption 6.4).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-refresh.md
+
+      # Encryption 6, 6.5: a keyring's active key older than its rotation period plus 7 days means the key rotation job
+      # hasn't rotated it. keyring_active_key_age_seconds{keyring} comes from the processes that load the keyrings
+      # (#260). email-hmac rotates yearly; code-hmac, link-hmac and csrf-hmac every 90 days.
+      - alert: KeyringKeyTooOld
+        expr: |
+          max by (keyring) (keyring_active_key_age_seconds{keyring!~"(?i)email(-hmac)?"}) > (90 + 7) * 86400
+          or
+          max by (keyring) (keyring_active_key_age_seconds{keyring=~"(?i)email(-hmac)?"}) > (365 + 7) * 86400
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: The {{ $labels.keyring }} keyring's active key is past its rotation period plus 7 days (encryption 6.5).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-rotation.md

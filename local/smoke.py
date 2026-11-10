@@ -569,7 +569,8 @@ async def main():
         threads=1,
     )
     try:
-        print(await store.part_url(StorageClass.STANDARD, "k", "u", part_number=1, size=1))
+        [url] = await store.part_urls(StorageClass.STANDARD, "k", "u", [(1, 1)])
+        print(url)
     finally:
         await store.close()
 

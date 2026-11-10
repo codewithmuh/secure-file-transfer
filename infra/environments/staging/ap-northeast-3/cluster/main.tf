@@ -64,6 +64,8 @@ locals {
 module "cluster" {
   source = "../../../../modules/eks-cluster"
 
+  conventions = module.conventions
+
   environment        = "staging"
   region             = module.conventions.region
   account_id         = var.account_id
@@ -86,8 +88,9 @@ module "cluster" {
   kubernetes_version  = "1.37"
   deletion_protection = false
 
-  # One always-on system node in the pilot light; the failover runbook raises it to 2 (ADR-0004).
-  system_node_count = 1
+  # One always-on system node in the pilot light; the failover runbook raises it to 2 with TF_VAR_system_node_count
+  # and the failback lowers it again (ADR-0004, #261).
+  system_node_count = var.system_node_count
 
   # The same pools as Tokyo's, so a failover lands staging's shape (ADR-0004). Nothing launches until then: Osaka's
   # values in Git keep every application workload at zero.

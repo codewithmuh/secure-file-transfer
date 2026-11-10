@@ -2,7 +2,8 @@
 
 `configure_tracing` runs once per process, at startup. After it, every span the service starts is
 recorded: the API's request spans (sft.api.observability), each SQL statement
-(sft.data.database), each AWS call of a client passed to `trace_aws_client`, and the message
+(sft.data.database), each counter store call (sft.data.counters, #136), each AWS call of a client
+passed to `trace_aws_client`, and the message
 spans of the outbox, the relay and the consumers (sft.data.outbox, sft.workers). Sampling
 happens only in the collector gateway, whose tail
 sampling keeps every error and slow trace and 10 % of the rest (ADR-0009). The service keeps

@@ -33,3 +33,13 @@ variable "budget_email" {
     error_message = "The teardown apply creates the NFR-19 budget: name the address it emails (TF_VAR_budget_email)."
   }
 }
+
+variable "alert_emails" {
+  description = "Who the retained stack's alert topics reach (alerts.tf): the maintainer's addresses, as TF_VAR_alert_emails, a JSON list, never committed. Each confirms its subscription once."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.alert_emails) > 0 && alltrue([for e in var.alert_emails : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", e))])
+    error_message = "alert_emails needs at least one plain email address."
+  }
+}

@@ -177,6 +177,9 @@ OWNER_DEFINER_FUNCTIONS: dict[str, tuple[str, ...]] = {
     # which makes the months a restore brings back.
     "audit_create_partitions(integer,date)": (JOBS, RECOVERY),
     "audit_partition_status()": (JOBS,),
+    # The retention's drop (#255, revision 0040): expired months archived in both regions, by the
+    # daily partition job alone.
+    "audit_drop_expired_partitions(timestamp with time zone)": (JOBS,),
     # The fail-closed audit check (#50): a trigger function, which no role calls itself.
     "audit_required()": (),
     # Break-glass (#232, revision 0030): the tenants of the session's active grant, read by the

@@ -19,7 +19,6 @@ Every change here commits only with an audit event (`audit_required`); the calle
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +28,7 @@ from uuid import UUID
 from sqlalchemy import Row, case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.tokens import token_hash
 from sft.data.access import NotFoundError, in_scope, require_scope
 from sft.data.models import (
     DeliveryState,
@@ -43,11 +43,6 @@ from sft.data.scope import ScopeKind
 LOCKOUT_AFTER: Final = 20
 """Failed attempts in total before a recipient is locked until a member unlocks them (NFR-14)."""
 IDLE: Final = text("interval '1 hour'")
-
-
-def token_hash(token: str) -> bytes:
-    """What `link_token_hash` holds: the SHA-256 of the token (data model 2.2)."""
-    return hashlib.sha256(token.encode()).digest()
 
 
 # ---- the notification worker ----

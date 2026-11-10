@@ -98,6 +98,7 @@ from sft.service.transfers import (
     file_view,
     invalid,
     require_reach,
+    state_conflict,
     tenant_scope,
 )
 
@@ -619,20 +620,12 @@ async def part_urls(
         )
     storage_class = StorageClass(file.storage_class)
     expires_at = datetime.now(UTC) + timedelta(seconds=PART_URL_SECONDS)
-    urls = []
-    for number in part_numbers:
-        try:
-            url = await objects.part_url(
-                storage_class,
-                file.storage_key,
-                file.s3_upload_id,
-                part_number=number,
-                size=sizes[number],
-            )
-        except ObjectStoreError:
-            raise _store_unavailable() from None
-        urls.append(PartUrl(number, sizes[number], url, expires_at))
-    return urls
+    parts = [(number, sizes[number]) for number in part_numbers]
+    try:
+        urls = await objects.part_urls(storage_class, file.storage_key, file.s3_upload_id, parts)
+    except ObjectStoreError:
+        raise _store_unavailable() from None
+    return [PartUrl(n, size, url, expires_at) for (n, size), url in zip(parts, urls, strict=True)]
 
 
 async def uploaded_parts(
@@ -913,20 +906,17 @@ async def delete_file(
     again changes nothing."""
     reach = authorize(caller, "deleteFile", now=now)
     async with database.transaction(tenant_scope(caller)) as session:
-        try:
-            file = await files.get_file(session, file_id)
-            if file.transfer_id is None:
-                raise NotFound  # a received file: `sft.service.received.delete_file`
-            transfer = await transfers.get_transfer(session, file.transfer_id, lock=True)
-        except NotFoundError:
-            raise NotFound from None
-        require_reach(caller, reach, transfer, now)
-        file = await files.get_file(session, file_id)
+        # A received file is 404 here: `sft.service.received.delete_file` removes it.
+        file, transfer = await _owned_file(
+            session, caller, file_id, reach=reach, now=now, lock=True, allow_removed=True
+        )
         if file.removed_at is not None:
             return
         state = effective_state(TransferState(transfer.state), transfer.expires_at, now)
         if state not in REMOVABLE:
-            raise _not_removable(state)
+            raise state_conflict(
+                state, "Files can't be removed once the transfer is sent or cancelled."
+            )
         await files.remove_file(session, file.id)
         if file.state != FileState.REJECTED.value:
             await usage.release_storage(session, file.declared_size)
@@ -949,15 +939,3 @@ async def delete_file(
                 details=audit_details(caller),
                 file_removed=True,
             )
-
-
-def _not_removable(state: TransferState) -> Conflict:
-    if state is TransferState.REVOKED:
-        return Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        return Conflict("transfer_expired", current_state=state.value)
-    return Conflict(
-        "invalid_state",
-        "Files can't be removed once the transfer is sent or cancelled.",
-        current_state=state.value,
-    )

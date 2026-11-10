@@ -53,10 +53,11 @@ module "data" {
   conventions = module.conventions
 
   aurora = {
-    cluster_role                       = "primary"
+    cluster_role                       = var.aurora_role
     instance_class                     = "db.r8g.large"
     instance_count                     = 2
     backup_retention_days              = 14
+    global_generation                  = var.aurora_global_generation
     master_secret_recovery_window_days = 30
   }
   osaka_ready             = var.osaka_ready

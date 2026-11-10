@@ -50,6 +50,12 @@ variable "replicate_to_osaka" {
   }
 }
 
+variable "replicate_to_tokyo" {
+  description = "Osaka only, at a failback: replicate Osaka's buckets back to Tokyo's with RTC (rule to-tokyo, #262, #42 gap 4), so files uploaded during a failover reach Tokyo. Off in the pilot light; the failback runbook sets it in step 2 and clears it in step 8."
+  type        = bool
+  default     = false
+}
+
 variable "create_iam_roles" {
   description = "True in Tokyo: make the replication role (where with_osaka) and GuardDuty's role. IAM is global, so Osaka uses Tokyo's."
   type        = bool
@@ -92,6 +98,16 @@ variable "cors_allowed_origins" {
 }
 
 variable "teardown_allowed" {
-  description = "dev and staging: the deploy role may delete objects and destroy non-empty buckets, so the environment tears down (NFR-19). In prod only the lifecycle jobs delete (ADR-0012)."
+  description = "The deploy role and Admin (which runs ops/teardown.sh) may delete objects and destroy non-empty buckets, so the environment tears down (NFR-19): always in dev and staging; in prod only from the teardown apply on (#263, #42 gap 11). Otherwise only the lifecycle jobs delete (ADR-0012)."
   type        = bool
+}
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the buckets, and the roles it makes or its policies name, from their one definition (#172)."
+  type = object({
+    global_name_prefix  = string
+    region_shorts       = map(string)
+    workload_role_names = map(string)
+    workload_role_arns  = map(string)
+  })
 }

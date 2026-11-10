@@ -417,20 +417,12 @@ async def session_part_urls(
         )
     storage_class = StorageClass(file.storage_class)
     expires_at = datetime.now(UTC) + timedelta(seconds=PART_URL_SECONDS)
-    urls = []
-    for number in part_numbers:
-        try:
-            url = await objects.part_url(
-                storage_class,
-                file.storage_key,
-                file.s3_upload_id,
-                part_number=number,
-                size=sizes[number],
-            )
-        except ObjectStoreError:
-            raise _store_unavailable() from None
-        urls.append(PartUrl(number, sizes[number], url, expires_at))
-    return urls
+    parts = [(number, sizes[number]) for number in part_numbers]
+    try:
+        urls = await objects.part_urls(storage_class, file.storage_key, file.s3_upload_id, parts)
+    except ObjectStoreError:
+        raise _store_unavailable() from None
+    return [PartUrl(n, size, url, expires_at) for (n, size), url in zip(parts, urls, strict=True)]
 
 
 async def session_uploaded_parts(

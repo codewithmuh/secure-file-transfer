@@ -110,7 +110,8 @@ only into the pool and the email, never into the outbox, a log or an audit row.
 their own yet. A suspended tenant's messages are recorded and send nothing.
 
 Every email sent is audited (`email.sent`, with its type), and counted in
-`emails_sent_total{type}`; every email held by a cap in `email_caps_hit_total{cap}`.
+`emails_sent_total{type}`; every email held by a cap in `email_caps_hit_total{cap}`. How long each
+took from its message to the provider is `send_latency_seconds{type}` (NFR-7, #260).
 """
 
 from __future__ import annotations
@@ -124,13 +125,14 @@ from enum import StrEnum
 from typing import Final, Protocol
 from uuid import UUID
 
-from prometheus_client import CollectorRegistry, Counter
+from prometheus_client import CollectorRegistry, Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import RateLimited
 from sft.core.hmac_keyrings import CodeKeyring, LinkKeyring
 from sft.core.ids import uuid7
 from sft.core.pseudonyms import EmailKeyring
+from sft.core.tokens import token_hash
 from sft.data import (
     api_keys,
     audit,
@@ -219,6 +221,8 @@ from sft.service.email.catalog import (
 )
 from sft.service.rate_limits import Charge
 from sft.service.rate_limits.limits import CROSS_TENANT_LINK_EMAILS, KeyType
+from sft.service.transfers import effective_state
+from sft.service.upload_requests import effective_state as request_effective_state
 from sft.service.user_pool import (
     INVITATION_ENROLMENT,
     TEMPORARY_PASSWORD_DAYS,
@@ -276,6 +280,15 @@ Release = Callable[[UUID, str], Awaitable[None]]
 class NotifyMetrics:
     emails: Counter
     caps: Counter
+    send_latency: Histogram
+
+    def observe_send(self, message_id: UUID, email_type: EmailType, now: datetime) -> None:
+        """NFR-7 (#260): from the outbox message that asked for the email, made when its UUIDv7
+        ID was (data model 1), to the provider accepting it."""
+        if message_id.version != 7:
+            return
+        made = datetime.fromtimestamp((message_id.int >> 80) / 1000, UTC)
+        self.send_latency.labels(email_type.value).observe(max(0.0, (now - made).total_seconds()))
 
     @classmethod
     def create(cls, registry: CollectorRegistry) -> NotifyMetrics:
@@ -298,7 +311,17 @@ class NotifyMetrics:
         # "no eligible approver" notices.
         caps.labels("approver_request_emails")
         caps.labels("tenant_no_eligible_approver")
-        return cls(emails, caps)
+        send_latency = Histogram(
+            "send_latency_seconds",
+            "NFR-7: from the message that asked for an email to the provider accepting it, by "
+            "type; the edge at 10 s is NFR-7's target.",
+            ["type"],
+            buckets=(1, 2.5, 5, 10, 20, 30, 60, 300, 900),
+            registry=registry,
+        )
+        for email_type in EmailType:
+            send_latency.labels(email_type.value)
+        return cls(emails, caps, send_latency)
 
 
 @dataclass
@@ -453,6 +476,7 @@ class Notifier:
                 continue
             delivered = True
             sent.append(email)
+            self.metrics.observe_send(message.id, email.TYPE, self.clock())
             if plan.charge is not None:
                 await plan.charge()
             if part is not None:
@@ -523,13 +547,11 @@ class Notifier:
         """The recipient, locked, if their transfer is sent and hasn't expired, they aren't
         locked out and their tenant is active."""
         target = await recipients.link_target(session, recipient_id, lock=True)
-        if target is None or target.transfer_state != TransferState.SENT.value:
+        if target is None or target.locked_at is not None:
             return None
-        if target.expires_at is not None and target.expires_at <= self.clock():
-            return None
-        if target.locked_at is not None:
-            return None
-        return target
+        stored = TransferState(target.transfer_state)
+        state = effective_state(stored, target.expires_at, self.clock())
+        return target if state is TransferState.SENT else None
 
     async def _suppressed(self, session: AsyncSession, address: str) -> bool:
         found = await suppressions.suppressed(session, self.emails.every_version(address))
@@ -660,7 +682,7 @@ class Notifier:
             target.id,
             key_id=key_id,
             issued_at=issued_at,
-            hashed=recipients.token_hash(token),
+            hashed=token_hash(token),
             replace=replace,
         )
         if not issued:
@@ -744,11 +766,10 @@ class Notifier:
         """The request, locked, if it is open and hasn't expired and its uploader isn't locked
         out."""
         target = await upload_requests.link_target(session, request_id, lock=True)
-        if target is None or target.state is not UploadRequestState.OPEN:
+        if target is None or target.locked_at is not None:
             return None
-        if target.expires_at <= self.clock() or target.locked_at is not None:
-            return None
-        return target
+        state = request_effective_state(target.state, target.expires_at, self.clock())
+        return target if state is UploadRequestState.OPEN else None
 
     async def _uploader_link(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         """`upload_request` to the uploader, as `_link` sends a recipient theirs."""
@@ -844,7 +865,7 @@ class Notifier:
             target.id,
             key_id=key_id,
             issued_at=issued_at,
-            hashed=recipients.token_hash(token),
+            hashed=token_hash(token),
             replace=replace,
         )
         if not issued:

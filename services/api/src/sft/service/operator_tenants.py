@@ -12,10 +12,11 @@ stands, with its record in the tenant's log, and the error is logged:
 
 - `suspendTenant` answers `503`. A retry is safe: it finds the tenant suspended, changes nothing
   and writes the platform event.
-- `createTenant` answers `201` with the tenant anyway. It keeps no idempotency key yet, so a retry
-  would make a second tenant and email a second invitation. The tenant's own log holds the record;
+- `createTenant` answers `201` with the tenant anyway. The tenant's own log holds the record;
   `CreatedTenant.platform_recorded` is False, and the operator API counts the miss in a metric
-  that alerts.
+  that alerts. A retry with the same `Idempotency-Key` gets the first tenant back, with no second
+  tenant, invitation or email (#160, `sft.service.idempotency`); without a key it makes a second
+  tenant, so an operator always sends one.
 
 Reads go through the tenant directory (`sft.data.tenants`), in platform scope: the tenant rows
 only, never a tenant's users, transfers, files or audit log.
@@ -44,7 +45,8 @@ from sft.data.audit import Origin, Target
 from sft.data.database import Database
 from sft.data.models import Role, Tenant, User
 from sft.data.scope import Scope
-from sft.data.users import UserExistsError, create_invitation
+from sft.data.users import UserExistsError, create_invitation, list_users
+from sft.service.idempotency import OperatorKey, operator_claim, operator_replay
 from sft.service.members import decode_cursor, encode_cursor
 from sft.service.operator_auth import Operator
 from sft.service.permissions import authorize
@@ -75,6 +77,8 @@ class CreatedTenant:
     first_admin: User
     platform_recorded: bool = True
     """False when the platform audit event failed after the commit (the module docstring)."""
+    replayed: bool = False
+    """A retry with the first request's `Idempotency-Key`: nothing was made this time."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +87,7 @@ class TenantPage:
     next_cursor: str | None
 
 
-async def _platform_event(
+async def platform_event(
     database: Database,
     operator: Operator,
     action: str,
@@ -128,9 +132,11 @@ async def create_tenant(
     origin: Origin,
     *,
     limiter: RateLimiter,
+    key: OperatorKey | None = None,
 ) -> CreatedTenant:
     """`createTenant`: the tenant, its policy, its first admin's invitation and its default DLP
-    policy, in one commit.
+    policy, in one commit, with the operator's `Idempotency-Key` if they sent one (`key`): a
+    retry gets the first tenant and its first admin as they are now.
 
     The invitation writes its own audit event and its email's outbox message (`MEMBER_INVITED`).
     The operator's limit (abuse and rate limits 2.2, J: 30 new tenants an hour) counts only a
@@ -139,6 +145,9 @@ async def create_tenant(
     address in it.
     """
     authorize(operator.caller, "createTenant", now=datetime.now(UTC))
+    replay = await operator_replay(database, key, resource_type=TARGET)
+    if replay is not None:
+        return await _created(database, replay.resource_id)
     tenant_id = uuid7()
     async with database.transaction(Scope.tenant(tenant_id)) as session:
         tenant = await tenants.insert_tenant(
@@ -149,6 +158,8 @@ async def create_tenant(
         )
         if tenant is None:  # pragma: no cover - a fresh UUIDv7 is never taken
             raise RuntimeError("the new tenant's ID is taken")
+        # The key's row names the tenant, so it follows the tenant's row; before any other work.
+        await operator_claim(session, key, status=201, resource_type=TARGET, resource_id=tenant_id)
         await audit.record(
             session,
             action="tenant.created",
@@ -173,10 +184,21 @@ async def create_tenant(
             session, created_by=first_admin.id, locale=new.default_locale
         )
         await limiter.check(CREATE_TENANT, operator.rate_limit_keys())
-    recorded = await _platform_event(
+    recorded = await platform_event(
         database, operator, "tenant.created", origin, tenant_id, retry_safe=False
     )
     return CreatedTenant(tenant, first_admin, platform_recorded=recorded)
+
+
+async def _created(database: Database, tenant_id: UUID) -> CreatedTenant:
+    """A replayed `createTenant`: the tenant and its first admin, the tenant's oldest user, as
+    they are now. Nothing is written or audited again, as for `inviteUser`."""
+    async with database.transaction(Scope.tenant(tenant_id)) as session:
+        tenant = await tenants.get_tenant(session, tenant_id)
+        oldest = await list_users(session, limit=1)
+    if tenant is None or not oldest:  # pragma: no cover - a tenant is never deleted with its key
+        raise NotFound()
+    return CreatedTenant(tenant, oldest[0], replayed=True)
 
 
 async def get_tenant(
@@ -259,5 +281,5 @@ async def suspend_tenant(
                     origin=origin,
                     details=operator.details(),
                 )
-    await _platform_event(database, operator, "tenant.suspended", origin, tenant_id)
+    await platform_event(database, operator, "tenant.suspended", origin, tenant_id)
     return tenant

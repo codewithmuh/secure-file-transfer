@@ -94,3 +94,11 @@ variable "log_retention_days" {
   type        = number
   default     = 90
 }
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the role and every Region's resources it reaches, from their one definition (#172)."
+  type = object({
+    region_shorts       = map(string)
+    workload_role_names = map(string)
+  })
+}

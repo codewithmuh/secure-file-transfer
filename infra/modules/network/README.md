@@ -130,7 +130,9 @@ One rule group per VPC, fail closed (`firewall_fail_open = DISABLED`): priority 
 200 answers NXDOMAIN for `*`. The list is the interface endpoints' own names, S3 in this Region, and
 `dns_firewall_allowed_domains`, whose defaults are the design's: the cluster API (`*.<region>.eks.amazonaws.com`), EC2
 host names, Cognito (`cognito-idp` and managed login), GitHub, ClamAV's database, the AWS APIs that Karpenter, the
-load balancer controller and Alertmanager reach through the proxy, and the Systems Manager agent's names. The allow
+load balancer controller and Alertmanager reach through the proxy, and the Systems Manager agent's names. With
+`service_domain` set (every root, from `TF_VAR_domain`), also `api.` and `app.` under it, which the synthetic probe
+calls through the egress proxy (#259). The allow
 rule trusts CNAME targets (`TRUST_REDIRECTION_DOMAIN`): the owner of an allowed name picks them, a pod can't. The
 `dns_firewall_allowed_domains` output shows the complete list for each VPC.
 

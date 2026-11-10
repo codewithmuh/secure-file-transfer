@@ -117,13 +117,24 @@ groups:
           summary: Downloads were refused with 503 because the API pods' stream slots were full.
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/download-capacity.md
 
-      # Abuse 8.2 (ApiKeyMisuse, its second half): requests on API keys refused by their limits for 10 minutes on end.
-      # The first half, bearer authentication failures, waits for a metric (docs/operations/slos.md).
+      # Abuse 8.2 (ApiKeyMisuse): more than 50 bearer authentication failures in 5 minutes (#260: auth_failures_total,
+      # from the API's authentication points), someone trying keys; or requests on API keys refused by their limits for
+      # 10 minutes on end.
+      - alert: ApiKeyMisuse
+        expr: sum(increase(auth_failures_total{scheme="api_key"}[5m])) > 50
+        labels:
+          severity: ticket
+          condition: auth_failures
+        annotations:
+          summary: More than 50 API key authentications failed in 5 minutes; someone may be trying keys.
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md
+
       - alert: ApiKeyMisuse
         expr: sum(rate(rate_limit_rejections_total{key_type="api_key"}[5m])) > 0
         for: 10m
         labels:
           severity: ticket
+          condition: held_at_limit
         annotations:
           summary: API key requests have been held at their rate limits for 10 minutes; a key may be misused or leaked.
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md

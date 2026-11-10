@@ -119,9 +119,14 @@ def test_stores_never_share_a_role_or_a_namespace(tmp_path: Path) -> None:
 
 
 def test_the_cluster_layer_makes_those_roles_and_the_controller_reads_nothing() -> None:
-    main = (ROOT / "infra/modules/eks-cluster/main.tf").read_text()
+    # The cluster layer makes the roles of the conventions module's one list (#172), the store roles among them.
+    conventions = (ROOT / "infra/modules/conventions/main.tf").read_text()
+    cluster = conventions[conventions.index("    cluster = [") :]
+    cluster = cluster[: cluster.index("    ]\n")]
     for suffix in ("platform", "app"):
-        assert f'"${{var.global_name_prefix}}-external-secrets-{suffix}"' in main
+        assert f'"external-secrets-{suffix}"' in cluster
+    main = (ROOT / "infra/modules/eks-cluster/main.tf").read_text()
+    assert "for r in var.conventions.workload_roles.cluster :" in main
     roles = (ROOT / "infra/modules/eks-cluster/workload-roles.tf").read_text()
     controller = roles[roles.index("    external_secrets = [") :]
     controller = controller[: controller.index("    ]\n")]

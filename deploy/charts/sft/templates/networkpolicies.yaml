@@ -49,6 +49,8 @@ inspector gets no egress at all.
   (dict "component" "signature-mirror" "ingress" (list $pods.fromClamd) "egress" (list $rules.dns $proxy.signatureMirror))
   (dict "component" "migrate" "ingress" (list) "egress" $base)
   (dict "component" "invite-backlog" "ingress" (list) "egress" (concat $base (list $proxy.notifier $rules.valkey)))
+  (dict "component" "standby-enrolment" "ingress" (list) "egress" (append $base $proxy.notifier))
+  (dict "component" "recovery" "ingress" (list) "egress" (append $base $rules.s3))
 }}
 {{- if eq .Values.region "ap-northeast-1" }}
 {{- /* No database: the endpoints (Secrets Manager, and the cluster API, whose ENIs share their subnets), its listener. */}}
@@ -68,7 +70,8 @@ inspector gets no egress at all.
 {{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $jobBase $rules.s3) $jobBase $job.s3)) }}
 {{- end }}
 {{- else }}
-{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (append $traced $rules.valkey)) }}
+{{- /* The operator API writes its security-critical records to the audit archive (#239): S3, as the API. */}}
+{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (concat $traced (list $rules.valkey $rules.s3))) }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

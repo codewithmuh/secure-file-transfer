@@ -35,7 +35,7 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 |---|---|---|---|---|
 | `bootstrap/<account>/ap-northeast-1` | each | Tokyo | The state bucket and tfstate key for Tokyo; the GitHub OIDC provider; the Terraform plan and deploy roles; the key-admin role and the emergency user (none of the last three in the management account) | The maintainer, `Admin` permission set, local state first |
 | `bootstrap/<account>/ap-northeast-3` | staging, prod | Osaka | The state bucket for Osaka and the Osaka replica of the tfstate key | The maintainer, `Admin` permission set, local state first; in a Tokyo outage, the account's emergency user |
-| `organization` | management | Tokyo (Organizations is global) | Organizations, OUs and accounts, Identity Center and permission sets, SCPs, budgets: [#55](https://github.com/codewithmuh/secure-file-transfer/issues/55) | The maintainer with MFA, never CI; CI plans it read-only (ADR-0006) |
+| `organization` | management | Tokyo (Organizations is global) | Organizations, OUs and accounts, Identity Center and permission sets, SCPs, budgets: [#55](https://github.com/codewithmuh/secure-file-transfer/issues/55); each environment's read-only role for the break-glass reconciliation (#239) | The maintainer with MFA, never CI; CI plans it read-only (ADR-0006) |
 | `shared` | shared | Tokyo, with Osaka and us-east-1 aliases when needed | ECR and the registry key, web bundle artifacts, the public DNS zone, the organization's log archive | CI, `shared` environment |
 | `environments/<env>/<region>/<layer>` | dev, staging, prod | dev: Tokyo; staging and prod: Tokyo and Osaka | Architecture 3.1 and 3.2, split into layers (below) | CI, the environment's GitHub environment |
 | `environments/prod/retained` | prod | Tokyo, with an Osaka alias | The audit archive buckets and key in both Regions and what guards them after teardown (encryption 8.4) | CI, through its own deploy role; local state first |
@@ -47,8 +47,8 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
 | `cluster-bootstrap` | Argo CD and its root Applications, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021); the observability stack's operator, namespaces and storage class, and its buckets and roles ([`modules/observability`](modules/observability/README.md), ADR-0009, #243) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
 | `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | [`modules/edge`](modules/edge/README.md) and [`modules/web-cdn`](modules/web-cdn/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
-| `identity` | SES (the `mail.<domain>` identity with DKIM and MAIL FROM, the configuration set `sft-<env>`, its SNS topic into the `ses-events` queue), the member user pool with its domain and app client and its sign-in triggers (#238), and the `sft/<env>/app/*` secrets without values (ADR-0015, ADR-0016, encryption 6.4) | [`modules/ses`](modules/ses/README.md), [`modules/user-pool`](modules/user-pool/README.md), [`modules/signin-triggers`](modules/signin-triggers/README.md), [`modules/app-secrets`](modules/app-secrets/README.md); after `data` and `edge`, before `cluster-bootstrap`, which reads its outputs (#185) |
-| `alarms` | The AWS-side alarms and the watchdog (ADR-0009, A34): the Region's page, ticket and heartbeat topics, alarms on Aurora, the queues, S3 replication, the load balancer, the NAT gateways, KMS, SES and the sign-in triggers, and in Tokyo the Route 53 health check alarms in us-east-1 | [`modules/alarms`](modules/alarms/README.md); applied last in its Region, reading its `network`, `data` and `edge` states; Tokyo's in staging and prod after Osaka's `edge`. `TF_VAR_alert_emails` names who the alerts reach (#246) |
+| `identity` | SES (the `mail.<domain>` identity with DKIM and MAIL FROM, the configuration set `sft-<env>`, its SNS topic into the `ses-events` queue), the member user pool with its domain and app client and its sign-in triggers (#238), the `sft/<env>/app/*` secrets without values (ADR-0015, ADR-0016, encryption 6.4), and the probe mailbox: SES receiving for `probe.` (and `loadtest.` in staging) into the Region's mailbox bucket, with staging's load-test role (#259) | [`modules/ses`](modules/ses/README.md), [`modules/user-pool`](modules/user-pool/README.md), [`modules/signin-triggers`](modules/signin-triggers/README.md), [`modules/app-secrets`](modules/app-secrets/README.md), [`modules/probe-mailbox`](modules/probe-mailbox/README.md); after `data` and `edge`, before `cluster-bootstrap`, which reads its outputs (#185) |
+| `alarms` | The AWS-side alarms and the watchdog (ADR-0009, A34): the Region's page, ticket and heartbeat topics, alarms on Aurora, the queues, S3 replication, the load balancer, the NAT gateways, KMS, SES and the sign-in triggers, the security alerts' EventBridge rules (#256), and in Tokyo the Route 53 health check alarms and the rule that forwards global sign-in events, in us-east-1 | [`modules/alarms`](modules/alarms/README.md); applied last in its Region, reading its `network`, `data` and `edge` states; Tokyo's in staging and prod after Osaka's `edge`. `TF_VAR_alert_emails` names who the alerts reach (#246) |
 | `retained` | See above | prod only, one root for both Regions |
 
 Every layer is written, and so are the `shared` stack and the bootstrap stacks.
@@ -66,7 +66,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `audit-archive` | One Region's audit archive bucket with Object Lock, its policy and replication to Osaka; in prod, called by the retained stack with its own replication role ([README](modules/audit-archive/README.md), #102) |
 | `break-glass-role` | `sft-<env>-break-glass-db`, which only BreakGlass may assume, with a grant's session tag, to sign in to the database as `sft_breakglass` under an approved grant; the EventBridge rule and topic that page on every assumption ([README](modules/break-glass-role/README.md), #232) |
 | `cluster-bootstrap` | The cluster's platform: Argo CD, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy, operator RBAC, the Prometheus Operator ([README](modules/cluster-bootstrap/README.md), #104, #243) |
-| `conventions` | Nothing: names, tags, the state bucket name and the bootstrap role names and ARNs, from the environment, Region and stack. Every root calls it once. |
+| `conventions` | Nothing: names, tags, the state bucket name and the bootstrap role names and ARNs, from the environment, Region and stack; the one definition of the Regions' short names and of the workload roles (#172). Every root calls it once and passes it to the modules that name things. |
 | `ses` | One Region's SES setup: the domain identity with Easy DKIM, the Region's MAIL FROM subdomain, SPF and DMARC, the configuration set and its events through SNS into the `ses-events` queue, the identity policy for Cognito ([README](modules/ses/README.md), #185) |
 | `tfstate-backend` | A state bucket and its tfstate key (or, in Osaka, the key's replica) with the bucket and key policies below |
 | `terraform-oidc-roles` | The GitHub OIDC provider, the plan role and the deploy role |
@@ -81,6 +81,7 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `kms-keys` | The environment's keys, one per data class: primaries in Tokyo, replicas in Osaka, with the key policies of encryption 4.4 ([README](modules/kms-keys/README.md), #102) |
 | `log-archive` | The organization's log archive under Object Lock, its logs key and the organization trail with the state buckets' data events ([README](modules/log-archive/README.md), #105) |
 | `network` | One VPC per account and Region: subnets, NAT gateways, endpoints with organization-scoped policies, security groups, DNS Firewall, flow log ([README](modules/network/README.md), #56) |
+| `probe-mailbox` | One Region's mailbox for the synthetic probe and the load test: the bucket (SSE-KMS, a 1-day expiry), SES receiving with its identity, rule set and rules, the MX records from Tokyo's stack, and in staging the load test's OIDC role and secret ([README](modules/probe-mailbox/README.md), #259) |
 | `observability` | One cluster's observability buckets and roles: Loki's and Tempo's buckets under the logs key, the account's Loki, Tempo, Alertmanager and CloudWatch exporter roles (from Tokyo) and their Pod Identity associations ([README](modules/observability/README.md), #243) |
 | `aurora` | One Region's Aurora PostgreSQL cluster: standalone (dev), the global database's primary (Tokyo) or secondary (Osaka), its security group and parameters, and the master secret ([README](modules/aurora/README.md), #101) |
 | `data-stack` | One environment and Region's data layer: calls `aurora`, `valkey` and `queues` with the network stack's subnets and groups, so every `data` root passes only what differs (#101) |
@@ -106,7 +107,11 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
 4. `shared`.
 5. For each environment, in Tokyo and then in Osaka: `network`, `data`, `cluster`, `edge`, `identity`,
    `cluster-bootstrap`, then `alarms` once both Regions' `edge` exist (Tokyo's reads Osaka's health check). In prod,
-   `retained` goes before `data`, because the environment refers to the archive by ARN. On a fresh build `network`
+   `retained` goes before `data`, because the environment refers to the archive by ARN; it needs
+   `TF_VAR_alert_emails` for its own alert topics, and the GitHub environment `prod-retained` (main only) that its
+   deploy role trusts. Every `network` root needs `TF_VAR_domain`: DNS Firewall answers the API's and the web app's
+   names, which the synthetic probe calls (#259). Staging's load test needs the GitHub environment `loadtest-staging`
+   (main only) that its role trusts. On a fresh build `network`
    runs twice: first without a flow log, then, once `data` has made the log bucket, with
    `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
    In staging and prod `data` also runs twice in Tokyo, because the two Regions need each other's keys and buckets:
@@ -135,7 +140,9 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    `TF_VAR_terraform_role=deploy` in an apply job.
 
 Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
-deletion protection off, skips the final snapshot and drops the master secret's recovery window, then the destroy.
+deletion protection off, skips the final snapshot, drops the master secret's recovery window and lets the files
+buckets be emptied (prod's too, from that apply on, #263), then the destroy. Prod's `cluster`, `identity` and `edge`
+take the same input for their deletion protection.
 Prod's `retained` stack stays, and a bootstrap stack goes only when its environment is
 destroyed for good: its bucket, key and key-admin role have `prevent_destroy`, which the last apply lifts
 (encryption 8.4).
@@ -231,7 +238,7 @@ SCPs never bind the management account, so it holds nothing else and is applied 
 
 | SCP | Attached to | Denies |
 |---|---|---|
-| 1 `region-guard` | Root | Everything outside Tokyo and Osaka, except global services (IAM, STS, Route 53, CloudFront, Organizations, account, billing, Budgets, Cost Explorer, Support, Health) and, in us-east-1 only, ACM, WAF, CloudWatch, SNS, CloudWatch Logs delivery and KMS (NFR-21). Also log groups in us-east-1, KMS replicas outside Osaka, and VPC endpoints to services outside Japan; `vpce:AllowMultiRegion` passes (ADR-0021). |
+| 1 `region-guard` | Root | Everything outside Tokyo and Osaka, except global services (IAM, STS, Route 53, CloudFront, Organizations, account, billing, Budgets, Cost Explorer, Support, Health) and, in us-east-1 only, ACM, WAF, CloudWatch, SNS, CloudWatch Logs delivery, KMS and EventBridge, whose rule there forwards root, IAM user and global STS events to Japan for the security alerts (NFR-21, #256). Also log groups in us-east-1, KMS replicas outside Osaka, and VPC endpoints to services outside Japan; `vpce:AllowMultiRegion` passes (ADR-0021). |
 | 2 `keys` | Root | Disabling or deleting KMS keys, or deleting imported key material, to all but apply roles and the staging and prod emergency users; putting key policies to all but those and `sft-<env>-keyadmin`. The key policies keep the emergency users to Osaka's tfstate keys. |
 | 3 `accounts-and-logging` | Root | Leaving the organization; the root user's own credentials; sharing EBS or RDS snapshots; turning off account-wide S3 Block Public Access or EBS default encryption, and changing CloudTrail, Config, GuardDuty, EKS logging, `sft-*` EventBridge rules and alarms or `/aws/eks/*` log groups, to all but apply roles; changing the settings of a `sft-*-apne?-tfstate-*` state bucket or deleting it, to all but `Admin`, the staging and prod emergency users and assumed-root sessions (#81) |
 | 4 `iam` | Root | Changing roles, policies and OIDC or SAML providers to all but deploy roles; changing what is under `/sft-bootstrap/`, the GitHub OIDC provider and `OrganizationAccountAccessRole` to all but `Admin`; access keys and service-specific credentials to everyone; creating, renaming, deleting IAM users or changing their passwords, policies or MFA devices to all but `Admin` |
@@ -265,7 +272,11 @@ removal and alerts (FR-35, M6).
 | KMS alias | `alias/sft/<env>/<class>` | `alias/sft/prod/files` |
 | Secret | `sft/<env>/<name>` | `sft/prod/db/master` |
 
-`<env>` is `management`, `shared`, `dev`, `staging` or `prod`; `<region-short>` is `apne1` (Tokyo) or `apne3` (Osaka).
+`<env>` is `management`, `shared`, `dev`, `staging` or `prod`; `<region-short>` is `apne1` (Tokyo) or `apne3` (Osaka),
+from the conventions module's `region_shorts`, the one definition every module reads (#172). The environment's
+workload roles, `sft-<env>-<name>` at path `/`, are listed once too, by the layer that makes each
+(`workload_roles`): key, bucket and queue policies, the cluster layer and the deploy role's permissions all read that
+list, so a renamed or new role can't be missed in one copy.
 The account ID in bucket names stops anyone else claiming our names first. Mind the short limits: load balancer and
 target group names allow 32 characters, and `sft-staging-apne3-` already uses 18. S3 allows 63, IAM roles 64. The
 `conventions` module builds the prefixes; use its outputs rather than writing a name out.
@@ -377,10 +388,11 @@ comment.
   rules. The deploy role also creates multi-Region keys and administers them (each key policy then limits it),
   replicates only to Osaka, creates grants only for AWS resources through RDS, ElastiCache and EKS, encrypts the
   secrets it writes, manages the buckets `sft-<env>-apne?-{files,large-files,audit-archive}-<account-id>` (not the
-  archive in prod, which is the retained stack's), the roles `sft-<env>-{s3-replication,malware-protection,events-delivery}`
-  and the services they are passed to (`events-delivery` only with the workload boundary), the Auto Scaling and EC2
+  archive in prod, which is the retained stack's), the roles `sft-<env>-{s3-replication,s3-batch-replication,malware-protection,events-delivery}`
+  (the conventions module's data layer list) and the services they are passed to (`events-delivery` only with the workload boundary), the Auto Scaling and EC2
   Fleet service-linked roles that the platform and files keys name, the account's EBS encryption by default,
-  GuardDuty plans and `sft-<env>-*` rules. In dev and staging it may empty the buckets at teardown.
+  GuardDuty plans and `sft-<env>-*` rules, in our Regions and us-east-1 (the alarms layer's forwarding rule, #256). In
+  dev and staging it may empty the buckets at teardown.
 
 - **Cluster** (#103), in the same Regions: every environment Region with a network has a cluster. Three managed
   policies under `/sft-bootstrap/` (`sft-<env>-terraform-cluster-read`, `-cluster-deploy`, `-cluster-deploy-iam`),
@@ -418,6 +430,10 @@ comment.
   which the key's own policy then gives the deploy role to administer. The plan role may also read CloudWatch metrics
   in Tokyo, so the promotion gate can read the synthetic probe's result as the previous environment's plan role
   (`.github/workflows/promote.yml`, #247).
+- **Probe mailbox** (#259), in the same Regions (`permissions-mailbox.tf`): `sft-<env>-terraform-mailbox-read` for the
+  plan role and `-mailbox` for the deploy role: the mailbox buckets `sft-<env>-apne?-probe-mailbox-<account-id>`,
+  SES's receipt rule sets and rules, and staging's load-test role `sft-<env>-loadtest` and its secret
+  `sft/<env>/loadtest/*`, never its value. Its own policies, because the identity layer's is near IAM's limit.
 - **Shared** (#105), in the shared account (`shared_stack = true`): managed policies `sft-shared-terraform-shared-read`
   and `-write` (`permissions-shared.tf`) for ECR in Tokyo and Osaka, creating KMS keys and aliases (each key's own
   policy then makes the deploy role its administrator), the zone and DNSSEC, IAM roles under `/sft-shared/` only, the
@@ -427,7 +443,7 @@ comment.
 cluster 3, cluster bootstrap 1, edge 2, identity 1), one over IAM's default limit of 10 per role, and its plan role 5.
 The break-glass database role (#232) adds one to each: 12 and 6. The observability stack (#243) adds one to the
 deploy role, and the boundary its roles carry, which is attached to none; the alarms layer (#246) adds one more to each:
-14 and 7.
+14 and 7; the probe mailbox (#259) one more again: 15 and 8.
 So before the bootstrap apply that adds the identity layer's policies, raise each environment account's quota in
 Service Quotas: IAM, "Managed policies per role" (`L-0DA4ABF3`), to 20, in us-east-1, where IAM's global quotas live
 (`aws service-quotas request-service-quota-increase --service-code iam --quota-code L-0DA4ABF3 --desired-value 20

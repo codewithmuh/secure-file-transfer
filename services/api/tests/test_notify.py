@@ -12,11 +12,14 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
+import time
 import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -31,7 +34,10 @@ from member_fixtures import (
     seed_user,
     session_caller,
 )
+from messaging import FakeQueues
 from notify_fixtures import (
+    CODE_KEYS,
+    LINK_KEYS,
     WEB_APP_URL,
     AdmitAll,
     Sent,
@@ -46,14 +52,16 @@ from sft.core.errors import RateLimited
 from sft.core.settings import MailSettings
 from sft.data.counters import CounterStore
 from sft.data.database import Database
-from sft.data.mail import MailError, MailErrorKind, mailer_from_settings
+from sft.data.mail import MailError, MailErrorKind, OutgoingEmail, mailer_from_settings
 from sft.data.models import Role
 from sft.data.roles import NOTIFY
-from sft.service.notifications import CONSUMER, Done
+from sft.service.email import EmailRenderer
+from sft.service.notifications import CONSUMER, Done, Notifier, NotifyMetrics
 from sft.service.rate_limits import RateLimiter
 from sft.service.rate_limits.limits import CROSS_TENANT_LINK_EMAILS, KeyType
-from sft.workers.consumer import Delivery, Outcome
-from sft.workers.notify import NotifyConsumer, threaded_send
+from sft.workers.consumer import ConsumerLoop, ConsumerMetrics, Delivery, Outcome
+from sft.workers.notify import MAIL_THREADS, NotifyConsumer, threaded_send
+from sft.workers.queues import ReceivedMessage
 from transfer_fixtures import seed_transfer
 
 pytestmark = pytest.mark.anyio
@@ -616,6 +624,66 @@ async def test_the_consumer_reports_a_duplicate_so_the_loop_deletes_it(w: World)
     assert await consumer.process(Delivery(invited)) is Outcome.PROCESSED
     assert await consumer.process(Delivery(invited)) is Outcome.DUPLICATE
     assert consumer.name == CONSUMER == "notify"
+
+
+@dataclass
+class Overlap:
+    """A blocking mailer that records how many sends were in flight at once."""
+
+    in_flight: int = 0
+    most: int = 0
+    sent: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def send(self, email: OutgoingEmail) -> str:
+        with self.lock:
+            self.in_flight += 1
+            self.most = max(self.most, self.in_flight)
+        time.sleep(0.02)  # long enough for a second send to start, if anything started one
+        with self.lock:
+            self.in_flight -= 1
+            self.sent += 1
+            return f"message-{self.sent}"
+
+    def release(self, tenant_id: uuid.UUID, address: str) -> None:
+        pass
+
+
+async def test_the_worker_has_one_send_in_flight_so_one_mail_thread_is_enough(w: World) -> None:
+    # #192: the loop handles a received batch one message at a time and the notifier awaits each
+    # send, so the mail pool is one thread. Given four, as before, it still uses only one.
+    addresses = tuple(unique() for _ in range(4))
+    transfer_id, _ = sent_transfer(w, addresses)
+    mailer = Overlap()
+    executor = ThreadPoolExecutor(max_workers=4)
+    worker = Notifier(
+        w.database,
+        renderer=EmailRenderer(WEB_APP_URL),
+        send=threaded_send(mailer, executor),
+        link_keys=LINK_KEYS,
+        code_keys=CODE_KEYS,
+        emails=EMAIL_KEYRING,
+        limiter=AdmitAll(),
+        metrics=NotifyMetrics.create(CollectorRegistry()),
+    )
+    loop = ConsumerLoop(
+        NotifyConsumer(w.database, worker),
+        FakeQueues(),
+        ConsumerMetrics.create(CollectorRegistry()),
+    )
+    try:
+        assert (
+            await worker.handle(message(w.tenant.id, "transfer.sent", transfer_id=transfer_id))
+            is Done.PROCESSED
+        )
+        due = pending(w.db, w.tenant.id)
+        received = [ReceivedMessage(m.body(), f"handle-{n}", 1) for n, m in enumerate(due)]
+        assert await loop.handle_all(received) == [Outcome.PROCESSED] * len(addresses)
+    finally:
+        executor.shutdown(wait=True)
+    assert mailer.sent == len(addresses)
+    assert mailer.most == 1
+    assert MAIL_THREADS == 1
 
 
 # ---- through Mailpit ----

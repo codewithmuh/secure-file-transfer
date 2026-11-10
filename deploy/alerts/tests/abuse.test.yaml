@@ -216,6 +216,36 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: ticket
+              condition: held_at_limit
             exp_annotations:
               summary: API key requests have been held at their rate limits for 10 minutes; a key may be misused or leaked.
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md
+
+  # Abuse 8.2 (#260): more than 50 API key authentications failing in 5 minutes open a ticket at once; 25 don't, nor do
+  # other schemes' failures.
+  - interval: 1m
+    input_series:
+      - series: 'auth_failures_total{scheme="api_key", job="api"}'
+        values: '0+20x10'
+      - series: 'auth_failures_total{scheme="session", job="api"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ApiKeyMisuse
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: auth_failures
+            exp_annotations:
+              summary: More than 50 API key authentications failed in 5 minutes; someone may be trying keys.
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/api-key-compromise.md
+  - interval: 1m
+    input_series:
+      - series: 'auth_failures_total{scheme="api_key", job="api"}'
+        values: '0+5x10'
+      - series: 'auth_failures_total{scheme="session", job="api"}'
+        values: '0+100x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ApiKeyMisuse
+        exp_alerts: []

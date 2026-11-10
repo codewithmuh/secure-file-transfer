@@ -7,3 +7,9 @@ variable "account_id" {
     error_message = "account_id must be a 12-digit AWS account ID."
   }
 }
+
+variable "teardown" {
+  description = "True only for the apply that comes before destroying this stack (ops/teardown.sh, docs/runbooks/teardown.md): it turns the EKS cluster's deletion protection off, so the destroy can run (NFR-19, #263)."
+  type        = bool
+  default     = false
+}

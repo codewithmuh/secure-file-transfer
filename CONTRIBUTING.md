@@ -48,10 +48,40 @@ changes, so it isn't required. When you rename or add a job, update that file in
 pull request. After the change merges, the maintainer runs `.github/scripts/apply-github-settings.sh` to apply it,
 along with CodeQL default setup.
 
-The ruleset also blocks direct pushes, force-pushes and deletion of `main`. Until
-[#6](https://github.com/codewithmuh/secure-file-transfer/issues/6) lands, the repository admin can bypass the rules
-when merging a pull request. That exists only for release-please's Release PRs, which get no CI run; don't use it for
-anything else.
+The ruleset also blocks direct pushes, force-pushes and deletion of `main`, and nobody may bypass it, the repository
+admin included ([#6](https://github.com/codewithmuh/secure-file-transfer/issues/6)): every merge, Release PRs too,
+needs green checks. `check-ruleset.sh` fails if a bypass actor comes back.
+
+## Releases
+
+release-please keeps a Release PR open with the next version and the changelog; merging it tags the release, and
+`release.yml` publishes the signed image. release-please acts as the repository's release GitHub App, with a token
+`actions/create-github-app-token` mints for each run, because GitHub starts no workflow for a pull request that
+`GITHUB_TOKEN` opens or updates: the Release PR would never get its required checks. The token lasts at most an hour
+and is revoked when the job ends; no personal access token is involved.
+
+The maintainer sets the App up once, before the change that uses it (#6) merges:
+
+1. **Create the App.** GitHub, Settings, Developer settings, GitHub Apps, New GitHub App, owned by the maintainer's
+   account: a name such as `sft-release`, the repository's URL as its homepage, webhook off. Repository permissions:
+   **Contents: Read and write** and **Pull requests: Read and write** only (Metadata: Read-only comes with them);
+   nothing else, no account or organization permissions, no events. Installable on this account only.
+2. **Install it** on `codewithmuh/secure-file-transfer` only ("Only select repositories").
+3. **Make a private key** on the App's page and download it. Note the App's **Client ID**.
+4. **Create the `release` environment** in the repository's settings, Environments: deployment branches and tags,
+   selected branches, `main` only; no reviewers (a release must not wait for one).
+5. **Add its two secrets** to the `release` environment: `RELEASE_APP_CLIENT_ID` (the Client ID) and
+   `RELEASE_APP_PRIVATE_KEY` (the whole `.pem` file). Then delete the downloaded key; GitHub keeps no other copy, and a
+   new one can be made on the App's page at any time (rotate it the same way, then delete the old key there).
+6. **Merge, then apply the ruleset**: `.github/scripts/apply-github-settings.sh` (#59) replaces `protect-main` with the
+   file in Git, which has no bypass actors.
+7. **Close a Release PR opened before the App**, and delete its branch `release-please--branches--main`, if one is
+   still open: the next push to `main` reopens it as the App, and its checks run.
+
+If the change merges before steps 1 to 5, `release.yml` fails at the token step on every push to `main`: no Release
+PR is opened or updated and nothing is released until the secrets exist, after which the next push to `main` works.
+Nothing else breaks, and no image is published by mistake. If the ruleset is applied before the App works, a Release
+PR opened by `GITHUB_TOKEN` can't be merged, because its checks never run; set the App up, then step 7.
 
 ## Standards
 

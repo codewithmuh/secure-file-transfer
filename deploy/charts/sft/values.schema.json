@@ -8,6 +8,14 @@
     "region": { "enum": ["ap-northeast-1", "ap-northeast-3"] },
     "part": { "enum": ["application", "operator"] },
     "pilotLight": { "type": "boolean" },
+    "auditArchive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["survivingRegionOnly"],
+      "properties": {
+        "survivingRegionOnly": { "type": "string", "enum": ["", "ap-northeast-1", "ap-northeast-3"] }
+      }
+    },
     "failover": {
       "type": "object",
       "additionalProperties": false,

@@ -17,6 +17,8 @@ External Secrets Secret.
 {{- if ne .Values.environment "dev" }}
 {{- $_ := set $archive "AUDIT_ARCHIVE_OSAKA_BUCKET" (printf "sft-%s-apne3-audit-archive-%s" .Values.environment (toString $c.accountId)) }}
 {{- end }}
+{{- /* During a regional loss, the surviving region's archive alone (#257). */}}
+{{- $archive = merge $archive (include "sft.survivingRegionEnv" . | fromJson) }}
 {{- $env := merge (dict
   "WEB_ORIGIN" (printf "https://app.%s" $c.serviceDomain)
   "OIDC_ISSUER" (printf "https://cognito-idp.%s.amazonaws.com/%s" .Values.region $c.userPoolId)

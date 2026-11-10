@@ -843,6 +843,12 @@ What is deliberately not a secret here:
   So an ExternalSecret can't cross from one store's secrets to the other's, whatever key it names. Not built yet: a
   pod that meets an unknown key ID refreshing at once (6.5); it waits for the next interval, which the staged step
   makes safe.
+- **The active key's age (#162).** Every process that loads a keyring reports
+  `keyring_active_key_age_seconds{keyring}`: the time since its active key's `activated_at`, or else its `created_at`,
+  the same rule the key rotation job uses to decide that a period has passed. It is set at load and at each reload
+  that changes the version, for a keyring named in Secrets Manager or held in the setting, and worked out at each
+  scrape, so it keeps growing between reads. A keyring whose active key carries neither time reports none. The alarm
+  of 6.5, a key older than its period plus 7 days, reads it (docs/operations/metrics.md).
 - Each role can read only its own secrets: `secretsmanager:GetSecretValue` on named ARNs, and Decrypt limited by
   `kms:EncryptionContext:SecretARN`.
 - In Osaka the same names resolve to the replicas. Replicas are read-only, and the key rotation job runs only in Tokyo.
@@ -929,7 +935,7 @@ On suspected exposure the job rotates at once, with no overlap:
 
 Rotation runs as a scheduled job rather than a Secrets Manager rotation function, so its logic stays in the
 application image and its tests. An alarm fires if a keyring's active key is older than its period plus 7 days
-(section 9).
+(section 9), from `keyring_active_key_age_seconds{keyring}` (6.4, #162).
 
 ## 7. Rotation policy
 
@@ -1048,10 +1054,11 @@ teardown removes (decision 19). From the day prod is created it holds:
 Teardown, in order:
 
 1. Apply the retained stack with the environment's principals removed from the audit key policy and the bucket
-   policies. KMS refuses a key policy that names a role that no longer exists, so leaving them in would block every
-   later change to the key. The same apply turns the audit key's rotation off (`DisableKeyRotation`): no new records
-   are written, so rotating would add cost without protecting anything new. It also turns on management events in
-   the retained trail, before the organization trail can end with the shared account, and creates the $7 budget.
+   policies. Leaving them in wouldn't block anything (the policies match those roles by `aws:PrincipalArn` conditions,
+   which KMS and S3 accept whether or not the role exists), but a role re-created later under the same name would match
+   them again. The same apply turns the audit key's rotation off (`DisableKeyRotation`): no new records are written, so
+   rotating would add cost without protecting anything new. It also turns on management events in the retained trail,
+   before the organization trail can end with the shared account, and creates the $7 budget.
 2. Destroy the environment, then its bootstrap stack. Its last apply lifts `prevent_destroy` on the key-admin role,
    which step 1 removed from the audit key policy.
 3. Check the next bill (NFR-19).

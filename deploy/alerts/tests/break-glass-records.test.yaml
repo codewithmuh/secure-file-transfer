@@ -1,0 +1,76 @@
+# Unit tests of break-glass-records.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../break-glass-records.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # #239: an assignment the job couldn't record for an hour pages, and stops once it is recorded.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_unrecorded_assignments{job="operator-api"}'
+        values: '0 0 1 1 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BreakGlassGrantUnrecorded
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: BreakGlassGrantUnrecorded
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+            exp_annotations:
+              summary: A BreakGlass assignment has no service record an hour after it started; tenants can't see it (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md
+      - eval_time: 4m
+        alertname: BreakGlassGrantUnrecorded
+        exp_alerts: []
+
+  # #239: a job that completes every 15 minutes never pages. Its timestamp follows the clock (promtool's starts at 0).
+  - interval: 15m
+    input_series:
+      - series: 'sft_break_glass_reconciliation_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0+900x12'
+    alert_rule_test:
+      - eval_time: 3h
+        alertname: BreakGlassReconciliationStalled
+        exp_alerts: []
+
+  # #239: the last success stops at 0; at 45 minutes it doesn't page yet, past it it does.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_reconciliation_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: BreakGlassReconciliationStalled
+        exp_alerts: []
+      - eval_time: 46m
+        alertname: BreakGlassReconciliationStalled
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+            exp_annotations:
+              summary: The break-glass reconciliation hasn't completed for 45 minutes; grants may go unrecorded (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md
+
+  # #239: a grant the job recorded instead of the tool opens a ticket for 30 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'sft_break_glass_records_reconciled_total{job="operator-api"}'
+        values: '0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: BreakGlassRecordedByReconciliation
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: BreakGlassRecordedByReconciliation
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              security: "true"
+            exp_annotations:
+              summary: A break-glass grant was recorded from CloudTrail, not by the break-glass tool (FR-35).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/break-glass-records.md

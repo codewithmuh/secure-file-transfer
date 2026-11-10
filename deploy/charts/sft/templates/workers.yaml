@@ -79,4 +79,47 @@ spec:
             {{- include "sft.appContainer" (dict "root" $ "name" "invite-backlog" "module" $backlog.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $keyrings $notifier.env) "resources" $notifier.resources "job" true) | nindent 12 }}
           volumes:
             {{- include "sft.tmpVolume" . | nindent 12 }}
+---
+{{- /*
+The standby enrolment (#258; authn-authz 2.6): after a regional failover, every active local member gets a user in this
+region's pool, with Cognito's own email suppressed, and a re-enrolment invitation. Run by hand once by the failover
+runbook after the recovery job's replay (kubectl create job --from=cronjob/standby-enrolment). It runs as the
+notification worker: the same settings, identity and proxy listener as invite-backlog. Always suspended.
+*/}}
+{{- $standby := .Values.standbyEnrolment }}
+{{- $standbyCtx := dict "root" $ "component" "standby-enrolment" "serviceAccount" $notifier.serviceAccount }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: standby-enrolment
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $standbyCtx | nindent 4 }}
+spec:
+  schedule: "0 0 1 1 *"
+  timeZone: Etc/UTC
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $standbyCtx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # running it again is safe: a member already enrolled is skipped
+      activeDeadlineSeconds: {{ $standby.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "sft.labels" $standbyCtx | nindent 12 }}
+        spec:
+          {{- include "sft.podCommon" $standbyCtx | nindent 10 }}
+          restartPolicy: Never
+          securityContext:
+            {{- include "sft.podSecurityContext" 10001 | nindent 12 }}
+          containers:
+            {{- include "sft.appContainer" (dict "root" $ "name" "standby-enrolment" "module" $standby.module "databaseRole" $notifier.databaseRole "valkeyUser" $notifier.valkeyUser "proxyListener" "notifier" "env" (merge (dict) $queues $mail $keyrings $notifier.env) "resources" $notifier.resources "job" true) | nindent 12 }}
+          volumes:
+            {{- include "sft.tmpVolume" . | nindent 12 }}
 {{- end }}

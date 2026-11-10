@@ -57,23 +57,26 @@ recovery. Their contract (`ops/lib/common.sh`):
 
 ### The values a failover flips
 
-Two keys in each cluster's values file, flipped by `ops/failover-values.sh` and committed by the maintainer:
+Three keys in each cluster's values file, flipped by `ops/failover-values.sh` and committed by the maintainer:
 
 | Key | Pilot light (Osaka) | Fenced | Running, workers held | Running |
 |---|---|---|---|---|
 | `pilotLight` | `true` | `true` | `false` | `false` |
 | `failover.holdWorkers` | `true` | any | `true` | `false` |
+| `auditArchive.survivingRegionOnly` | `""` | `ap-northeast-3` (Osaka) | `ap-northeast-3` | `ap-northeast-3` until failback, then `""` |
 
 `failover.holdWorkers` keeps every worker Deployment at zero and every CronJob suspended while the API, the operator
 API and the migration job run, so nothing acts on a revocation the replica hadn't received before the recovery job has
 re-applied it (architecture 7). Osaka's files carry it from the start; the script adds it to Tokyo's when a failback
-or a restore needs it. The chart reads it once the application track adds it (section 8).
+or a restore needs it. `auditArchive.survivingRegionOnly` writes the surviving region's archive alone during a
+regional loss; failback's back-fill writes the other (#257, gap 12). The chart reads both (section 8).
 
 ## 4. The recovery job
 
-`sft.service.recovery_replay`, run as the `sft_recovery` database role (IAM role `sft-{env}-recovery`) in recovery
-scope, by a suspended `recovery` CronJob rendered with its steps, as the field-keys runbook renders its job. One
-module serves the regional failover, the failback and the restore, in four steps:
+`sft.service.recovery_replay`, run by `python -m sft.workers.recovery` (`sft.service.recovery`, #258) as the
+`sft_recovery` database role (IAM role `sft-{env}-recovery`, which lists and reads this Region's audit archive) in
+recovery scope, by a suspended `recovery` CronJob rendered with its steps, as the field-keys runbook renders its
+job. One module serves the regional failover, the failback and the restore, in four steps:
 
 1. **`generation`.** The archive cursor's generation becomes one more than the highest in the surviving region's
    archive, and the cursor goes back to the oldest event written since `RECOVERY_REWIND_TO`, so reused transaction
@@ -138,9 +141,9 @@ Each gap of the phase 4 review, with its decision and the drill step that proves
 | 2a | **Backups in Osaka.** Do cross-region backup copies exist, and does the promoted Osaka cluster keep 14 days of point-in-time recovery? | **No cross-region copies; 14 days from promotion.** Osaka's secondary already has `backup_retention_days = 14` (its data root), so once promoted it keeps its own 14 days from that moment. Points before the failover are restorable again only from Tokyo's backups once Tokyo returns. Aurora doesn't copy automated backups across regions, and daily AWS Backup copies would add about $90 a month of transfer for a restore point no better than the secondary. Accepted: for 14 days after a failover, NFR-11's restore window is the time since the failover. | Failover drill, step 3: `describe-db-clusters` shows `BackupRetentionPeriod` 14 on the promoted cluster, and `LatestRestorableTime` moves. |
 | 2b | **A restored cluster has no secondary** until a new one catches up, hours at 150 GB. | **A snapshot copy in Osaka covers the window.** Right after the restore, one cluster snapshot is copied to Osaka under Osaka's database key, and deleted when the new secondary is in sync. A regional loss in that window loses the changes since the snapshot, not the database; security-critical records are in both archives anyway. | Restore drill, steps 3 and 8: the copy's time and the new secondary's catch-up time. |
 | 3 | **Intake-queue events lost with Tokyo**: GuardDuty results, SES events, Cognito sign-in events. | **GuardDuty results:** recovered by the scan deadline: a large file whose result was lost stays `scanning`, the sweep fails it `scan_failed` at its deadline, and the member uploads it again (scan-failed runbook); nothing unscanned is shared. **SES bounces and complaints:** accepted loss; at worst one more email to an address that just bounced, whose next bounce is recorded in Osaka. **Cognito sign-in events:** accepted loss of the failed and successful sign-ins still in the queue, normally under a minute's worth; the drill report states the queue's age at the failure as the audit gap (NFR-15 can't hold for events lost with the region; T-81). | Failover drill: a file over 2 GB completed just before the failover ends `scan_failed` at its deadline and is never downloadable; the sign-in queue's `ApproximateAgeOfOldestMessage` at the failure is written in the log. |
-| 4 | **S3 failback**: replication runs one way, so Osaka's new objects never reach Tokyo. | **Reverse replication at failback, then Batch Replication.** The failback's apply adds an Osaka-to-Tokyo rule to both files bucket pairs (with RTC), and an S3 Batch Replication job copies every object created in Osaka since the failover, tags included; the rule goes when Osaka is back in pilot light. Needs an input on modules/files-buckets (section 8). | Failback drill, step 2: each job's succeeded count equals the objects Osaka's buckets gained since the failover; the probe downloads, from Tokyo, a file uploaded during the failover. |
+| 4 | **S3 failback**: replication runs one way, so Osaka's new objects never reach Tokyo. | **Reverse replication at failback, then Batch Replication.** The failback's apply of Osaka's data root with `TF_VAR_replicate_to_tokyo=true` adds the rule `to-tokyo` to both files buckets (with RTC), and an S3 Batch Replication job per bucket, run as `sft-<env>-s3-batch-replication`, copies every object created in Osaka since the failover, tags included; the rule goes when Osaka is back in pilot light. The replication role's permissions and the files key's policy cover both directions at all times, so the failback changes only Osaka's stack (modules/files-buckets, #262). | Failback drill, step 2: each job's succeeded count equals the objects Osaka's buckets gained since the failover; the probe downloads, from Tokyo, a file uploaded during the failover. |
 | 5 | **Degraded mode for download grants during an Osaka-only outage**, and its effect on NFR-1. | **No degraded mode.** Grants fail closed with `503` and count nothing; streams under existing grants continue; the other security-critical changes commit and answer `503` "done, not confirmed" (architecture 6). A grant with its intent in one region only is exactly what NFR-10 rules out if Tokyo is then lost. The errors count against NFR-1's download path: 43 minutes of failed grants a month is the whole error budget, so an Osaka S3 outage longer than that breaches NFR-1, and is reported as such, not excluded. | Osaka archive outage drill (staging only, section 6): grants answer `503` with nothing counted, streams continue, the alert fires, and grants succeed again within a minute of Osaka returning. |
-| 6 | **Who creates Cognito users during a failover** while the workers are at zero. | **The notifier's role, in a one-off job.** A suspended `standby-enrolment` CronJob, run by hand like `invite-backlog`, as the notifier's service account and IAM role (`sft-{env}-notify`), which already holds Cognito's admin API on its region's pool through its proxy listener: no new role. It creates every active member without SSO in the standby pool without sending Cognito's email, records each identity, and writes the re-enrolment invitations to the outbox; the notifier sends them once the workers scale up. It runs after the replay, so it never enrols a member the replay deactivates. Needs the job (section 8). | Failover drill, step 6: a local test member of the synthetic tenant gets the invitation after the workers start, re-enrols, and signs in through the standby pool; a member the drill deactivated just before the failover gets none. |
+| 6 | **Who creates Cognito users during a failover** while the workers are at zero. | **The notifier's role, in a one-off job.** A suspended `standby-enrolment` CronJob, run by hand like `invite-backlog`, as the notifier's service account and IAM role (`sft-{env}-notify`), which already holds Cognito's admin API on its region's pool through its proxy listener: no new role. It creates every active member without SSO in the standby pool without sending Cognito's email, records each identity, and sends each re-enrolment invitation itself (an outbox message can't carry the temporary password), with its `email.sent` event in the member's tenant (`python -m sft.workers.standby_enrolment`, #258). It runs after the replay, so it never enrols a member the replay deactivates. | Failover drill, step 6: a local test member of the synthetic tenant gets the invitation when the job runs, re-enrols, and signs in through the standby pool; a member the drill deactivated just before the failover gets none. |
 | 7 | **Grant byte counters lost within the replication lag.** | **Accepted, bounded by the lag.** A grant's `bytes_served` and `request_count` updates in the seconds before the failure can be lost, so that grant may serve those seconds' bytes again, still within its 24 hours and 3 × size budget. Its count isn't affected: counts are re-applied from committed records (section 4). | Failover drill, step 3: `AuroraGlobalDBRPOLag` at the promotion is the bound, written in the log. |
 | 8 | **GuardDuty retries and files over 2 GB mid-scan at the failover.** | **No on-demand rescan.** A large file completed in Tokyo whose result never arrived ends `scan_failed` at its deadline (gap 3); the member uploads it again, to Osaka, whose plan exists from step 4. A rescan of the replica would mean copying it in place, a new version that the file's pinned version wouldn't match, and an operator rescan is something the scan-failed runbook already rules out. Small files mid-scan are scanned again in Osaka: the outbox re-publish resends their scan messages. | Failover drill: a small file and a large one in `scanning` at the failover: the small one is scanned in Osaka, the large one ends `scan_failed` at its deadline. |
 
@@ -150,7 +153,8 @@ Gaps the runbooks found while being written, decided the same way:
 |---|---|---|---|
 | 9 | **DNS when Tokyo's state can't be read.** The API's record belongs to Tokyo's edge stack, whose state is in Tokyo. | In a real failover, if Tokyo's state bucket doesn't answer, the operator upserts the API's alias record to Osaka's load balancer through the environment's DNS role in the shared zone, by CLI; the failback's edge apply puts it back under Terraform. Drills use the Terraform path. | Failover drill, step 8 (Terraform path); the CLI path once, in staging, with Tokyo's state bucket denied to the operator. |
 | 10 | **The old Tokyo database after an unplanned failover.** | Never a writer again (T-78). After a managed failover Aurora brings it back as Osaka's secondary and keeps a snapshot of its volume from before; after a detach it is deleted and a new secondary made, its final snapshot kept. Rows only it had are the RPO NFR-10 allows: security-critical ones are re-applied from the archive, the rest are not merged automatically in v1, and the snapshot is kept 30 days for support questions. | Failback drill, step 1. |
-| 11 | **Prod's files buckets have no teardown rights** (modules/data-stack gives `teardown_allowed` only outside prod), so prod's `data` destroy fails on non-empty buckets. | The teardown apply should give prod the same rights for its last apply only; until modules/data-stack takes `teardown` for it (section 8), the runbook empties the buckets with a lifecycle expiration as `Admin`. | Teardown rehearsal in staging; prod's timed teardown. |
+| 11 | **Prod's files buckets have no teardown rights** (modules/data-stack gives `teardown_allowed` only outside prod), so prod's `data` destroy fails on non-empty buckets. | **The teardown apply gives them.** modules/data-stack passes `teardown_allowed` to prod's files buckets from its `TF_VAR_teardown=true` apply on (#263): `force_destroy`, and deletes by the deploy role and `Admin`, which runs `ops/teardown.sh`, as in dev and staging always. Never while prod runs. Prod's `cluster`, `identity` and `edge` take the same input for their deletion protection. | Teardown rehearsal in staging; prod's timed teardown. |
+| 12 | **A regional loss and the archive's two-region writes** (#257). | **Surviving-region mode, back-filled at failback.** The failover sets `auditArchive.survivingRegionOnly`; the API and the archive job write the surviving region alone, the job records each range, and at failback rewrites the same objects to the other region. Grant intents aren't back-filled (never in the database; superseded by their committed records). Never for an Osaka-only S3 outage while Tokyo serves (gap 5). | Failback drill, step 10: the two regions' `g<n>/` listings are equal and `audit_archive_single_region_ranges` is 0. |
 
 ## 6. Drills
 
@@ -179,24 +183,35 @@ goes in `docs/operations/drills/`.
 ## 7. Teardown
 
 Architecture 3.4 sets the order; `ops/teardown.sh` runs it and [teardown.md](../runbooks/teardown.md) explains each
-step. In short: in prod, the retained stack's teardown apply first (`TF_VAR_teardown=true`: the key-admin role leaves
-the audit key's policy and the $7 budget is created); then each region's layers in reverse (Osaka first), each `data`
-stack after its own teardown apply; then, for a final teardown, the bootstrap stacks, and with the last environment
-the shared account's registry; then the tag search, and the next bill. dev and staging go the same way without the
-retained stack when idle, and keep their bootstrap stacks to be built again (NFR-20).
+step. In short: in prod, the retained stack's teardown apply first (`TF_VAR_teardown=true`: the key-admin role and the
+environment's workload roles leave the audit key's and archive's policies, the key's rotation stops, the retained
+trail logs management events, and the $7 budget is created); then the layers in reverse, Osaka before Tokyo in each,
+each `data` stack (and in prod each `cluster`, `identity` and `edge`) after its own teardown apply; then, for a final
+teardown, the bootstrap stacks, and with the last environment the shared account's registry; then the tag search, and
+the next bill. dev and staging go the same way without the retained stack when idle, and keep their bootstrap stacks
+to be built again (NFR-20).
 
 ## 8. What other parts of the repository still owe this page
 
-- **The chart** reads `failover.holdWorkers` and runs the suspended `recovery` and `standby-enrolment` CronJobs
-  (`python -m sft.workers.recovery`, `RECOVERY_STEPS`, `RECOVERY_SINCE`, `RECOVERY_REWIND_TO`; the standby
-  enrolment as the notifier).
-- **The application** has the recovery entry point, which reads the surviving region's archive (both key layouts),
-  finds its highest generation and calls `sft.service.recovery_replay`; the standby enrolment job; and the revision
-  with the grants of section 4.
-- **Terraform**: the teardown inputs of modules/kms-keys and modules/audit-archive (the environment's roles out of
-  the audit key and bucket policies, rotation off) and the retained trail, state bucket, deploy role and alerts
-  (encryption 8.4); a teardown input for prod's files buckets (gap 11); the reverse replication rule and the
-  `sft-{env}-s3-batch-replication` role (gap 4); Osaka's `system` node count and heartbeat alarm as inputs, so a
-  failover's Git change and its apply agree.
+What the drills need from elsewhere, and where each landed:
 
-Until each lands, its runbook step says so.
+- **The chart and the application** (#257, #258): the chart reads `failover.holdWorkers` and
+  `auditArchive.survivingRegionOnly` (`AUDIT_ARCHIVE_SURVIVING_REGION`) and runs the suspended `recovery` and
+  `standby-enrolment` CronJobs; `ops/failover-values.sh` flips the toggles (`surviving-osaka` at the failover's fence,
+  `both-regions` at the failback).
+- **Terraform**: the recovery job's Pod Identity role `sft-{env}-recovery` (modules/eks-cluster, #258), and the inputs
+  of #261, #262 and #263: every runbook step sets inputs only.
+
+  | Input | Root | Set by |
+  |---|---|---|
+  | `TF_VAR_system_node_count=2` | Osaka's `cluster` | The failover, step 4; the failback, step 8, back to 1 |
+  | `TF_VAR_database_role=primary` (Osaka), `secondary` (Tokyo) | `alarms` | The failover, step 4; the failback, step 8, back |
+  | `TF_VAR_heartbeat_enabled`, `TF_VAR_pilot_light`, `TF_VAR_malware_protection_enabled` | Osaka's `alarms`, `data` | The failover; the failback, back (#246, ADR-0019) |
+  | `TF_VAR_replicate_to_tokyo=true` | Osaka's `data` | The failback, step 2 to step 8 (gap 4) |
+  | `TF_VAR_aurora_global_generation=2`, `TF_VAR_aurora_role=secondary` (Tokyo) | Both `data` roots | A failback after a detach, step 1, until the next rebuild |
+  | `TF_VAR_teardown=true` | prod's `retained`, `data`, `cluster`, `identity`, `edge` | The teardown (gap 11) |
+
+  The retained stack has its own state bucket, deploy role, trail and alerts, and its teardown apply takes the
+  environment's roles out of the audit key's and archive's policies and turns the key's rotation off (encryption 8.4).
+- **Still outside this repository's reach:** an alert on SCP changes, which only the management account's own trail
+  sees (encryption 8.4's table names it); the organization stack would need its own rule there. A follow-up issue.

@@ -64,6 +64,8 @@ locals {
 module "cluster" {
   source = "../../../../modules/eks-cluster"
 
+  conventions = module.conventions
+
   environment        = "prod"
   region             = module.conventions.region
   account_id         = var.account_id
@@ -84,8 +86,8 @@ module "cluster" {
   karpenter_discovery_tag = local.network.karpenter_discovery_tag
 
   kubernetes_version = "1.37"
-  # prod's clusters can't be deleted until an apply turns this off (NFR-19's teardown starts there).
-  deletion_protection = true
+  # prod's clusters can't be deleted until the teardown apply turns this off (TF_VAR_teardown, NFR-19, #263).
+  deletion_protection = !var.teardown
 
   # Two always-on system nodes in different AZs (capacity 4.2, 4.3).
   system_node_count = 2

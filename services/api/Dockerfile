@@ -14,6 +14,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
+# The bank and branch code list behind jp_bank_account's high confidence (DLP detectors 4.4, #146).
+# No licence for its data could be confirmed, so git holds only its header and the image fetches it
+# here: zengin-code/source-data at one commit, refused unless the codes' digest is the pinned one.
+# The refresh steps are in the README ("DLP bank and branch codes"). BANK_CODES=none builds without
+# it, for an image that is published publicly or built offline: jp_bank_account then stays medium.
+ARG BANK_CODES=zengin-code
+ARG BANK_CODES_REF=658711c701f40189d5a4fb131a7ccb57fb7d04ba
+ARG BANK_CODES_DATE=2026-08-24
+ARG BANK_CODES_SHA256=7efd7f8b8b690e5e0560b151337b31e0fbb92c1d5da8769f99e88ce829229c6f
+COPY tools/__init__.py tools/bank_codes.py ./tools/
+RUN case "${BANK_CODES}" in \
+      zengin-code) PYTHONPATH=src /app/.venv/bin/python -m tools.bank_codes zengin-code \
+          --ref "${BANK_CODES_REF}" --retrieved "${BANK_CODES_DATE}" --sha256 "${BANK_CODES_SHA256}" \
+          --output src/sft/dlp/detect/bank_codes.txt ;; \
+      none) ;; \
+      *) echo "BANK_CODES is zengin-code or none" >&2; exit 1 ;; \
+    esac
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-editable
 
 # ---- runtime: slim image, only the virtualenv, non-root ----

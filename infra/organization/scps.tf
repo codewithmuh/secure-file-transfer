@@ -44,8 +44,10 @@ locals {
 
   # What CloudFront and Route 53 need in us-east-1 and nowhere else outside Japan (NFR-21): the certificate, the web
   # ACL, CloudWatch metrics and alarms with the SNS topic they notify, the CloudWatch Logs delivery of the web ACL's
-  # logs to Tokyo, and the KMS key that signs the zone (DNSSEC).
-  us_east_1_actions = ["acm:*", "cloudwatch:*", "kms:*", "logs:*", "sns:*", "wafv2:*"]
+  # logs to Tokyo, and the KMS key that signs the zone (DNSSEC). Also EventBridge: root and IAM user sign-ins and
+  # STS's global endpoint record their events in us-east-1, and a rule there forwards them to a Japanese Region's
+  # event bus for the security alerts (#256); nothing is stored there.
+  us_east_1_actions = ["acm:*", "cloudwatch:*", "events:*", "kms:*", "logs:*", "sns:*", "wafv2:*"]
 
   scp_region_guard = {
     Version = "2012-10-17"

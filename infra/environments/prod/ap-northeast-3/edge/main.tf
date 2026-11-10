@@ -82,5 +82,5 @@ module "edge" {
   web_distribution_arn = var.web_distribution_arn
 
   managed_rules_in_count = true
-  deletion_protection    = true
+  deletion_protection    = !var.teardown
 }

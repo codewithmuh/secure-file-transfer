@@ -1,0 +1,99 @@
+# Unit tests of sso.rules.yaml: `promtool test rules deploy/alerts/tests/*.test.yaml` (CI's deploy job).
+rule_files:
+  - ../sso.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # #239: every pair at zero is quiet; a provider missing in Osaka pages, naming the pool and the problem.
+  - interval: 1m
+    input_series:
+      - series: 'sft_sso_provider_drift{pool="ap-northeast-1", problem="missing", job="operator-api"}'
+        values: '0 0 0 0'
+      - series: 'sft_sso_provider_drift{pool="ap-northeast-3", problem="missing", job="operator-api"}'
+        values: '0 0 1 1'
+      - series: 'sft_sso_provider_drift{pool="ap-northeast-3", problem="unrecorded", job="operator-api"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SsoProviderDrift
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: SsoProviderDrift
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+              pool: ap-northeast-3
+              problem: missing
+            exp_annotations:
+              summary: A tenant's SSO provider is missing in the ap-northeast-3 user pool (FR-26).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+      - eval_time: 2m
+        alertname: SsoProviderUnrecorded
+        exp_alerts: []
+
+  # #239: a changed provider pages too.
+  - interval: 1m
+    input_series:
+      - series: 'sft_sso_provider_drift{pool="ap-northeast-1", problem="changed"}'
+        values: '2 2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SsoProviderDrift
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              security: "true"
+              pool: ap-northeast-1
+              problem: changed
+            exp_annotations:
+              summary: A tenant's SSO provider is changed in the ap-northeast-1 user pool (FR-26).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+
+  # #239: an unrecorded provider is a ticket, not a page.
+  - interval: 1m
+    input_series:
+      - series: 'sft_sso_provider_drift{pool="ap-northeast-1", problem="unrecorded"}'
+        values: '1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: SsoProviderUnrecorded
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              security: "true"
+              pool: ap-northeast-1
+            exp_annotations:
+              summary: The ap-northeast-1 user pool has an SSO provider no tenant has recorded (FR-26).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+      - eval_time: 1m
+        alertname: SsoProviderDrift
+        exp_alerts: []
+
+  # #239: a check that completes daily never alerts; one that stops for more than 26 hours does.
+  - interval: 1h
+    input_series:
+      - series: 'sft_sso_drift_check_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: SsoDriftCheckStalled
+        exp_alerts: []
+      - eval_time: 27h
+        alertname: SsoDriftCheckStalled
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: The SSO provider drift check hasn't completed for 26 hours (FR-26).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+  # The next day's check at 24h resets it.
+  - interval: 1h
+    input_series:
+      - series: 'sft_sso_drift_check_last_success_timestamp_seconds{job="operator-api"}'
+        values: '0x23 86400x20'
+    alert_rule_test:
+      - eval_time: 40h
+        alertname: SsoDriftCheckStalled
+        exp_alerts: []

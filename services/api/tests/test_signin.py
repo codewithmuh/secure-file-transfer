@@ -2,10 +2,13 @@
 pool that signs real RS256 ID tokens. The acceptance criteria: a member signs in and calls
 `GET /me`; an unsafe request without the CSRF token is refused; a revoked session stops at once."""
 
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -22,6 +25,7 @@ from sft.api.app import create_app
 from sft.api.caller import AUTH_COOKIE, SESSION_COOKIE
 from sft.api.rate_limits import get_rate_limiter
 from sft.data.database import Database
+from sft.data.scope import Scope
 from sft.data.signin_state import PendingSignIn
 from sft.service.csrf import CsrfKeyring
 from sft.service.oidc import OidcClient
@@ -165,6 +169,12 @@ class Harness:
         return await self.client.get(
             "/v1/auth/callback", params={"code": code, "state": query["state"][0]}
         )
+
+
+def states_of(harness: Harness) -> MemoryStates:
+    states = harness.service.states
+    assert isinstance(states, MemoryStates)
+    return states
 
 
 @pytest.fixture
@@ -523,3 +533,98 @@ async def test_sign_in_fails_closed_when_the_database_is_down(harness: Harness) 
     finally:
         harness.service.database = up
         await down.dispose()
+
+
+# ---- the session the browser had (#159) ----
+
+
+async def test_a_cross_site_callback_still_ends_the_session_the_browser_had(
+    harness: Harness,
+) -> None:
+    # A session cookie in the browser before sign-in: an earlier sign-in's, or a planted one.
+    await harness.sign_in()
+    planted = harness.client.cookies[SESSION_COOKIE]
+    # The start is a same-site navigation from the web app, so the Strict cookie goes along.
+    started = await harness.client.get("/v1/auth/sign-in", params={"method": "local"})
+    query = parse_qs(urlsplit(started.headers["location"]).query)
+    harness.pool.nonce = query["nonce"][0]
+    # The record keeps the session's hash, never its token.
+    [pending] = states_of(harness).records.values()
+    assert pending.previous_session == hashlib.sha256(planted.encode()).hexdigest()
+    assert planted not in pending.to_json()
+    # The callback is a cross-site redirect from the user pool: only the Lax pre-auth cookie.
+    auth = harness.client.cookies[AUTH_COOKIE]
+    harness.client.cookies.clear()
+    harness.client.cookies.set(AUTH_COOKIE, auth, domain="api.sft.test")
+    callback = await harness.client.get(
+        "/v1/auth/callback", params={"code": "good-code", "state": query["state"][0]}
+    )
+    assert callback.status_code == 302
+    assert SESSION_COOKIE in callback.headers["set-cookie"]
+    assert (await harness.client.get("/v1/me")).status_code == 200  # the new session works
+    harness.client.cookies.clear()
+    harness.client.cookies.set(SESSION_COOKIE, planted, domain="api.sft.test")
+    old = await harness.client.get("/v1/me")
+    assert (old.status_code, old.json()["code"]) == (401, "session_expired")
+    [(reason,)] = harness.db.sql(
+        "SELECT revoked_reason FROM member_sessions WHERE session_hash = :hash",
+        hash=hashlib.sha256(planted.encode()).digest(),
+    )
+    assert reason == "sign_in_replaced"
+    assert harness.db.sql(
+        "SELECT count(*) FROM audit_events WHERE action = 'member.signed_out' "
+        "AND details->>'reason' = 'sign_in_replaced' AND tenant_id = :t",
+        t=harness.member.tenant_id,
+    ) == [(1,)]
+
+
+async def test_a_refused_sign_in_ends_no_session(harness: Harness) -> None:
+    await harness.sign_in()
+    kept = harness.client.cookies[SESSION_COOKIE]
+    refused = await harness.sign_in(code="bad-code")
+    assert "error=sign_in_failed" in refused.headers["location"]
+    harness.client.cookies.clear()
+    harness.client.cookies.set(SESSION_COOKIE, kept, domain="api.sft.test")
+    assert (await harness.client.get("/v1/me")).status_code == 200
+
+
+def test_a_record_from_an_older_pod_has_no_session_and_no_raw_value_is_read() -> None:
+    record = PendingSignIn("s", "v", "n", uuid.uuid4(), "/")
+    old = json.loads(record.to_json())
+    del old["previous_session"], old["invited_user_id"], old["invitation"]
+    assert PendingSignIn.from_json(json.dumps(old)) == record
+    # Anything but a SHA-256 in hex is dropped: a record never carries a raw token.
+    raw = {**old, "previous_session": "a-raw-session-token", "invitation": "z" * 64}
+    assert PendingSignIn.from_json(json.dumps(raw)) == record
+
+
+# ---- GET /me answers from the request's session check (#161) ----
+
+
+async def test_me_reads_the_session_once(harness: Harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    await harness.sign_in()
+    database = harness.service.database
+    opened: list[str] = []
+    original = database.transaction
+
+    def counting(scope: Scope) -> Any:
+        opened.append(scope.kind.value)
+        return original(scope)
+
+    monkeypatch.setattr(database, "transaction", counting)
+    me = await harness.client.get("/v1/me")
+    assert me.status_code == 200, me.text
+    # The session lookup and the session check; `GET /me` itself opens none (it was three).
+    assert opened == ["lookup", "tenant"]
+    body = me.json()
+    [(expires_at,)] = harness.db.sql(
+        "SELECT expires_at FROM member_sessions WHERE user_id = :user AND revoked_at IS NULL",
+        user=harness.member.user_id,
+    )
+    assert datetime.fromisoformat(body["session"]["expires_at"]) == expires_at
+    assert body["tenant"] == {
+        "id": str(harness.member.tenant_id),
+        "name": "Signin Co",
+        "status": "active",
+        "created_at": body["tenant"]["created_at"],
+    }

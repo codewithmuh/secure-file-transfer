@@ -1,4 +1,5 @@
-"""The sign-in routes and `GET /me`: startSignIn, completeSignIn, signOut, getCurrentMember.
+"""The sign-in routes and `GET /me`: startSignIn, completeSignIn, startInvitationSignIn, signOut,
+getCurrentMember.
 
 The operations are the contract's (docs/api/openapi.yaml); the rules are in authentication and
 authorization 2.4 and 3, and the work is `sft.service.signin`'s. This module only speaks HTTP:
@@ -14,14 +15,21 @@ cookies, redirects and problem responses (`sft.api.errors`).
   clears `__Host-sft_auth`.
 - **Rate limits** (abuse and rate limits 2.2): 60 sign-in starts and 60 callbacks per IP a minute
   (group B), failing closed with `503`; `GET /me` and sign-out count against the caller's and the
-  tenant's budget (group H), like every other member operation.
+  tenant's budget (group H), like every other member operation. An invitation's start counts with
+  the sign-in starts.
+- **The previous session** (#159). Both starts pass the session cookie the browser sent, if any,
+  to the service, which keeps only its hash for the callback: the starts are same-site, the
+  callback isn't (`sft.service.signin`).
+- **An invitation's start** (`startInvitationSignIn`, #239) is public but unsafe: `Origin` must be
+  the web app's, `Sec-Fetch-Site` same-origin or same-site, and the body JSON, as for a member's
+  unsafe request but with no CSRF token, since there is no session yet (authn and authz 3.4). It
+  answers `200` with the provider's URL rather than a redirect, since the web app posts it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Annotated, Final, Literal
-from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +40,7 @@ from sft.api.caller import (
     AUTH_COOKIE,
     SESSION_COOKIE,
     SessionContext,
+    check_origin,
     get_session,
     get_tenant_caller,
     origin_of,
@@ -40,7 +49,8 @@ from sft.api.caller import (
 from sft.api.errors import problem_for, problem_responses
 from sft.api.members import UserOut
 from sft.api.rate_limits import rate_limit
-from sft.core.errors import FieldError, ServiceUnavailable, Unprocessable
+from sft.api.tenant_schemas import Tenant
+from sft.core.errors import FieldError, NotFound, ServiceUnavailable, Unprocessable
 from sft.core.settings import Settings
 from sft.data.counters import ValkeyIam
 from sft.data.database import Database
@@ -50,7 +60,13 @@ from sft.service.caller import AuthMethod
 from sft.service.csrf import CsrfKeyring
 from sft.service.oidc import OidcClient
 from sft.service.rate_limits.limits import SIGN_IN_CALLBACK, SIGN_IN_START, TENANT_OPERATION
-from sft.service.signin import SignIn, SignInConfig, SignInMethod, SignInUnavailableError
+from sft.service.signin import (
+    InvitationNotFoundError,
+    SignIn,
+    SignInConfig,
+    SignInMethod,
+    SignInUnavailableError,
+)
 
 PREFIX: Final = "/v1"
 NO_STORE: Final = {"Cache-Control": "no-store"}
@@ -71,17 +87,6 @@ CsrfToken = Annotated[
 Uri = Annotated[str, Field(json_schema_extra={"format": "uri"})]
 
 
-class TenantOut(BaseModel):
-    """The contract's `Tenant`."""
-
-    model_config = ConfigDict(title="Tenant")
-
-    id: UUID
-    name: str
-    status: Literal["active", "suspended"]
-    created_at: datetime
-
-
 class CurrentSession(BaseModel):
     auth_method: AuthMethod
     auth_time: datetime
@@ -91,9 +96,19 @@ class CurrentSession(BaseModel):
 
 class CurrentMember(BaseModel):
     user: UserOut
-    tenant: TenantOut
+    tenant: Tenant
     session: CurrentSession
     csrf_token: CsrfToken
+
+
+class InvitationSignInRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: Annotated[str, Field(min_length=43, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")]
+
+
+class SignInRedirect(BaseModel):
+    location: Uri
 
 
 class SignOutRequest(BaseModel):
@@ -165,13 +180,44 @@ async def start_sign_in(
     service = sign_in_service(request)
     try:
         started = await service.start(
-            method=SignInMethod(method), return_to=return_to, sso_domain=sso_domain
+            method=SignInMethod(method),
+            return_to=return_to,
+            sso_domain=sso_domain,
+            previous_session=request.cookies.get(SESSION_COOKIE),
         )
     except (StateStoreUnavailableError, SignInUnavailableError) as exc:
         raise _unavailable() from exc
     response = _redirect(started.location)
     _set_cookie(response, AUTH_COOKIE, started.cookie, lax=True)
     return response
+
+
+@router.post(
+    "/auth/invitations",
+    operation_id="startInvitationSignIn",
+    response_model=SignInRedirect,
+    summary="Start sign-in from an SSO invitation",
+    tags=["Sign-in"],
+    dependencies=[rate_limit(SIGN_IN_START)],
+    responses=problem_responses(400, 403, 404, 422, 429, 503),
+)
+async def start_invitation_sign_in(
+    request: Request, response: Response, body: InvitationSignInRequest
+) -> SignInRedirect:
+    """Store the pre-auth record for the invited user and return their provider's URL."""
+    service = sign_in_service(request)
+    check_origin(request, service.config.web_origin)
+    try:
+        started = await service.start_invitation(
+            token=body.token, previous_session=request.cookies.get(SESSION_COOKIE)
+        )
+    except InvitationNotFoundError as exc:
+        raise NotFound() from exc
+    except (StateStoreUnavailableError, SignInUnavailableError) as exc:
+        raise _unavailable() from exc
+    _set_cookie(response, AUTH_COOKIE, started.cookie, lax=True)
+    response.headers.update(NO_STORE)
+    return SignInRedirect(location=started.location)
 
 
 @router.get(
@@ -256,18 +302,12 @@ async def get_current_member(
 ) -> CurrentMember:
     """The signed-in member, their tenant, the session and its CSRF token."""
     service = sign_in_service(request)
-    member = await service.current_member(context.caller)
+    member = service.current_member(context.caller, context.live)
     response.headers.update(NO_STORE)
     caller = context.caller
-    tenant = member.tenant
     return CurrentMember(
         user=UserOut.of(member.user),
-        tenant=TenantOut(
-            id=tenant.id,
-            name=tenant.name,
-            status=tenant.status,  # type: ignore[arg-type] # the table's CHECK allows only these
-            created_at=tenant.created_at,
-        ),
+        tenant=Tenant.of(member.tenant),
         session=CurrentSession(
             auth_method=member.auth_method,
             auth_time=member.auth_time,

@@ -57,6 +57,8 @@ ENV_NAMES = (
     "OIDC_GROUPS_CLAIM",
     "SSO_DNS_OVERRIDES",
     "SSO_DNS_NAMESERVERS",
+    # The audit archive's surviving region during a regional loss (#257).
+    "AUDIT_ARCHIVE_SURVIVING_REGION",
 )
 OTHER_ENV_NAMES = ("MIGRATION_DATABASE_URL", "BOOTSTRAP_DATABASE_URL", "BOOTSTRAP_IAM_AUTH")
 DATABASE_URL = "postgresql+psycopg://sft_api@127.0.0.1:5432/sft"
@@ -250,8 +252,10 @@ def test_a_bad_files_bucket_setting_stops_the_api(
 
 
 def test_the_operator_api_reads_none_of_the_sign_in_settings() -> None:
-    # It serves no member sign-in (#111), so a missing OIDC setting can't stop it.
-    assert not set(OperatorSettings.model_fields) & {n.lower() for n in API_ENV} - {"valkey_url"}
+    # It serves no member sign-in (#111), so a missing OIDC setting can't stop it. It shares the
+    # counter store, and the audit archive's buckets for recoverTenantAdmin (#239), optional here.
+    shared = {"valkey_url", "audit_archive_tokyo_bucket"}
+    assert not set(OperatorSettings.model_fields) & {n.lower() for n in API_ENV} - shared
 
 
 def test_a_bad_valkey_url_is_never_echoed(clean_env: pytest.MonkeyPatch) -> None:

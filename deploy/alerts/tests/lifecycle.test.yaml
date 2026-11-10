@@ -204,3 +204,24 @@ tests:
             exp_annotations:
               summary: A daily lifecycle job hasn't finished a run for 26 hours.
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/lifecycle-jobs.md
+
+  # #257: ranges in one region only for half an hour open a ticket; the back-fill clearing them ends it.
+  - interval: 1m
+    input_series:
+      - series: 'audit_archive_single_region_ranges{job="audit-archive"}'
+        values: '0 3x40 0x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: AuditArchiveSingleRegion
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: AuditArchiveSingleRegion
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+            exp_annotations:
+              summary: The audit archive holds events in one region only, waiting for the back-fill to the other (#257).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-single-region.md
+      - eval_time: 45m
+        alertname: AuditArchiveSingleRegion
+        exp_alerts: []

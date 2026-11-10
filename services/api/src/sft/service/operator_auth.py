@@ -39,6 +39,7 @@ from typing import Final, Protocol
 from uuid import UUID
 
 from sft.core.errors import ServiceUnavailable, Unauthenticated
+from sft.core.tokens import token_hash
 from sft.data import audit
 from sft.data.audit import Actor, ActorType, OperatorName, Origin, Outcome, Target
 from sft.data.database import Database
@@ -161,10 +162,6 @@ class _RefusedError(Exception):
     def __init__(self, reason: Refusal) -> None:
         super().__init__(reason.value)
         self.reason = reason
-
-
-def token_hash(token: str) -> bytes:
-    return hashlib.sha256(token.encode()).digest()
 
 
 def _signed_request(

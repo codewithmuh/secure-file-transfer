@@ -87,14 +87,39 @@ expect_refusal "prod has no idle teardown" "$ops/teardown.sh" --env prod --profi
 expect_refusal "--last needs --scope final" "$ops/teardown.sh" --env staging --profile p --last
 expect_refusal "--inventory needs --account-id" "$ops/teardown.sh" --env staging --profile p --inventory
 
-# The teardown's dry run lists the stacks in order: Osaka's layers, then Tokyo's, cluster-bootstrap first, network last.
+# The teardown's dry run lists the stacks in order: layer by layer, Osaka then Tokyo, alarms first, network last.
 out="$("$ops/teardown.sh" --env prod --profile p --last </dev/null 2>&1)"
 listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
-want="environments/prod/ap-northeast-3/cluster-bootstrap environments/prod/ap-northeast-3/identity"
+want="environments/prod/ap-northeast-3/alarms environments/prod/ap-northeast-1/alarms environments/prod/ap-northeast-3/cluster-bootstrap"
+# prod's dry run checks its prerequisites in the repository (#263): none may be unmet.
+[[ "$out" == *"Prerequisites of a prod teardown"* ]] || fail "prod's teardown dry run didn't check its prerequisites"
+[[ "$out" != *"UNMET"* ]] || fail "prod's teardown has unmet prerequisites: $(grep UNMET <<<"$out")"
+[[ "$out" == *"apply -var teardown=true"*"ap-northeast-3/cluster"* ]] || fail "prod's cluster gets no teardown apply"
+[[ "$out" == *"bootstrap/prod/ap-northeast-1 state rm module.terraform_roles.aws_iam_openid_connect_provider.github"* ]] ||
+  fail "prod's Tokyo bootstrap keeps the OIDC provider in its state: $out"
 [[ "$listed" == *"retained: teardown apply"* ]] || fail "prod's teardown doesn't start with the retained stack"
 [[ "$listed" == *"$want"* ]] || fail "teardown order: $listed"
 [[ "$listed" == *"environments/prod/ap-northeast-1/network bootstrap/prod/ap-northeast-3 bootstrap/prod/ap-northeast-1 shared "* ]] ||
   fail "teardown's final order: $listed"
+
+# A missing prerequisite shows as unmet, and --execute refuses: on a copy of the repository without the retained trail.
+copy="$(mktemp -d)"
+mkdir -p "$copy/ops" "$copy/infra"
+cp -R "$ops/." "$copy/ops/"
+cp -R "$root/infra/environments" "$root/infra/modules" "$copy/infra/"
+rm "$copy/infra/environments/prod/retained/trail.tf"
+out="$("$copy/ops/teardown.sh" --env prod --profile p </dev/null 2>&1)"
+[[ "$out" == *"UNMET: the retained trail"* ]] || fail "a missing retained trail isn't listed as unmet"
+expect_refusal "prerequisite(s) of a prod teardown unmet" "$copy/ops/teardown.sh" --env prod --profile p \
+  --account-id 000000000000 --execute
+rm -rf "$copy"
+
+# The failback after a detach: its dry run makes the new global database from Osaka's cluster and runs nothing.
+rm -f "$calls"
+out="$("$ops/regional-failback.sh" --env staging --profile p --after-detach </dev/null 2>&1)"
+[[ "$out" == *"create-global-cluster"*"sft-staging-aurora-2"* ]] || fail "the failback after a detach has no new global database"
+[[ "$out" == *"TF_VAR_aurora_role=secondary"* ]] || fail "the failback after a detach doesn't set Tokyo's role input"
+[[ ! -s "$calls" ]] || fail "the failback's dry run ran: $(cat "$calls")"
 
 # failover-values.sh on a copy of the repository's values files.
 copy="$(mktemp -d)"
@@ -130,6 +155,17 @@ changed="$(diff <(echo "$before_dev") "$dev" || true)"
 [[ "$changed" == *"> failover:"* ]] || fail "dev's file didn't get the failover block: $changed"
 [[ "$(grep -c '^[<>]' <<<"$changed")" -le 4 ]] || fail "dev's file changed beyond the block: $changed"
 expect_refusal "dev has no Osaka" "$values" fence --env dev
+# The surviving region's archive (#257): only Osaka's file, only its auditArchive line, and back to "" at failback.
+"$values" surviving-osaka --env staging --write >/dev/null
+[[ "$(state)" == *'ap-northeast-3/values.yaml: pilotLight: true; holdWorkers: true; survivingRegionOnly: "ap-northeast-3"'* ]] ||
+  fail "surviving-osaka: $(state)"
+[[ "$(cat "$tokyo")" == "$before_tokyo" ]] || fail "surviving-osaka changed Tokyo's file"
+"$values" both-regions --env staging --write >/dev/null
+[[ "$(state)" == *'ap-northeast-3/values.yaml: pilotLight: true; holdWorkers: true; survivingRegionOnly: ""'* ]] ||
+  fail "both-regions: $(state)"
+changed="$(diff <(echo "$before_osaka") "$osaka" || true)"
+[[ "$(grep -c '^>' <<<"$changed")" -le 4 && "$(grep -c '^<' <<<"$changed")" -eq 0 ]] ||
+  fail "the toggle changed Osaka's file beyond its block: $changed"
 rm -rf "$copy"
 
 if ((failures > 0)); then

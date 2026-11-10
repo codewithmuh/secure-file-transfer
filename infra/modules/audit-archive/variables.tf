@@ -1,13 +1,3 @@
-variable "environment" {
-  description = "The environment: dev, staging or prod. Names the bucket and the roles the policy names."
-  type        = string
-
-  validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be dev, staging or prod."
-  }
-}
-
 variable "account_id" {
   description = "ID of the account that owns the archive. The bucket name ends in it."
   type        = string
@@ -122,4 +112,20 @@ variable "prevent_destroy" {
   description = "Guard the bucket with prevent_destroy: true in prod's retained stack (encryption 8.4)."
   type        = bool
   default     = false
+}
+
+variable "environment_retired" {
+  description = "True once the environment is torn down (prod's retained stack, from its teardown apply on, encryption 8.4): the environment's workload roles leave the bucket policy, so nobody writes and only the audit reader and BreakGlass read (#263)."
+  type        = bool
+  default     = false
+}
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the buckets, and the roles its policies name, from their one definition (#172)."
+  type = object({
+    global_name_prefix  = string
+    region_shorts       = map(string)
+    workload_role_names = map(string)
+    workload_role_arns  = map(string)
+  })
 }

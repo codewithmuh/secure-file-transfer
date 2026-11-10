@@ -1,5 +1,6 @@
-# Values for Trivy's misconfiguration scan of the charts (trivy.yaml), which renders each chart on its own. The same
-# obviously fake cluster facts as deploy/render.sh, with dev's network. Not used by Argo CD.
+# Values for Trivy's misconfiguration scan of the charts (trivy.yaml), which renders each chart on its own. Not used by
+# Argo CD. environment, region, cluster, global and probe are dev's in Tokyo exactly as deploy/tests/cluster-facts.sh
+# writes them, the one source of the fake facts (test_rendered.py checks it, #186); image and network are dev's.
 environment: dev
 region: ap-northeast-1
 cluster:
@@ -28,3 +29,6 @@ global:
     environment: dev
     region: ap-northeast-1
     accountId: "000000000000"
+# The workloads that are off until their AWS side exists, switched on as in cluster-facts.sh.
+probe:
+  enabled: true

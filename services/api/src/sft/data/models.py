@@ -277,6 +277,29 @@ class AuditArchiveCursor(Base):
     archived_up_to_tx: Mapped[int] = mapped_column(Xid8)
     claimed_up_to_tx: Mapped[int | None] = mapped_column(Xid8)
     archived_at: Mapped[datetime | None]
+    # The surviving-region mode's window (#257, revision 0039): when the job first wrote one
+    # region alone, and when it first wrote both again after that.
+    single_region_since: Mapped[datetime | None]
+    both_regions_since: Mapped[datetime | None]
+
+
+class AuditArchiveSingleRegion(Base):
+    """A range the archive job wrote to one region's archive alone, while the failover's toggle
+    said the other was lost (#257, revision 0039; data model 2.5). The job writes it to every
+    region once both answer again, as the same objects, then deletes the row. No tenant:
+    `sft_archive` uses it in system scope."""
+
+    __tablename__ = "audit_archive_single_region"
+    __table_args__ = (
+        CheckConstraint("up_to_tx > from_tx", name="range"),
+        CheckConstraint("region IN ('ap-northeast-1', 'ap-northeast-3')", name="region"),
+    )
+
+    generation: Mapped[int] = mapped_column(primary_key=True)
+    from_tx: Mapped[int] = mapped_column(Xid8, primary_key=True)
+    up_to_tx: Mapped[int] = mapped_column(Xid8)
+    region: Mapped[str] = mapped_column(Text)
+    archived_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
 class Outbox(TenantOwned, Base):
@@ -554,6 +577,56 @@ class SsoGroupRole(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
+class AdminRecoveryKind(StrEnum):
+    """What `recoverTenantAdmin` gave the admin (#239; authn and authz 2.5)."""
+
+    SIGN_IN_RESET = "sign_in_reset"
+    """A local admin: their sign-in reset, as `resetUserSignIn` does."""
+    TEMPORARY_LOCAL_SIGN_IN = "temporary_local_sign_in"
+    """An admin of a tenant that uses SSO: a local sign-in for 72 hours."""
+
+
+class AdminRecovery(TenantOwned, Base):
+    """An operator-assisted recovery of a tenant admin (#239; data model 2.1; authn and authz 2.5).
+
+    `confirmed_via` is how the operator confirmed the request through the tenant's recovery
+    contact: free text, kept here and never in an audit event. A temporary local sign-in ends at
+    `temporary_sign_in_expires_at`, when its identity expires; the daily job then deletes the
+    identity and sets `ended_at` (revision 0037)."""
+
+    __tablename__ = "admin_recoveries"
+    __table_args__ = (
+        CheckConstraint(f"kind IN {sql_values(AdminRecoveryKind)}", name="kind"),
+        CheckConstraint("char_length(confirmed_via) BETWEEN 1 AND 500", name="confirmed_via"),
+        CheckConstraint("char_length(operator_name) BETWEEN 1 AND 128", name="operator_name"),
+        CheckConstraint(
+            "(kind = 'temporary_local_sign_in') = (temporary_sign_in_expires_at IS NOT NULL)",
+            name="temporary",
+        ),
+        CheckConstraint(
+            "ended_at IS NULL OR temporary_sign_in_expires_at IS NOT NULL", name="ended_at"
+        ),
+        UniqueConstraint("tenant_id", "id"),
+        ForeignKeyConstraint(["tenant_id", "user_id"], ["users.tenant_id", "users.id"]),
+        Index(
+            "admin_recoveries_temporary_idx",
+            "temporary_sign_in_expires_at",
+            postgresql_where=text("temporary_sign_in_expires_at IS NOT NULL AND ended_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    user_id: Mapped[uuid.UUID]
+    kind: Mapped[str] = mapped_column(Text)
+    confirmed_via: Mapped[str] = mapped_column(Text)
+    operator_name: Mapped[str] = mapped_column(Text)
+    sign_in_reset_id: Mapped[uuid.UUID]
+    temporary_sign_in_expires_at: Mapped[datetime | None]
+    ended_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class BreakGlassState(StrEnum):
     """Where a break-glass request stands (#232; authn and authz 8.3)."""
 
@@ -695,7 +768,8 @@ class IdempotencyKey(TenantOwned, Base):
     __table_args__ = (
         PrimaryKeyConstraint("caller_type", "caller_id", "key"),
         CheckConstraint(
-            "caller_type IN ('member', 'api_key', 'recipient', 'uploader')", name="caller_type"
+            "caller_type IN ('member', 'api_key', 'recipient', 'uploader', 'operator')",
+            name="caller_type",
         ),
         CheckConstraint("key ~ '^[\\x21-\\x7e]{1,255}$'", name="key"),
         CheckConstraint("octet_length(request_fingerprint) = 32", name="request_fingerprint"),

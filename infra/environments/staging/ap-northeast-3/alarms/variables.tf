@@ -30,3 +30,14 @@ variable "probe_enabled" {
   type        = bool
   default     = false
 }
+
+variable "database_role" {
+  description = "What Osaka's cluster is for the database alarms (modules/alarms): secondary in the pilot light; the failover runbook applies it as primary (TF_VAR_database_role=primary), so the writer's CPU and memory alarms watch Osaka, and the failback back to secondary (#261)."
+  type        = string
+  default     = "secondary"
+
+  validation {
+    condition     = contains(["primary", "secondary"], var.database_role)
+    error_message = "database_role must be primary or secondary."
+  }
+}

@@ -4,6 +4,12 @@ name: release
 # Conventional Commits. Merging that PR creates the tag + GitHub release, then images are
 # published to GHCR, signed with cosign (keyless) and get an SBOM attached to the release.
 # GHCR stays until M4 adds the ECR push in the shared account, which replaces it (ADR-0007).
+#
+# release-please acts as the repository's release GitHub App (#6), with a token minted for this run that expires within
+# the hour, not with GITHUB_TOKEN: GitHub runs no workflow for events GITHUB_TOKEN creates, so a Release PR opened with
+# it never gets its required checks, and protect-main has no bypass for it. The App may write contents and pull
+# requests on this repository only; its client ID and private key are secrets of the `release` environment, which
+# accepts deployments from main only, so no pull request's workflow can read them (CONTRIBUTING.md, "Releases").
 on:
   push:
     branches: [main]
@@ -14,16 +20,25 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    environment: release # the App's secrets; main only
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read # release-please writes with the App's token, not this job's
     outputs:
       release_created: ${{ steps.rp.outputs.release_created }}
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # This repository only (the default), and only what release-please needs, whatever the installation grants.
+          permission-contents: write
+          permission-pull-requests: write
       - id: rp
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
+          token: ${{ steps.app.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -72,7 +87,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: APP_VERSION=${{ steps.img.outputs.version }}
+          # The public GHCR copy carries no bank and branch code list: its data has no confirmed licence
+          # (docs/design/dlp-detectors.md 4.4, #146). The ECR images (build.yml) fetch it at build time.
+          build-args: |
+            APP_VERSION=${{ steps.img.outputs.version }}
+            BANK_CODES=none
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=${{ matrix.service }}

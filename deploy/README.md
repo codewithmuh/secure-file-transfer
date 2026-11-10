@@ -15,11 +15,14 @@ deploy/
   argocd/                              the apps chart: AppProject `sft` and the Applications `sft` and `sft-operator`
   charts/sft/                          the application chart: the API and every worker from one image
   observability/                       the observability stack (ADR-0009): its apps chart, its charts, their sizes
-                                       per environment, the dashboards, and their tests (docs/operations/observability.md)
+                                       per environment, the dashboards, the Prometheus Operator's CRDs for upgrades
+                                       (crds/), and their tests (docs/operations/observability.md)
   environments/<env>/<region>/values.yaml   one file per cluster: the image digest, the pilot light, the network, sizes
   check.sh, render.sh                  the static checks and the renderer they use
   policies.sh                          the cluster's Kyverno policies (#104) against every rendered pod
-  tests/                               the runtime-contract test on the rendered manifests
+  conftest.py                          the tests' `rendered` fixture: render.sh's output, read once
+  tests/                               the runtime-contract test on the rendered manifests; cluster-facts.sh, the
+                                       fake cluster facts every check renders with
 ```
 
 Clusters: dev in Tokyo; staging and prod in Tokyo (`ap-northeast-1`) and Osaka (`ap-northeast-3`).
@@ -65,12 +68,14 @@ after a failover.
 | `clamd-{small,large}` | Deployment per pool, scan nodes | the clamav image's `/init-unprivileged` | none | The signature mirror only |
 | `dlp-inspector-{small,large}` | Deployment per pool, scan nodes, port 8070, its own protocol; probes on 8001 | `python -m sft.dlp.inspector` | none | Nothing at all |
 | `signature-mirror` | Deployment, 1 | freshclam, and `python -m http.server` from our image | none | Its proxy listener (ClamAV's database) |
-| `operator-api` | Deployment in `sft-operator`, port-forward only | `python -m sft.api.operator` | `operator-api`, sft_operator | Endpoints (STS), Aurora, Valkey |
+| `operator-api` | Deployment in `sft-operator`, port-forward only | `python -m sft.api.operator` | `operator-api`, sft_operator | Endpoints (STS), Aurora, Valkey, S3: both Regions' audit archive outside dev, for `recoverTenantAdmin`'s record (#239) |
 | `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `purge`, `audit-partitions` | CronJobs | `python -m sft.workers.<job>` | `jobs`, sft_jobs | Endpoints, Aurora, the Pushgateway; S3 for deletion, reconciliation and the storage audit (both Regions' files buckets outside dev, and the audit archive for reconciliation, #181). The purge deletes metadata 372 days after its end (#224) |
 | `audit-archive` | CronJob, every minute | `python -m sft.workers.audit_archive` | `audit-archive`, sft_archive | Endpoints, Aurora, the Pushgateway, S3: both Regions' audit archive outside dev (#183) |
 | `key-rotation` | CronJob, hourly, Tokyo only | `python -m sft.workers.key_rotation` | `key-rotation`, no database; the one projected Kubernetes token | Its proxy listener (Cognito; Osaka's Secrets Manager and Cognito outside dev), endpoints (Secrets Manager), the cluster API |
 | `field-keys` | CronJob, daily, Tokyo only | `python -m sft.workers.field_keys` (`FIELD_KEY_STEPS=rotate,backfill,purge`, #236) | `api`, sft_api: it acts as the API, the only role that unwraps field data keys | The database and the endpoints (KMS) |
 | `invite-backlog` | CronJob, always suspended, run by hand | `python -m sft.workers.invite_backlog` | `notifier`, sft_notify | As the notifier |
+| `recovery` | CronJob, always suspended, run by the restore, failover and failback runbooks (#258) | `python -m sft.workers.recovery` (`RECOVERY_STEPS`, `RECOVERY_SINCE`, `RECOVERY_REWIND_TO`, empty until the runbook renders its Job) | `recovery`, sft_recovery | Endpoints, Aurora, S3: this Region's audit archive, read only |
+| `standby-enrolment` | CronJob, always suspended, run by hand after a failover's replay (#258) | `python -m sft.workers.standby_enrolment` | `notifier`, sft_notify | As the notifier, without the counter store |
 | `migrate` | Job, PreSync hook | `python -m sft.data.migrate` | `migrate`, sft_migrate | Endpoints, Aurora |
 | `synthetic-probe` | CronJob, every 5 minutes, off until `probe.enabled` (#248) | `python -m sft.probe` | `synthetic-probe`, no database | Its proxy listener (the public API, the web app, CloudWatch), S3 (the probe mailbox), the Pushgateway |
 
@@ -195,6 +200,13 @@ isn't run. `tests/test_secret_stores.py` renders the cluster bootstrap's Externa
 (`infra/modules/cluster-bootstrap/charts/secret-stores`) and checks that each assumes its own role (encryption 6.4).
 CI's `deploy` job also scans every rendered manifest with Trivy, and the repository-wide Trivy scan renders
 the charts with `tests/trivy-values.yaml`.
+
+Every check renders a cluster with the same values (#186): its values file, then `tests/cluster-facts.sh`, the one
+source of the obviously fake facts that Terraform supplies in AWS, and of the switches that render the workloads that
+are off until their AWS side exists (the synthetic probe) switched on, so every check covers them first.
+`tests/trivy-values.yaml` holds dev's in Tokyo, and a test checks that it matches. CI's `deploy` job renders every
+cluster once, with `check.sh`, and the tests, `policies.sh` and Trivy read that directory: the tests through
+`SFT_RENDERED` (`conftest.py`), which, unset, makes them render for themselves.
 
 ## Not here yet
 

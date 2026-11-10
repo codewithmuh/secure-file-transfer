@@ -13,3 +13,8 @@ variable "flow_log_destination_arn" {
   type        = string
   default     = null
 }
+
+variable "domain" {
+  description = "The maintainer's domain; the shared zone is sft.<domain> (PRD open question 5). DNS Firewall answers the API's and the web app's names under it (#259). TF_VAR_domain, never committed."
+  type        = string
+}

@@ -86,7 +86,8 @@ then. Pending the AWS run.
    `s3:ListBucket`/`GetObject`/`DeleteObject` under `probe/` in the mailbox bucket; the mailbox bucket
    `sft-<env>-<region-short>-probe-mailbox-<account>` (SSE-KMS, a 1-day expiry rule, a policy that lets SES write under
    `probe/` and `loadtest/` for this account only); the MX record for `probe.<serviceDomain>` and the SES receipt rule
-   that writes its mail there; the egress proxy listener `synthetic-probe` on 3134 allowing `api.<serviceDomain>`,
+   that writes its mail there (the MX names Tokyo then Osaka, and each Region has its own mailbox bucket:
+   [modules/probe-mailbox](../../infra/modules/probe-mailbox/README.md), #259); the egress proxy listener `synthetic-probe` on 3134 allowing `api.<serviceDomain>`,
    `app.<serviceDomain>` and `monitoring.<region>.amazonaws.com`; and the secret `sft/<env>/app/probe-api-key`, which
    the application store may read.
 2. **The tenant**: `createTenant` (operator API) named "Synthetic probe", its first admin an address the maintainer

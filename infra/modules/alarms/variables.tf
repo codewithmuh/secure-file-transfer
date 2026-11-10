@@ -139,3 +139,15 @@ variable "region_health" {
     error_message = "region_health.health_checks is keyed by ap-northeast-1 or ap-northeast-3."
   }
 }
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the Regions' health check alarms, Alertmanager's and the delivery role, and the roles and users the security alerts watch (#256), from their one definition (#172)."
+  type = object({
+    region_shorts         = map(string)
+    workload_role_arns    = map(string)
+    bootstrap_iam_path    = string
+    bootstrap_role_arns   = object({ terraform_deploy = string, terraform_plan = string, key_admin = string })
+    emergency_user        = object({ name = string, path = string, arn = string })
+    sso_role_arn_patterns = object({ admin = string, break_glass = string })
+  })
+}

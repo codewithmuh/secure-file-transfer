@@ -63,4 +63,7 @@ module "network" {
   interface_endpoint_availability_zone_ids = ["apne1-az1"]
 
   flow_log_destination_arn = var.flow_log_destination_arn
+
+  # The API's and the web app's names, for the synthetic probe (#259).
+  service_domain = "dev.sft.${var.domain}"
 }

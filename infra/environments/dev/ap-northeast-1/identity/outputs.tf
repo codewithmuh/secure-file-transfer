@@ -32,3 +32,12 @@ output "secret_arns" {
   description = "The application's secrets in this Region, by name under sft/<env>/app/."
   value       = module.app_secrets.secret_arns
 }
+
+output "probe_mailbox" {
+  description = "The probe's mailbox in this Region (#259): the bucket (PROBE_MAILBOX_BUCKET), its domains, and in staging's Tokyo the load test's role (LOADTEST_ROLE_ARN)."
+  value = {
+    bucket_name        = module.probe_mailbox.bucket_name
+    domains            = module.probe_mailbox.mailbox_domains
+    load_test_role_arn = module.probe_mailbox.load_test_role_arn
+  }
+}

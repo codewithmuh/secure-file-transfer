@@ -20,6 +20,10 @@ reference to its secret, `secretsmanager:sft/<env>/app/<name>` (encryption and k
 process reads a referenced secret at startup and every 5 minutes after (`sft.runtime.secrets`),
 and each keyring's `reload` swaps in the new version whole, so a rotation takes effect without a
 restart. A malformed new version is refused and the loaded one stays.
+
+`active_since` reads when the active key took over (`activated_at`, else `created_at`), which the
+process reports as `keyring_active_key_age_seconds{keyring}`, so a rotation that stops running
+alerts (6.5, #162).
 """
 
 from __future__ import annotations
@@ -118,6 +122,29 @@ def check_keyring_setting(
     """For the settings: a reference to a secret, or a keyring that `parse_keyring` accepts."""
     if secret_reference(raw, name=name) is None:
         parse_keyring(raw, name=name, key_id=key_id, needs_activation=needs_activation)
+
+
+def active_since(raw: str) -> datetime | None:
+    """When the keyring's active key took over: its `activated_at`, or else its `created_at`, as
+    the key rotation job counts a key's period (6.5). None when the keyring has neither, or isn't
+    one `parse_keyring` would accept; the caller has parsed it already. Reads no key."""
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entries, list):
+        return None
+    active = [e for e in entries if isinstance(e, dict) and e.get("state") == "active"]
+    if len(active) != 1:
+        return None
+    for field_name in ("activated_at", "created_at"):
+        try:
+            when = _time(active[0].get(field_name), "", "")
+        except KeyringError:
+            continue
+        if when is not None:
+            return when
+    return None
 
 
 def _time(value: object, name: str, ident: str) -> datetime | None:

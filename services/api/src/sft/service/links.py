@@ -117,6 +117,8 @@ from sft.service.rate_limits.limits import (
     REQUEST_CODE,
     KeyType,
 )
+from sft.service.transfers import effective_state
+from sft.service.upload_requests import effective_state as request_effective_state
 
 log = logging.getLogger(__name__)
 
@@ -275,9 +277,10 @@ async def _subject_view(session: AsyncSession, subject: Subject, now: datetime) 
     """The subject in the session's tenant or resource scope, or `NotFoundError`."""
     if _uploader(subject):
         request = await upload_requests.link_view(session, subject.id)
-        if request.state is UploadRequestState.REVOKED:
+        request_state = request_effective_state(request.state, request.expires_at, now)
+        if request_state is UploadRequestState.REVOKED:
             status = Status.REVOKED
-        elif request.state is UploadRequestState.EXPIRED or request.expires_at <= now:
+        elif request_state is UploadRequestState.EXPIRED:
             status = Status.EXPIRED
         else:
             status = Status.LIVE
@@ -293,11 +296,10 @@ async def _subject_view(session: AsyncSession, subject: Subject, now: datetime) 
             tenant_active=request.tenant_active,
         )
     view = await recipients.link_view(session, subject.id)
-    state = TransferState(view.transfer_state)
-    expired = view.expires_at is not None and view.expires_at <= now
+    state = effective_state(TransferState(view.transfer_state), view.expires_at, now)
     if state is TransferState.REVOKED:
         status = Status.REVOKED
-    elif state is TransferState.EXPIRED or (state is TransferState.SENT and expired):
+    elif state is TransferState.EXPIRED:
         status = Status.EXPIRED
     elif state is TransferState.SENT:
         status = Status.LIVE

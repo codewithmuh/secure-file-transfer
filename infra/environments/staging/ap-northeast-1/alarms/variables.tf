@@ -18,3 +18,14 @@ variable "probe_enabled" {
   type        = bool
   default     = false
 }
+
+variable "database_role" {
+  description = "What Tokyo's cluster is for the database alarms (modules/alarms): primary while Tokyo writes; the failover runbook applies it as secondary, so the writer's CPU and memory alarms leave Tokyo, and the failback back to primary (#261)."
+  type        = string
+  default     = "primary"
+
+  validation {
+    condition     = contains(["primary", "secondary"], var.database_role)
+    error_message = "database_role must be primary or secondary."
+  }
+}

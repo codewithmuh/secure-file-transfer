@@ -54,6 +54,8 @@ class SweepJob(StrEnum):
     """The system actor's name in the sweep's events."""
 
     BREAK_GLASS_SWEEP = "break_glass_sweep"
+    BREAK_GLASS_RECONCILIATION = "break_glass_reconciliation"
+    """The job that records Identity Center grants from CloudTrail (`break_glass_records`)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,7 +157,7 @@ async def approve(
             security_critical=True,
             details=_details(grant, operator),
         )
-    await _tenant_records(database, grant, "break_glass.approved", operator.actor, operator)
+    await tenant_records(database, grant, "break_glass.approved", operator.actor, operator)
     return grant
 
 
@@ -186,7 +188,7 @@ async def end(
             details=_details(grant, operator),
         )
     if was_active:
-        await _tenant_records(database, grant, "break_glass.ended", operator.actor, operator)
+        await tenant_records(database, grant, "break_glass.ended", operator.actor, operator)
     return grant
 
 
@@ -222,22 +224,26 @@ async def sweep(database: Database) -> SweepResult:
         active = await break_glass.active_counts(session)
     missed = 0
     for grant in expired:
-        missed += await _tenant_records(database, grant, "break_glass.expired", system, None)
+        missed += await tenant_records(database, grant, "break_glass.expired", system, None)
     return SweepResult(expired, lapsed, active, missed)
 
 
-async def _tenant_records(
+async def tenant_records(
     database: Database,
     grant: BreakGlassGrant,
     action: str,
     actor: Actor,
     operator: Operator | None,
+    *,
+    job: SweepJob = SweepJob.BREAK_GLASS_SWEEP,
+    extra: dict[str, audit.Detail] | None = None,
 ) -> int:
-    """The step's record in each named tenant's log; how many couldn't be written."""
+    """The step's record in each named tenant's log; how many couldn't be written. Without an
+    operator, the system actor is `job`."""
     missed = 0
-    details = _details(grant, operator)
+    details = {**_details(grant, operator), **(extra or {})}
     if operator is None:
-        details["job"] = SweepJob.BREAK_GLASS_SWEEP
+        details["job"] = job
     for tenant_id in grant.tenant_ids:
         try:
             async with database.transaction(Scope.tenant(tenant_id)) as session:
@@ -266,10 +272,12 @@ def _invalid(field_name: str, detail: str) -> Unprocessable:
 
 __all__ = [
     "NewRequest",
+    "SweepJob",
     "SweepResult",
     "approve",
     "end",
     "list_requests",
     "request",
     "sweep",
+    "tenant_records",
 ]

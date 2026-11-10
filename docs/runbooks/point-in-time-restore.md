@@ -97,7 +97,11 @@ The recovery job (disaster-recovery.md section 4) with `RECOVERY_STEPS=generatio
 Copy its counts into the log, and tell tenant admins of the unlocks it left out (their members unlock again) and the
 sign-in resets whose invitation must be sent again.
 
-Pending: the `recovery` CronJob and its entry point, and the grants of disaster-recovery.md section 4.
+The job is `python -m sft.workers.recovery` (#258), as `sft_recovery`, reading Tokyo's archive under both layouts; the
+grants are revisions 0034 and 0035 (disaster-recovery.md section 4). Copy its report line into the log: `newest`
+against the restore point shows how much the archive held beyond it. Ranges a regional loss left for the back-fill
+(`audit_archive_single_region`, #257) come back with the restored database and are written again by the archive job;
+that rewrites nothing that exists.
 
 ## 6. Re-publish the outbox; start the workers (5 min)
 

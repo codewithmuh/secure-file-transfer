@@ -407,6 +407,33 @@ class Due:
     transfer_id: UUID
 
 
+@dataclass(frozen=True, slots=True)
+class Backlog:
+    """How long pending requests have waited, across tenants (#260; abuse and rate limits 8.2)."""
+
+    oldest_seconds: float
+    """The oldest pending request's age; 0 when none is pending."""
+    timeout_used: float
+    """The largest share of its own timeout a pending request has used: above 0.5 is
+    `DlpApprovalBacklog`'s "older than half the tenant's approval timeout". 0 when none."""
+
+
+async def pending_backlog(session: AsyncSession, *, now: datetime) -> Backlog:
+    """The expiry job's measure of the approval queue, in system scope (revision 0041 lets it
+    read `created_at`). Times only: nothing a sender or an approver wrote."""
+    require_scope(session, ScopeKind.SYSTEM)
+    age = func.extract("epoch", now - DlpApprovalRequest.created_at)
+    timeout = func.extract("epoch", DlpApprovalRequest.expires_at - DlpApprovalRequest.created_at)
+    row = (
+        await session.execute(
+            select(func.max(age), func.max(age / func.nullif(timeout, 0))).where(
+                DlpApprovalRequest.state == _PENDING, in_scope(DlpApprovalRequest, session)
+            )
+        )
+    ).one()
+    return Backlog(max(0.0, float(row[0] or 0)), max(0.0, float(row[1] or 0)))
+
+
 async def due_for_expiry(session: AsyncSession, *, now: datetime, limit: int) -> list[Due]:
     """Pending requests past `expires_at`, across tenants: the expiry job's find step, in system
     scope (data model 3.6, 6)."""

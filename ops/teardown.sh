@@ -14,9 +14,11 @@
 #   --inventory          read-only, with --account-id: list every resource each stack's state holds and every
 #                        resource still tagged with the environment, then stop. Changes nothing.
 #
-# A dry run (the default) prints every stack in the order it would be destroyed, with the commands, and runs none.
-# With --execute it runs them, times each step against NFR-19's hour, and ends with the tag search: nothing tagged
-# with the environment may remain but the retained stack's (retention = audit-archive). Pending the AWS run.
+# A dry run (the default) checks the prerequisites in the repository (prod: the retained stack's own state bucket,
+# deploy role, trail and alerts, its teardown inputs, and the teardown inputs of the stacks prod protects), prints
+# every stack in the order it would be destroyed, with the commands, and runs none. With --execute it refuses while a
+# prerequisite is unmet, runs them, times each step against NFR-19's hour, and ends with the tag search: nothing
+# tagged with the environment may remain but the retained stack's (retention = audit-archive). Pending the AWS run.
 set -euo pipefail
 
 DRILL=teardown
@@ -25,7 +27,7 @@ STEPS_DOC=docs/runbooks/teardown.md
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-  sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
   echo
   common_usage
 }
@@ -55,15 +57,22 @@ if $INVENTORY; then
 fi
 
 INFRA="$REPO_ROOT/infra"
-# The layers of an environment, in the order they are destroyed: the reverse of infra/README.md's apply order.
-LAYERS=(cluster-bootstrap identity edge cluster data network)
+# The layers of an environment, in the order they are destroyed: the reverse of infra/README.md's apply order, so
+# alarms, applied last, go first.
+LAYERS=(alarms cluster-bootstrap identity edge cluster data network)
+# prod's layers with deletion protection, which a teardown apply turns off before the destroy (TF_VAR_teardown, #263);
+# data's teardown apply does more (below). dev and staging have none on.
+PROTECTED_LAYERS=(cluster identity edge)
 REGIONS=("$OSAKA" "$TOKYO") # Osaka first: it replicates Tokyo's keys and refers to Tokyo's roles
 [[ "$ENV_NAME" != dev ]] || REGIONS=("$TOKYO")
 
+# Layer by layer, Osaka then Tokyo within each: a Tokyo stack that reads an Osaka state (alarms reads Osaka's edge,
+# cluster-bootstrap Osaka's identity) goes before the Osaka stack it reads, and Osaka's key replicas go before Tokyo's
+# primaries.
 roots_in_order() {
   local region layer
-  for region in "${REGIONS[@]}"; do
-    for layer in "${LAYERS[@]}"; do
+  for layer in "${LAYERS[@]}"; do
+    for region in "${REGIONS[@]}"; do
       echo "environments/$ENV_NAME/$region/$layer"
     done
   done
@@ -100,7 +109,7 @@ tag_search() {
   done
   # What Kubernetes made outside Terraform: Karpenter's instances, volumes from claims, and their network interfaces.
   for region in "${REGIONS[@]}"; do
-    run aws ec2 describe-instances --region "$region" --filters "Name=tag:karpenter.sh/discovery,Values=$(eks_cluster "$region")" \
+    run aws ec2 describe-instances --region "$region" --filters "Name=tag:karpenter.sh/discovery,Values=$(region_prefix "$region")" \
       "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId'
     run aws ec2 describe-volumes --region "$region" \
       --filters "Name=tag:kubernetes.io/cluster/$(eks_cluster "$region"),Values=owned" --query 'Volumes[].VolumeId'
@@ -109,6 +118,45 @@ tag_search() {
 
 ROOTS=()
 while IFS= read -r root; do ROOTS+=("$root"); done < <(roots_in_order)
+
+# The prerequisites of a prod teardown that live in the repository (docs/runbooks/teardown.md, "Prerequisites"):
+# each is a file and a line that must be in it. Read from the checkout, so the dry run needs no AWS. The operator's
+# own prerequisites (Rashid's go, no file data left to keep) are printed as operator steps below.
+PREREQUISITES=(
+  "the retained stack's own state bucket, under the audit key|environments/prod/retained/state.tf|resource \"aws_s3_bucket\" \"state\""
+  "the retained stack's own deploy role|environments/prod/retained/deploy-role.tf|resource \"aws_iam_role\" \"deploy\""
+  "the retained stack adopts the GitHub OIDC provider at teardown|environments/prod/retained/deploy-role.tf|resource \"aws_iam_openid_connect_provider\" \"github\""
+  "the retained trail|environments/prod/retained/trail.tf|resource \"aws_cloudtrail\" \"retained\""
+  "the retained stack's EventBridge alerts|environments/prod/retained/alerts.tf|resource \"aws_cloudwatch_event_rule\" \"retained_tokyo\""
+  "the environment's roles out of the audit key and archive bucket policies at teardown|environments/prod/retained/archive.tf|environment_retired = var.teardown"
+  "the audit key's rotation off at teardown|modules/kms-keys/main.tf|enable_key_rotation     = !var.environment_retired"
+  "teardown rights for prod's files buckets (#42 gap 11)|modules/data-stack/storage.tf|teardown_allowed = local.teardown_allowed || var.teardown"
+)
+for region in "$TOKYO" "$OSAKA"; do
+  for layer in "${PROTECTED_LAYERS[@]}"; do
+    PREREQUISITES+=("a teardown input for prod's $region $layer deletion protection|environments/prod/$region/$layer/variables.tf|variable \"teardown\"")
+  done
+done
+
+prerequisites() {
+  local entry what file line unmet=0
+  echo "Prerequisites of a prod teardown, in the repository:"
+  for entry in "${PREREQUISITES[@]}"; do
+    IFS='|' read -r what file line <<<"$entry"
+    if grep -qF -- "$line" "$INFRA/$file" 2>/dev/null; then
+      echo "  met:   $what (infra/$file)"
+    else
+      echo "  UNMET: $what (infra/$file)"
+      unmet=$((unmet + 1))
+    fi
+  done
+  echo "Inputs the operator sets before --execute:"
+  local name
+  for name in SFT_BUDGET_EMAIL TF_VAR_alert_emails; do
+    if [[ -n "${!name:-}" ]]; then echo "  set:     $name"; else echo "  not set: $name"; fi
+  done
+  return "$unmet"
+}
 
 if $INVENTORY; then
   echo "== inventory, read-only: each root's state, then the tag search"
@@ -121,19 +169,35 @@ if $INVENTORY; then
   exit 0
 fi
 
+if [[ "$ENV_NAME" == prod ]]; then
+  unmet=0
+  prerequisites || unmet=$?
+  if $EXECUTE; then
+    ((unmet == 0)) || die "$unmet prerequisite(s) of a prod teardown unmet (docs/runbooks/teardown.md)"
+    [[ -n "${SFT_BUDGET_EMAIL:-}" ]] || die "set SFT_BUDGET_EMAIL: the retained stack's \$7 budget emails it (NFR-19)"
+    [[ -n "${TF_VAR_alert_emails:-}" ]] || die "set TF_VAR_alert_emails: the retained stack's alert topics reach them (encryption 8.4)"
+  fi
+fi
 echo "Would destroy, in this order ($SCOPE):"
 [[ "$ENV_NAME" != prod ]] || echo "  0. environments/prod/retained: teardown apply (it stays; only its guards change)"
 printf '%s\n' "${ROOTS[@]}" | nl -w3 -s'. ' | sed 's/^/ /'
-if $EXECUTE && [[ "$ENV_NAME" == prod ]]; then
-  [[ -n "${SFT_BUDGET_EMAIL:-}" ]] || die "set SFT_BUDGET_EMAIL: the retained stack's \$7 budget emails it (NFR-19)"
-fi
 confirm_execute
 T0=$(date +%s)
 
 retained_apply() {
   # Architecture 3.4 step 1: the environment's principals out of the audit key and bucket policies, the key's
-  # rotation off, the retained trail's management events on, and the $7 budget (encryption 8.4).
+  # rotation off, the retained trail's management events on, the GitHub OIDC provider adopted, and the $7 budget
+  # (encryption 8.4). Its alert topics keep TF_VAR_alert_emails. The key-changed rules page for DisableKeyRotation:
+  # expected, and acknowledged in the log.
   tf environments/prod/retained apply -var teardown=true -var "budget_email=${SFT_BUDGET_EMAIL:-<budget email>}"
+  manual "Acknowledge the pages this apply sets off on purpose: kms-key-destroyed and retained-key-changed for the" \
+    "audit key's DisableKeyRotation (docs/runbooks/kms-key-change.md, retained-stack-change.md)."
+}
+
+protected_teardown_apply() {
+  local root="$1"
+  # prod only: deletion protection off before the destroy (TF_VAR_teardown, #263).
+  tf "$root" apply -var teardown=true
 }
 
 drain_cluster() {
@@ -156,10 +220,18 @@ destroy_root() {
   case "$root" in
     environments/*/cluster-bootstrap) drain_cluster "$(basename "$(dirname "$root")")" ;;
     environments/*/data) data_teardown_apply "$(basename "$(dirname "$root")")" ;;
+    environments/prod/*/cluster | environments/prod/*/identity | environments/prod/*/edge) protected_teardown_apply "$root" ;;
+    bootstrap/prod/"$TOKYO")
+      # The GitHub OIDC provider stays for the retained stack's deploy role, which adopted it in step 0.
+      tf "$root" state rm 'module.terraform_roles.aws_iam_openid_connect_provider.github[0]'
+      manual "The bootstrap stack's state bucket, key and key-admin role have prevent_destroy: on the teardown branch" \
+        "set it false in modules/tfstate-backend and modules/key-admin-role, and move this root's state back to local" \
+        "(terraform init -migrate-state with the backend block removed), as docs/runbooks/teardown.md step 2 says."
+      ;;
     bootstrap/*)
       manual "The bootstrap stack's state bucket, key and key-admin role have prevent_destroy: on the teardown branch" \
         "set it false in modules/tfstate-backend and modules/key-admin-role, and move this root's state back to local" \
-        "(terraform init -migrate-state with the backend block removed), as docs/runbooks/teardown.md step 5 says."
+        "(terraform init -migrate-state with the backend block removed), as docs/runbooks/teardown.md step 2 says."
       ;;
   esac
   tf "$root" destroy -auto-approve

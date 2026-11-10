@@ -33,7 +33,7 @@ variable "member_account_ids" {
 variable "record_labels" {
   description = "The labels each environment may write under its own domain, and anything below them."
   type        = list(string)
-  default     = ["app", "api", "api-apne1", "api-apne3", "auth", "mail"]
+  default     = ["app", "api", "api-apne1", "api-apne3", "auth", "loadtest", "mail", "probe"]
 
   validation {
     condition     = alltrue([for label in var.record_labels : can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", label))])

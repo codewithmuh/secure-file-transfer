@@ -108,7 +108,7 @@ data "aws_iam_policy_document" "trust" {
 resource "aws_iam_role" "this" {
   for_each = var.create_iam ? local.roles : {}
 
-  name                 = "${local.global_prefix}-${each.key}"
+  name                 = var.conventions.workload_role_names[each.key]
   description          = "${each.value.description}, in ${local.global_prefix}, through EKS Pod Identity (${local.namespace})."
   assume_role_policy   = data.aws_iam_policy_document.trust[each.key].json
   permissions_boundary = var.permissions_boundary_arn

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -266,3 +267,102 @@ def test_a_word_file_whose_text_part_is_refused_is_not_inspected(tmp_path: Path)
     )
     outcome, _ = run(data, tmp_path)
     assert (outcome.state, outcome.reasons) == ("not_inspected", ("parse_error",))
+
+
+# ---- reading text once (#166) ----
+
+
+class CountingBytes(io.BytesIO):
+    """A file that counts the bytes read from it."""
+
+    read_bytes = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        data = super().read(size)
+        self.read_bytes += len(data)
+        return data
+
+    def readinto(self, buffer: Any, /) -> int:
+        count = super().readinto(buffer)
+        self.read_bytes += count
+        return count
+
+
+def units_of(data: bytes, tmp_path: Path) -> tuple[Outcome, list[TextUnit]]:
+    units: list[TextUnit] = []
+    outcome = extract(io.BytesIO(data), emit=units.append, limits=Limits(), scratch_dir=tmp_path)
+    return outcome, units
+
+
+def lines_as(data: bytes, encoding: str) -> list[tuple[str, str]]:
+    """The units a reading of the whole file in `encoding` hands on: each non-blank line."""
+    return [
+        (f"line {n}", line)
+        for n, line in enumerate(data.decode(encoding).splitlines(), 1)
+        if line.strip()
+    ]
+
+
+ASCII_LINES = b"".join(b"order %06d TOKEN-0001 shipped\n" % n for n in range(4000))
+"""About 120 KiB of ASCII: past the 64 KiB prefix, so the prefix decodes as UTF-8 first."""
+
+
+def test_a_text_file_that_decodes_is_decoded_once(tmp_path: Path) -> None:
+    # Before #166 the whole file was decoded once to choose the encoding, then again to read it.
+    data = ("注文番号 TOKEN-0001\n" * 200_000).encode()
+    counted = CountingBytes(data)
+    units: list[TextUnit] = []
+    outcome = extract(counted, emit=units.append, limits=Limits(), scratch_dir=tmp_path)
+    assert outcome.state == "inspected"
+    assert len(units) == 200_000
+    # The 64 KiB prefix the sniffing reads, then the file once.
+    assert counted.read_bytes <= len(data) + Limits().prefix_bytes
+
+
+def test_a_file_that_turns_cp932_after_the_prefix_reads_as_cp932_line_by_line(
+    tmp_path: Path,
+) -> None:
+    # UTF-8 is the best candidate for the prefix, but the file is CP932: the lines read before
+    # the first CP932 byte stay inspected, the rest is read as CP932, and every line is handed on
+    # once, as reading the whole file as CP932 would.
+    data = ASCII_LINES + "注文番号 TOKEN-0002\n".encode("cp932") * 100
+    outcome, units = units_of(data, tmp_path)
+    assert outcome.state == "inspected"
+    assert [(u.location, u.text) for u in units] == lines_as(data, "cp932")
+
+
+def test_a_csv_that_turns_cp932_after_the_prefix_hands_each_row_on_once(tmp_path: Path) -> None:
+    rows = b"".join(b"%d,TOKEN-0001\r\n" % n for n in range(8000))
+    data = b"id,code\r\n" + rows + "9001,注文番号\r\n".encode("cp932")
+    outcome, units = units_of(data, tmp_path)
+    assert outcome.state == "inspected"
+    locations = [u.location for u in units]
+    assert len(locations) == len(set(locations)) == 8002
+    assert units[-1].text == "9001\t注文番号"
+    assert units[-1].cells[1].header == "code"
+
+
+def test_bytes_no_candidate_decodes_are_replaced_and_no_line_is_handed_on_twice(
+    tmp_path: Path,
+) -> None:
+    # No candidate decodes \x85\x40.
+    data = ASCII_LINES + b"bad \x85\x40 byte\n" + b"after TOKEN-0003\n"
+    outcome, units = units_of(data, tmp_path)
+    assert outcome.state == "partial"
+    assert outcome.reasons == ("parse_error",)
+    locations = [u.location for u in units]
+    assert len(locations) == len(set(locations)) == 4002
+    assert units[-1].text == "after TOKEN-0003"
+    assert "�" in units[-2].text
+
+
+def test_a_crlf_cut_between_its_cr_and_lf_ends_one_line(tmp_path: Path) -> None:
+    units: list[TextUnit] = []
+    data = b"x" * 99 + b"\r\nTOKEN-0001\n"
+    extract(
+        io.BytesIO(data),
+        emit=units.append,
+        scratch_dir=tmp_path,
+        limits=Limits(max_unit_chars=110, unit_overlap_chars=10),
+    )
+    assert [u.location for u in units] == ["line 1", "line 2"]

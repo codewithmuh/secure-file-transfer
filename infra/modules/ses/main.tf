@@ -21,6 +21,10 @@ locals {
   mail_from_domain = "${var.region_short}.${local.mail_domain}"
   configuration    = "sft-${var.environment}"
   topic_name       = "${var.name_prefix}-ses-events"
+
+  # Easy DKIM's CNAME target: Osaka signs from its own domain, the other Regions from dkim.amazonses.com (AWS General
+  # Reference, "Amazon SES endpoints and quotas", DKIM domains).
+  dkim_domain = var.region == "ap-northeast-3" ? "dkim.ap-northeast-3.amazonses.com" : "dkim.amazonses.com"
 }
 
 data "aws_route53_zone" "this" {
@@ -156,7 +160,7 @@ resource "aws_route53_record" "dkim" {
   name    = "${aws_sesv2_email_identity.mail.dkim_signing_attributes[0].tokens[count.index]}._domainkey.${local.mail_domain}"
   type    = "CNAME"
   ttl     = 1800
-  records = ["${aws_sesv2_email_identity.mail.dkim_signing_attributes[0].tokens[count.index]}.dkim.amazonses.com"]
+  records = ["${aws_sesv2_email_identity.mail.dkim_signing_attributes[0].tokens[count.index]}.${local.dkim_domain}"]
 }
 
 resource "aws_sesv2_email_identity_mail_from_attributes" "mail" {

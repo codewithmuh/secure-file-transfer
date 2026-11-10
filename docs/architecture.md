@@ -1029,8 +1029,9 @@ response: they are checked and audited every time.
 The API and workers use OpenTelemetry for traces and Prometheus-format metrics. JSON logs carry `request_id`,
 `trace_id` and `tenant_id`, never file names, message text or plain email addresses. Business signals that the SLOs
 depend on (scan latency, time to shareable, queue age, outbox age, replication lag) are metrics with alerts, and every
-alert links to a runbook (NFR-17). Each request is one server span named by its route template, each SQL statement
-and AWS call a client span under it; spans go over OTLP/HTTP to the node's collector agent when
+alert links to a runbook (NFR-17). Each request is one server span named by its route template, each SQL statement,
+AWS call and rate-limit counter call a client span under it (a counter span names its operation, never its key, #136);
+spans go over OTLP/HTTP to the node's collector agent when
 `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nowhere otherwise. The service records every span and leaves sampling to
 the gateway's tail sampling (ADR-0009), so a caller's "not sampled" flag is ignored. Only allowlisted span attributes
 are exported: route templates, never paths or query strings; SQL text with its parameters, never their values; error
@@ -1093,7 +1094,7 @@ decisions below.
 | Fence Tokyo through Git: set Tokyo's Argo CD applications to zero replicas in the desired state, so a returning Tokyo cluster converges to no workloads. The same commit takes Osaka out of pilot-light mode with its workers held (`failover.holdWorkers`). This doesn't need Tokyo to answer. | 2 min |
 | Promote the Osaka PostgreSQL replica to primary | 5 min |
 | Scale the Osaka `system` node group from its one node to two; Karpenter adds the main and scan nodes, and Argo CD deploys the current versions with every worker scaled to zero. Turn on the GuardDuty plan for the Osaka large-files bucket and the Osaka heartbeat alarm, which is off during the pilot light. | 20 min |
-| Sign-in: the Osaka API signs members in through the standby user pool, where SSO members sign in as usual. Create every active member without SSO in that pool and record each new identity; their re-enrolment emails go out once the workers scale up ([AUTH] 2.6). | Alongside the next two steps |
+| Sign-in: the Osaka API signs members in through the standby user pool, where SSO members sign in as usual. Create every active member without SSO in that pool and record each new identity; the job sends their re-enrolment emails itself, since an outbox message can't carry the temporary password ([AUTH] 2.6, #258). | Alongside the next two steps |
 | Start the audit archive generation after the highest in the archive, so reused transaction IDs never overwrite or hide an archived record, with the cursor rewound an hour (data model 2.5). Then re-import the archived events and re-apply security-critical changes from the Osaka audit archive with the `sft_recovery` role: every record of 5.2 that takes access away, and only the grants that have a committed record or a database row (4.2) | 5 min |
 | Re-publish unprocessed outbox messages from the last 24 hours, then scale the workers up | 5 min |
 | Switch DNS and the CDN origin to Osaka | 5 min |

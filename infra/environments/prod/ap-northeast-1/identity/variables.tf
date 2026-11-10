@@ -43,3 +43,9 @@ variable "signin_trigger_image" {
   description = "The API image by digest, <registry>/sft/app@sha256:<digest>, that the sign-in triggers run (#238). The deploy supplies the digest it promotes (TF_VAR_signin_trigger_image)."
   type        = string
 }
+
+variable "teardown" {
+  description = "True only for the apply that comes before destroying this stack (ops/teardown.sh, docs/runbooks/teardown.md): it turns the user pool's deletion protection off, so the destroy can run (NFR-19, #263)."
+  type        = bool
+  default     = false
+}

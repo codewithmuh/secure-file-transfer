@@ -77,10 +77,10 @@ provider "aws" {
 locals {
   # The files buckets the browser uploads parts to (ADR-0012, #102), for the web app's CSP.
   upload_origins = [
-    "https://sft-staging-apne1-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
-    "https://sft-staging-apne1-large-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
-    "https://sft-staging-apne3-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
-    "https://sft-staging-apne3-large-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
+    "https://${module.conventions.name_prefix}-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
+    "https://${module.conventions.name_prefix}-large-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
+    "https://${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
+    "https://${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-large-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
   ]
 }
 
@@ -128,8 +128,8 @@ module "web_cdn" {
   }
 
   failover_bucket = {
-    region_short         = "apne3"
-    regional_domain_name = "sft-staging-apne3-web-${var.account_id}.s3.ap-northeast-3.amazonaws.com"
+    region_short         = module.conventions.region_shorts["ap-northeast-3"]
+    regional_domain_name = "${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-web-${var.account_id}.s3.ap-northeast-3.amazonaws.com"
   }
 
   managed_rules_in_count = true

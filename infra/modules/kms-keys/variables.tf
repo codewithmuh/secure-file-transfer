@@ -130,3 +130,18 @@ variable "volume_service_linked_role_arns" {
   })
   default = null
 }
+
+variable "environment_retired" {
+  description = "True once the environment is torn down (prod's retained stack, from its teardown apply on, encryption 8.4): the environment's workload roles leave the audit key's policy and the key's rotation is turned off, since nothing new is written under it (#263)."
+  type        = bool
+  default     = false
+}
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the buckets and Regions, and the workload roles the policies name, from their one definition (#172)."
+  type = object({
+    global_name_prefix = string
+    region_shorts      = map(string)
+    workload_role_arns = map(string)
+  })
+}

@@ -11,6 +11,9 @@ import os
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import boto3
 import httpx2 as httpx
@@ -85,11 +88,11 @@ async def test_the_adapter_uploads_assembles_and_reads_a_versioned_object(
     key = f"tenants/{uuid.uuid4()}/files/{uuid.uuid4()}"
     upload_id = await objects.create_multipart_upload(StorageClass.STANDARD, key)
     first, last = os.urandom(5 * MIB), os.urandom(10)
+    urls = await objects.part_urls(
+        StorageClass.STANDARD, key, upload_id, [(1, len(first)), (2, len(last))]
+    )
     async with httpx.AsyncClient() as client:
-        for number, data in ((1, first), (2, last)):
-            url = await objects.part_url(
-                StorageClass.STANDARD, key, upload_id, part_number=number, size=len(data)
-            )
+        for url, data in zip(urls, (first, last), strict=True):
             await put(client, url, data)
     parts = await objects.list_parts(StorageClass.STANDARD, key, upload_id)
     assert parts is not None
@@ -113,9 +116,7 @@ async def test_an_aborted_upload_is_gone(objects: S3Objects) -> None:
 
 async def test_a_part_url_lives_15_minutes_at_most(objects: S3Objects) -> None:
     with pytest.raises(ValueError, match="15 minutes"):
-        await objects.part_url(
-            StorageClass.STANDARD, "k", "u", part_number=1, size=1, expires_in=901
-        )
+        await objects.part_urls(StorageClass.STANDARD, "k", "u", [(1, 1)], expires_in=901)
 
 
 async def test_part_urls_name_the_presign_endpoint_and_nothing_else_does(
@@ -136,11 +137,52 @@ async def test_part_urls_name_the_presign_endpoint_and_nothing_else_does(
         threads=1,
     )
     try:
-        url = await store.part_url(StorageClass.STANDARD, "k", "u", part_number=1, size=5)
+        [url] = await store.part_urls(StorageClass.STANDARD, "k", "u", [(1, 5)])
         assert url.startswith("http://localhost:9090/sft-test-files/k?")
         assert store._client.meta.endpoint_url == "http://s3:9090"
     finally:
         await store.close()
+
+
+class CountingExecutor(ThreadPoolExecutor):
+    def __init__(self) -> None:
+        super().__init__(max_workers=1)
+        self.submitted = 0
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+        self.submitted += 1
+        return super().submit(fn, *args, **kwargs)
+
+
+async def test_every_part_url_of_a_request_is_signed_in_one_hop_to_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#166: signing is local work, so 100 part URLs cost one executor call, not 100. Each is
+    for its own part, with its size signed. No S3Mock needed."""
+    for name, value in FAKE_CREDENTIALS.items():
+        monkeypatch.setenv(name, value)
+    store = S3Objects.create(
+        region=REGION,
+        files_bucket="sft-test-files",
+        large_files_bucket="sft-test-large-files",
+        endpoint_url="http://s3:9090",
+        threads=1,
+    )
+    store._executor.shutdown()
+    counting = store._executor = CountingExecutor()
+    parts = [(number, 5 * MIB + number) for number in range(1, 101)]
+    try:
+        urls = await store.part_urls(StorageClass.LARGE, "k", "u", parts)
+    finally:
+        await store.close()
+    assert counting.submitted == 1
+    assert len(urls) == len(parts)
+    for (number, _), url in zip(parts, urls, strict=True):
+        query = parse_qs(urlsplit(url).query)
+        assert url.startswith("http://s3:9090/sft-test-large-files/k?")
+        assert query["partNumber"] == [str(number)]
+        assert query["uploadId"] == ["u"]
+        assert "content-length" in query["X-Amz-SignedHeaders"][0].split(";")
 
 
 def test_a_presign_endpoint_without_the_stand_in_is_refused() -> None:

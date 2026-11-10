@@ -32,3 +32,29 @@ variable "osaka_ready" {
   type        = bool
   default     = true
 }
+
+variable "aurora_role" {
+  description = <<-EOT
+    What Tokyo's Aurora cluster is in the global database: primary from the build on. A failback after a detach sets
+    secondary (TF_VAR_aurora_role=secondary): Tokyo's old cluster goes, with its final snapshot, and a new one joins
+    Osaka's global database as its secondary; the switchover then makes it the writer, and the input stays secondary
+    until the next rebuild, because changing it replaces the cluster (docs/runbooks/regional-failback.md, #261).
+  EOT
+  type        = string
+  default     = "primary"
+
+  validation {
+    condition     = contains(["primary", "secondary"], var.aurora_role)
+    error_message = "aurora_role must be primary or secondary."
+  }
+}
+
+variable "aurora_global_generation" {
+  description = <<-EOT
+    The global database's generation: 1 (sft-<env>-aurora) from the build on. A failback after a detach makes a new
+    global database from Osaka's cluster, sft-<env>-aurora-2, and both data roots take 2 from then on
+    (docs/runbooks/regional-failback.md, #261).
+  EOT
+  type        = number
+  default     = 1
+}

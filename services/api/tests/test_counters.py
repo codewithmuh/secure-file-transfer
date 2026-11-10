@@ -5,18 +5,27 @@ import random
 from collections.abc import AsyncIterator
 
 import pytest
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 from prometheus_client import CollectorRegistry
 
+from sft.core.telemetry import traced
+from sft.data import counters
 from sft.data.counters import (
     BREAKER_ERRORS,
     BREAKER_SECONDS,
+    CALL_TIMEOUT_SECONDS,
     CounterMetrics,
     CounterStore,
     CounterStoreUnavailableError,
+    RateCall,
+    ScoresCall,
     Verdict,
     gcra_split,
 )
-from sft.service.rate_limits.limits import ALL, Rate
+from sft.service.rate_limits import RateLimiter
+from sft.service.rate_limits.limits import ALL, TENANT_OPERATION, KeyType, Rate
 from sft.service.rate_limits.local import LocalCounters, fallback_limit
 
 pytestmark = pytest.mark.anyio
@@ -372,3 +381,184 @@ async def test_leases_are_capped_renewed_and_expire(counter_store: CounterStore)
     assert await counter_store.acquire_lease(key, "s4", now_ms=30, ttl_ms=1000, cap=4)
     # A worker that died leaves its lease to expire.
     assert await counter_store.acquire_lease(key, "s5", now_ms=1500, ttl_ms=1000, cap=4)
+
+
+# ---- traces (#136) ----
+
+KEY = "rl:T.code:email:e1.pseudonym-of-someone"
+MEMBER = "attempt-7f3a"
+
+
+def counter_spans(spans: InMemorySpanExporter) -> list[ReadableSpan]:
+    return [s for s in spans.get_finished_spans() if s.name.startswith("counter.")]
+
+
+def shows(span: ReadableSpan, text: str) -> bool:
+    return text in span.name or any(text in str(v) for v in (span.attributes or {}).values())
+
+
+async def test_each_call_is_a_client_span_under_the_current_one_naming_no_key(
+    counter_store: CounterStore, spans: InMemorySpanExporter
+) -> None:
+    with traced("request", kind=SpanKind.SERVER) as request:
+        await counter_store.rate(KEY, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+        await counter_store.log(
+            KEY + ":log", now_ms=T0, limit=3, window_ms=1000, mode="hit", member=MEMBER
+        )
+        await counter_store.scores(KEY + ":log", now_ms=T0, window_ms=1000)
+        await counter_store.acquire_lease(KEY + ":lease", MEMBER, now_ms=T0, ttl_ms=1000, cap=1)
+        await counter_store.release_lease(KEY + ":lease", MEMBER)
+        await counter_store.holds(KEY + ":log", MEMBER)
+        await counter_store.forget_newest(KEY + ":log")
+        await counter_store.run(
+            [RateCall(KEY, 3, 3000, 1, peek=True), ScoresCall(KEY + ":log", 1000)], now_ms=T0
+        )
+    found = counter_spans(spans)
+    assert [s.name for s in found] == [
+        "counter.rate",
+        "counter.log",
+        "counter.scores",
+        "counter.lease_acquire",
+        "counter.lease_release",
+        "counter.holds",
+        "counter.forget_newest",
+        "counter.batch",
+    ]
+    parent = request.get_span_context().span_id
+    for span in found:
+        assert span.kind is SpanKind.CLIENT
+        assert span.parent is not None
+        assert span.parent.span_id == parent
+        assert span.status.status_code is StatusCode.UNSET
+        attributes = dict(span.attributes or {})
+        assert attributes.pop("db.system.name") == "valkey"
+        assert attributes.pop("db.operation.name") == span.name
+        assert attributes.pop("server.address") == "127.0.0.1"
+        assert isinstance(attributes.pop("server.port"), int)
+        assert attributes == {}
+        # Neither a key (a pseudonymised identifier) nor a member, a score or a time.
+        for secret in (KEY, "pseudonym", MEMBER, str(T0)):
+            assert not shows(span, secret), (span.name, secret)
+
+
+async def test_a_failed_call_is_an_error_span_with_the_error_type_alone(
+    silent_server: int, spans: InMemorySpanExporter
+) -> None:
+    store = CounterStore.connect(
+        f"redis://u:p@127.0.0.1:{silent_server}/0", CounterMetrics.create(CollectorRegistry())
+    )
+    with pytest.raises(CounterStoreUnavailableError):
+        await store.rate(KEY, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+    await store.close()
+    [span] = counter_spans(spans)
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
+    assert span.attributes is not None
+    assert span.attributes["error.type"] == "TimeoutError"
+    assert span.events == ()
+    assert not shows(span, KEY)
+
+
+async def test_a_resting_store_and_the_per_pod_fallback_make_no_span(
+    spans: InMemorySpanExporter,
+) -> None:
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = CounterStore.connect("redis://u:p@127.0.0.1:1/0", metrics)
+    store._clock = Clock()
+    for _ in range(BREAKER_ERRORS):
+        with pytest.raises(CounterStoreUnavailableError):
+            await rate(store, T0)
+    failed = counter_spans(spans)
+    assert len(failed) == BREAKER_ERRORS
+    assert {s.attributes["error.type"] for s in failed if s.attributes} == {"ConnectionError"}
+    spans.clear()
+    with pytest.raises(CounterStoreUnavailableError, match="resting"):
+        await rate(store, T0)
+    # The limiter then counts in this pod: no Valkey, so no span.
+    keys = {KeyType.ACCOUNT: "a", KeyType.TENANT: "t"}
+    await RateLimiter(store, metrics).check(TENANT_OPERATION, keys)
+    await store.close()
+    assert counter_spans(spans) == []
+
+
+# ---- scripts after a restart (found in M8: sign-in starts stuck at 503) ----
+
+
+async def flush_scripts(store: CounterStore) -> None:
+    """What a restart or a failover does to the script cache."""
+    await store._client.script_flush()
+
+
+async def test_a_restart_s_lost_scripts_load_outside_the_call_s_50_ms(
+    counter_store: CounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await flush_scripts(counter_store)
+    real = counter_store._load_scripts
+
+    async def slow(seen: int) -> None:
+        # A load slower than a whole call's budget: it used to run inside it, and time out.
+        await asyncio.sleep(CALL_TIMEOUT_SECONDS * 2)
+        await real(seen)
+
+    monkeypatch.setattr(counter_store, "_load_scripts", slow)
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._loads == 1
+    assert errors(counter_store._metrics) == 0
+    # Loaded: the next calls run at once.
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._loads == 1
+
+
+async def test_concurrent_calls_after_a_restart_share_one_load(
+    counter_store: CounterStore,
+) -> None:
+    await flush_scripts(counter_store)
+    keys = [f"rl:T.rate:ip:192.0.2.{n}" for n in range(20)]
+    verdicts = await asyncio.gather(
+        *(
+            counter_store.rate(key, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+            for key in keys
+        )
+    )
+    assert all(v.allowed for v in verdicts)
+    assert counter_store._loads == 1
+    # A batch, which runs its scripts in a pipeline, recovers the same way, and counts once.
+    await flush_scripts(counter_store)
+    [first, second] = await counter_store.run(
+        [RateCall(keys[0], 3, 3000, 1, peek=False), RateCall(keys[0], 3, 3000, 1, peek=False)],
+        now_ms=T0,
+    )
+    assert first == Verdict(True, 0)
+    assert second == Verdict(False, 1500)  # the third at T0 of 3 in 3 s: the burst is 2
+    assert counter_store._loads == 2
+
+
+async def test_a_load_that_runs_out_of_time_is_a_failure_and_the_breaker_still_closes(
+    counter_store: CounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(counters, "SCRIPT_LOAD_TIMEOUT_SECONDS", 0.01)
+    await flush_scripts(counter_store)
+    real = counter_store._load_scripts
+
+    async def stuck(seen: int) -> None:
+        async with asyncio.timeout(counters.SCRIPT_LOAD_TIMEOUT_SECONDS):
+            await asyncio.sleep(1)
+        await real(seen)  # pragma: no cover - never reached
+
+    monkeypatch.setattr(counter_store, "_load_scripts", stuck)
+    with pytest.raises(CounterStoreUnavailableError, match="TimeoutError"):
+        await rate(counter_store, T0)
+    assert errors(counter_store._metrics) == 1
+    # Resting after five failures, the scripts still gone: once the rest is over, the next
+    # call loads them and closes the circuit, so the limits don't stay failed for good.
+    monkeypatch.setattr(counter_store, "_load_scripts", real)
+    clock = Clock()
+    counter_store._clock = clock
+    counter_store._failures = BREAKER_ERRORS
+    counter_store._resting_until = clock.now + BREAKER_SECONDS
+    with pytest.raises(CounterStoreUnavailableError, match="resting"):
+        await rate(counter_store, T0)
+    clock.now += BREAKER_SECONDS
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._failures == 0
+    assert counter_store._metrics.fallback_active._value.get() == 0  # type: ignore[attr-defined]

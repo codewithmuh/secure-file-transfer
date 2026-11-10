@@ -59,6 +59,9 @@ def load_engine(module: str = DETECTORS_MODULE) -> Engine:
         new_scanner = cast(NewScanner, detect.new_scanner)
         builtin = frozenset(cast(frozenset[str], detect.BUILTIN_DETECTORS))
         version = str(detect.DETECTORS_VERSION)
-    except (ImportError, AttributeError) as exc:
+    except (ImportError, AttributeError, ValueError) as exc:
+        # ValueError: data the detectors load at import is malformed, such as a damaged bank and
+        # branch code list (BankCodeError). The inspector stops at start rather than inspect
+        # without it.
         raise EngineUnavailableError(f"{module}: {type(exc).__name__}") from None
     return Engine(new_scanner=new_scanner, builtin_detectors=builtin, detectors_version=version)

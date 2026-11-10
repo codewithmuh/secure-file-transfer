@@ -14,7 +14,7 @@ locals {
   region_health = var.region_health == null ? {} : var.region_health.health_checks
 
   region_health_severity = { "ap-northeast-1" = "page", "ap-northeast-3" = "ticket" }
-  region_health_short    = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+  region_health_short    = var.conventions.region_shorts
 
   region_health_topics = var.region_health == null ? {} : {
     page   = "arn:aws:sns:us-east-1:${var.account_id}:${var.name_prefix}-region-health-page"

@@ -6,7 +6,11 @@ yet, and these tests never need a real code.
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import random
+import tarfile
 import time
 from pathlib import Path
 
@@ -16,6 +20,7 @@ from dlp_corpus import generate as g
 from sft.dlp.detect import bank_codes
 from sft.dlp.detect.bank_codes import EMPTY, BankCodeError, BankCodes, parse, render
 from sft.dlp.detect.scanner import _Scanner
+from sft.dlp.engine import EngineUnavailableError, load_engine
 from sft.dlp.units import Cell, TextUnit
 from tools import bank_codes as refresh
 
@@ -131,7 +136,8 @@ def test_japan_post_accounts_stay_medium(rng: random.Random) -> None:
 
 
 def test_the_bundled_list_is_empty_and_says_so() -> None:
-    # #146: no source whose licence allows bundling has been confirmed, so nothing is bundled.
+    # #146: no source whose licence allows bundling has been confirmed, so git holds only the
+    # header; the image build fetches the list (Dockerfile, tools/bank_codes.py zengin-code).
     bundled = bank_codes.load()
     assert len(bundled) == 0
     assert (bundled.source, bundled.licence, bundled.retrieved) == ("none", "none", "none")
@@ -203,6 +209,7 @@ def test_the_refresh_tool_writes_the_list_from_a_csv(tmp_path: Path) -> None:
     output = tmp_path / "bank_codes.txt"
     status = refresh.main(
         [
+            "csv",
             str(source),
             "--source",
             "a test",
@@ -225,6 +232,163 @@ def test_the_refresh_tool_refuses_a_bad_csv(tmp_path: Path, csv_text: str) -> No
     source = tmp_path / "codes.csv"
     source.write_text(csv_text, encoding="utf-8")
     output = tmp_path / "out.txt"
-    arguments = [str(source), "--source", "s", "--licence", "l", "--retrieved", "2026-11-05"]
+    arguments = ["csv", str(source), "--source", "s", "--licence", "l", "--retrieved", "2026-11-05"]
     assert refresh.main([*arguments, "--output", str(output)]) == 1
     assert not output.exists()
+
+
+# ---- the image build's source: zengin-code/source-data at a pinned commit ----
+
+REF = "0" * 40
+TOP = f"source-data-{REF}"
+SYNTHETIC = {"9990": ["001", "002", "100"], "9991": ["001"]}
+"""Made-up banks and branches in the archive's layout; nothing here is fetched."""
+
+
+def zengin_archive(
+    tmp_path: Path, branches: dict[str, object] | None = None, extra: dict[str, bytes] | None = None
+) -> Path:
+    """A `.tar.gz` laid out like the repository's archive: branches/NNNN.json, and other files."""
+    files: dict[str, bytes] = {
+        f"{TOP}/README.md": b"not data",
+        f"{TOP}/data/banks.json": b"{}",
+        f"{TOP}/data/branches/9990.yml": b"not counted",
+    }
+    for bank, value in (branches if branches is not None else SYNTHETIC).items():
+        if isinstance(value, list):
+            value = {code: {"code": code, "name": "見本"} for code in value}
+        files[f"{TOP}/data/branches/{bank}.json"] = json.dumps(value).encode()
+    files.update(extra or {})
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    path = tmp_path / "source-data.tar.gz"
+    path.write_bytes(buffer.getvalue())
+    return path
+
+
+@pytest.fixture
+def few_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(refresh, "MIN_CODES", 3)
+
+
+def zengin(archive: Path, *extra: str) -> list[str]:
+    return [
+        "zengin-code",
+        "--ref",
+        REF,
+        "--retrieved",
+        "2026-08-24",
+        "--archive",
+        str(archive),
+        *extra,
+    ]
+
+
+def expected_digest() -> str:
+    codes = sorted(b + c for b, cs in SYNTHETIC.items() for c in cs)
+    return hashlib.sha256("".join(f"{c}\n" for c in codes).encode()).hexdigest()
+
+
+@pytest.mark.usefixtures("few_codes")
+def test_zengin_code_reads_the_branch_files_and_reports_the_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    archive = zengin_archive(tmp_path)
+    codes = refresh.codes_from_zengin_archive(archive.read_bytes())
+    assert sorted(codes) == ["9990001", "9990002", "9990100", "9991001"]
+    assert refresh.digest(codes) == refresh.digest(reversed(codes)) == expected_digest()
+    # Without --output it only checks, and says what to pin.
+    assert refresh.main(zengin(archive)) == 0
+    assert f"4 codes, sha256 {expected_digest()}" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("few_codes")
+def test_zengin_code_writes_only_the_pinned_list(tmp_path: Path) -> None:
+    archive = zengin_archive(tmp_path)
+    output = tmp_path / "bank_codes.txt"
+    # Writing needs the pinned digest, and refuses any other.
+    assert refresh.main(zengin(archive, "--output", str(output))) == 1
+    assert refresh.main(zengin(archive, "--sha256", "f" * 64, "--output", str(output))) == 1
+    assert not output.exists()
+    assert (
+        refresh.main(zengin(archive, "--sha256", expected_digest(), "--output", str(output))) == 0
+    )
+    written = parse(output.read_text("utf-8"))
+    assert written.valid("9990", "100")
+    assert written.source.startswith(f"zengin-code/source-data at {REF}")
+    assert written.licence.startswith("MIT")
+    assert written.version == "20260824"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--ref", "master"], "40-character commit"),
+        (["--sha256", "ABC"], "64 lowercase hex"),
+    ],
+)
+def test_zengin_code_refuses_a_loose_pin(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], arguments: list[str], message: str
+) -> None:
+    archive = zengin_archive(tmp_path)
+    assert refresh.main([*zengin(archive), *arguments]) == 1
+    assert message in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("few_codes")
+@pytest.mark.parametrize(
+    ("branches", "extra", "message"),
+    [
+        ({"9990": {"01": {}}}, None, "3-digit codes"),
+        ({"9990": ["001"], "9991": []}, None, "only 1 codes"),
+        (None, {f"{TOP}/data/branches/9992.json": b"{not json"}, "JSONDecodeError"),
+        (
+            None,
+            {f"{TOP}/data/branches/9993.json": b" " * (refresh.MAX_MEMBER_BYTES + 1)},
+            "larger than",
+        ),
+    ],
+)
+def test_zengin_code_refuses_a_broken_archive(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    branches: dict[str, object] | None,
+    extra: dict[str, bytes] | None,
+    message: str,
+) -> None:
+    archive = zengin_archive(tmp_path, branches, extra)
+    assert refresh.main(zengin(archive)) == 1
+    error = capsys.readouterr().err
+    assert message in error
+    assert "9990001" not in error
+
+
+def test_zengin_code_refuses_what_isnt_an_archive(tmp_path: Path) -> None:
+    archive = tmp_path / "page.html"
+    archive.write_bytes(b"<html>rate limited</html>")
+    with pytest.raises(BankCodeError, match="can't be read"):
+        refresh.codes_from_zengin_archive(archive.read_bytes())
+    assert refresh.main(zengin(tmp_path / "missing.tar.gz")) == 1
+
+
+def test_a_full_archive_falls_below_no_floor_by_accident() -> None:
+    # The floor catches an emptied or truncated source; Japan has about 31,000 branches.
+    assert 1_000 < refresh.MIN_CODES < 31_000 < bank_codes.MAX_CODES
+
+
+# ---- the inspector with a damaged list ----
+
+
+def test_a_damaged_list_stops_the_inspector_at_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The image build checks the digest, so this is a broken image: the inspector refuses to
+    # start (EXIT_NO_ENGINE) rather than inspect without the list, or with half of it.
+    def damaged(_name: str) -> object:
+        raise BankCodeError("line 9: not a 7-digit bank and branch code")
+
+    monkeypatch.setattr("importlib.import_module", damaged)
+    with pytest.raises(EngineUnavailableError, match="BankCodeError"):
+        load_engine()

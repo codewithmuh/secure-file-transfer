@@ -25,7 +25,22 @@ A key belongs to its caller: a member's user (so it survives a new sign-in), an 
 session. Response bodies are never kept, so no secret or address is stored, and an operation whose
 answer holds a secret (`createApiKey`) takes no key at all.
 
-`delete_expired_keys` is the daily job's step (data model 6), run as `sft_jobs`.
+`delete_expired_keys` is the daily job's step (data model 6), run as `sft_jobs`, in the `cleanup`
+job (#162).
+
+**An operator's keys** (#160, revision 0036): `createTenant` and `recoverTenantAdmin`. The key
+belongs to the operator, by their Identity Center user name (`OperatorKey`), so a retry with a new
+15-minute token still finds it. It is kept in the scope of the tenant the call made or acted on,
+committed with the change:
+
+- `operator_replay` runs first, in platform scope: the same key, method, path and body within 24
+  hours is answered as the first request was, with nothing done again; another request with the
+  key is `409 idempotency_conflict`, and so is a key used more than 24 hours ago that the daily
+  job hasn't deleted yet, which is never written again.
+- `operator_claim` runs in the creating transaction, before the work: it takes the key's lock
+  (else `409 idempotency_in_progress`, as for `inviteUser`) and writes the key's row. A second
+  request that raced past `operator_replay` can't write the row again, so it is refused the same
+  way and rolls back: one tenant, one invitation, one email.
 """
 
 from __future__ import annotations
@@ -36,7 +51,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +65,10 @@ log = logging.getLogger(__name__)
 
 JOB_BATCH: Final = 1000
 """Rows the daily job deletes per transaction, and tenants it finds per pass."""
+
+_OPERATORS: Final = UUID("0195f3c0-7a1e-7c4e-9b2d-6f1d0c2a8e51")
+"""The namespace of the UUIDs that stand for operators' Identity Center user names (#160). Fixed:
+changing it would orphan every live operator key."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +194,80 @@ async def _replayed[T](
     if value is None:
         raise NotFound
     return Outcome(value, stored.status, replayed=True)
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorKey:
+    """An operator's `Idempotency-Key`, owned by the operator rather than their token."""
+
+    caller_id: UUID
+    request: IdempotentRequest
+
+    @classmethod
+    def of(cls, operator_name: str, request: IdempotentRequest | None) -> OperatorKey | None:
+        if request is None:
+            return None
+        return cls(uuid5(_OPERATORS, operator_name), request)
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorReplay:
+    """What the first request with an operator's key did: in which tenant, to which resource."""
+
+    tenant_id: UUID
+    resource_id: UUID
+    status: int
+
+
+async def operator_replay(
+    database: Database, key: OperatorKey | None, *, resource_type: str
+) -> OperatorReplay | None:
+    """The first answer's tenant, resource and status for a retry; None without a key or for a
+    new one (the module docstring)."""
+    if key is None:
+        return None
+    async with database.transaction(Scope.platform()) as session:
+        found = await idempotency.find_operator(session, key.caller_id, key.request.key)
+    if found is None:
+        return None
+    stored = found.stored
+    if not found.live:
+        raise Conflict(
+            "idempotency_conflict", "This key was used more than 24 hours ago. Use a new key."
+        )
+    if stored.fingerprint != key.request.fingerprint or stored.resource_type != resource_type:
+        raise Conflict("idempotency_conflict", "This key was used for a different request.")
+    return OperatorReplay(found.tenant_id, stored.resource_id, stored.status)
+
+
+async def operator_claim(
+    session: AsyncSession,
+    key: OperatorKey | None,
+    *,
+    status: int,
+    resource_type: str,
+    resource_id: UUID,
+) -> None:
+    """Lock and write the operator's key in the creating transaction, before its work; nothing
+    without a key."""
+    if key is None:
+        return
+    in_progress = Conflict("idempotency_in_progress", "A request with this key is still running.")
+    if not await idempotency.lock_operator(session, key.caller_id, key.request.key):
+        raise in_progress
+    saved = await idempotency.save_operator(
+        session,
+        key.caller_id,
+        key.request.key,
+        fingerprint=key.request.fingerprint,
+        status=status,
+        resource_type=resource_type,
+        resource_id=resource_id,
+    )
+    if not saved:
+        # Written by a request that committed after this one's `operator_replay`: its retry
+        # gets the first answer.
+        raise in_progress
 
 
 async def delete_expired_keys(database: Database, *, batch: int = JOB_BATCH) -> int:

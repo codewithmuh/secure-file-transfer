@@ -15,26 +15,15 @@ locals {
   region  = data.aws_region.current.region
   primary = length(var.primary_key_arns) == 0
 
-  region_short = {
-    "ap-northeast-1" = "apne1"
-    "ap-northeast-3" = "apne3"
-  }[local.region]
+  region_short = var.conventions.region_shorts[local.region]
 
-  name_prefix  = "sft-${var.environment}-${local.region_short}"
+  name_prefix  = "${var.conventions.global_name_prefix}-${local.region_short}"
   account_root = "arn:aws:iam::${var.account_id}:root"
   alias_prefix = "alias/sft/${var.environment}"
 
-  # Workload roles of authn-authz and encryption 4.3, created by the cluster layer, and loki, tempo and alertmanager by
-  # the cluster-bootstrap layer (modules/observability): sft-<env>-<name>, path /.
-  role_arns = {
-    for name in [
-      "api", "scan", "notify", "relay", "jobs", "archive", "operator", "recovery", "key-rotation", "db-bootstrap",
-      "s3-replication", "malware-protection", "events-delivery", "signin-trigger", "karpenter", "ebs-csi",
-      "external-secrets", "external-secrets-platform", "external-secrets-app", "eks-cluster", "loki", "tempo",
-      "alertmanager",
-    ] :
-    name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
-  }
+  # The environment's workload roles, sft-<env>-<name> at path /, from their one list in modules/conventions (#172):
+  # the cluster layer's, the data layer's, the sign-in trigger's and the observability stack's.
+  role_arns = var.conventions.workload_role_arns
 
   replication_role_arn = (
     var.replication_role_name == null
@@ -64,8 +53,9 @@ locals {
     files         = "arn:aws:s3:::${local.name_prefix}-files-${var.account_id}"
     large_files   = "arn:aws:s3:::${local.name_prefix}-large-files-${var.account_id}"
     audit_archive = "arn:aws:s3:::${local.name_prefix}-audit-archive-${var.account_id}"
+    probe_mailbox = "arn:aws:s3:::${local.name_prefix}-probe-mailbox-${var.account_id}" # #259
     # The retained stack's own state bucket, Tokyo only (encryption 8.4).
-    retained_state = "arn:aws:s3:::sft-prod-apne1-retained-tfstate-${var.account_id}"
+    retained_state = "arn:aws:s3:::sft-prod-${var.conventions.region_shorts["ap-northeast-1"]}-retained-tfstate-${var.account_id}"
   }
 
   via = {
@@ -92,6 +82,7 @@ locals {
     idp_here   = "${local.secret_arn_prefix}app/idp-client/${local.region}-??????"
     idp_all    = "${local.secret_arn_prefix}app/idp-client/ap-northeast-?-??????"
     probe_key  = "${local.secret_arn_prefix}app/probe-api-key-??????" # the synthetic tenant's API key (#248)
+    load_test  = "${local.secret_arn_prefix}loadtest/api-keys-??????" # staging's load test keys (#259)
     db_master  = "${local.secret_arn_prefix}db/master-??????"
     platform   = "${local.secret_arn_prefix}platform/*"
   }
@@ -129,8 +120,8 @@ resource "aws_kms_key" "guarded" {
 
   description             = "sft ${var.environment} ${each.key}: ${local.descriptions[each.key]} (encryption 4.1)"
   multi_region            = true
-  enable_key_rotation     = true
-  rotation_period_in_days = 365
+  enable_key_rotation     = !var.environment_retired
+  rotation_period_in_days = var.environment_retired ? null : 365
   deletion_window_in_days = var.deletion_window_in_days
   policy                  = local.policies[each.key]
 
@@ -146,8 +137,8 @@ resource "aws_kms_key" "unguarded" {
 
   description             = "sft ${var.environment} ${each.key}: ${local.descriptions[each.key]} (encryption 4.1)"
   multi_region            = true
-  enable_key_rotation     = true
-  rotation_period_in_days = 365
+  enable_key_rotation     = !var.environment_retired
+  rotation_period_in_days = var.environment_retired ? null : 365
   deletion_window_in_days = var.deletion_window_in_days
   policy                  = local.policies[each.key]
 

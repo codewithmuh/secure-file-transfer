@@ -94,3 +94,13 @@ variable "tempo_retention_days" {
     error_message = "tempo_retention_days must be at least 3."
   }
 }
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the buckets and the roles, from their one definition (#172)."
+  type = object({
+    global_name_prefix  = string
+    region_shorts       = map(string)
+    workload_role_names = map(string)
+    workload_role_arns  = map(string)
+  })
+}

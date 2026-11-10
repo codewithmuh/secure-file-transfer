@@ -149,6 +149,11 @@ API pods.
 SES quotas are per region and per account. A new production account often starts at 50,000 emails a day, which is
 too close to this load: request at least 100,000 a day and 20 a second in both Tokyo and Osaka before the load test.
 
+Each notification worker pod sends one email at a time, on one mail thread: its loop handles one message at a time and
+waits for each send (#192). Through the SMTP adapter to a local Mailpit, one thread sent 25 emails a second (median
+27 ms, p95 107 ms, 300 sends, measured 2026-11-09), ten times a pod's share of the 5 a second at the peak. SES's own
+latency is pending the AWS run; more pods, not threads, raise the rate.
+
 ### 3.3 Scanning
 
 NFR-5 asks for p95 ≤ 2 minutes to shareable when the largest file is ≤ 100 MB, and ≤ 15 minutes for any transfer

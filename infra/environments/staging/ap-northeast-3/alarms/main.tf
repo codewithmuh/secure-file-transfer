@@ -100,6 +100,8 @@ module "alarms" {
     aws.us_east_1 = aws.us_east_1
   }
 
+  conventions = module.conventions
+
   environment      = "staging"
   account_id       = var.account_id
   region           = module.conventions.region
@@ -117,7 +119,7 @@ module "alarms" {
 
   database = {
     cluster_identifier          = local.data.aurora_cluster_identifier
-    role                        = "secondary"
+    role                        = var.database_role
     freeable_memory_alarm_bytes = 1610612736 # 1536 MiB, about a tenth of the writer's after a failover
   }
 

@@ -64,4 +64,7 @@ module "network" {
   dns_firewall_additional_domains = ["cognito-idp.ap-northeast-3.amazonaws.com", "secretsmanager.ap-northeast-3.amazonaws.com"]
 
   flow_log_destination_arn = var.flow_log_destination_arn
+
+  # The API's and the web app's names, for the synthetic probe (#259).
+  service_domain = "sft.${var.domain}"
 }

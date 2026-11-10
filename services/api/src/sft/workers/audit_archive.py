@@ -7,8 +7,10 @@ Locally it is `make audit-archive`, run in the compose stack's `audit-archive` s
 S3 stand-in's two archive buckets (docs/local-development.md). A run reads `ArchiveJobSettings`,
 logs its report as one JSON line and, with `METRICS_PUSHGATEWAY_URL`, pushes its metrics under the
 grouping key `job="audit-archive"`, which is also its `lifecycle_job_last_success_timestamp_seconds`
-label. It exits 0 when the archive is up to date as far as the run got, 1 when a region refused a
-write or the run failed, and 2 on bad settings.
+label. With `AUDIT_ARCHIVE_SURVIVING_REGION` it writes that region alone and records each range
+for the back-fill, which it runs once the variable is gone (#257, `sft.service.archive_job`). It
+exits 0 when the archive is up to date as far as the run got, 1 when a region refused a write or
+the run failed, and 2 on bad settings.
 """
 
 from __future__ import annotations
@@ -24,9 +26,9 @@ from prometheus_client import CollectorRegistry, push_to_gateway
 from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, ArchiveJobSettings, load_settings
 from sft.data.database import Database
-from sft.runtime.archive import S3AuditArchive
+from sft.runtime.archive import open_audit_archive
 from sft.service.archive_job import ArchiveJobMetrics, ArchiveReport, run_archive
-from sft.service.audit_archive import Region
+from sft.service.audit_archive import ArchiveStore, Region
 from sft.service.lifecycle import last_success_gauge
 
 log = logging.getLogger(__name__)
@@ -35,14 +37,17 @@ JOB: Final = "audit-archive"
 EXIT_FAILED: Final = 1
 
 
-def open_store(settings: ArchiveJobSettings) -> S3AuditArchive:
-    """Both regions' archive buckets, or Tokyo's alone where there is no Osaka (dev)."""
-    buckets = {Region.TOKYO: settings.audit_archive_tokyo_bucket}
-    endpoints = {Region.TOKYO: settings.audit_archive_tokyo_endpoint_url}
-    if settings.audit_archive_osaka_bucket is not None:
-        buckets[Region.OSAKA] = settings.audit_archive_osaka_bucket
-        endpoints[Region.OSAKA] = settings.audit_archive_osaka_endpoint_url
-    return S3AuditArchive.create(buckets, endpoints, threads=2)
+def open_store(settings: ArchiveJobSettings) -> ArchiveStore:
+    """Both regions' archive buckets, or Tokyo's alone where there is no Osaka (dev); the
+    surviving region's alone during a regional loss (#257)."""
+    return open_audit_archive(
+        tokyo_bucket=settings.audit_archive_tokyo_bucket,
+        osaka_bucket=settings.audit_archive_osaka_bucket,
+        tokyo_endpoint=settings.audit_archive_tokyo_endpoint_url,
+        osaka_endpoint=settings.audit_archive_osaka_endpoint_url,
+        surviving_region=settings.audit_archive_surviving_region,
+        threads=2,
+    )
 
 
 async def run_once(settings: ArchiveJobSettings, registry: CollectorRegistry) -> ArchiveReport:
@@ -55,7 +60,10 @@ async def run_once(settings: ArchiveJobSettings, registry: CollectorRegistry) ->
     metrics = ArchiveJobMetrics.create(registry)
     last_success = last_success_gauge(registry)
     try:
-        report = await run_archive(database, store, metrics)
+        surviving = settings.audit_archive_surviving_region
+        report = await run_archive(
+            database, store, metrics, surviving=None if surviving is None else Region(surviving)
+        )
         last_success.labels(JOB).set(time.time())
         return report
     finally:

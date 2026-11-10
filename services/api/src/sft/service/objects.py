@@ -51,17 +51,18 @@ class ObjectStore(Protocol):
         """Start a multipart upload, encrypted with the files key; its upload ID."""
         ...
 
-    async def part_url(
+    async def part_urls(
         self,
         storage_class: StorageClass,
         key: str,
         upload_id: str,
+        parts: Sequence[tuple[int, int]],
         *,
-        part_number: int,
-        size: int,
         expires_in: int = PART_URL_SECONDS,
-    ) -> str:
-        """A pre-signed `UploadPart` URL for one part, with its `Content-Length` signed."""
+    ) -> list[str]:
+        """A pre-signed `UploadPart` URL for each `(part number, size)` in `parts`, in order, each
+        with its `Content-Length` signed. Signing is local work, so all of them are made in one
+        call (#166)."""
         ...
 
     async def list_parts(

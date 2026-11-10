@@ -76,7 +76,7 @@ data "terraform_remote_state" "identity" {
 data "terraform_remote_state" "identity_osaka" {
   backend = "s3"
   config = {
-    bucket = "sft-staging-apne3-tfstate-${var.account_id}"
+    bucket = "${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-tfstate-${var.account_id}"
     key    = "environments/staging/ap-northeast-3/identity/terraform.tfstate"
     region = "ap-northeast-3"
   }
@@ -184,6 +184,8 @@ module "cluster_bootstrap" {
 # deploy/observability; the module above installs its operator, namespaces and storage class.
 module "observability" {
   source = "../../../../modules/observability"
+
+  conventions = module.conventions
 
   environment  = "staging"
   region       = module.conventions.region

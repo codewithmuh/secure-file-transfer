@@ -334,11 +334,7 @@ async def find_another_tenants_session(session: AsyncSession, tenants: Tenants) 
 
 @cases.add(scopes={API: [TENANT, RESOURCE], OPERATOR: [TENANT]})
 async def read_another_tenants_session(session: AsyncSession, tenants: Tenants) -> object:
-    their_session = tenants.theirs.rows["session"]
-    return [
-        await get_live_session(session, their_session),
-        await member_sessions.expires_at(session, their_session),
-    ]
+    return await get_live_session(session, tenants.theirs.rows["session"])
 
 
 @cases.add(scopes=SESSION_WRITERS)

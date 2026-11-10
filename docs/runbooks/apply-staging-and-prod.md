@@ -19,13 +19,14 @@ environment, and the stacks refuse to plan without the ones that have no default
 |---|---|---|
 | An AWS CLI profile per account: management, shared, dev, staging, prod, each through IAM Identity Center with MFA | The maintainer's shell (`AWS_PROFILE`), never the default identity | Every local apply (bootstrap, organization) |
 | The account IDs | `TF_VAR_account_id`, `TF_VAR_shared_account_id` | Every root |
-| The domain, `sft.<domain>` under it | `TF_VAR_domain` | `edge`, `identity`, `cluster-bootstrap` |
+| The domain, `sft.<domain>` under it | `TF_VAR_domain` | `edge`, `identity`, `cluster-bootstrap`, and every `network` root (DNS Firewall's `api.` and `app.` names, #259) |
 | SES: production access (out of the sandbox) in Tokyo and Osaka for staging and prod, requested after `identity` makes the domain identity; a mailbox for DMARC reports | AWS Support case per account and Region; `TF_VAR_dmarc_report_address` | `identity` (ADR-0015) |
-| The operators' alert addresses (each confirms its SNS subscription by email) | `TF_VAR_alert_emails`, a list | `alarms` |
+| The operators' alert addresses (each confirms its SNS subscription by email) | `TF_VAR_alert_emails`, a list | `alarms`, and prod's `retained` (its own alert topics, #263) |
 | The API image digest that the sign-in triggers run | `TF_VAR_signin_trigger_image` | `identity` (#238) |
 | Argo CD's GitHub App for deployment statuses (needed by the promotion gate) and its Identity Center SAML application | `TF_VAR_github_app`, `TF_VAR_identity_center_saml` | `cluster-bootstrap` |
 | The plan roles' ARNs, for the promotion gate to read the probe's result in the previous environment | Repository variables `TF_PLAN_ROLE_ARN_DEV` and `TF_PLAN_ROLE_ARN_STAGING` (outputs of `bootstrap/<env>/ap-northeast-1`) | `.github/workflows/promote.yml` |
 | The GitHub environments `staging` and `prod`, deployments from `main` only, before their deploy roles exist (T-71) | Repository settings | `infra/README.md`, step 0 |
+| The GitHub environments `prod-retained` (the retained stack's deploy role, #263) and `loadtest-staging` (staging's load test role, #259), deployments from `main` only | Repository settings | `retained`; Tokyo's staging `identity` |
 | Whether break-glass may be self-approved in staging or prod while the run has a single operator | A reviewed commit adding `BREAK_GLASS_SELF_APPROVAL: "true"` to the cluster's values, as dev has ([break-glass.md](break-glass.md)); off until then | `operatorApi.env` |
 | The operating period's budget (PRD open question 7) | `infra/organization/budgets.tf` | Budgets (NFR-20) |
 

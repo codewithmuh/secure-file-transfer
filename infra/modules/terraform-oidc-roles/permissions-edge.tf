@@ -19,7 +19,7 @@ locals {
   edge_environment = one(regex("^sft-([a-z]+)-terraform-plan$", var.plan_role_name))
 
   edge_regions         = concat(var.network_regions, ["us-east-1"])
-  edge_region_shorts   = [for region in var.network_regions : { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }[region]]
+  edge_region_shorts   = [for region in var.network_regions : var.conventions.region_shorts[region]]
   edge_dns_role_prefix = var.shared_account_id == null ? null : "arn:aws:iam::${var.shared_account_id}:role/sft-shared/sft-shared-dns-${local.edge_environment}"
 
   # The edge's buckets: the WAF and CloudFront logs, the load balancer's access logs and the web bundle.

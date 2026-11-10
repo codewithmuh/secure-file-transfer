@@ -30,6 +30,7 @@ from link_fixtures import Browser, World, unique, w
 from member_fixtures import EMAIL_KEYRING, RecordingLimiter, client, seed_tenant, session_caller
 from notify_fixtures import WEB_APP_URL
 from sft.core.errors import RateLimited
+from sft.core.tokens import token_hash
 from sft.data import link_sessions, transfers, upload_requests
 from sft.data.access import NotFoundError
 from sft.data.database import Database
@@ -352,7 +353,7 @@ async def test_the_old_session_lookup_returns_recipients_sessions_only(w: World)
     browser = await w.browser()
     _, session = await verify(w, browser, address)
     assert browser.cookie is not None
-    hashes = [link_sessions.token_hash(t) for t in browser.cookie.split(".")]
+    hashes = [token_hash(t) for t in browser.cookie.split(".")]
     api = Database.connect(w.db.url(API), pool_size=1)
     try:
         async with api.transaction(Scope.lookup()) as lookup:

@@ -1,7 +1,7 @@
 # Metrics catalogue
 
 Every metric the service exposes, what it measures, where it comes from, and which SLO or alert reads it (#242;
-[architecture](../architecture.md) 5.5, 6; [PRD](../prd.md) NFR-1, NFR-2, NFR-5, NFR-8, NFR-9, NFR-15, NFR-23).
+[architecture](../architecture.md) 5.5, 6; [PRD](../prd.md) NFR-1, NFR-2, NFR-5, NFR-7, NFR-8, NFR-9, NFR-15, NFR-23).
 
 - **Where they come from.** The API, the operator API and every worker serve `/metrics` on their internal port, which
   Prometheus scrapes (ADR-0009, architecture 8). The scheduled jobs exit after each run, so they push their registry
@@ -29,6 +29,7 @@ How each SLO's indicator is computed. The objectives, windows and burn-rate aler
 | NFR-1 availability, 99.9 % over 28 days | Good: API responses that aren't `5xx`, over all valid requests, from `http_requests_total{status}`; the load balancer's `5xx` (it answers for a pod that didn't) from the CloudWatch exporter; and the synthetic probe's journey, every 5 minutes | Sections 2, 9 |
 | NFR-2 API latency, p95 at most 300 ms and p99 at most 1 s | `http_request_duration_seconds` by route, leaving out the routes that move file bytes (`route=~".*/content"`, which NFR-2 excludes; uploads go to S3 directly); the bucket edges at 0.3 s and 1 s make both exact | Section 2 |
 | NFR-5 time to shareable, p95 at most 2 min up to 100 MB and 15 min up to 20 GB | `time_to_shareable_seconds{kind, size_class}`, with edges at 120 s and 900 s. The email hand-off after a transfer is sent is bounded by `outbox_oldest_unpublished_age_seconds` and the notification queue's age, and measured end to end by the probe | Sections 3, 4, 9 |
+| NFR-7 email hand-off, p95 at most 10 s | `send_latency_seconds{type}` for `verification_code`, `transfer_link` and `upload_request`, the emails a person waits for: from the outbox message that asked for the email to SES accepting it; the edge at 10 s makes the p95 exact (`EmailSendSlow`) | Section 5 |
 | NFR-8 deletion within 7 days | `lifecycle_deletion_lag_seconds` below 7 days, and `lifecycle_overdue_deletions` at 0 | Section 7 |
 | NFR-15 audit integrity, every event archived within 60 s | `audit_archive_lag_seconds` below 120 s (the job runs every minute, data model 2.5), and the job's last success | Section 7 |
 | NFR-23 inspection time, p95 at most 60 s and p99 at most 3 min up to 100 MB, p95 at most 10 min up to 2,000,000,000 bytes | `scan_pass_duration_seconds{pool}`, with edges at 60 s, 180 s and 600 s | Section 3 |
@@ -40,6 +41,13 @@ for its sender's confirmation or an approver restarts NFR-5's clock at that act;
 remains, NFR-5's 60-second leg, which the outbox age and the probe cover. `kind="request_file"`: from a received
 file's upload completing to its scan result recorded `clean`. `size_class` is `small` when the largest counted file
 is at most 100 MB, else `large`.
+
+**What `send_latency_seconds` measures** (`sft.service.notifications`, #260): from the outbox message's ID, a UUIDv7
+made in the transaction of the change that asked for the email (data model 1), to the provider accepting the email.
+So it covers the relay, the `notify` queue and the worker. A link email starts at its `recipient.link_due` message,
+which the worker writes when it fans out a sent transfer; the hop before it is measured by
+`outbox_oldest_unpublished_age_seconds` and the probe. Every type is measured, for the dashboards; some wait on purpose (a link held by the cross-tenant cap,
+an approver's digest, a notice window), so NFR-7's alert reads the three types above.
 
 **What `scan_pass_duration_seconds` measures** (`sft.workers.scan`): from a scan attempt starting, after its tenant's
 cap let it in, to its malware and inspection results committed. `pool="small"` serves files up to 100 MB and
@@ -56,6 +64,12 @@ inspection, outside NFR-23.
 | `sft_break_glass_active_grants` | gauge | `self_approved` | `sft.api.operator.app` | `BreakGlassActive`, `BreakGlassSelfApproved` |
 | `sft_break_glass_sweep_last_success_timestamp_seconds` | gauge | none | `sft.api.operator.app` | `BreakGlassSweepStalled` |
 | `sft_break_glass_tenant_records_missed_total` | counter | none | `sft.api.operator.app` | `BreakGlassTenantRecordsMissed` |
+| `sft_break_glass_unrecorded_assignments` | gauge | none | `sft.api.operator.jobs` (#239) | `BreakGlassGrantUnrecorded` |
+| `sft_break_glass_records_reconciled_total` | counter | none | `sft.api.operator.jobs` (#239) | `BreakGlassRecordedByReconciliation` |
+| `sft_break_glass_reconciliation_last_success_timestamp_seconds` | gauge | none | `sft.api.operator.jobs` (#239) | `BreakGlassReconciliationStalled` |
+| `sft_sso_provider_drift` | gauge | `pool`, `problem` | `sft.api.operator.jobs` (#239) | `SsoProviderDrift`, `SsoProviderUnrecorded` |
+| `sft_sso_drift_check_last_success_timestamp_seconds` | gauge | none | `sft.api.operator.jobs` (#239) | `SsoDriftCheckStalled` |
+| `auth_failures_total` | counter | `scheme` | `sft.api.auth_failures` (#260): the API's and the operator API's authentication points, every scheme at 0 on start | `ApiKeyMisuse` (`scheme="api_key"`, more than 50 in 5 minutes); dashboards |
 
 `route` is the route template (`/v1/transfers/{transfer_id}`), `unmatched` for a path no route serves, so IDs never
 become labels; `method` is one of the seven HTTP methods or `other`; `status` is the response's status code.
@@ -72,6 +86,7 @@ become labels; `method` is one of the seven HTTP methods or `other`; `status` is
 | `dlp_inspection_results_total` | counter | `state`, `reason` | `sft.workers.scan` | `DlpInspectorFailing` |
 | `dlp_inspector_failures_total` | counter | `kind` | `sft.workers.scan` | `DlpInspectorFailing` |
 | `guardduty_results_total` | counter | `outcome` | `sft.workers.scan` | The scan-failed runbook; dashboards |
+| `clamav_signature_age_seconds` | gauge | none | `sft.workers.scan` | `ClamavSignaturesStale` (T-27: above a day). From clamd's `VERSION` every 5 minutes, computed at each scrape from the database's build time; NaN until clamd first answers |
 
 ## 4. The outbox, the queues and the workers
 
@@ -92,6 +107,7 @@ CloudWatch exporter (section 9).
 |---|---|---|---|---|
 | `emails_sent_total` | counter | `type` | `sft.service.notifications` | Dashboards; NFR-7 |
 | `email_caps_hit_total` | counter | `cap` | `sft.service.notifications` | Dashboards (abuse 7.2) |
+| `send_latency_seconds` | histogram | `type` | `sft.service.notifications` | NFR-7 (`EmailSendSlow`); dashboards. Edges 1, 2.5, 5, 10, 20, 30, 60, 300 and 900 s |
 | `link_lookups_total` | counter | `result` | `sft.service.links` | Dashboards (abuse 8.1) |
 | `verification_attempts_total` | counter | `result` | `sft.service.links` | Dashboards (abuse 8.1) |
 | `verification_codes_total` | counter | `result` | `sft.service.links` | Dashboards (abuse 8.1) |
@@ -125,12 +141,16 @@ Pushed to the Pushgateway by each run (grouping key `job`), so each value is the
 | `metadata_purge_rows_total` | counter | `kind` | `sft.service.lifecycle` | Dashboards (NFR-9) |
 | `metadata_purge_blocked` | gauge | `kind` | `sft.service.lifecycle` | `MetadataPurgeBlocked` |
 | `metadata_purge_lag_seconds` | gauge | none | `sft.service.lifecycle` | `MetadataPurgeBehind` |
+| `dlp_approval_oldest_pending_age_seconds` | gauge | none | `sft.service.lifecycle` | Dashboards; the `DlpApprovalBacklog` runbook (FR-43). The expiry job's |
+| `dlp_approval_pending_timeout_used_ratio` | gauge | none | `sft.service.lifecycle` | `DlpApprovalBacklog` (`pending_half_timeout`, above 0.5; abuse 8.2). The largest share of its tenant's approval timeout a pending request has used |
 | `audit_archive_lag_seconds` | gauge | none | `sft.service.archive_job` | `AuditArchiveLagging`, NFR-15 SLO |
 | `audit_archive_events_total` | counter | `region` | `sft.service.archive_job` | Dashboards: both regions keep pace |
 | `audit_archive_write_failures_total` | counter | `region` | `sft.service.audit_archive` | `AuditArchiveLagging` runbook; the API's security-critical writes too |
+| `audit_archive_single_region_ranges` | gauge | none | `sft.service.archive_job` | `AuditArchiveSingleRegion` (#257): ranges written to one region alone during a regional loss, waiting for the back-fill |
 | `sft_audit_default_partition_rows` | gauge | none | `sft.service.audit_partitions` | `AuditPartitions` (data model 6) |
 | `sft_audit_partition_months_covered` | gauge | none | `sft.service.audit_partitions` | `AuditPartitions` (data model 6) |
 | `sft_audit_partition_last_success_timestamp_seconds` | gauge | none | `sft.service.audit_partitions` | `AuditPartitions` |
+| `sft_audit_expired_partitions` | gauge | none | `sft.service.audit_partitions` | `AuditPartitions` (`expired_present`; NFR-9, #255) |
 
 `job` is the CronJob's name: `expiry`, `deletion`, `reconciliation`, `storage-audit`, `cleanup`, `purge`,
 `audit-partitions` or `audit-archive`. `audit_archive_write_failures_total` counts the archive job's batch writes and
@@ -145,7 +165,8 @@ the API's security-critical records together, by region; the API's series are sc
 | `field_decrypt_scope_mismatch_total` | counter | `purpose` | `sft.service.fields` | `FieldDecryptScopeMismatch` |
 | `field_plaintext_reads_total` | counter | `column` | `sft.service.fields` | Dashboards: the backfill's progress (#236) |
 | `sft_keyring_refresh_failures_total` | counter | `keyring` | `sft.runtime.secrets` | `KeyringRefreshFailing` |
-| `sft_keyring_refreshed_timestamp_seconds` | gauge | `keyring` | `sft.runtime.secrets` | Dashboards (a keyring-age alert is pending, slos.md 6) |
+| `sft_keyring_refreshed_timestamp_seconds` | gauge | `keyring` | `sft.runtime.secrets` | Dashboards |
+| `keyring_active_key_age_seconds` | gauge | `keyring` | `sft.runtime.secrets` (#260), where each process loads and reloads its keyrings: `CSRF`, `email`, `code`, `link` | `KeyringKeyTooOld` (encryption 6.5: its period plus 7 days) |
 
 ## 9. From outside the application
 
@@ -200,6 +221,7 @@ The closed list of label names, which tests/test_sli_metrics.py holds the code t
 | `size_class` | `small` (up to 100 MB), `large` |
 | `pool` | `small`, `large` |
 | `step` | A step of the synthetic probe (section 10) |
-| `state`, `reason`, `result`, `outcome`, `type`, `cap`, `group`, `key_type`, `queue`, `consumer`, `purpose`, `column`, `keyring`, `action`, `self_approved` | Codes from enums or fixed lists in the module named in the Source column |
+| `scheme` | `session`, `api_key`, `operator`, `link`: how a caller authenticated (`auth_failures_total`) |
+| `state`, `reason`, `result`, `outcome`, `type`, `cap`, `group`, `key_type`, `queue`, `consumer`, `purpose`, `column`, `keyring`, `action`, `self_approved`, `problem` | Codes from enums or fixed lists in the module named in the Source column |
 
 A detector ID may appear in a label (NFR-26 allows IDs and counts); no metric has one today.

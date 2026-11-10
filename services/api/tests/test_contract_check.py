@@ -1021,7 +1021,9 @@ def test_the_command_passes_on_the_service(capsys: pytest.CaptureFixture[str]) -
     assert main(["--list-remaining"]) == 0
     out = capsys.readouterr().out
     assert "contract operations implemented" in out
-    assert "  remaining: " in out
+    # Every operation is built since #239: nothing is left to list.
+    assert "0 remain." in out
+    assert "  remaining: " not in out
     assert out.rstrip().endswith("OK: every implemented operation matches the contract.")
 
 

@@ -153,31 +153,41 @@ class S3Objects:
         )
         return response["UploadId"]
 
-    async def part_url(
+    async def part_urls(
         self,
         storage_class: StorageClass,
         key: str,
         upload_id: str,
+        parts: Sequence[tuple[int, int]],
         *,
-        part_number: int,
-        size: int,
         expires_in: int = PART_URL_SECONDS,
-    ) -> str:
+    ) -> list[str]:
         if not 1 <= expires_in <= PART_URL_SECONDS:
             raise ValueError("a part URL lives at most 15 minutes")
-        return await self._call(
-            self._presign_client.generate_presigned_url,
-            ClientMethod="upload_part",
-            Params={
-                "Bucket": self._bucket(storage_class),
-                "Key": key,
-                "UploadId": upload_id,
-                "PartNumber": part_number,
-                "ContentLength": size,
-            },
-            ExpiresIn=expires_in,
-            HttpMethod="PUT",
-        )
+        bucket = self._bucket(storage_class)
+        sign = self._presign_client.generate_presigned_url
+
+        def sign_all() -> list[str]:
+            # Signing makes no request, so up to 100 URLs take one hop to the pool, not one each
+            # (#166). The pod's credentials may refresh on the first, which is why it isn't the
+            # event loop's work.
+            return [
+                sign(
+                    ClientMethod="upload_part",
+                    Params={
+                        "Bucket": bucket,
+                        "Key": key,
+                        "UploadId": upload_id,
+                        "PartNumber": number,
+                        "ContentLength": size,
+                    },
+                    ExpiresIn=expires_in,
+                    HttpMethod="PUT",
+                )
+                for number, size in parts
+            ]
+
+        return await self._call(sign_all)
 
     async def list_parts(
         self, storage_class: StorageClass, key: str, upload_id: str

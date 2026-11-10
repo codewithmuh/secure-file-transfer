@@ -10,16 +10,16 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
 
+from sft.api.tenant_schemas import Tenant
 from sft.core.addresses import is_plain_address
+from sft.data.models import AdminRecovery as AdminRecoveryRow
 from sft.data.models import BreakGlassGrant
-from sft.data.models import Tenant as TenantRow
 from sft.data.models import User as UserRow
 from sft.service.sso import RecordedSso
 
-TenantStatus = Literal["active", "suspended"]
 Locale = Literal["en", "ja"]
 Role = Literal["admin", "member"]
 UserStatus = Literal["invited", "active", "deactivated"]
@@ -47,17 +47,6 @@ class TenantCreate(BaseModel):
     first_admin_email: EmailAddress
     recovery_contact: Annotated[str, Field(min_length=1, max_length=320)]
     default_locale: Locale = "en"
-
-
-class Tenant(BaseModel):
-    id: UUID
-    name: str
-    status: TenantStatus
-    created_at: datetime
-
-    @classmethod
-    def of(cls, row: TenantRow) -> Tenant:
-        return cls(id=row.id, name=row.name, status=row.status, created_at=row.created_at)  # type: ignore[arg-type]
 
 
 class User(BaseModel):
@@ -228,3 +217,94 @@ class BreakGlassRequest(BaseModel):
 
 class BreakGlassRequestList(BaseModel):
     items: Annotated[list[BreakGlassRequest], Field(max_length=100)]
+
+
+# ---- break-glass records (#239) ----
+
+
+class BreakGlassGrantCreate(BaseModel):
+    """What the break-glass tool records after an Identity Center `BreakGlass` assignment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assignment_request_id: Annotated[str, Field(min_length=1, max_length=128)]
+    requester: Annotated[str, Field(min_length=1, max_length=128)]
+    approver: Annotated[str, Field(min_length=1, max_length=128)]
+    incident_id: Annotated[str, Field(min_length=1, max_length=64)]
+    reason: Annotated[str, Field(min_length=1, max_length=1000)]
+    tenant_ids: Annotated[
+        list[UUID], Field(max_length=100, json_schema_extra={"uniqueItems": True})
+    ]
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+
+
+class RecordedBreakGlassGrant(BaseModel):
+    """The contract's `BreakGlassGrant`."""
+
+    model_config = ConfigDict(title="BreakGlassGrant")
+
+    id: UUID
+    assignment_request_id: str
+    requester: str
+    approver: str
+    incident_id: str
+    reason: str
+    tenant_ids: list[UUID]
+    starts_at: datetime
+    ends_at: datetime
+    recorded_by: Literal["tool", "reconciliation"]
+    review_due_at: datetime
+    review_url: Annotated[str | None, Field(json_schema_extra={"format": "uri"})]
+
+    @classmethod
+    def of(cls, row: BreakGlassGrant) -> RecordedBreakGlassGrant:
+        # A recorded grant has every one of these (sft.data.break_glass_records).
+        assert row.assignment_request_id is not None  # noqa: S101
+        assert row.approver is not None  # noqa: S101
+        assert row.starts_at is not None  # noqa: S101
+        assert row.ends_at is not None  # noqa: S101
+        assert row.review_due_at is not None  # noqa: S101
+        return cls(
+            id=row.id,
+            assignment_request_id=row.assignment_request_id,
+            requester=row.requester,
+            approver=row.approver,
+            incident_id=row.incident_id,
+            reason=row.reason,
+            tenant_ids=list(row.tenant_ids),
+            starts_at=row.starts_at,
+            ends_at=row.ends_at,
+            recorded_by=row.recorded_by,  # type: ignore[arg-type] # never `service` here
+            review_due_at=row.review_due_at,
+            review_url=row.review_url,
+        )
+
+
+class AdminRecoveryRequest(BaseModel):
+    """`recoverTenantAdmin`'s body (#239)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: UUID
+    confirmed_via: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class AdminRecovery(BaseModel):
+    id: UUID
+    tenant_id: UUID
+    user_id: UUID
+    kind: Literal["sign_in_reset", "temporary_local_sign_in"]
+    temporary_sign_in_expires_at: datetime | None
+    created_at: datetime
+
+    @classmethod
+    def of(cls, row: AdminRecoveryRow) -> AdminRecovery:
+        return cls(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            user_id=row.user_id,
+            kind=row.kind,  # type: ignore[arg-type] # the table's CHECK allows only these
+            temporary_sign_in_expires_at=row.temporary_sign_in_expires_at,
+            created_at=row.created_at,
+        )

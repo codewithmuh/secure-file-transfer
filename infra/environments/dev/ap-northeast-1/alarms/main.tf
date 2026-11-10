@@ -98,6 +98,8 @@ module "alarms" {
     aws.us_east_1 = aws.us_east_1
   }
 
+  conventions = module.conventions
+
   environment      = "dev"
   account_id       = var.account_id
   region           = module.conventions.region

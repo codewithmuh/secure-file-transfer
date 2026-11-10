@@ -40,12 +40,32 @@ leave out; `details` holds IDs, enums, numbers, flags and times only (data model
 are the same for the same range every time: lines in `(tx_id, id)` order, sorted keys, and gzip's
 header time fixed at 0.
 
+**One region alone, for a regional loss** (#257; architecture 7). While the failover's toggle names
+a surviving region (`AUDIT_ARCHIVE_SURVIVING_REGION`, the chart's
+`auditArchive.survivingRegionOnly`), the job writes each range to that region alone and moves the
+cursor on, so the archive keeps up in the region that is left; the same transaction records the
+range (`audit_archive_single_region`, revision 0039). The API's security-critical records go to that
+region alone too (`sft.service.audit_archive.SurvivingRegion`). Once the toggle is off again, at
+failback, each run first **back-fills**, with up to half its time budget so new events keep being
+archived: it reads each recorded range's events again, makes the same objects (same keys, same
+bytes, since a range's bytes depend on its rows alone) and writes them to every region, which keeps
+what it already holds; then it deletes the row. So the lost region ends with exactly the objects the
+surviving one has: no gap, no duplicate. The security-critical records of the window's events are
+written to every region too, from the same rows, since the API's went to one region alone; and for
+`GRACE_SECONDS` after the job first writes both regions again, every new range's records are written
+to every region as well, because the API's pods leave the mode a little after the job does. A
+grant's intent record (`download.grant_intent`) is never in the database, so it isn't back-filled:
+it gave no access by itself, its committed record (which is back-filled) supersedes it, and every
+reader ignores intents (data model 2.3). A month of audit events is never dropped while a range of
+it waits for the back-fill (#255, revision 0040).
+
 **Metrics** (docs/operations/metrics.md): `audit_archive_lag_seconds`, the age of the oldest
 committed event not yet in both regions (alert `AuditArchiveLagging` above 2 minutes, data model
 2.5); `audit_archive_events_total{region}`, events newly written to each region;
-`audit_archive_write_failures_total{region}`, shared with the security-critical writes; and the
-run's `lifecycle_job_last_success_timestamp_seconds{job="audit-archive"}`
-(`AuditArchiveJobNotRunning`).
+`audit_archive_write_failures_total{region}`, shared with the security-critical writes;
+`audit_archive_single_region_ranges`, the ranges waiting for the back-fill
+(`AuditArchiveSingleRegion`); and the run's
+`lifecycle_job_last_success_timestamp_seconds{job="audit-archive"}` (`AuditArchiveJobNotRunning`).
 """
 
 from __future__ import annotations
@@ -58,14 +78,23 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date
 from typing import Final
+from uuid import UUID
 
 from prometheus_client import CollectorRegistry, Counter, Gauge
 
 from sft.data import archive_cursor
 from sft.data.archive_cursor import ArchiveRow, Claim
+from sft.data.audit import ArchivedEvent
 from sft.data.database import Database
 from sft.data.scope import Scope
-from sft.service.audit_archive import ArchiveMetrics, ArchiveStore, ArchiveWriteError, Region
+from sft.service.audit_archive import (
+    ArchiveMetrics,
+    ArchiveStore,
+    ArchiveWriteError,
+    Region,
+    record_body,
+    record_key,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +104,14 @@ RUN_BUDGET_SECONDS: Final = 240.0
 """A run starts no new range after this, inside the CronJob's 300-second deadline."""
 CONTENT_TYPE: Final = "application/gzip"
 _TX_DIGITS: Final = 20
+GRACE_SECONDS: Final = 900.0
+"""After a regional loss, how long the job keeps writing new ranges' security-critical records to
+every region once it writes both again: an API rollout takes minutes, 15 covers it."""
+BACKFILL_RANGES: Final = 50
+"""Recorded ranges the back-fill reads at a time."""
+BACKFILL_SHARE: Final = 0.5
+"""The share of a run's budget the back-fill may take, so new events keep being archived while a
+day's back-fill catches up over several runs."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +119,7 @@ class ArchiveJobMetrics:
     events: Counter
     lag: Gauge
     failures: ArchiveMetrics
+    single_region: Gauge
 
     @classmethod
     def create(cls, registry: CollectorRegistry) -> ArchiveJobMetrics:
@@ -97,9 +135,15 @@ class ArchiveJobMetrics:
             "(NFR-15; the alert fires above 120 s).",
             registry=registry,
         )
+        single_region = Gauge(
+            "audit_archive_single_region_ranges",
+            "Ranges the archive job wrote to one region's archive alone during a regional loss, "
+            "waiting for the back-fill to the other (#257).",
+            registry=registry,
+        )
         for region in Region:
             events.labels(region.value)
-        return cls(events, lag, ArchiveMetrics.create(registry))
+        return cls(events, lag, ArchiveMetrics.create(registry), single_region)
 
 
 @dataclass
@@ -108,6 +152,10 @@ class ArchiveReport:
     events: int = 0
     objects_written: dict[str, int] = field(default_factory=dict)
     lag_seconds: float = 0.0
+    backfilled: int = 0
+    """Ranges written to every region after a regional loss (module docstring)."""
+    records_written: dict[str, int] = field(default_factory=dict)
+    single_region: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -115,6 +163,9 @@ class ArchiveReport:
             "events": self.events,
             "objects_written": dict(self.objects_written),
             "lag_seconds": round(self.lag_seconds, 3),
+            "backfilled": self.backfilled,
+            "records_written": dict(self.records_written),
+            "single_region": self.single_region,
         }
 
 
@@ -149,6 +200,76 @@ def batches(claimed: Claim, rows: Sequence[ArchiveRow]) -> list[tuple[str, bytes
     ]
 
 
+def _uuid(value: str | None) -> UUID | None:
+    return None if value is None else UUID(value)
+
+
+def records(rows: Sequence[ArchiveRow]) -> list[tuple[str, bytes]]:
+    """The security-critical records of the rows, as the API writes them (#177): the same key, and
+    a record made from the same columns."""
+    found = []
+    for row in rows:
+        if not row.security_critical:
+            continue
+        event = ArchivedEvent(
+            id=UUID(row.id),
+            tenant_id=_uuid(row.tenant_id),
+            occurred_at=row.occurred_at,
+            action=row.action,
+            actor_type=row.actor_type,
+            actor_id=_uuid(row.actor_id),
+            target_type=row.target_type,
+            target_id=_uuid(row.target_id),
+            outcome=row.outcome,
+            details=dict(row.details),
+        )
+        found.append((record_key(event), record_body(event)))
+    return found
+
+
+async def _write_range(
+    store: ArchiveStore,
+    metrics: ArchiveJobMetrics,
+    report: ArchiveReport,
+    claimed: Claim,
+    rows: Sequence[ArchiveRow],
+    *,
+    regions: Sequence[Region],
+    with_records: bool,
+) -> set[Region]:
+    """Write the range's objects, and with `with_records` its security-critical records, to each
+    of `regions`; the regions where a write failed."""
+    failed: set[Region] = set()
+
+    async def put(region: Region, key: str, body: bytes, content_type: str) -> bool | None:
+        try:
+            return await store.put_once(region, key, body, content_type=content_type)
+        except ArchiveWriteError as exc:
+            metrics.failures.failures.labels(region.value).inc()
+            log.warning(
+                "audit archive batch write failed",
+                extra={"region": region.value, "code": exc.code, "key": key},
+            )
+            failed.add(region)
+            return None
+
+    for key, body, count in batches(claimed, rows):
+        for region in regions:
+            if await put(region, key, body, CONTENT_TYPE):
+                metrics.events.labels(region.value).inc(count)
+                report.objects_written[region.value] = (
+                    report.objects_written.get(region.value, 0) + 1
+                )
+    if with_records:
+        for key, body in records(rows):
+            for region in regions:
+                if await put(region, key, body, "application/json"):
+                    report.records_written[region.value] = (
+                        report.records_written.get(region.value, 0) + 1
+                    )
+    return failed
+
+
 async def archive_range(
     database: Database,
     store: ArchiveStore,
@@ -156,36 +277,28 @@ async def archive_range(
     report: ArchiveReport,
     *,
     max_rows: int = BATCH_ROWS,
+    surviving: Region | None = None,
+    with_records: bool = False,
 ) -> Claim | None:
     """Claim, write and advance one range (module docstring); the range, or None when nothing was
-    ready. Raises `ArchiveIncompleteError` if a region failed."""
+    ready. With `surviving`, the range goes to that region alone and is recorded for the
+    back-fill. Raises `ArchiveIncompleteError` if a region failed."""
     async with database.transaction(Scope.system()) as session:
         claimed = await archive_cursor.claim(session, max_rows=max_rows)
         rows = [] if claimed is None else await archive_cursor.events(session, claimed)
     if claimed is None:
         return None
-    failed: set[Region] = set()
-    for key, body, count in batches(claimed, rows):
-        for region in store.regions:
-            try:
-                written = await store.put_once(region, key, body, content_type=CONTENT_TYPE)
-            except ArchiveWriteError as exc:
-                metrics.failures.failures.labels(region.value).inc()
-                log.warning(
-                    "audit archive batch write failed",
-                    extra={"region": region.value, "code": exc.code, "key": key},
-                )
-                failed.add(region)
-                continue
-            if written:
-                metrics.events.labels(region.value).inc(count)
-                report.objects_written[region.value] = (
-                    report.objects_written.get(region.value, 0) + 1
-                )
+    regions = (surviving,) if surviving is not None else store.regions
+    failed = await _write_range(
+        store, metrics, report, claimed, rows, regions=regions, with_records=with_records
+    )
     if failed:
         raise ArchiveIncompleteError(",".join(sorted(r.value for r in failed)))
     async with database.transaction(Scope.system()) as session:
-        moved = await archive_cursor.advance(session, claimed)
+        if surviving is None:
+            moved = await archive_cursor.advance(session, claimed)
+        else:
+            moved = await archive_cursor.advance_single_region(session, claimed, surviving.value)
     if not moved:
         log.info("another run moved the archive cursor first")
     report.ranges += 1
@@ -193,11 +306,49 @@ async def archive_range(
     return claimed
 
 
-async def measure_lag(database: Database, metrics: ArchiveJobMetrics) -> float:
-    """`audit_archive_lag_seconds`, from the database's clock."""
+async def backfill(
+    database: Database,
+    store: ArchiveStore,
+    metrics: ArchiveJobMetrics,
+    report: ArchiveReport,
+    *,
+    within_budget: Callable[[], bool],
+) -> None:
+    """Write every range recorded during a regional loss to every region, with its records, and
+    forget it (module docstring), while the budget lasts. Raises `ArchiveIncompleteError` if a
+    region failed: the range stays recorded, and the next run tries again."""
+    while within_budget():
+        async with database.transaction(Scope.system()) as session:
+            ranges = await archive_cursor.single_region_ranges(session, limit=BACKFILL_RANGES)
+        if not ranges:
+            return
+        for claimed in ranges:
+            async with database.transaction(Scope.system()) as session:
+                rows = await archive_cursor.events(session, claimed)
+            failed = await _write_range(
+                store, metrics, report, claimed, rows, regions=store.regions, with_records=True
+            )
+            if failed:
+                raise ArchiveIncompleteError(",".join(sorted(r.value for r in failed)))
+            async with database.transaction(Scope.system()) as session:
+                if await archive_cursor.backfilled(session, claimed):
+                    report.backfilled += 1
+            if not within_budget():
+                return
+
+
+async def measure_lag(
+    database: Database, metrics: ArchiveJobMetrics, report: ArchiveReport | None = None
+) -> float:
+    """`audit_archive_lag_seconds` and `audit_archive_single_region_ranges`, from the database;
+    the lag."""
     async with database.transaction(Scope.system()) as session:
         age = await archive_cursor.unarchived_age(session)
+        waiting = await archive_cursor.single_region_count(session)
     metrics.lag.set(age)
+    metrics.single_region.set(waiting)
+    if report is not None:
+        report.lag_seconds, report.single_region = age, waiting
     return age
 
 
@@ -209,21 +360,49 @@ async def run_archive(
     max_rows: int = BATCH_ROWS,
     budget_seconds: float = RUN_BUDGET_SECONDS,
     monotonic: Callable[[], float] = time.monotonic,
+    surviving: Region | None = None,
+    grace_seconds: float = GRACE_SECONDS,
 ) -> ArchiveReport:
-    """One run: ranges while more is ready and the budget lasts, then the lag. The lag is
-    measured even when a region failed, so the gauge never goes stale behind an error; then the
-    error is raised, and the run counts as failed."""
+    """One run: the back-fill after a regional loss, then ranges while more is ready and the
+    budget lasts, then the lag. With `surviving`, every range goes to that region alone (module
+    docstring). The lag is measured even when a region failed, so the gauge never goes stale
+    behind an error; then the error is raised, and the run counts as failed."""
     report = ArchiveReport()
     started = monotonic()
+
+    def within_budget() -> bool:
+        return monotonic() - started < budget_seconds
+
     error: ArchiveIncompleteError | None = None
     try:
-        while monotonic() - started < budget_seconds:
-            claimed = await archive_range(database, store, metrics, report, max_rows=max_rows)
+        with_records = False
+        if surviving is None:
+            async with database.transaction(Scope.system()) as session:
+                window = await archive_cursor.both_regions_again(
+                    session, grace_seconds=grace_seconds
+                )
+            with_records = window.single_region_since is not None
+            if with_records:
+
+                def backfill_budget() -> bool:
+                    return monotonic() - started < budget_seconds * BACKFILL_SHARE
+
+                await backfill(database, store, metrics, report, within_budget=backfill_budget)
+        while within_budget():
+            claimed = await archive_range(
+                database,
+                store,
+                metrics,
+                report,
+                max_rows=max_rows,
+                surviving=surviving,
+                with_records=with_records,
+            )
             if claimed is None or not claimed.more:
                 break
     except ArchiveIncompleteError as exc:
         error = exc
-    report.lag_seconds = await measure_lag(database, metrics)
+    await measure_lag(database, metrics, report)
     if error is not None:
         raise error
     return report

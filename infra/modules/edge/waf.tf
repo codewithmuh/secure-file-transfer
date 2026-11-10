@@ -7,6 +7,47 @@
 # itself; these rules keep floods off the pods.
 
 locals {
+  # The rollout mode, decided here once for every rule that rolls out (#186). Each such rule has one dynamic block per
+  # action, iterating over one of these two lists, so exactly one of the pair is present: Count during the rollout;
+  # after it, a managed rule group's own actions (override_action none) or a rate rule's Block.
+  rollout_count   = var.managed_rules_in_count ? [1] : []
+  rollout_enforce = var.managed_rules_in_count ? [] : [1]
+
+  # The managed rule groups (abuse 3.2, rules 1 to 4), by rule name: the web ACLs that run each, its priority there,
+  # whether it only labels (Count always, outside the rollout), and the group's own rules that only count.
+  managed_rule_groups = {
+    "ip-reputation" = {
+      web_acls    = ["api", "sign_in"]
+      priority    = 1
+      group       = "AWSManagedRulesAmazonIpReputationList"
+      labels_only = false
+      count_rules = []
+    }
+    # Labels only: corporate recipients often reach the internet through cloud proxies.
+    "anonymous-ip" = {
+      web_acls    = ["api"]
+      priority    = 2
+      group       = "AWSManagedRulesAnonymousIpList"
+      labels_only = true
+      count_rules = []
+    }
+    "known-bad-inputs" = {
+      web_acls    = ["api"]
+      priority    = 3
+      group       = "AWSManagedRulesKnownBadInputsRuleSet"
+      labels_only = false
+      count_rules = []
+    }
+    # Its 8 KB body rule only labels; rule 5 decides.
+    "core-rule-set" = {
+      web_acls    = ["api"]
+      priority    = 4
+      group       = "AWSManagedRulesCommonRuleSet"
+      labels_only = false
+      count_rules = ["SizeRestrictions_BODY"]
+    }
+  }
+
   # Rule 5's exceptions: the three routes whose bodies may exceed 8 KB. WAF allows only two levels of and, or and
   # not, so the rule matches the path alone; the API answers any other method on these paths with 405 unread.
   large_body_path_regex = "^/v1/(transfers|upload-requests|tenant/policy)$"
@@ -81,122 +122,49 @@ resource "aws_wafv2_web_acl" "api" {
     }
   }
 
-  rule {
-    name     = "ip-reputation"
-    priority = 1
+  # Rules 1 to 4: the managed rule groups this web ACL runs, in the rollout mode unless they only label.
+  dynamic "rule" {
+    for_each = { for name, g in local.managed_rule_groups : name => g if contains(g.web_acls, "api") }
 
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
+    content {
+      name     = rule.key
+      priority = rule.value.priority
+
+      override_action {
+        dynamic "count" {
+          for_each = rule.value.labels_only ? [1] : local.rollout_count
+          content {}
+        }
+        dynamic "none" {
+          for_each = rule.value.labels_only ? [] : local.rollout_enforce
+          content {}
+        }
       }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
-      }
-    }
 
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesAmazonIpReputationList"
-      }
-    }
+      statement {
+        managed_rule_group_statement {
+          vendor_name = "AWS"
+          name        = rule.value.group
 
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "ip-reputation"
-      sampled_requests_enabled   = true
-    }
-  }
+          dynamic "rule_action_override" {
+            for_each = rule.value.count_rules
 
-  # Labels only: corporate recipients often reach the internet through cloud proxies.
-  rule {
-    name     = "anonymous-ip"
-    priority = 2
+            content {
+              name = rule_action_override.value
 
-    override_action {
-      count {}
-    }
-
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesAnonymousIpList"
-      }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "anonymous-ip"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  rule {
-    name     = "known-bad-inputs"
-    priority = 3
-
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
-      }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
-      }
-    }
-
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesKnownBadInputsRuleSet"
-      }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "known-bad-inputs"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  # Its 8 KB body rule only labels; rule 5 decides.
-  rule {
-    name     = "core-rule-set"
-    priority = 4
-
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
-      }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
-      }
-    }
-
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesCommonRuleSet"
-
-        rule_action_override {
-          name = "SizeRestrictions_BODY"
-
-          action_to_use {
-            count {}
+              action_to_use {
+                count {}
+              }
+            }
           }
         }
       }
-    }
 
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "core-rule-set"
-      sampled_requests_enabled   = true
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = rule.key
+        sampled_requests_enabled   = true
+      }
     }
   }
 
@@ -497,32 +465,49 @@ resource "aws_wafv2_web_acl" "sign_in" {
     }
   }
 
-  rule {
-    name     = "ip-reputation"
-    priority = 1
+  # Rule 1: the managed rule groups this web ACL runs, in the rollout mode unless they only label.
+  dynamic "rule" {
+    for_each = { for name, g in local.managed_rule_groups : name => g if contains(g.web_acls, "sign_in") }
 
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
-      }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
-      }
-    }
+    content {
+      name     = rule.key
+      priority = rule.value.priority
 
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesAmazonIpReputationList"
+      override_action {
+        dynamic "count" {
+          for_each = rule.value.labels_only ? [1] : local.rollout_count
+          content {}
+        }
+        dynamic "none" {
+          for_each = rule.value.labels_only ? [] : local.rollout_enforce
+          content {}
+        }
       }
-    }
 
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "ip-reputation"
-      sampled_requests_enabled   = true
+      statement {
+        managed_rule_group_statement {
+          vendor_name = "AWS"
+          name        = rule.value.group
+
+          dynamic "rule_action_override" {
+            for_each = rule.value.count_rules
+
+            content {
+              name = rule_action_override.value
+
+              action_to_use {
+                count {}
+              }
+            }
+          }
+        }
+      }
+
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = rule.key
+        sampled_requests_enabled   = true
+      }
     }
   }
 
@@ -587,11 +572,11 @@ resource "aws_wafv2_web_acl" "sign_in" {
 
     action {
       dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
+        for_each = local.rollout_count
         content {}
       }
       dynamic "block" {
-        for_each = var.managed_rules_in_count ? [] : [1]
+        for_each = local.rollout_enforce
         content {}
       }
     }
@@ -623,11 +608,11 @@ resource "aws_wafv2_web_acl" "sign_in" {
 
     action {
       dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
+        for_each = local.rollout_count
         content {}
       }
       dynamic "block" {
-        for_each = var.managed_rules_in_count ? [] : [1]
+        for_each = local.rollout_enforce
         content {}
       }
     }
@@ -663,11 +648,11 @@ resource "aws_wafv2_web_acl" "sign_in" {
 
     action {
       dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
+        for_each = local.rollout_count
         content {}
       }
       dynamic "block" {
-        for_each = var.managed_rules_in_count ? [] : [1]
+        for_each = local.rollout_enforce
         content {}
       }
     }

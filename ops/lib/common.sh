@@ -208,10 +208,18 @@ utc() {
   date -u -r "$1" +%H:%M:%S 2>/dev/null || date -u -d "@$1" +%H:%M:%S
 }
 
-# Names (infra/README.md, Names): the Aurora global database and clusters, the EKS clusters and kube contexts.
-global_cluster() { echo "sft-$ENV_NAME-aurora"; }
+# Names (infra/README.md, Names): the Aurora global database and clusters, the EKS clusters and kube contexts. The
+# global database is sft-<env>-aurora until a failback after a detach makes sft-<env>-aurora-<n> (#261):
+# SFT_AURORA_GENERATION names it.
+global_cluster() {
+  local generation="${SFT_AURORA_GENERATION:-1}"
+  if [[ "$generation" == 1 ]]; then echo "sft-$ENV_NAME-aurora"; else echo "sft-$ENV_NAME-aurora-$generation"; fi
+}
 db_cluster() { echo "sft-$ENV_NAME-$(short "$1")-aurora"; }
-eks_cluster() { echo "sft-$ENV_NAME-$(short "$1")"; }
+# sft-<env>-<region-short>: the prefix of the region's names, Karpenter's discovery tag among them (modules/network).
+region_prefix() { echo "sft-$ENV_NAME-$(short "$1")"; }
+# The EKS cluster, <prefix>-eks (modules/eks-cluster), whose name Kubernetes puts in its volumes' tags.
+eks_cluster() { echo "$(region_prefix "$1")-eks"; }
 short() {
   case "$1" in
     "$TOKYO") echo apne1 ;;

@@ -64,6 +64,8 @@ locals {
 module "cluster" {
   source = "../../../../modules/eks-cluster"
 
+  conventions = module.conventions
+
   environment        = "dev"
   region             = module.conventions.region
   account_id         = var.account_id

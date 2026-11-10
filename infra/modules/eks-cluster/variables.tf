@@ -278,3 +278,12 @@ variable "tunnel_extra_hosts" {
     error_message = "tunnel_extra_hosts must be plain host names."
   }
 }
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): the Regions' short names and the workload roles this layer makes, from their one definition (#172)."
+  type = object({
+    region_shorts       = map(string)
+    workload_roles      = map(list(string))
+    workload_role_names = map(string)
+  })
+}
