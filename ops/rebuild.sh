@@ -5,14 +5,16 @@
 # that may change the environment's IAM (SCP OnlyDeployRolesChangeIam) and, with BreakGlass, its clusters (ADR-0004).
 #
 #   ops/rebuild.sh --env staging --profile sft-ci                                     # dry run: lists every step
-#   ops/rebuild.sh --env dev --profile sft-ci --account-id <id> --stage stacks --execute --unattended
+#   ops/rebuild.sh --env dev --profile sft-ci --account-id <id> --stage foundation --execute --unattended
 #
 # Script options, besides the common ones (ops/lib/common.sh):
-#   --stage stacks|after|all  stacks: network, data, cluster, edge and identity, layer by layer, Tokyo then Osaka.
-#                             after: the alarms, then the first deploy: the key rotation's first run (the identity
-#                             layer's secrets start empty, deploy/README.md) and Argo CD's Applications synced and
-#                             healthy. cluster-bootstrap goes between the two, in its own job
-#                             (cluster-bootstrap-apply.yml), so all (the default) is for a dry run only.
+#   --stage S                 foundation: network, data, and network again for its flow log, Tokyo then Osaka.
+#                             platform: cluster, edge and identity. stacks: both. after: the alarms, then the first
+#                             deploy: the key rotation's first run (the identity layer's secrets start empty,
+#                             deploy/README.md) and Argo CD's Applications synced and healthy. cluster-bootstrap goes
+#                             between platform and after, in its own job (cluster-bootstrap-apply.yml), so all (the
+#                             default) is for a dry run only. The environment workflow runs foundation and platform
+#                             as two jobs, each with its own 2-hour deploy session (#299).
 #   --unattended              with --execute: nobody at the keyboard (the environment workflow): no typed confirmation,
 #                             and operator steps are listed in the log for after the run instead of waited for.
 #   --allow-destroy           apply a plan that destroys or replaces something. Without it a rebuild refuses one: on
@@ -30,7 +32,7 @@ STEPS_DOC=docs/runbooks/environment-up-down.md
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
   echo
   common_usage
 }
@@ -47,8 +49,14 @@ while [[ $# -gt 0 ]]; do
     *) die "unknown option $1" ;;
   esac
 done
-[[ "$STAGE" =~ ^(stacks|after|all)$ ]] || die "--stage must be stacks, after or all"
-! $EXECUTE || [[ "$STAGE" != all ]] || die "--execute takes --stage stacks or after: cluster-bootstrap runs between them, in its own job (cluster-bootstrap-apply.yml)"
+[[ "$STAGE" =~ ^(foundation|platform|stacks|after|all)$ ]] || die "--stage must be foundation, platform, stacks, after or all"
+! $EXECUTE || [[ "$STAGE" != all ]] || die "--execute takes --stage foundation, platform, stacks or after: cluster-bootstrap runs between platform and after, in its own job (cluster-bootstrap-apply.yml)"
+DO_FOUNDATION=false
+DO_PLATFORM=false
+DO_AFTER=false
+[[ ! "$STAGE" =~ ^(foundation|stacks|all)$ ]] || DO_FOUNDATION=true
+[[ ! "$STAGE" =~ ^(platform|stacks|all)$ ]] || DO_PLATFORM=true
+[[ ! "$STAGE" =~ ^(after|all)$ ]] || DO_AFTER=true
 ! $UNATTENDED || $EXECUTE || die "--unattended is for --execute"
 
 REGIONS=("$TOKYO" "$OSAKA")
@@ -66,8 +74,8 @@ apply() {
   plan="${SFT_TF_LOG_DIR:-${TMPDIR:-/tmp}/sft-$DRILL-$ENV_NAME-terraform}/${root//\//_}.tfplan"
   tf_root "$root" plan -input=false -out="$plan" "$@"
   if $EXECUTE; then
-    destroys="$(sed -n 's/^Plan: .* \([0-9][0-9]*\) to destroy\.$/\1/p' "$TF_LAST_LOG" | head -1)"
-    if [[ -n "$destroys" && "$destroys" != 0 ]] && ! $ALLOW_DESTROY; then
+    destroys="$(plan_destroys "$TF_LAST_LOG")"
+    if [[ "$destroys" != 0 ]] && ! $ALLOW_DESTROY; then
       die "$root: the plan destroys $destroys resource(s). A rebuild only creates and updates; review the plan (its log: $TF_LAST_LOG) and run again with --allow-destroy if it is meant"
     fi
   fi
@@ -76,25 +84,49 @@ apply() {
 
 # --- stacks ----------------------------------------------------------------------------------------------------------
 
-network() { apply "$(env_root "$1" network)"; }
+# The VPC flow log goes to the same Region's flow-log bucket, the data stack's flow_log_bucket_arn output, which a first
+# build doesn't have yet: network goes once without it, then again after data (infra/README.md). Once the data stack
+# exists every apply passes it, so no apply turns the flow log off.
+network() {
+  local region="$1" data arn
+  data="$(env_root "$region" data)"
+  tf_init "$data"
+  arn="$(tf_output "$data" flow_log_bucket_arn)"
+  arn="${arn//\"/}"
+  if [[ -n "$arn" && "$arn" != null ]]; then
+    echo "   TF_VAR_flow_log_destination_arn: the data stack's flow_log_bucket_arn output"
+    TF_VAR_flow_log_destination_arn="$arn" apply "$(env_root "$region" network)"
+  else
+    echo "   No flow-log bucket yet (a first build): the flow log comes with network's apply after data."
+    apply "$(env_root "$region" network)"
+  fi
+}
 
-# Tokyo's data stack. In staging and prod the Regions need each other's keys and buckets, so a first build applies it
-# with osaka_ready=false, then Osaka's, then Tokyo's again (infra/README.md). A first build is one where Osaka's data
-# stack holds nothing yet; once it does, osaka_ready keeps its default, true, so no apply turns replication off.
+# Whether Tokyo's data stack replicates to Osaka already: its state holds the files buckets' replication rules, which
+# exist only with osaka_ready (modules/files-buckets). Until they do, Osaka isn't ready, whether this is a first build
+# or one that stopped before Osaka's data stack was complete (#299), so the build can always be resumed.
+tokyo_replicates() {
+  local list
+  $EXECUTE || return 1
+  list="$(state_list "$(env_root "$TOKYO" data)")"
+  grep -q 'aws_s3_bucket_replication_configuration\.this' <<<"$list"
+}
+
+# Tokyo's data stack. In staging and prod the Regions need each other's keys and buckets, so until Tokyo replicates,
+# it goes with osaka_ready=false, then Osaka's, then Tokyo's again (infra/README.md). Once it replicates, osaka_ready
+# keeps its default, true, so no apply turns replication off.
 data_tokyo() {
-  local osaka
   if ! $TWO_REGIONS; then
     apply "$(env_root "$TOKYO" data)"
     return
   fi
-  osaka="$(env_root "$OSAKA" data)"
-  tf_init "$osaka"
-  if has_state "$osaka"; then
-    echo "   Osaka's data stack exists: osaka_ready keeps its default (true)."
+  tf_init "$(env_root "$TOKYO" data)"
+  if tokyo_replicates; then
+    echo "   Tokyo already replicates to Osaka: osaka_ready keeps its default (true)."
     echo false >"$FIRST_BUILD_FILE"
     apply "$(env_root "$TOKYO" data)"
   else
-    echo "   Osaka's data stack holds nothing: a first build, so Tokyo goes first with osaka_ready=false."
+    echo "   Tokyo doesn't replicate to Osaka yet (a first build, or one that stopped early): osaka_ready=false first."
     echo true >"$FIRST_BUILD_FILE"
     apply "$(env_root "$TOKYO" data)" -var osaka_ready=false
   fi
@@ -114,7 +146,7 @@ data_osaka() {
 # A first build's second apply of Tokyo's data stack, now that Osaka's buckets and key replicas exist.
 data_tokyo_again() {
   if $EXECUTE && [[ "$(cat "$FIRST_BUILD_FILE")" != true ]]; then
-    echo "   Not a first build: Tokyo's data stack already has osaka_ready=true."
+    echo "   Tokyo already replicates: its data stack keeps osaka_ready=true."
     return 0
   fi
   apply "$(env_root "$TOKYO" data)"
@@ -138,13 +170,7 @@ edge() {
   TF_VAR_web_distribution_arn="$arn" apply "$(env_root "$OSAKA" edge)"
 }
 
-identity() {
-  if $EXECUTE && [[ "$(image_digest)" =~ ^sha256:0+$ ]]; then
-    die "deploy/environments/$ENV_NAME/$TOKYO/values.yaml pins no image yet (the all-zeros digest): the sign-in" \
-      "triggers need one. Let build.yml build main, merge its pull request that pins dev, then run this again."
-  fi
-  apply "$(env_root "$1" identity)"
-}
+identity() { apply "$(env_root "$1" identity)"; }
 
 # --- after -----------------------------------------------------------------------------------------------------------
 
@@ -179,38 +205,55 @@ synced_and_healthy() {
 # --- order -----------------------------------------------------------------------------------------------------------
 
 stack_inputs
-if [[ "$STAGE" != after ]]; then
+# The sign-in triggers (identity) run the image the values pin. Checked before anything is built: without one, the
+# build would stop at identity after about an hour of stacks that bill (#299).
+if $EXECUTE && ($DO_FOUNDATION || $DO_PLATFORM) && [[ "$(image_digest)" =~ ^sha256:0+$ ]]; then
+  die "deploy/environments/$ENV_NAME/$TOKYO/values.yaml pins no image yet (the all-zeros digest): the sign-in" \
+    "triggers need one. Let build.yml build main, merge its pull request that pins dev, then run this again."
+fi
+if $DO_FOUNDATION || $DO_PLATFORM; then
   echo "Stacks, in this order:"
   {
-    for region in "${REGIONS[@]}"; do env_root "$region" network; done
-    env_root "$TOKYO" data
-    if $TWO_REGIONS; then
-      env_root "$OSAKA" data
-      echo "$(env_root "$TOKYO" data) (again, on a first build)"
+    if $DO_FOUNDATION; then
+      for region in "${REGIONS[@]}"; do env_root "$region" network; done
+      env_root "$TOKYO" data
+      if $TWO_REGIONS; then
+        env_root "$OSAKA" data
+        echo "$(env_root "$TOKYO" data) (again, until Tokyo replicates)"
+      fi
+      for region in "${REGIONS[@]}"; do printf '%s (again: the flow log, once data exists)\n' "$(env_root "$region" network)"; done
     fi
-    for layer in cluster edge identity; do
-      for region in "${REGIONS[@]}"; do env_root "$region" "$layer"; done
-    done
+    if $DO_PLATFORM; then
+      for layer in cluster edge identity; do
+        for region in "${REGIONS[@]}"; do env_root "$region" "$layer"; done
+      done
+    fi
   } | nl -w3 -s'. ' | sed 's/^/ /'
 fi
 if [[ "$STAGE" == all ]]; then
   echo "Then cluster-bootstrap, Tokyo then Osaka, in cluster-bootstrap-apply.yml."
 fi
-if [[ "$STAGE" != stacks ]]; then
+if $DO_AFTER; then
   echo "Then the alarms ($(printf '%s ' "${REGIONS[@]}")) and the first deploy."
 fi
 confirm_execute
 T0=$(date +%s)
 
-if [[ "$STAGE" != after ]]; then
+if $DO_FOUNDATION; then
   for region in "${REGIONS[@]}"; do
     step 900 "Apply $(env_root "$region" network)" network "$region"
   done
   step 1800 "Apply $(env_root "$TOKYO" data)" data_tokyo
   if $TWO_REGIONS; then
     step 1800 "Apply $(env_root "$OSAKA" data)" data_osaka
-    step 900 "Apply $(env_root "$TOKYO" data) again (first build only)" data_tokyo_again
+    step 900 "Apply $(env_root "$TOKYO" data) again (until Tokyo replicates)" data_tokyo_again
   fi
+  for region in "${REGIONS[@]}"; do
+    step 600 "Apply $(env_root "$region" network) again: the flow log" network "$region"
+  done
+fi
+
+if $DO_PLATFORM; then
   for region in "${REGIONS[@]}"; do
     step 1800 "Apply $(env_root "$region" cluster)" cluster "$region"
   done
@@ -226,7 +269,7 @@ if [[ "$STAGE" == all ]]; then
   manual "cluster-bootstrap, Tokyo then Osaka: the environment workflow runs cluster-bootstrap-apply.yml here."
 fi
 
-if [[ "$STAGE" != stacks ]]; then
+if $DO_AFTER; then
   for region in "${REGIONS[@]}"; do
     step 600 "Apply $(env_root "$region" alarms)" alarms "$region"
   done

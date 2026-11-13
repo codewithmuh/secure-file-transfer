@@ -41,12 +41,13 @@ output "kms" {
 }
 
 output "storage" {
-  description = "The buckets and roles (#102): the files buckets, the audit archive (null in prod, whose archive is the retained stack's), EventBridge's delivery role (Tokyo only) and the Malware Protection plan (null where it is off)."
+  description = "The buckets and roles (#102): the files buckets, the audit archive (null in prod, whose archive is the retained stack's), EventBridge's delivery role (Tokyo only), the Malware Protection plan (null where it is off) and the VPC flow log's bucket ARN (flow-logs.tf)."
   value = {
     files_bucket_names          = module.files_buckets.bucket_names
     audit_archive_bucket_name   = one(module.audit_archive[*].bucket_name)
     events_delivery_role_arn    = one(module.events_delivery[*].role_arn)
     malware_protection_plan_arn = module.files_buckets.malware_protection_plan_arn
+    flow_log_bucket_arn         = aws_s3_bucket.flow_logs.arn
   }
 }
 

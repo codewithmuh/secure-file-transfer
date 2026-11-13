@@ -914,7 +914,9 @@ data "aws_iam_policy_document" "logs" {
     }
   }
 
-  # Vended logs to S3: CloudFront's standard logs, whose delivery sources are in us-east-1, and the web ACLs' (#105).
+  # Vended logs to S3: CloudFront's standard logs, whose delivery sources are in us-east-1, the web ACLs' (#105) and
+  # the VPC flow logs (modules/data-stack, flow-logs.tf), each delivered by CloudWatch Logs' delivery service. AWS's
+  # key policy for vended logs to an SSE-KMS bucket; the buckets' policies repeat the same source conditions.
   statement {
     sid       = "LogDeliveryWritesVendedLogs"
     actions   = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]

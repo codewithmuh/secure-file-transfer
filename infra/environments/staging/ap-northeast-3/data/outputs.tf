@@ -1,5 +1,5 @@
 # Read by the cluster and cluster-bootstrap stacks and by the application's settings (infra/modules/data-stack).
-# The keys and buckets (#102) are at the end.
+# The keys and buckets (#102) are at the end, then the flow log's bucket, which the network's second apply takes.
 
 output "aurora_cluster_identifier" {
   description = "The Aurora cluster in this Region."
@@ -88,4 +88,9 @@ output "audit_archive_bucket_name" {
 output "malware_protection_plan_arn" {
   description = "The large-files bucket's GuardDuty Malware Protection plan, or null where it is off."
   value       = module.data.storage.malware_protection_plan_arn
+}
+
+output "flow_log_bucket_arn" {
+  description = "The VPC flow log's bucket in this Region, sft-<env>-<region-short>-flow-logs-<account-id>, as a bucket ARN: the network root's flow_log_destination_arn for its second apply (infra/README.md, \"Apply order\")."
+  value       = module.data.storage.flow_log_bucket_arn
 }

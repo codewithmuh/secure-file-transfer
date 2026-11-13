@@ -353,10 +353,31 @@ tf_output() {
   terraform -chdir="$REPO_ROOT/infra/$1" output -json "$2" 2>/dev/null || true
 }
 
+# state_list <root>: the resource addresses an initialized root's state holds, empty when it has none. A state that
+# can't be read stops the script: guessing "empty" would plan a first build's inputs, or a create, on a live stack.
+state_list() {
+  local list
+  if list="$(terraform -chdir="$REPO_ROOT/infra/$1" state list 2>&1)"; then
+    printf '%s\n' "$list"
+  elif [[ "$list" == *"No state file was found"* ]]; then
+    return 0
+  else
+    die "can't read infra/$1's state: $list"
+  fi
+}
+
 # has_state <root>: whether an initialized root holds any resource; a dry run says no.
 has_state() {
   $EXECUTE || return 1
-  [[ -n "$(terraform -chdir="$REPO_ROOT/infra/$1" state list 2>/dev/null | head -1)" ]]
+  [[ -n "$(state_list "$1")" ]]
+}
+
+# plan_destroys <log>: how many resources a plan's log says it destroys (0 when it says nothing), from Terraform's
+# summary line, colored or not: "Plan: 1 to add, 0 to change, 2 to destroy." or "..., 2 to destroy, 1 to forget."
+plan_destroys() {
+  local n
+  n="$(sed $'s/\x1b\\[[0-9;]*m//g' "$1" | sed -n 's/^Plan: .*[^0-9]\([0-9][0-9]*\) to destroy.*$/\1/p' | head -1)"
+  echo "${n:-0}"
 }
 
 # with_tunnel <region> <command...>: run it with that Region's private cluster API reachable through the Systems
@@ -365,8 +386,12 @@ has_state() {
 # tunnel closes afterwards, whatever the command did. Needs the Session Manager plugin, and an identity the cluster
 # admits: the deploy role (the environment workflow) or BreakGlass.
 with_tunnel() {
-  local region="$1" port="${SFT_TUNNEL_PORT:-8443}" kubeconfig status=0
+  local region="$1" port kubeconfig status=0
   shift
+  # A port per Region, so a tunnel still closing in one never answers for the next (#299).
+  port=8443
+  [[ "$region" != "$OSAKA" ]] || port=8444
+  port="${SFT_TUNNEL_PORT:-$port}"
   kubeconfig="${TMPDIR:-/tmp}/sft-$ENV_NAME-$(short "$region")-kubeconfig"
   run "$REPO_ROOT/.github/scripts/cluster-tunnel.sh" open "$ENV_NAME" "$region" "$port" "$kubeconfig"
   set +e

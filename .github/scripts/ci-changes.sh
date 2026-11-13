@@ -63,6 +63,19 @@ if [[ "${1:-}" == --test ]]; then
   expect "python=true stack=true " .gitleaks.toml
   expect "python=true stack=true " some/new/place.txt
   expect "python=false stack=false "
+  # A move out of a tested tree counts at its old path too (--no-renames).
+  repo="$(mktemp -d)"
+  git -C "$repo" init -q
+  mkdir -p "$repo/services/api"
+  echo "x = 1" >"$repo/services/api/tool.py"
+  git -C "$repo" add -A && git -C "$repo" -c user.name=t -c user.email=t@example.com commit -qm base
+  base_sha="$(git -C "$repo" rev-parse HEAD)"
+  mkdir -p "$repo/ops" && git -C "$repo" mv services/api/tool.py ops/tool.py
+  git -C "$repo" -c user.name=t -c user.email=t@example.com commit -qm move
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  got="$(cd "$repo" && EVENT=pull_request PR_BASE="$base_sha" "$self" | tr '\n' ' ')"
+  [[ "$got" == "python=true stack=true " ]] || { echo "FAIL: a move out of services/api -> $got" >&2; failures=$((failures + 1)); }
+  rm -rf "$repo"
   ((failures == 0)) || exit 1
   echo "ci-changes checks passed"
   exit 0
@@ -75,5 +88,6 @@ if [[ "$event" != pull_request || -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-
   echo "stack=true"
   exit 0
 fi
-# On a pull request HEAD is the merge commit, so this diff is exactly what the pull request changes.
-git diff --name-only "$base" HEAD | decide
+# On a pull request HEAD is the merge commit, so this diff is exactly what the pull request changes. Without rename
+# detection a moved file is listed at both its old and its new path, so a move out of a tested tree still counts.
+git diff --name-only --no-renames "$base" HEAD | decide

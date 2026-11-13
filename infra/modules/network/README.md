@@ -140,10 +140,14 @@ rule trusts CNAME targets (`TRUST_REDIRECTION_DOMAIN`): the owner of an allowed 
 ## Flow log
 
 All traffic, Parquet, Hive-compatible hourly partitions, with the fields that show where traffic went behind NAT
-(`pkt-dstaddr`, `traffic-path`, `pkt-dst-aws-service`). It goes to the environment's S3 log bucket under the logs key
-(capacity A19, encryption 3.1), which the data layer creates after this one: until `flow_log_destination_arn` is set
-there is no flow log (`.trivyignore.yaml`, AVD-AWS-0178), and the first build applies the network twice
-(infra/README.md, "Apply order").
+(`pkt-dstaddr`, `traffic-path`, `pkt-dst-aws-service`). It goes to the Region's flow log bucket,
+`sft-<env>-<region-short>-flow-logs-<account-id>`, which the data layer creates after this one
+([`data-stack`](../data-stack/README.md), `flow-logs.tf`): SSE-KMS under the logs key with S3 Bucket Keys, kept 90
+days (capacity A19 and A33, encryption 3.1). Its policy and the logs key's let `delivery.logs.amazonaws.com` write
+only for this account and Region (`aws:SourceAccount`, `aws:SourceArn`), under `AWSLogs/aws-account-id=<account>/`.
+Until `flow_log_destination_arn` is set there is no flow log (`.trivyignore.yaml`, AVD-AWS-0178), so the first build
+applies the network twice, the second time with the data root's `flow_log_bucket_arn` output as
+`flow_log_destination_arn` (infra/README.md, "Apply order").
 
 ## Inputs and outputs
 

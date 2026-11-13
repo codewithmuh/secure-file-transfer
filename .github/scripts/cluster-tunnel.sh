@@ -40,6 +40,8 @@ cmd_open() {
   host=${endpoint#https://}
   [[ -n $host && $arn == arn:aws:eks:* ]] || die "can't read $name-eks"
 
+  # A listener already on the port would answer the readiness probe below in the tunnel's place (#299).
+  if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then die "port $port is already in use on this machine"; fi
   mkdir -p "$state"
   aws ssm start-session --region "$region" --target "$instance" --document-name "$name-cluster-tunnel" \
     --parameters "{\"host\":[\"$host\"],\"portNumber\":[\"443\"],\"localPortNumber\":[\"$port\"]}" \
@@ -72,6 +74,8 @@ cmd_close() {
   if [[ -n $id ]]; then
     aws ssm terminate-session --region "$(cat "$state/region")" --session-id "$id" >/dev/null || true
   fi
+  # The CLI runs the Session Manager plugin as its child, which holds the local port: end both (#299).
+  pkill -TERM -P "$(cat "$state/pid")" 2>/dev/null || true
   kill "$(cat "$state/pid")" 2>/dev/null || true
   rm -rf "$state"
 }

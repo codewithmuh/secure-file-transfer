@@ -35,10 +35,11 @@ misconfigurations:
       - "**/modules/network/main.tf"
     statement: >-
       The module has a flow log for all traffic (aws_flow_log.this), created once the root sets
-      flow_log_destination_arn. Its destination is the environment's S3 log bucket under the logs key (capacity A19,
-      encryption 3.1), which the data layer creates after the network, so a fresh build applies the network a second
-      time with it (infra/README.md, "Apply order"). Trivy sees the default, null. Flow logs are part of T-53's
-      detection, with the proxy's byte logs and GuardDuty.
+      flow_log_destination_arn. Its destination is the Region's sft-<env>-<region-short>-flow-logs-<account-id> bucket
+      under the logs key (capacity A19, encryption 3.1; modules/data-stack, flow-logs.tf), which the data layer creates
+      after the network, so a fresh build applies the network a second time with the data root's flow_log_bucket_arn
+      output (infra/README.md, "Apply order"). Trivy sees the default, null. Flow logs are part of T-53's detection,
+      with the proxy's byte logs and GuardDuty.
   - id: AVD-AWS-0089 # S3 bucket logging
     paths:
       - "**/modules/files-buckets/main.tf"
@@ -93,18 +94,19 @@ misconfigurations:
   - id: AVD-AWS-0089 # S3 bucket logging
     paths:
       - "**/modules/edge/logs.tf"
+      - "**/modules/data-stack/flow-logs.tf"
       - "**/modules/edge/web-bucket.tf"
       - "**/modules/web-bundles/main.tf"
       - "**/modules/log-archive/main.tf"
     statement: >-
       Log buckets don't log to more log buckets, which would only move the question one bucket on: the edge's WAF and
-      load balancer log buckets and the organization's log archive are written by AWS's log delivery services and
-      read by people only through their own sessions, which the organization trail records as management events and
-      KMS calls (T-75). The web bundle buckets hold public content; CloudFront's own standard logs record every read,
-      and only the release pipeline writes them (ADR-0008, T-02); the bundle store is read only by the environments'
-      release roles and written only by the publish role, each assumed from a main-only GitHub environment whose
-      runs are the record (#283). Changes to any of them are management events in the
-      organization trail.
+      load balancer log buckets, the data layer's VPC flow log buckets and the organization's log archive are written
+      by AWS's log delivery services and read by people only through their own sessions, which the organization trail
+      records as management events and KMS calls (T-75). The web bundle buckets hold public content; CloudFront's own
+      standard logs record every read, and only the release pipeline writes them (ADR-0008, T-02); the bundle store is
+      read only by the environments' release roles and written only by the publish role, each assumed from a
+      main-only GitHub environment whose runs are the record (#283). Changes to any of them are management events in
+      the organization trail.
   - id: AVD-AWS-0162 # CloudTrail to CloudWatch Logs
     paths:
       - "**/modules/log-archive/main.tf"

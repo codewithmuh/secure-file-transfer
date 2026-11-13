@@ -31,6 +31,7 @@ jobs:
           persist-credentials: false
       - name: The Python suite and the local stack, each affected or not
         id: changes
+        shell: bash # with pipefail: a failing script fails the job, which then runs everything (#299)
         env:
           EVENT: ${{ github.event_name }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
