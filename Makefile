@@ -5,7 +5,7 @@ SHELL := bash
 PY := services/api
 
 .PHONY: help setup fmt lint test check scan build up down logs clean
-.PHONY: prereqs reset smoke
+.PHONY: prereqs reset smoke aws-up aws-down aws-status
 
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
@@ -195,6 +195,15 @@ infra-check: ## Check infra/: conventions, fmt, validate, tflint, Trivy and terr
 
 # The deploy config under deploy/ (deploy/README.md): needs helm 3, kubeconform and Docker, at the versions in ci.yml.
 .PHONY: deploy-check
+aws-up: ## AWS: build an environment, up to 2 hours: make aws-up ENV=dev (runs the environment workflow on main)
+	@ops/environment.sh up "$(ENV)"
+
+aws-down: ## AWS: destroy what an environment bills for: make aws-down ENV=dev (asks you to type the name)
+	@ops/environment.sh down "$(ENV)"
+
+aws-status: ## AWS: what an environment still has, read-only: make aws-status ENV=dev
+	@ops/environment.sh status "$(ENV)"
+
 deploy-check: ## Check deploy/: helm lint, template and kubeconform per cluster, the runtime contract, the admission policies, the alert rules (same as CI)
 	deploy/check.sh
 	uv run --project $(PY) --locked pytest -p no:cacheprovider deploy/tests deploy/observability/tests

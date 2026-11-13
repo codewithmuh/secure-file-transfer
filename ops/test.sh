@@ -48,6 +48,7 @@ scripts=(
   "az-failure.sh --az apne1-az1"
   "point-in-time-restore.sh --restore-to 2026-11-01T00:00:00Z"
   "teardown.sh"
+  "rebuild.sh"
 )
 
 for entry in "${scripts[@]}"; do
@@ -101,6 +102,46 @@ want="environments/prod/ap-northeast-3/alarms environments/prod/ap-northeast-1/a
 [[ "$listed" == *"$want"* ]] || fail "teardown order: $listed"
 [[ "$listed" == *"environments/prod/ap-northeast-1/network bootstrap/prod/ap-northeast-3 bootstrap/prod/ap-northeast-1 shared "* ]] ||
   fail "teardown's final order: $listed"
+
+# The teardown's parts (#295): the workflow runs the layers as the deploy role, unattended, through the tunnel.
+expect_refusal "--part retained is prod's" "$ops/teardown.sh" --env staging --profile p --part retained
+expect_refusal "--part bootstrap needs --scope final" "$ops/teardown.sh" --env staging --profile p --part bootstrap
+expect_refusal "--unattended takes --part retained or layers" "$ops/teardown.sh" --env prod --profile p \
+  --account-id 000000000000 --execute --unattended --log "$fake_bin/refused.md"
+rm -f "$calls"
+out="$("$ops/teardown.sh" --env staging --profile p --part layers </dev/null 2>&1)"
+[[ ! -s "$calls" ]] || fail "the layers teardown's dry run ran: $(cat "$calls")"
+[[ "$out" == *"cluster-tunnel.sh open staging ap-northeast-3"*"delete applications.argoproj.io"*"cluster-bootstrap destroy"*"cluster-tunnel.sh close"* ]] ||
+  fail "the teardown doesn't drain and destroy cluster-bootstrap through the tunnel: $out"
+[[ "$out" == *"not set: TF_VAR_domain"* ]] || fail "the teardown doesn't check the stacks' inputs"
+[[ "$out" != *"bootstrap/staging"* ]] || fail "the layers teardown lists a bootstrap stack"
+out="$("$ops/teardown.sh" --env prod --profile p --part layers </dev/null 2>&1)"
+[[ "$out" != *"retained: teardown apply"* ]] || fail "prod's layers teardown applies the retained stack"
+out="$("$ops/teardown.sh" --env prod --profile p --part retained </dev/null 2>&1)"
+listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
+[[ "$listed" == *"retained: teardown apply"* && "$listed" != *"environments/prod/ap-northeast"* && "$listed" != *bootstrap* ]] ||
+  fail "prod's retained part does more than the retained apply: $listed"
+
+# The rebuild (#295): its refusals, and the order of a staging rebuild and a dev one, which has no Osaka.
+expect_refusal "--execute takes --stage stacks or after" "$ops/rebuild.sh" --env staging --profile p \
+  --account-id 000000000000 --execute --log "$fake_bin/refused.md"
+expect_refusal "--unattended is for --execute" "$ops/rebuild.sh" --env staging --profile p --unattended
+expect_refusal "--stage must be" "$ops/rebuild.sh" --env staging --profile p --stage everything
+out="$("$ops/rebuild.sh" --env staging --profile p </dev/null 2>&1)"
+listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
+want="environments/staging/ap-northeast-1/network environments/staging/ap-northeast-3/network"
+want+=" environments/staging/ap-northeast-1/data environments/staging/ap-northeast-3/data"
+want+=" environments/staging/ap-northeast-1/data (again, on a first build)"
+want+=" environments/staging/ap-northeast-1/cluster environments/staging/ap-northeast-3/cluster"
+want+=" environments/staging/ap-northeast-1/edge environments/staging/ap-northeast-3/edge"
+want+=" environments/staging/ap-northeast-1/identity environments/staging/ap-northeast-3/identity "
+[[ "$listed" == "$want" ]] || fail "rebuild order: $listed"
+[[ "$out" == *"-var osaka_ready=false"* ]] || fail "a first staging build doesn't pass osaka_ready=false"
+[[ "$out" == *"alarms"*"cluster-tunnel.sh open staging ap-northeast-1"*"create job"*"key-rotation"* ]] ||
+  fail "the rebuild's after stage has no first deploy through the tunnel"
+out="$("$ops/rebuild.sh" --env dev --profile p </dev/null 2>&1)"
+[[ "$out" != *"ap-northeast-3"* ]] || fail "dev's rebuild touches Osaka"
+[[ "$out" != *"osaka_ready"* ]] || fail "dev's rebuild passes osaka_ready"
 
 # A missing prerequisite shows as unmet, and --execute refuses: on a copy of the repository without the retained trail.
 copy="$(mktemp -d)"

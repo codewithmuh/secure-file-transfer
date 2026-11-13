@@ -5,6 +5,15 @@ period, in under an hour, leaving nothing that bills but the retained stack (NFR
 and infra/README.md's ("Teardown runs the other way"); `ops/teardown.sh` runs it, times it and ends with a tag search
 for anything left. Decisions: [disaster-recovery.md](../operations/disaster-recovery.md) section 7.
 
+**Run it with `make aws-down ENV=<env>`** ([environment-up-down.md](environment-up-down.md), #295). That runs the
+environment workflow, so the script runs as the identity each part needs:
+- **the environment's stacks:** its deploy role. Only that role may delete their IAM roles (SCP
+  `OnlyDeployRolesChangeIam`), and only it and BreakGlass are cluster admins.
+- **prod's retained stack:** its own deploy role.
+- **the bootstrap stacks:** `Admin`, by hand (step 2).
+
+The commands below with `--profile` are the dry runs, which call nothing, and the bootstrap's step.
+
 > [!IMPORTANT]
 > **Pending the AWS run.** Staging's idle teardown is the rehearsal. The prerequisites in the repository are met
 > (#263): the dry run below lists each and says so.
@@ -23,8 +32,8 @@ the prerequisites below that live in the repository, and lists each as met or un
 unmet). `--inventory` also reads each stack's state and the tag search, read-only:
 
 ```bash
-ops/teardown.sh --env staging --profile sft-staging-admin
-ops/teardown.sh --env staging --profile sft-staging-admin --account-id <account> --inventory
+ops/teardown.sh --env staging --profile sft-staging-admin       # dry run: calls nothing
+make aws-status ENV=staging                                      # the inventory, as the deploy role
 ```
 
 ## Prerequisites of a prod teardown
@@ -52,7 +61,9 @@ ops/teardown.sh --env staging --profile sft-staging-admin --account-id <account>
 ## Steps
 
 ```bash
-ops/teardown.sh --env prod --profile sft-prod-admin --account-id <account> --scope final --execute
+make aws-down ENV=prod    # steps 0, 1 and 4: the retained apply, then every stack and the tag search
+ops/teardown.sh --env prod --profile sft-prod-admin --account-id <account> --scope final --part bootstrap --execute
+                          # step 2, as Admin, afterwards; add --last for step 3
 ```
 
 ### 0. The retained stack's teardown apply (prod only, 10 min)
@@ -114,10 +125,11 @@ its expected line (capacity 7.3).
 When nobody has used dev or staging for a working day, or at the end of a release rehearsal or drill, tear it down:
 
 ```bash
-ops/teardown.sh --env staging --profile sft-staging-admin --account-id <account> --execute
+make aws-down ENV=staging
 ```
 
-Rebuilding is infra/README.md's apply order against the same bootstrap stacks; capacity A22 expects about 260 billed
-hours a month for dev and 162 for staging. Each idle teardown is also a rehearsal of prod's, timed in its log.
+Rebuilding is `make aws-up ENV=staging`: infra/README.md's apply order against the same bootstrap stacks
+([environment-up-down.md](environment-up-down.md)). Capacity A22 expects about 260 billed hours a month for dev and
+162 for staging. Each idle teardown is also a rehearsal of prod's, timed in its log.
 
 [KEYS]: ../security/encryption-and-keys.md

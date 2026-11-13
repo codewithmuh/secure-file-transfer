@@ -144,6 +144,10 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    bucket's only reader is that distribution. The edge roots need `TF_VAR_shared_account_id` and `TF_VAR_domain`, and
    `TF_VAR_terraform_role=deploy` in an apply job.
 
+Once an environment's one-time setup is done (steps 1 to 4, and prod's `retained`), step 5 and its teardown are one
+command each: `make aws-up ENV=<env>` and `make aws-down ENV=<env>` run `ops/rebuild.sh` and `ops/teardown.sh` in the
+environment workflow, as the deploy role ([environment-up-down.md](../docs/runbooks/environment-up-down.md), #295).
+
 Teardown runs the other way. Each `data` stack first gets an apply with `TF_VAR_teardown=true`, which turns Aurora's
 deletion protection off, skips the final snapshot, drops the master secret's recovery window and lets the files
 buckets be emptied (prod's too, from that apply on, #263), then the destroy. Prod's `cluster`, `identity` and `edge`
