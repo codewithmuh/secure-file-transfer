@@ -79,15 +79,33 @@ def with_pool(w: World, sent: Sent, pool: UserPool | None) -> Notifier:
     return worker
 
 
-def use_sso(w: World, status: str = "active") -> None:
-    """The tenant's own connection, as `configureTenantSso` records it."""
+def use_sso(w: World, status: str = "active") -> str:
+    """The tenant's own connection, as `configureTenantSso` records it, with one proven domain
+    linked to it; the domain."""
+    connection, domain = uuid.uuid4(), f"corp-{w.tenant.id.hex}.example.test"
     w.db.sql(
         "INSERT INTO idp_connections (id, tenant_id, kind, provider_name, issuer, status) "
-        "VALUES (gen_random_uuid(), :tenant, 'oidc', :name, 'https://idp.example.test', :status)",
+        "VALUES (:id, :tenant, 'oidc', :name, 'https://idp.example.test', :status)",
+        id=connection,
         tenant=w.tenant.id,
         name=w.tenant.id.hex,
         status=status,
     )
+    w.db.sql(
+        "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, verified_at, "
+        "idp_connection_id, created_by) VALUES (gen_random_uuid(), :tenant, :domain, "
+        "repeat('v', 32), now(), :connection, :admin)",
+        tenant=w.tenant.id,
+        domain=domain,
+        connection=connection,
+        admin=w.tenant.admin,
+    )
+    return domain
+
+
+def invite_on(w: World, domain: str, status: str = "invited") -> uuid.UUID:
+    """A user of the tenant at an address on `domain`."""
+    return seed_user(w.db, w.tenant.id, status=status, email=f"{uuid.uuid4().hex}@{domain}")
 
 
 def tenant_log(w: World, target: uuid.UUID) -> list[tuple[str, dict[str, object]]]:
@@ -174,8 +192,8 @@ def cognito_pool(client: object, provider_name: str) -> CognitoUserPool:
 
 
 async def test_an_sso_tenants_invitation_is_a_one_time_link_and_no_pool_user(w: World) -> None:
-    use_sso(w)
-    invited = seed_user(w.db, w.tenant.id, status="invited")
+    domain = use_sso(w)
+    invited = invite_on(w, domain)
     sent = Sent()
     worker = with_pool(w, sent, w.pool)
     before = datetime.now(UTC)
@@ -209,11 +227,11 @@ async def test_an_sso_tenants_invitation_is_a_one_time_link_and_no_pool_user(w: 
 async def test_an_sso_invitation_asks_nothing_of_keycloak_or_cognito(
     w: World, cognito: tuple[object, Stubber]
 ) -> None:
-    use_sso(w)
+    domain = use_sso(w)
     keycloak = KeycloakFake([])  # any request would find no answer and fail
     client, _ = cognito  # the stubber has no response queued: any call would fail
     for pool in (keycloak.pool(w.pool.provider_name), cognito_pool(client, w.pool.provider_name)):
-        invited = seed_user(w.db, w.tenant.id, status="invited")
+        invited = invite_on(w, domain)
         sent = Sent()
         done = await with_pool(w, sent, pool).handle(
             message(w.tenant.id, "member.invited", user_id=invited)
@@ -224,8 +242,8 @@ async def test_an_sso_invitation_asks_nothing_of_keycloak_or_cognito(
 
 
 async def test_an_sso_invitation_needs_no_pool(w: World) -> None:
-    use_sso(w)
-    invited = seed_user(w.db, w.tenant.id, status="invited")
+    domain = use_sso(w)
+    invited = invite_on(w, domain)
     sent = Sent()
     done = await with_pool(w, sent, None).handle(
         message(w.tenant.id, "member.invited", user_id=invited)
@@ -235,8 +253,8 @@ async def test_an_sso_invitation_needs_no_pool(w: World) -> None:
 
 
 async def test_a_tenant_whose_connection_is_inactive_invites_through_the_pool(w: World) -> None:
-    use_sso(w, status="inactive")
-    invited = seed_user(w.db, w.tenant.id, status="invited")
+    domain = use_sso(w, status="inactive")
+    invited = invite_on(w, domain)
     sent = Sent()
     await with_pool(w, sent, w.pool).handle(message(w.tenant.id, "member.invited", user_id=invited))
     assert [e.email_type for e in sent.emails] == ["member_invitation"]
@@ -244,11 +262,70 @@ async def test_a_tenant_whose_connection_is_inactive_invites_through_the_pool(w:
     assert invitation(w, invited) == (None, None)
 
 
+@pytest.mark.parametrize("where", ["elsewhere", "an unproven claim", "proven but not linked"])
+async def test_an_address_off_the_proven_linked_domains_gets_a_local_invitation(
+    w: World, where: str
+) -> None:
+    # The tenant allows local members unless it requires SSO, and a link would be no use to
+    # someone with no identity at its provider (authn and authz 2.5).
+    use_sso(w)
+    domain = "example.test"
+    if where != "elsewhere":
+        domain = f"{where.split()[0]}-{uuid.uuid4().hex}.example.test"
+        w.db.sql(
+            "INSERT INTO sso_domains (id, tenant_id, domain, verification_token, verified_at, "
+            "created_by) VALUES (gen_random_uuid(), :tenant, :domain, repeat('c', 32), "
+            "CASE WHEN :proven THEN now() END, :admin)",
+            tenant=w.tenant.id,
+            domain=domain,
+            proven=where == "proven but not linked",
+            admin=w.tenant.admin,
+        )
+    invited = invite_on(w, domain)
+    sent = Sent()
+    done = await with_pool(w, sent, w.pool).handle(
+        message(w.tenant.id, "member.invited", user_id=invited)
+    )
+    assert done is Done.PROCESSED
+    [email] = sent.emails
+    assert email.email_type == "member_invitation"
+    assert re.search(r"Your temporary password: (\S+)", email.text)
+    assert str(invited) in w.pool.users
+    assert invitation(w, invited) == (None, None)
+
+
+async def test_without_a_pool_an_address_off_the_domains_is_left_for_the_pool(w: World) -> None:
+    use_sso(w)
+    invited = invite_on(w, "example.test")
+    sent = Sent()
+    done = await with_pool(w, sent, None).handle(
+        message(w.tenant.id, "member.invited", user_id=invited)
+    )
+    assert done is Done.PROCESSED
+    assert sent.emails == []
+    assert invitation(w, invited) == (None, None)
+
+
+async def test_a_tenant_that_requires_sso_sends_a_link_whatever_the_domain(w: World) -> None:
+    use_sso(w)
+    w.db.sql("UPDATE tenants SET sso_required = true WHERE id = :t", t=w.tenant.id)
+    for pool in (w.pool, None):
+        invited = invite_on(w, "example.test")
+        sent = Sent()
+        done = await with_pool(w, sent, pool).handle(
+            message(w.tenant.id, "member.invited", user_id=invited)
+        )
+        assert done is Done.PROCESSED
+        assert [e.email_type for e in sent.emails] == ["member_invitation_sso"]
+        assert invitation(w, invited)[0] is not None
+    assert w.pool.calls == []
+
+
 async def test_a_redelivery_after_a_failed_send_mints_a_link_that_replaces_the_first(
     w: World,
 ) -> None:
-    use_sso(w)
-    invited = seed_user(w.db, w.tenant.id, status="invited")
+    domain = use_sso(w)
+    invited = invite_on(w, domain)
     sent = Sent(fail=[MailErrorKind.UNAVAILABLE])
     worker = with_pool(w, sent, w.pool)
     invite = message(w.tenant.id, "member.invited", user_id=invited)
@@ -275,8 +352,7 @@ async def test_a_redelivery_after_a_failed_send_mints_a_link_that_replaces_the_f
 
 @pytest.mark.parametrize("status", ["active", "deactivated"])
 async def test_a_member_no_longer_invited_gets_no_link(w: World, status: str) -> None:
-    use_sso(w)
-    user_id = seed_user(w.db, w.tenant.id, status=status)
+    user_id = invite_on(w, use_sso(w), status=status)
     sent = Sent()
     for pool in (w.pool, None):
         done = await with_pool(w, sent, pool).handle(
@@ -288,8 +364,8 @@ async def test_a_member_no_longer_invited_gets_no_link(w: World, status: str) ->
 
 
 async def test_a_suspended_tenants_invitation_sends_nothing(w: World) -> None:
-    use_sso(w)
-    invited = seed_user(w.db, w.tenant.id, status="invited")
+    domain = use_sso(w)
+    invited = invite_on(w, domain)
     w.db.sql("UPDATE tenants SET status = 'suspended' WHERE id = :t", t=w.tenant.id)
     sent = Sent()
     await with_pool(w, sent, None).handle(message(w.tenant.id, "member.invited", user_id=invited))

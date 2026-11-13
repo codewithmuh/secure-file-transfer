@@ -1466,3 +1466,28 @@ def test_the_sso_invitation_revision_keeps_the_sql_the_helpers_wrote_for_it() ->
             using="tenant_id = app_tenant_id()",
         ),
     ]
+
+
+def test_the_sso_invitation_rule_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #273: the worker reads whether its tenant requires SSO, and its proven, linked domains.
+    [module] = [
+        s.module
+        for s in SCRIPTS.walk_revisions()
+        if hasattr(s.module, "NOTIFY_SSO_INVITATION_RULE")
+    ]
+    assert list(module.NOTIFY_SSO_INVITATION_RULE) == [
+        grant_sql("tenants", "sft_notify", "SELECT", columns=["sso_required"]),
+        grant_sql(
+            "sso_domains",
+            "sft_notify",
+            "SELECT",
+            columns=["tenant_id", "domain", "idp_connection_id", "verified_at"],
+        ),
+        policy_sql(
+            "notify_domains",
+            "sso_domains",
+            roles=["sft_notify"],
+            command="SELECT",
+            using="tenant_id = app_tenant_id()",
+        ),
+    ]

@@ -2097,6 +2097,18 @@ async def read_another_tenants_connection_as_the_worker(
 
 
 @cases.add(scopes={NOTIFY: [TENANT]})
+async def match_an_address_on_another_tenants_domain_as_the_worker(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # Revision 0043: their proven domain, linked to their connection, never makes this tenant's
+    # invitation an SSO link. A yes is returned as their marker, so the harness sees the leak.
+    theirs = tenants.theirs
+    address = f"someone@{theirs.marker}.example"
+    linked = await sso.invites_through_sso(session, theirs.rows["connection"], address)
+    return theirs.marker if linked else None
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
 async def issue_a_link_to_another_tenants_invited_user(
     session: AsyncSession, tenants: Tenants
 ) -> object:

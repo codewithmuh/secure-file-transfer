@@ -54,15 +54,16 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `dlp_approval.approver_deactivated` (#230): a deactivation cleared an approver designation.
   With fewer than two active approvers left, `dlp_approver_deactivated` to every active admin at
   once; otherwise the kind `approvers_changed` joins the coalesced policy notice.
-- `member.invited`: in a tenant with an active SSO connection (#273), no pool user: a new one-time
-  link (256 bits, its SHA-256 and a 7-day expiry on the user, `user.invitation_link_issued`), then
-  `member_invitation_sso` with it; the member binds their identity provider's subject when they
-  follow it (`startInvitationSignIn`). Otherwise, with a user pool (`sft.service.user_pool`;
-  Keycloak locally, #197), the member's pool user with a temporary password, its identity, then
-  `member_invitation` with that password; an address that already signs in locally for another
-  tenant gets `invitation_address_in_use` instead and no pool user. Cognito's admin API in AWS
-  (#193), Keycloak's locally. Without a pool: recorded, and nothing sent; `invite_backlog` invites
-  those members once the pool exists.
+- `member.invited`: in a tenant with an active SSO connection (#273), when the tenant requires SSO
+  or the address is on one of its proven domains linked to that connection, no pool user: a new
+  one-time link (256 bits, its SHA-256 and a 7-day expiry on the user,
+  `user.invitation_link_issued`), then `member_invitation_sso` with it; the member binds their
+  identity provider's subject when they follow it (`startInvitationSignIn`). Otherwise, with a user
+  pool (`sft.service.user_pool`; Keycloak locally, #197), the member's pool user with a temporary
+  password, its identity, then `member_invitation` with that password; an address that already signs
+  in locally for another tenant gets `invitation_address_in_use` instead and no pool user. Cognito's
+  admin API in AWS (#193), Keycloak's locally. Without a pool: recorded, and nothing sent;
+  `invite_backlog` invites those members once the pool exists.
 - `member.sign_in_reset`: the pool user, after deleting the member's earlier one: a new user, a
   new identity, a new invitation (authn and authz 2.5). The API already ended the sessions and
   deleted the old identities.
@@ -1354,11 +1355,16 @@ class Notifier:
     async def _sso_invitation(
         self, session: AsyncSession, message: OutboxMessage, user: User, sender: tenants.Sender
     ) -> _Plan | None:
-        """An invited user of a tenant with an active SSO connection (authn and authz 2.5, #273):
-        a new one-time link, its hash and expiry on the user, committed before the send, then
-        `member_invitation_sso`; no pool user. None for a tenant without an active connection.
-        The token goes only into the email; the row, the audit event and the logs never hold it."""
-        if await sso.active_connection_id(session) is None:
+        """An invited user of a tenant with an active SSO connection, if the tenant requires SSO or
+        their address is on one of its proven domains linked to that connection (authn and authz
+        2.5, #273): a new one-time link, its hash and expiry on the user, committed before the
+        send, then `member_invitation_sso`; no pool user. None otherwise: the invitation takes the
+        pool's path, as any local member's. The token goes only into the email; the row, the
+        audit event and the logs never hold it."""
+        connection_id = await sso.active_connection_id(session)
+        if connection_id is None or not await sso.invites_through_sso(
+            session, connection_id, user.email_normalized
+        ):
             return None
         token = secrets.token_urlsafe(INVITATION_TOKEN_BYTES)
         expires_at = await users.issue_invitation_link(session, user.id, token_hash(token))

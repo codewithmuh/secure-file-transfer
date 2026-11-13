@@ -4,8 +4,8 @@ A user belongs to one tenant, with one role (`admin` or `member`) and one status
 their first sign-in, then `active`, or `deactivated`). The invitation lives on the user's row:
 `invitation_token_hash`, the SHA-256 of a one-time invitation link, and when it stops working
 (authentication and authorization 2.5). The notification worker mints it for a tenant with an
-active SSO connection (`issue_invitation_link`, #273). A local member gets no link; their first
-sign-in activates them.
+active SSO connection that requires SSO or proved the address's domain (`issue_invitation_link`,
+#273). A local member gets no link; their first sign-in activates them.
 
 Every function that changes a user writes its audit event in the same transaction (FR-27), and the
 database refuses to commit the change otherwise (`audit_required`, revision 0004). The caller says
