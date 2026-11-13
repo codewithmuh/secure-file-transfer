@@ -27,7 +27,8 @@ export interface paths {
          *
          *     The web app also uses this operation for step-up, after a `reauthentication_required` answer, and to sign an
          *     admin in with a passkey, after `passkey_required`, the same way in as before. Every sign-in creates a new
-         *     session.
+         *     session. If the browser sends a `__Host-sft_session` cookie (this navigation is same-site), the pre-auth record
+         *     keeps its SHA-256, never the token, and `completeSignIn` revokes that session (#159).
          *
          *     Public. Rate limit: 60 sign-in starts per IP address per minute. When the sign-in state store or the
          *     rate-limit counters are unavailable, it fails closed with `503`.
@@ -59,9 +60,11 @@ export interface paths {
          *     `__Host-sft_auth` cookie (deleting it), compares `state` in constant time, exchanges the code with the client
          *     secret and the PKCE verifier, and validates the ID token: signature, `iss`, `aud`, `token_use`, `exp` and
          *     `nonce`. It finds the connection from how the sign-in arrived and the identity by
-         *     `(idp_connection_id, subject)`, never by an email claim, then creates a new member session, revokes any
-         *     session cookie the browser sent, revokes Cognito's refresh token and keeps no Cognito token
-         *     (authn-authz 2.4, 3.3). For an invitation (`startInvitationSignIn`) it binds the identity provider's subject
+         *     `(idp_connection_id, subject)`, never by an email claim, then creates a new member session, revokes the
+         *     session the browser held when sign-in started, revokes Cognito's refresh token and keeps no Cognito token
+         *     (authn-authz 2.4, 3.3). This request is a cross-site redirect from Cognito, so the `SameSite=Strict` session
+         *     cookie doesn't reach it: the start, a same-site navigation, kept that cookie's SHA-256 in the pre-auth
+         *     record, and the session is revoked by it (#159). A session cookie that does arrive is revoked too. For an invitation (`startInvitationSignIn`) it binds the identity provider's subject
          *     to the invited user in the same transaction.
          *
          *     `code` is Cognito's authorization code: valid for 5 minutes, single use, and useless without the PKCE
@@ -2652,12 +2655,20 @@ export interface paths {
          *     (abuse-and-rate-limits 7.3). Operators never get access to file contents through this API (FR-35). Rate
          *     limit: 30 new tenants an hour per operator.
          *
-         *     The tenant, its policy, the first admin's invitation, the invitation email's outbox message and the tenant's
-         *     audit event commit in one transaction, in the new tenant's scope; then the platform audit event is written.
-         *     If that second write fails, the tenant exists, with its record in the tenant's log, and the call still returns
-         *     `201`: a retry would create a second tenant. The missing platform event is logged and alerts.
+         *     The tenant, its policy, the first admin's invitation, the invitation email's outbox message, the tenant's
+         *     audit event and the `Idempotency-Key` commit in one transaction, in the new tenant's scope; then the platform
+         *     audit event is written. If that second write fails, the tenant exists, with its record in the tenant's log,
+         *     and the call still returns `201`; the missing platform event is logged and alerts.
          *
-         *     Errors: `409 idempotency_conflict`, `429 rate_limited`, `503 service_unavailable`.
+         *     **Idempotency-Key** (README section 5, #160). The key belongs to the operator, by their Identity Center user
+         *     name, not to the operator token, so a retry with a new token counts. A retry with the same key and body
+         *     returns `201` with the first tenant and its first admin as they are now, and creates no second tenant,
+         *     invitation or email. The same key with another body, or one used more than 24 hours ago, gets
+         *     `409 idempotency_conflict`; a retry while the first call still runs gets `409 idempotency_in_progress`.
+         *     Without a key a retry creates a second tenant, so an operator always sends one.
+         *
+         *     Errors: `409 idempotency_conflict`, `409 idempotency_in_progress`, `429 rate_limited`,
+         *     `503 service_unavailable`.
          *
          *     Requirements: FR-34, FR-35, FR-27.
          */
@@ -2798,10 +2809,19 @@ export interface paths {
          *     is emailed. It commits first and takes effect at once, and the `202` comes only after its record is in both
          *     regions' audit archive (NFR-10), so a failover or restore re-applies it. If that write fails, the recovery has
          *     still taken effect and the call returns `503`. A retry with the same `Idempotency-Key` finds the recovery,
-         *     writes the archive record if it is still missing and returns `202`; it never starts a second recovery.
+         *     writes the archive record if it is still missing and returns `202`; it never starts a second recovery. The
+         *     key is the operator's, as for `createTenant`.
+         *
+         *     The record is the tenant's `user.sign_in_reset` event, by the operator, naming the recovery and its kind, so
+         *     the failover and restore runbooks re-apply it as a reset. `confirmed_via` stays in the recovery's row and
+         *     never reaches an audit event. A temporary local sign-in is the kind for an admin of a tenant with an active
+         *     SSO connection who isn't one of its fallback admins; sign-in accepts it even when the tenant requires SSO,
+         *     as a security-critical record, until it expires, and the daily job then deletes it. Emailing the tenant's
+         *     admins is pending the notification worker (#239's follow-up).
          *
          *     Errors: `404 not_found` (tenant, or a user who isn't in it), `409 invalid_state` (the user isn't an active
-         *     admin), `409 idempotency_conflict`, `422 validation_failed`, `503 service_unavailable`.
+         *     admin), `409 idempotency_conflict`, `409 idempotency_in_progress`, `422 validation_failed`,
+         *     `503 service_unavailable`.
          *
          *     Requirements: FR-22, FR-25, FR-34, NFR-10.
          */
@@ -3959,6 +3979,7 @@ export interface components {
             requester: string;
             /** @description Identity Center user name of the approving operator. With one maintainer it can be the requester, which alerts. */
             approver: string;
+            /** @description The incident or ticket, as `requestBreakGlass` takes it; the removal schedule is named after it. */
             incident_id: string;
             reason: string;
             /** @description The tenants concerned; each gets a record in its audit log. Empty for platform-wide work. */
