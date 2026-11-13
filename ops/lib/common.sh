@@ -344,13 +344,38 @@ tf_run() {
 }
 
 # tf_output <root> <name>: one output of an initialized root, as JSON; empty when the root has no state or no such
-# output. A dry run prints a placeholder.
+# output. Any other failure stops the script: an output that can't be read isn't one that's missing (#299). It runs in
+# a command substitution, where that stop ends only the substitution, so callers add `|| exit 2`. A dry run prints a
+# placeholder.
 tf_output() {
+  local out err
   if ! $EXECUTE; then
     echo "<$2 output of $1>"
     return 0
   fi
-  terraform -chdir="$REPO_ROOT/infra/$1" output -json "$2" 2>/dev/null || true
+  err="$(mktemp "${TMPDIR:-/tmp}/sft-tf-output.XXXXXX")"
+  if out="$(terraform -chdir="$REPO_ROOT/infra/$1" output -no-color -json "$2" 2>"$err")"; then
+    rm -f "$err"
+    printf '%s\n' "$out"
+  elif grep -qF "Output \"$2\" not found" "$err"; then
+    rm -f "$err"
+  else
+    out="$(cat "$err")"
+    rm -f "$err"
+    die "can't read infra/$1's $2 output: $out"
+  fi
+}
+
+# primary_key_arns: Osaka's data stack replicates Tokyo's key primaries, a required input with no default, so it gets
+# TF_VAR_primary_key_arns from Tokyo's data stack's kms_key_arns output (modules/data-stack). The rebuild applies
+# Osaka's after Tokyo's, and the teardown destroys it first, so Tokyo's state has them both times.
+primary_key_arns() {
+  local tokyo="environments/$ENV_NAME/$TOKYO/data" keys
+  tf_init "$tokyo"
+  keys="$(tf_output "$tokyo" kms_key_arns)" || exit 2
+  [[ -n "$keys" && "$keys" != null ]] || die "Tokyo's data stack has no kms_key_arns output, which Osaka's needs"
+  echo "   TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"
+  export TF_VAR_primary_key_arns="$keys"
 }
 
 # state_list <root>: the resource addresses an initialized root's state holds, empty when it has none. A state that
@@ -366,17 +391,21 @@ state_list() {
   fi
 }
 
-# has_state <root>: whether an initialized root holds any resource; a dry run says no.
+# has_state <root>: whether an initialized root holds any resource; a dry run says no. Callers test it in an `if`,
+# where a failure doesn't stop the script on its own, so a state that can't be read exits here (#299).
 has_state() {
+  local list
   $EXECUTE || return 1
-  [[ -n "$(state_list "$1")" ]]
+  list="$(state_list "$1")" || exit 2
+  [[ -n "$list" ]]
 }
 
-# plan_destroys <log>: how many resources a plan's log says it destroys (0 when it says nothing), from Terraform's
-# summary line, colored or not: "Plan: 1 to add, 0 to change, 2 to destroy." or "..., 2 to destroy, 1 to forget."
-plan_destroys() {
+# plan_count <log> <add|destroy>: how many resources a plan's log says it adds or destroys (0 when it says nothing),
+# from Terraform's summary line, colored or not: "Plan: 1 to add, 0 to change, 2 to destroy." or "..., 2 to destroy,
+# 1 to forget."
+plan_count() {
   local n
-  n="$(sed $'s/\x1b\\[[0-9;]*m//g' "$1" | sed -n 's/^Plan: .*[^0-9]\([0-9][0-9]*\) to destroy.*$/\1/p' | head -1)"
+  n="$(sed $'s/\x1b\\[[0-9;]*m//g' "$1" | grep -m1 '^Plan: ' | grep -oE "[0-9]+ to $2" | grep -oE '^[0-9]+')" || true
   echo "${n:-0}"
 }
 

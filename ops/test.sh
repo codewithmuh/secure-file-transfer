@@ -95,7 +95,9 @@ want="environments/prod/ap-northeast-3/alarms environments/prod/ap-northeast-1/a
 # prod's dry run checks its prerequisites in the repository (#263): none may be unmet.
 [[ "$out" == *"Prerequisites of a prod teardown"* ]] || fail "prod's teardown dry run didn't check its prerequisites"
 [[ "$out" != *"UNMET"* ]] || fail "prod's teardown has unmet prerequisites: $(grep UNMET <<<"$out")"
-[[ "$out" == *"apply -var teardown=true"*"ap-northeast-3/cluster"* ]] || fail "prod's cluster gets no teardown apply"
+plan="ap-northeast-3/cluster plan -input=false -var teardown=true"
+[[ "$out" == *"$plan"*"ap-northeast-3/cluster apply -input=false"* ]] ||
+  fail "prod's cluster gets no teardown apply"
 [[ "$out" == *"bootstrap/prod/ap-northeast-1 state rm module.terraform_roles.aws_iam_openid_connect_provider.github"* ]] ||
   fail "prod's Tokyo bootstrap keeps the OIDC provider in its state: $out"
 [[ "$listed" == *"retained: teardown apply"* ]] || fail "prod's teardown doesn't start with the retained stack"
@@ -125,21 +127,39 @@ listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
 # The teardown's fixes (#299): Osaka's data stack gets Tokyo's key primaries, a stack already gone is checked for
 # before anything is applied to it, and the drain removes the AppProjects while Argo CD still runs.
 out="$("$ops/teardown.sh" --env staging --profile p --part layers </dev/null 2>&1)"
-[[ "$out" == *"TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"*"ap-northeast-3/data apply -var teardown=true"* ]] ||
+plan="ap-northeast-3/data plan -input=false -var teardown=true"
+[[ "$out" == *"TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"*"$plan"* ]] ||
   fail "Osaka's data teardown doesn't get primary_key_arns: $out"
 [[ "$out" == *"delete applications.argoproj.io"*"delete appprojects.argoproj.io"*"cluster-bootstrap destroy"* ]] ||
   fail "the drain doesn't remove the AppProjects before the destroy"
 [[ "$out" == *"cluster-tunnel.sh open staging ap-northeast-3 8444"*"cluster-tunnel.sh open staging ap-northeast-1 8443"* ]] ||
   fail "the tunnels don't use a port per Region"
 
-# plan_destroys reads Terraform's summary, colored or not, and the "to forget" form.
+# plan_count reads Terraform's summary, colored or not, with "to import" first or "to forget" last.
 plans="$(mktemp -d)"
 printf 'Plan: 1 to add, 0 to change, 2 to destroy.\n' >"$plans/plain"
 printf '\033[0m\033[1mPlan:\033[0m 0 to add, 0 to change, 3 to destroy, 1 to forget.\n' >"$plans/colored"
+printf 'Plan: 1 to import, 4 to add, 0 to change, 0 to destroy.\n' >"$plans/import"
 printf 'No changes. Your infrastructure matches the configuration.\n' >"$plans/none"
-got="$(bash -c 'source "$1"; for f in plain colored none; do plan_destroys "$2/$f"; done' _ "$ops/lib/common.sh" "$plans" | tr '\n' ' ')"
-[[ "$got" == "2 3 0 " ]] || fail "plan_destroys read $got, not 2 3 0"
+got="$(bash -c 'source "$1"; for f in plain colored import none; do
+  plan_count "$2/$f" add; plan_count "$2/$f" destroy; done' \
+  _ "$ops/lib/common.sh" "$plans" | tr '\n' ' ')"
+[[ "$got" == "1 2 0 3 4 0 0 0 " ]] || fail "plan_count read $got, not 1 2 0 3 4 0 0 0"
 rm -rf "$plans"
+
+# Reading a state or an output (#299): a missing one reads as empty, and any other failure stops the script, even in
+# an `if`, where a failure inside a command substitution would otherwise be lost.
+reads() {
+  # shellcheck disable=SC2016 # expanded by the inner bash
+  bash -c 'source "$1"; EXECUTE=true; message="$2"; terraform() { echo "$message" >&2; return 1; }
+    if has_state r; then echo has; else echo none; fi
+    out="$(tf_output r x)" || exit 2
+    echo "output=$out"' _ "$ops/lib/common.sh" "$1" 2>/dev/null || echo "exit=$?"
+}
+got="$(reads 'No state file was found! Output "x" not found' | tr '\n' ' ')"
+[[ "$got" == "none output= " ]] || fail "a missing state or output doesn't read as empty: $got"
+got="$(reads 'Error: ExpiredToken: the security token included in the request is expired' | tr '\n' ' ')"
+[[ "$got" == "exit=2 " ]] || fail "a state that can't be read doesn't stop the script: $got"
 
 # The rebuild (#295): its refusals, and the order of a staging rebuild and a dev one, which has no Osaka.
 expect_refusal "--execute takes --stage foundation, platform, stacks or after" "$ops/rebuild.sh" --env staging --profile p \

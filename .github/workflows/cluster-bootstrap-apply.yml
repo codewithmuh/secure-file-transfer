@@ -48,6 +48,8 @@ jobs:
     timeout-minutes: 60
     environment: ${{ inputs.environment }} # the deploy role's OIDC subject; main only, prod waits for approval (T-71)
     # One apply per cluster at a time, whichever workflow calls it (cluster-bootstrap.yml or environment.yml, #299).
+    # GitHub cancels a pending job when a newer one joins the group, but each caller's own workflow-level group lets
+    # it hold at most one job per cluster here, so the two callers can wait on each other and never cancel each other.
     concurrency:
       group: cluster-bootstrap-${{ inputs.environment }}-${{ inputs.region }}
       cancel-in-progress: false
@@ -112,19 +114,35 @@ jobs:
         id: cluster
         env:
           REQUIRE: ${{ inputs.require-cluster }}
+        # Up means ACTIVE, or UPDATING (a version upgrade, which serves the API throughout). Missing, or being created
+        # or deleted by make aws-up or aws-down, it is skipped here unless the caller requires it.
         run: |
-          case $REGION in ap-northeast-1) short=apne1 ;; ap-northeast-3) short=apne3 ;; esac
-          if out=$(aws eks describe-cluster --region "$REGION" --name "sft-$ENVIRONMENT-$short-eks" \
+          case $REGION in
+            ap-northeast-1) short=apne1 ;;
+            ap-northeast-3) short=apne3 ;;
+            *) echo "::error::unknown region '$REGION'"; exit 1 ;;
+          esac
+          if status=$(aws eks describe-cluster --region "$REGION" --name "sft-$ENVIRONMENT-$short-eks" \
             --query cluster.status --output text 2>&1); then
-            echo "up=true" >> "$GITHUB_OUTPUT"
-          elif [[ $out == *ResourceNotFoundException* && $REQUIRE != true ]]; then
-            echo "up=false" >> "$GITHUB_OUTPUT"
-            echo "$ENVIRONMENT has no cluster in $REGION: it is down (make aws-down), so there is nothing to apply." \
-              "make aws-up applies this layer when it comes back." >> "$GITHUB_STEP_SUMMARY"
+            :
+          elif [[ $status == *ResourceNotFoundException* ]]; then
+            status=missing
           else
-            echo "::error::Can't read $ENVIRONMENT's cluster in $REGION: $out"
+            echo "::error::Can't read $ENVIRONMENT's cluster in $REGION: $status"
             exit 1
           fi
+          case $status in
+            ACTIVE | UPDATING) echo "up=true" >> "$GITHUB_OUTPUT" ;;
+            *)
+              if [[ $REQUIRE == true ]]; then
+                echo "::error::$ENVIRONMENT's cluster in $REGION is $status, not ACTIVE."
+                exit 1
+              fi
+              echo "up=false" >> "$GITHUB_OUTPUT"
+              echo "$ENVIRONMENT's cluster in $REGION is $status (make aws-down, or an aws-up under way), so there is" \
+                "nothing to apply. make aws-up applies this layer when it is up." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
       - name: Open the tunnel to the cluster API
         if: steps.cluster.outputs.up == 'true'
         run: |

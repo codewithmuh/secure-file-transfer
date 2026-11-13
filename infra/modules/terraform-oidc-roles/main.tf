@@ -107,7 +107,8 @@ data "aws_iam_policy_document" "placeholder" {
 
   # The teardown's last check and `make aws-status` (ops/teardown.sh, #299): every resource still tagged with the
   # environment, and what Kubernetes made outside Terraform (Karpenter's instances, the claims' volumes). Read-only;
-  # none of these calls takes a resource.
+  # none of these calls takes a resource. Not a placeholder like the statement above: whatever replaces this
+  # document keeps it, or the teardown can't prove what it left, and only warns that it can't.
   statement {
     sid       = "FindWhatIsLeft"
     actions   = ["tag:GetResources", "ec2:DescribeInstances", "ec2:DescribeVolumes"]

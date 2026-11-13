@@ -87,8 +87,10 @@ What `down` leaves, and what still bills afterwards:
 - **`up` fails in `cluster-bootstrap`:** the same, and a rerun applies only that layer onward. It can also be run on
   its own: `gh workflow run cluster-bootstrap.yml -f environment=dev`.
 - **`down` fails halfway:** run it again. Each destroy picks up from what's left, and `make aws-status` shows what
-  that is. If a stack refuses (a non-empty bucket, an ENI left by a deleted pod), [teardown.md](teardown.md) has the
-  manual step for it.
+  that is: a stack already gone is skipped, and a stack partly gone has its guards turned off on what's left, with
+  nothing built back. If a stack refuses (a non-empty bucket, an ENI left by a deleted pod), [teardown.md](teardown.md)
+  has the manual step for it. Finish the `down` before an `up`: a half-destroyed stack can need a plan that destroys
+  something, which `up` refuses.
 - **Billing after a `down`:** `make aws-status` lists every resource still tagged with the environment. Cost Explorer
   by the `environment` tag shows the rest the next day.
 - **"Error acquiring the state lock":** a job stopped mid-apply (its timeout, or a cancel) and left the stack's lock file. First make sure no other run is applying that stack (the Actions tab). Then, with BreakGlass, run `terraform -chdir=infra/<root> force-unlock <lock ID from the error>`, and run the command again.

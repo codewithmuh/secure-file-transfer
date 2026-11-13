@@ -20,8 +20,8 @@
 #   --allow-destroy           apply a plan that destroys or replaces something. Without it a rebuild refuses one: on
 #                             a live environment a destroy means drift or a change that needs its own review.
 #
-# Safe to run again on a live environment: each apply converges, and the inputs only a first build takes (Tokyo's
-# osaka_ready=false, before Osaka's data stack exists) are passed only while Osaka's data stack holds nothing.
+# Safe to run again on a live environment: each apply converges, and Tokyo's osaka_ready=false, which only a first
+# build takes, is passed only until Tokyo's data stack replicates to Osaka (its state holds the replication rules).
 # Prod's retained stack is not here: it is built once, before prod's first data apply, and outlives every teardown.
 # Pending the AWS run.
 set -euo pipefail
@@ -64,8 +64,10 @@ REGIONS=("$TOKYO" "$OSAKA")
 TWO_REGIONS=false
 [[ "$ENV_NAME" == dev ]] || TWO_REGIONS=true
 env_root() { echo "environments/$ENV_NAME/$1/$2"; }
+# Each step runs in a subshell (step, ops/lib/common.sh), so what one step learns for a later one goes in a file.
 FIRST_BUILD_FILE="$(mktemp "${TMPDIR:-/tmp}/sft-rebuild-first-build.XXXXXX")"
-trap 'rm -f "$FIRST_BUILD_FILE"' EXIT
+FLOW_LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/sft-rebuild-flow-log.XXXXXX")" # the Regions whose network has its flow log
+trap 'rm -f "$FIRST_BUILD_FILE" "$FLOW_LOG_FILE"' EXIT
 
 # apply <root> [-var ...]: plan, refuse a plan that destroys anything (unless --allow-destroy), then apply that plan.
 apply() {
@@ -74,7 +76,7 @@ apply() {
   plan="${SFT_TF_LOG_DIR:-${TMPDIR:-/tmp}/sft-$DRILL-$ENV_NAME-terraform}/${root//\//_}.tfplan"
   tf_root "$root" plan -input=false -out="$plan" "$@"
   if $EXECUTE; then
-    destroys="$(plan_destroys "$TF_LAST_LOG")"
+    destroys="$(plan_count "$TF_LAST_LOG" destroy)"
     if [[ "$destroys" != 0 ]] && ! $ALLOW_DESTROY; then
       die "$root: the plan destroys $destroys resource(s). A rebuild only creates and updates; review the plan (its log: $TF_LAST_LOG) and run again with --allow-destroy if it is meant"
     fi
@@ -87,19 +89,38 @@ apply() {
 # The VPC flow log goes to the same Region's flow-log bucket, the data stack's flow_log_bucket_arn output, which a first
 # build doesn't have yet: network goes once without it, then again after data (infra/README.md). Once the data stack
 # exists every apply passes it, so no apply turns the flow log off.
+#
+# network <region> [again]: again is the apply after data, which runs only if the first had no bucket to pass (#299).
 network() {
-  local region="$1" data arn
+  local region="$1" again="${2:-}" data network arn list
   data="$(env_root "$region" data)"
+  network="$(env_root "$region" network)"
+  if [[ -n "$again" ]] && $EXECUTE && grep -qx "$region" "$FLOW_LOG_FILE"; then
+    echo "   Its first apply passed the flow-log bucket already."
+    return 0
+  fi
   tf_init "$data"
-  arn="$(tf_output "$data" flow_log_bucket_arn)"
+  arn="$(tf_output "$data" flow_log_bucket_arn)" || exit 2
   arn="${arn//\"/}"
   if [[ -n "$arn" && "$arn" != null ]]; then
     echo "   TF_VAR_flow_log_destination_arn: the data stack's flow_log_bucket_arn output"
-    TF_VAR_flow_log_destination_arn="$arn" apply "$(env_root "$region" network)"
-  else
-    echo "   No flow-log bucket yet (a first build): the flow log comes with network's apply after data."
-    apply "$(env_root "$region" network)"
+    TF_VAR_flow_log_destination_arn="$arn" apply "$network"
+    echo "$region" >>"$FLOW_LOG_FILE"
+    return 0
   fi
+  [[ -z "$again" ]] || die "$data has no flow_log_bucket_arn output after its apply"
+  if $EXECUTE; then
+    # A teardown that stopped after data and before network leaves a flow log whose bucket is gone. Applied without
+    # the bucket, network would plan to destroy it; after data, the bucket is back under the same name (#299).
+    tf_init "$network"
+    list="$(state_list "$network")" || exit 2
+    if grep -q 'aws_flow_log\.this' <<<"$list"; then
+      echo "   The flow log is there but its bucket isn't (a teardown that stopped partway): network waits for data."
+      return 0
+    fi
+  fi
+  echo "   No flow-log bucket yet (a first build): the flow log comes with network's apply after data."
+  apply "$network"
 }
 
 # Whether Tokyo's data stack replicates to Osaka already: its state holds the files buckets' replication rules, which
@@ -108,7 +129,8 @@ network() {
 tokyo_replicates() {
   local list
   $EXECUTE || return 1
-  list="$(state_list "$(env_root "$TOKYO" data)")"
+  # Tested in an `if`, where a failure doesn't stop the script on its own: a state that can't be read exits here.
+  list="$(state_list "$(env_root "$TOKYO" data)")" || exit 2
   grep -q 'aws_s3_bucket_replication_configuration\.this' <<<"$list"
 }
 
@@ -132,15 +154,10 @@ data_tokyo() {
   fi
 }
 
-# Osaka's data stack replicates Tokyo's key primaries: Tokyo's kms_key_arns output (modules/data-stack).
+# Osaka's data stack replicates Tokyo's key primaries (primary_key_arns, ops/lib/common.sh).
 data_osaka() {
-  local tokyo keys
-  tokyo="$(env_root "$TOKYO" data)"
-  tf_init "$tokyo"
-  keys="$(tf_output "$tokyo" kms_key_arns)"
-  [[ -n "$keys" && "$keys" != null ]] || die "Tokyo's data stack has no kms_key_arns output; apply it first"
-  echo "   TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"
-  TF_VAR_primary_key_arns="$keys" apply "$(env_root "$OSAKA" data)"
+  primary_key_arns
+  apply "$(env_root "$OSAKA" data)"
 }
 
 # A first build's second apply of Tokyo's data stack, now that Osaka's buckets and key replicas exist.
@@ -163,7 +180,7 @@ edge() {
   fi
   tokyo="$(env_root "$TOKYO" edge)"
   tf_init "$tokyo"
-  arn="$(tf_output "$tokyo" web_distribution_arn)"
+  arn="$(tf_output "$tokyo" web_distribution_arn)" || exit 2
   arn="${arn//\"/}"
   [[ -n "$arn" && "$arn" != null ]] || die "Tokyo's edge stack has no web_distribution_arn output; apply it first"
   echo "   TF_VAR_web_distribution_arn: Tokyo's web_distribution_arn output"
@@ -249,7 +266,7 @@ if $DO_FOUNDATION; then
     step 900 "Apply $(env_root "$TOKYO" data) again (until Tokyo replicates)" data_tokyo_again
   fi
   for region in "${REGIONS[@]}"; do
-    step 600 "Apply $(env_root "$region" network) again: the flow log" network "$region"
+    step 600 "Apply $(env_root "$region" network) again: the flow log" network "$region" again
   done
 fi
 
