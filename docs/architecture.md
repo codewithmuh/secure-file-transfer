@@ -7,11 +7,17 @@
 | Requirements | [PRD](prd.md) |
 | Decisions | [ADRs](adr/) |
 | Security design | [Threat model][THREAT], [encryption and keys][KEYS], [authentication and authorization][AUTH], [abuse and rate limits][ABUSE] |
-| Tracking | [#12](https://github.com/codewithmuh/secure-file-transfer/issues/12), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26); data loss prevention added in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64) |
+| Tracking | [#12](https://github.com/codewithmuh/secure-file-transfer/issues/12), part of phase 2 ([#16](https://github.com/codewithmuh/secure-file-transfer/issues/16)); aligned with phase 3 in [#26](https://github.com/codewithmuh/secure-file-transfer/issues/26); data loss prevention added in [#64](https://github.com/codewithmuh/secure-file-transfer/issues/64); brought up to what M0 to M8 built in [#269](https://github.com/codewithmuh/secure-file-transfer/issues/269) |
+| Status | Built and checked in CI; nothing applied to AWS yet. Every AWS behaviour on this page is pending the AWS run |
 
 Every technology choice on this page is recorded in an ADR (section 9).
 API paths in the diagrams are illustrative; the contract is [openapi.yaml](api/openapi.yaml) and its
 [README](api/README.md).
+
+**Reading the diagrams.** Every flowchart uses the same colours: indigo for people, blue for our services, purple
+for scheduled jobs, green for data stores, amber for managed AWS services, red for the sandboxed scan engines, grey for
+observability, and a dashed grey outline for systems outside ours. Dashed arrows are asynchronous or occasional:
+replication, events, sign-in redirects. Sequence diagrams number their steps, which the text refers to.
 
 ## 1. Context
 
@@ -20,11 +26,12 @@ flowchart LR
     member(["Member or tenant admin<br/>browser"])
     ext(["Recipient or uploader<br/>browser"])
     auto(["Tenant automation<br/>API key"])
-    op(["Platform operator<br/>CLI"])
-    sft["secure-file-transfer"]
+    op(["Platform operator<br/>CLI, runbooks"])
+    sft["Secure File Transfer"]
     email["Email provider<br/>Amazon SES"]
     inbox(["Invited person's inbox"])
     idp["Customer identity provider<br/>SSO, FR-26"]
+    git["GitHub<br/>code, CI, deploy config"]
     member -->|"send, request, revoke, audit"| sft
     ext -->|"verify, download, upload"| sft
     auto -->|"REST API"| sft
@@ -32,107 +39,146 @@ flowchart LR
     sft -->|"links, codes, notices"| email
     email --> inbox
     sft -.->|"OIDC or SAML"| idp
+    sft -.->|"alerts by email"| op
+    git -.->|"images, Terraform, Argo CD sync"| sft
+    classDef person fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef aws fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef ext fill:#f5f5f4,stroke:#78716c,color:#1c1917,stroke-dasharray:4 3
+    class member,ext,auto,op,inbox person
+    class sft app
+    class email aws
+    class idp,git ext
 ```
 
 The service sends every link, code and notice by email, so the email provider is on the critical path: if recipients
-can't receive a code, they can't download (FR-14).
+can't receive a code, they can't download (FR-14). Alerts reach operators through SNS topics they subscribe to
+(3.5).
 
 ## 2. Containers
 
 ```mermaid
 flowchart TB
     browser(["Browsers"])
-    subgraph edge["Edge, global"]
-        r53["Route 53<br/>DNS and failover"]
-        cf["CloudFront + WAF"]
-    end
+    auto(["Tenant automation"])
+    r53["Route 53<br/>DNS, health checks"]
+    cf["CloudFront + WAF"]
     subgraph tokyo["Tokyo ap-northeast-1, 3 AZs"]
         alb["Load balancer + WAF"]
-        subgraph k8s["Kubernetes, EKS"]
+        subgraph k8s["EKS cluster"]
             api["API service<br/>FastAPI"]
             relay["Outbox relay"]
-            scan["Scan worker"]
-            clamd["ClamAV clamd<br/>own pods, no credentials"]
-            inspector["DLP inspector<br/>own pods, no credentials,<br/>no network out"]
             notify["Notification worker"]
             proxy["Egress proxy<br/>per-workload allowlists"]
-            jobs["Lifecycle jobs<br/>expiry, deletion,<br/>reconciliation, audit archive"]
-            opapi["Operator API<br/>namespace sft-operator"]
+            subgraph pools["Scan pools"]
+                scan["Scan worker"]
+                clamd["clamd<br/>no credentials"]
+                inspector["DLP inspector<br/>no credentials, no network"]
+            end
         end
         cognito["Cognito user pool<br/>+ sign-in triggers"]
-        db[("PostgreSQL<br/>Aurora")]
-        files[("S3: files up to 2 GB")]
-        large[("S3: large files")]
-        gd["GuardDuty Malware<br/>Protection for S3"]
-        evb["EventBridge"]
+        db[("Aurora PostgreSQL")]
+        files[("S3: files, and<br/>large files over 2 GB")]
         audit[("S3: audit archive<br/>Object Lock")]
         web[("S3: web app bundle")]
         sqs[["SQS queues + DLQs"]]
-        rl[("Rate-limit counters<br/>Valkey")]
+        rl[("Valkey<br/>rate-limit counters")]
+        gd["GuardDuty Malware<br/>Protection for S3"]
+        evb["EventBridge"]
         ses["SES"]
         kms["KMS, Secrets Manager"]
     end
-    subgraph osaka["Osaka ap-northeast-3, pilot light"]
-        db2[("PostgreSQL replica")]
-        files2[("S3: replicas of<br/>both files buckets")]
-        audit2[("S3: audit archive replica")]
-        cognito2["Cognito standby pool"]
-        ses2["SES"]
-        web2[("S3: web app bundle")]
-    end
-    browser --> r53
-    r53 --> cf
-    cf --> web
-    r53 --> alb
-    alb --> api
+    osaka[("Osaka pilot light, 3.2<br/>replicas and standby")]
+    browser & auto --> r53
+    r53 --> cf --> web
+    r53 --> alb --> api
     browser -. "sign-in" .-> cognito
     browser -. "upload parts, pre-signed" .-> files
-    browser -. "upload parts, pre-signed" .-> large
-    api --> db
-    api --> files
-    api --> large
+    api --> db & files & rl & kms & audit
     api -->|"code exchange"| proxy
     proxy --> cognito
-    api --> rl
-    api --> kms
-    api --> audit
     cognito -. "sign-in events" .-> sqs
-    opapi --> db
-    opapi --> audit
-    relay --> db
-    relay --> sqs
-    sqs --> scan
-    sqs --> notify
-    scan --> files
-    scan --> large
-    scan -->|"stream bytes"| clamd
-    scan -->|"stream bytes"| inspector
-    scan --> rl
-    scan --> db
-    gd --> large
-    gd --> evb
-    evb --> sqs
-    notify --> ses
+    relay --> db & sqs
+    sqs --> scan & notify
+    scan --> db & files & rl
+    scan -->|"stream bytes"| clamd & inspector
+    gd -. "scans large files" .-> files
+    gd --> evb --> sqs
+    notify --> db & rl & ses
     notify -->|"Cognito admin calls"| proxy
-    notify --> rl
-    notify --> db
-    jobs --> db
-    jobs --> files
-    jobs --> large
-    jobs --> audit
-    db -. "replication" .-> db2
-    files -. "replication with RTC" .-> files2
-    large -. "replication with RTC" .-> files2
-    audit -. "replication" .-> audit2
-    api -. "security-critical records" .-> audit2
-    web -. "copy" .-> web2
+    db & files & audit & web -. "replication" .-> osaka
+    api -. "security-critical records" .-> osaka
+    classDef person fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef store fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef aws fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef sandbox fill:#fee2e2,stroke:#b91c1c,color:#450a0a
+    class browser,auto person
+    class api,relay,notify,proxy,scan app
+    class db,files,audit,web,sqs,rl,osaka store
+    class r53,cf,alb,cognito,gd,evb,ses,kms aws
+    class clamd,inspector sandbox
+    style tokyo fill:none,stroke:#64748b,stroke-dasharray:6 4
+    style k8s fill:none,stroke:#3b82f6
+    style pools fill:none,stroke:#ef4444
 ```
 
 The backend is **one codebase**: the API service and every worker are built from the same image with different entry
 points, so they share the data model and the service layer (ADR-0002). PostgreSQL is the single system of record. File
 bytes reach a recipient's browser through the API service, streamed under a download grant (section 4.2). Files over
 2 GB live in their own bucket pair, chosen at upload start from the declared size, because GuardDuty Malware Protection
-covers a whole bucket and ClamAV can't scan them.
+covers a whole bucket and ClamAV can't scan them. Each scan node runs one trio, a scan worker with its own clamd and
+DLP inspector, in two pools split at 100 MB, so large files never delay small ones.
+
+Beside the request path run the operator API, the scheduled jobs and the synthetic probe. They share the image too,
+each with its own entry point, identity and database role ([deploy/README.md](../deploy/README.md), Workloads):
+
+```mermaid
+flowchart LR
+    op(["Platform operator"])
+    subgraph k8s["EKS cluster, Tokyo"]
+        opapi["Operator API<br/>port-forward only"]
+        lifecycle["Lifecycle jobs<br/>expiry, deletion, reconciliation,<br/>storage audit, cleanup, purge,<br/>audit partitions"]
+        archive["Audit archive job<br/>every minute"]
+        keys["Key rotation, hourly<br/>field keys, daily"]
+        runbook["Recovery and standby enrolment<br/>suspended, run by runbooks"]
+        probe["Synthetic probe<br/>every 5 min"]
+    end
+    db[("Aurora PostgreSQL")]
+    files[("S3 files, both regions")]
+    audit[("S3 audit archive,<br/>both regions")]
+    secrets["Secrets Manager, KMS"]
+    pools["Cognito user pools"]
+    trail["CloudTrail and Identity Center,<br/>management account"]
+    public["The public API and web app"]
+    mailbox[("S3 probe mailbox<br/>SES receiving")]
+    op -->|"tenants, admin recovery,<br/>break-glass records"| opapi
+    opapi --> db
+    opapi -. "SSO drift check, daily" .-> pools
+    opapi -. "break-glass reconciliation,<br/>every 15 min" .-> trail
+    lifecycle --> db & files
+    archive --> db & audit
+    keys --> secrets & db
+    runbook --> db & audit
+    runbook -. "standby enrolment" .-> pools
+    probe --> public
+    probe --> mailbox
+    classDef person fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef job fill:#ede9fe,stroke:#6d28d9,color:#2e1065
+    classDef store fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef aws fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef ext fill:#f5f5f4,stroke:#78716c,color:#1c1917,stroke-dasharray:4 3
+    class op person
+    class opapi app
+    class lifecycle,archive,keys,runbook,probe job
+    class db,files,audit,mailbox store
+    class secrets,pools,trail aws
+    class public ext
+    style k8s fill:none,stroke:#3b82f6
+```
+
+The observability stack that watches all of this, and how its alerts reach a person, is section 3.5.
 
 | Container | Responsibility | Scales by | When it fails |
 |---|---|---|---|
@@ -143,14 +189,18 @@ covers a whole bucket and ClamAV can't scan them.
 | ClamAV (clamd) | Scans the bytes a scan worker streams to it (INSTREAM), with 4 GiB of scratch for temporary extraction (ADR-0019). Its own Deployment, one pod beside each scan worker: no service account token, no AWS identity, ingress only from the scan workers and egress only to the signature mirror: one pod on the main pool whose freshclam fetches ClamAV's database through its own proxy listener and tests each one before the clamd pods take it. | With the scan workers | The worker's scan times out and is retried, as for any scan failure; a crashed pod is replaced. |
 | DLP inspector | Extracts text from the bytes a scan worker streams to it and runs the DLP detectors, with the tenant's own detectors sent along; returns findings with masked previews, never values (ADR-0022, 4.6). Its own Deployment from the application image, one pod beside each scan worker: no service account token, no AWS identity, no database, ingress only from the scan workers and no egress at all. A fresh child process per file, under seccomp and resource limits, with 4 GiB of scratch. | With the scan workers | The worker's attempt fails and is retried; the last attempt marks the inspection `failed`, which blocks the file and alerts (FR-47). A crashed pod is replaced. |
 | Notification worker | Derives each link token and creates each code, stores only the token's hash and the code's HMAC, and sends them through SES's endpoint (NFR-7). Sends the DLP notices: to a member whose transfer needs them, to approvers, and to tenant admins on a policy change (4.6). Applies the per-address caps across tenants in the counter store. Creates invited members in the user pool, through its egress proxy listener. Records SES's bounces and complaints from the `ses-events` queue in the sending tenant's suppression list (#185), and marks the recipient or the upload request whose email bounced (#228). Writes the sign-in triggers' events to the audit log. Outbox messages carry IDs, never secrets. Emails are fixed templates in English and Japanese, text and HTML (`sft.service.email`), sent through one adapter: SES API v2 in AWS, SMTP to Mailpit locally (`sft.data.mail`, #100). | Queue depth | Retries with backoff. Codes not sent within NFR-7 raise an alert, and so does a sign-in event waiting over 30 s. |
-| Lifecycle jobs | Expiry, deletion from both files bucket pairs in both regions, daily reconciliation, audit archiving (section 4.5, 5.2); expiry of DLP approval requests, and deletion of finding details with their file's contents (4.6). The only workload that deletes objects. | Scheduled jobs | Work waits for the next run. An alert fires on lag (NFR-8, NFR-15). |
-| Operator API | Tenant provisioning and the other operator calls (FR-34). Its own Deployment in the `sft-operator` namespace with its own IAM and database roles, on no load balancer; operators reach it only by port-forward ([AUTH] 8.2). It never returns file names, messages or contents. | Not on the request path | Operators wait; tenants are unaffected. Break-glass doesn't need it (3.4). |
+| Lifecycle jobs | `expiry`, `deletion` and `reconciliation` every 5 minutes; `storage-audit`, `cleanup`, `purge` and `audit-partitions` daily (4.5, 5.2). Deletion covers both files bucket pairs in both regions; expiry also expires DLP approval requests, and deletion clears finding details with their file's contents (4.6). The purge deletes the metadata of transfers and upload requests 372 days after they end (#224), and the partition job drops a month of audit events once it is past its 365 days and archived in both regions (#255). The only workload that deletes objects. | CronJobs; each run is a fresh pod | Work waits for the next run. An alert fires on lag, or when a job hasn't succeeded in time (NFR-8, NFR-9). |
+| Audit archive job | Copies committed audit events to both regions' Object Lock archive every minute, and moves its cursor only once both hold a batch (5.2, NFR-15). During a regional loss it writes the surviving region alone and back-fills the other at failback (#257). | A CronJob every minute | Records are safe in PostgreSQL; the next run catches up. Lag over 2 minutes alerts. |
+| Key jobs | `key-rotation`, hourly in Tokyo, is the only writer of the HMAC keyrings and the app clients' secrets; every pod reloads its keyrings every 5 minutes ([KEYS] 6.4). `field-keys`, daily in Tokyo, rotates, reseals and purges the tenants' field data keys ([KEYS] 3.2). | CronJobs | Keys stay valid until the next run; an old active key opens a ticket. |
+| Recovery and standby-enrolment jobs | `recovery` re-imports archived audit events and re-applies security-critical changes after a restore or failover, as `sft_recovery` (section 7). `standby-enrolment` creates each active member without SSO in the standby user pool after a failover and emails their re-enrolment invitation (#258, [AUTH] 2.6). | Suspended CronJobs that the runbooks start | The runbook's step fails and is run again; both are safe to repeat. |
+| Synthetic probe | Sends, verifies, downloads and revokes a transfer through the public API every 5 minutes, from a synthetic tenant to its own mailbox: SES receives the mail into an S3 bucket in each region (#248, #259). Its result is the promotion gate's health signal (3.3) and a probe of NFR-1 and NFR-4. Off until the AWS side is applied. | A CronJob every 5 minutes | Pages after 10 minutes of failures, and when it stops reporting. |
+| Operator API | Tenant provisioning and the other operator calls (FR-34): `createTenant` with an `Idempotency-Key` (#160), `recoverTenantAdmin` and `recordBreakGlassGrant` (#239). Two checks run inside it: the daily SSO provider drift check, which compares each tenant's recorded connection with both user pools, and the break-glass reconciliation every 15 minutes, which records any `BreakGlass` assignment that CloudTrail shows and nobody recorded (#239, [AUTH] 2.5, 8.3). Its own Deployment in the `sft-operator` namespace with its own IAM and database roles, on no load balancer; operators reach it only by port-forward ([AUTH] 8.2). It never returns file names, messages or contents. | Not on the request path | Operators wait; tenants are unaffected. Break-glass doesn't need it (3.4). A check that stops running alerts. |
 | Egress proxy | Envoy as an HTTPS `CONNECT` proxy on the `system` nodes, the only way out of the VPC that doesn't go through a VPC endpoint: one listener and allowlist per workload (3.1, ADR-0021) | 2 replicas in different AZs | If both fail, code exchanges, Cognito admin calls and Argo CD syncs stop; sends, downloads and Osaka writes use endpoints and continue (section 6). |
 | Cognito user pool and sign-in triggers | Member sign-in with mandatory MFA, and tenant SSO federated through it (FR-25, FR-26). A pre-authentication trigger counts failed sign-ins in the counter store, and both triggers send attempts and successes through an SQS queue to the audit log ([AUTH] 2.4). The API keeps its own session; Cognito is used only at sign-in. | Managed | No new sign-ins; existing member sessions keep working. The trigger denies sign-in when it can't reach the counter store or the queue. After a regional failover, the Osaka standby pool takes over (section 7). |
 | PostgreSQL | Tenants, users, transfers, upload requests, files, sessions, download grants, DLP policies, findings, decisions and approvals, audit events, outbox | Instance size; read replica for audit search | Fails over to another AZ automatically. For a region, the Osaka replica is promoted (section 7). |
 | S3: files and large files | File contents under keys that start with `tenants/{tenant_id}/` and use file IDs, never file names. Files over 2 GB go to a second bucket pair with the same settings and key layout, chosen at upload start from the declared size. | Managed | Regional service. Both pairs replicate to Osaka with a 15-minute commitment for 99.99 % of objects (NFR-10). |
 | GuardDuty Malware Protection for S3 | Scans every new object in the large-files bucket and publishes each result to EventBridge, which delivers it to the scan worker's queue through its own delivery role (3.4) | Managed | No result: the file stays in `scanning`, and reconciliation moves it to `scan-failed` at its scan deadline, as for a worker that dies (4.1). |
-| S3: audit archive | Immutable copy of every audit record (NFR-15). Security-critical records (5.2) are written straight to both regions. | Managed | The archive job retries; records are safe in PostgreSQL meanwhile. If Osaka can't be reached, see section 6. |
+| S3: audit archive | Immutable copy of every audit record (NFR-15). Security-critical records (5.2) are written straight to both regions, or to the surviving one alone while a regional loss lasts (#257). | Managed | The archive job retries; records are safe in PostgreSQL meanwhile. If Osaka can't be reached, see section 6. |
 | SQS | Work queues with dead-letter queues | Managed | Regional service. The outbox keeps every message until it is published; after a regional failover, unprocessed messages are published again (5.3, section 7). |
 | Rate-limit counters | Counters shared by all API pods and the sign-in triggers (NFR-14), the sign-in state between redirect and callback, the scan worker's scan leases and the notification worker's per-address caps across tenants; no other workload reaches it. ElastiCache Serverless for Valkey, one cache per environment and region (ADR-0014), behind WAF rate rules for coarse per-IP floods. The state that decides access (code attempts, lockouts, download counts, grant byte use, storage quotas) stays in PostgreSQL ([ABUSE] 4). | Managed | Link verification and sign-in fail closed; every other call falls back to a per-pod limiter, with an alert (section 6). |
 | SES | Outgoing email in Tokyo; a verified, production-approved setup in Osaka for failover | Managed | The notification worker retries; failover sends from Osaka (PRD section 10). |
@@ -205,7 +255,8 @@ covers a whole bucket and ClamAV can't scan them.
   - **GuardDuty Malware Protection:** its own role reads objects in the large-files bucket and decrypts them with the
     files key through S3, for that bucket only.
   - **S3 replication:** its own role, with `s3:GetObjectVersionTagging` and `s3:ReplicateTags`, so the `scan` tag
-    reaches the Osaka replicas.
+    reaches the Osaka replicas. The same role carries the replication back to Tokyo at a failback, and a separate
+    batch replication role, which can't read objects, copies what Osaka wrote meanwhile (#262, 3.2).
   - **Lifecycle jobs:** the only role with `s3:DeleteObjectVersion` on the files buckets.
   - **Recovery:** `sft-{env}-recovery`, with the `sft_recovery` database role, used only by the restore and failover
     jobs to re-apply security-critical records across tenants ([data model](design/data-model.md) 4.2).
@@ -216,6 +267,10 @@ covers a whole bucket and ClamAV can't scan them.
   - **Operator API, notification worker and sign-in triggers:** their own roles. Of all workloads, only the API, the
     sign-in triggers, the scan worker (scan leases) and the notification worker (per-address caps) reach the counter
     store; the triggers reach nothing else but the queue that carries sign-in events.
+  - **Audit archive job, synthetic probe and the observability stack:** their own roles too: the archive job writes
+    both regions' archives as `sft_archive`, the probe reads and deletes its own mail in the probe mailbox, and Loki,
+    Tempo, Alertmanager and the CloudWatch exporter each reach only their bucket, their topics or CloudWatch's reads
+    (deploy/README.md, [observability](operations/observability.md) 1).
   - Infected objects are denied to every principal by their tag (FR-17).
 
 ### 3.2 Osaka pilot light
@@ -236,10 +291,14 @@ Running all the time, so a failover only has to add compute (section 7):
   objects.
 - **Control:** a Kubernetes control plane and one `system` node that always runs, with Argo CD, Kyverno, Karpenter,
   CoreDNS and the egress proxy, so Argo CD and Kyverno stay installed and in sync with Git (ADR-0004). Osaka's values
-  in Git keep every application workload at zero and the observability stack off. A failover scales `system` to two
-  nodes; Karpenter adds the main and scan nodes, and Argo CD syncs what Git holds. Each region has its own Terraform
-  state bucket and lock, Osaka's in Osaka, so a failover needs no backend switch (ADR-0005). The first drill measures
-  this against the RTO.
+  in Git keep every application workload at zero and the observability stack off. A failover raises `system` to two
+  nodes with a Terraform input (`system_node_count`, #261); Karpenter adds the main and scan nodes, and Argo CD syncs
+  what Git holds. Each region has its own Terraform state bucket and lock, Osaka's in Osaka, so a failover needs no
+  backend switch (ADR-0005). The first drill measures this against the RTO.
+- **Mail for the probe:** SES receives the synthetic probe's mail in both regions into an S3 mailbox bucket; Tokyo's
+  MX record comes first and Osaka's second, so after a failover the mail lands in Osaka (#259).
+- **The way back:** Osaka's files buckets can replicate to Tokyo. The rule is an input that only a failback turns on,
+  through the same replication role (#262, section 7).
 
 ### 3.3 Environments and delivery
 
@@ -250,22 +309,31 @@ Running all the time, so a failover only has to add compute (section 7):
 | prod | Section 3.1 and 3.2 | Destroyed after the operating period, except the retained stack (3.4, NFR-19) |
 
 ```mermaid
-flowchart LR
-    pr["Pull request"] --> ci["CI: lint, test, scan"]
-    ci --> main["main"]
-    main --> build["Build and sign images,<br/>build web app bundle"]
-    build --> reg[("Container registry<br/>shared account")]
-    build --> cfg["Deploy config:<br/>new versions"]
-    cfg --> argo["Argo CD"]
-    argo --> dev["dev"]
-    dev --> stg["staging"]
-    stg -->|"manual approval"| prod["prod"]
-    tf["Terraform via GitHub OIDC"] --> aws[("AWS")]
+flowchart TB
+    pr["Pull request"] --> ci["CI: tests, isolation suite, contract,<br/>Terraform, deploy config, Trivy, gitleaks"]
+    ci -->|"review, squash merge"| main["main"]
+    main --> build["build.yml: arm64 image,<br/>scan, cosign signature"]
+    build --> ecr[("ECR<br/>shared account")]
+    build -->|"pull request that<br/>pins dev's digest"| dev["dev"]
+    dev -->|"promotion pull request,<br/>promotion-gate"| stg["staging"]
+    stg -->|"promotion pull request;<br/>merging is prod's approval"| prod["prod"]
+    ecr -. "pulled by digest,<br/>signature checked" .-> dev
+    ecr -.-> stg & prod
+    tf["Terraform through<br/>GitHub OIDC roles"] --> aws[("AWS accounts")]
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef store fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef ext fill:#f5f5f4,stroke:#78716c,color:#1c1917,stroke-dasharray:4 3
+    class pr,ci,main,build,tf ext
+    class dev,stg,prod app
+    class ecr,aws store
 ```
 
-The same image digests and the same web app bundle move from dev to staging to prod (NFR-18). Terraform owns AWS
-resources; Argo CD owns what runs in Kubernetes; the delivery pipeline promotes the web app bundle (a versioned copy
-that CloudFront points to). A rollback reverts the version change in the deploy config, for both (ADR-0005).
+Each environment's cluster runs Argo CD, which syncs that environment's values file from `main`: a deploy is a merged
+pull request that changes a digest. The same image digests move from dev to staging to prod (NFR-18). Terraform owns
+AWS resources; Argo CD owns what runs in Kubernetes. A rollback reverts the digest change in the deploy config, and the
+promotion gate passes a revert at once, so it merges within NFR-18's 10 minutes (ADR-0005). The web app bundle is
+built and checked on every pull request; ADR-0008's release workflow, which uploads one versioned bundle per build and
+promotes it the same way, isn't written yet, nor is the shared stack's store it writes to (infra/shared).
 
 - **Promotion gate.** A promotion is a pull request that changes the next environment's deploy config. Its required
   `promotion-gate` job runs on the pull request's own head commit and passes only if the previous environment is
@@ -279,8 +347,10 @@ that CloudFront points to). A rollback reverts the version change in the deploy 
 - **Deploy config** ([deploy/](../deploy/README.md)). One Helm chart for the application, one values file per cluster
   that pins the image digest, and an apps chart that makes the AppProject and the two Applications (`sft`, and
   `sft-operator` for the operator API). Terraform's root Application passes in what only it knows, such as the
-  registry's account and the database endpoint, so no account ID is committed. A `pilotLight` flag in Osaka's files
-  holds every workload at zero, suspends the jobs and skips the migration job; the fencing commit flips it.
+  registry's account and the database endpoint, so no account ID is committed. A second root Application,
+  `observability`, deploys the observability stack the same way (3.5). A `pilotLight` flag in Osaka's files holds
+  every workload at zero, suspends the jobs and skips the migration job; the fencing commit flips it, with
+  `failover.holdWorkers` and `auditArchive.survivingRegionOnly` (section 7).
 - **Operators never change Argo CD Applications.** Argo CD runs with Identity Center sign-in and read-only roles for
   `ReadOnly` and `Operator`; every sync comes from Git ([AUTH] 8.1).
 
@@ -306,8 +376,8 @@ like break-glass. [ADR-0006](adr/0006-aws-account-per-environment.md) records th
 | Shared registry, in the shared account | ECR repositories for every environment and the registry key (`alias/sft/shared/registry`). A repository's encryption can't change after creation, so it can't use an environment's key, which goes away with that environment. | From the bootstrap until the last environment is destroyed |
 | Retained, prod only | The audit archive buckets in both regions and the audit key, plus what guards them without the environment: its own state bucket under the audit key, its own deploy role, a trail, EventBridge rules in both regions with an alert topic and their delivery role, and the NFR-19 budget alarm, created by the teardown apply or filtered on the `retention = audit-archive` tag so it never fires while prod runs. `prevent_destroy`, and CI fails any plan that would delete them. | In the prod account, which stays open until the archive's retention ends ([KEYS] 8.4) |
 
-- **EventBridge rules** (GuardDuty scan results and SES tenant pauses into queues, security alerts into alarm topics)
-  deliver through their own execution role, `sft-{env}-events-delivery`, whose trust policy pins the source account
+- **EventBridge rules** (GuardDuty scan results and SES tenant pauses into queues, security alerts into alarm topics,
+  3.5) deliver through their own execution role, `sft-{env}-events-delivery`, whose trust policy pins the source account
   and the rule ARNs. The key policies then name that one role instead of trusting any EventBridge rule ([KEYS] 4.4).
 - **Operators** ([AUTH] 8). The operator API runs as its own Deployment in the `sft-operator` namespace, which runs
   nothing else. The `Operator` permission set may port-forward only there, and can't exec, attach, port-forward or
@@ -319,14 +389,92 @@ like break-glass. [ADR-0006](adr/0006-aws-account-per-environment.md) records th
 **Prod teardown, in order** ([KEYS] 8.4):
 
 1. Apply the retained stack with the environment's principals removed from the audit key policy and the bucket
-   policies (KMS refuses a key policy that names a role that no longer exists), and turn the audit key's rotation off,
-   since no new records will be written.
+   policies (they match roles by ARN, so a role re-created later under the same name would match them again), and turn
+   the audit key's rotation off, since no new records will be written (#263).
 2. Destroy the environment, then its bootstrap stack. The shared registry stack goes with the last environment. The
    organization's log archive stays under its 90-day Object Lock and bills a few cents until that ends (NFR-19).
 3. Check the next bill (NFR-19).
 
 dev and staging keep their archive in the environment stack, with a 1-day governance-mode lock and 7-day key deletion,
 so they tear down completely.
+
+### 3.5 Observability and alerting
+
+```mermaid
+flowchart LR
+    subgraph cluster["Each cluster, off in the Osaka pilot light"]
+        apps["API, operator API,<br/>workers"]
+        jobs["Scheduled jobs,<br/>synthetic probe"]
+        agent["OTel agent<br/>on every node"]
+        gw["OTel gateway<br/>tail sampling"]
+        push["Pushgateway"]
+        prom["Prometheus<br/>SLO and alert rules"]
+        am["Alertmanager"]
+        loki["Loki"]
+        tempo["Tempo"]
+        cwx["CloudWatch exporter"]
+        graf["Grafana<br/>port-forward only"]
+    end
+    subgraph region["AWS, per Region"]
+        cwm["CloudWatch metrics"]
+        alarms["CloudWatch alarms"]
+        trail["CloudTrail"]
+        evr["EventBridge<br/>security rules"]
+        sns["SNS topics<br/>page, ticket, heartbeat"]
+        buckets[("S3: logs and traces")]
+    end
+    ops(["Operators"])
+    apps -->|"spans"| agent
+    agent -->|"container logs"| loki
+    agent --> gw -->|"sampled traces"| tempo
+    apps -->|"metrics"| prom
+    jobs -->|"metrics after each run"| push --> prom
+    cwm --> cwx --> prom
+    loki & tempo --> buckets
+    graf --> prom & loki & tempo
+    prom --> am -->|"through the egress proxy"| sns
+    cwm --> alarms --> sns
+    trail --> evr --> sns
+    sns -->|"email, pager"| ops
+    sns -. "heartbeat silent for 5 min" .-> alarms
+    classDef person fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef job fill:#ede9fe,stroke:#6d28d9,color:#2e1065
+    classDef store fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef aws fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef obs fill:#e2e8f0,stroke:#475569,color:#0f172a
+    class ops person
+    class apps app
+    class jobs job
+    class buckets store
+    class cwm,alarms,trail,evr,sns aws
+    class agent,gw,push,prom,am,loki,tempo,cwx,graf obs
+    style cluster fill:none,stroke:#3b82f6
+    style region fill:none,stroke:#64748b,stroke-dasharray:6 4
+```
+
+- **In each cluster** ([observability](operations/observability.md), ADR-0009). An OpenTelemetry agent on every node
+  takes the pods' spans and tails their log files. Logs go to Loki; spans go to a gateway whose tail sampling keeps
+  every trace with an error or slower than 1 s and a tenth of the rest, for Tempo. Prometheus scrapes each service's
+  internal port, the scheduled jobs and the probe through the Pushgateway, and AWS metrics through the CloudWatch
+  exporter. Loki and Tempo keep their data in S3 in the cluster's region. Grafana has no accounts and is reached only
+  by port-forward. An Osaka pilot light runs none of it; the fencing commit starts it, with empty history.
+- **Alerts** ([SLOs](operations/slos.md)). Prometheus evaluates the multi-window burn-rate alerts on each SLO and
+  every rule in `deploy/alerts/`. Alertmanager sends pages and tickets to the region's SNS topics through the egress
+  proxy. CloudWatch alarms watch what the cluster can't see (the load balancer, Aurora, the queues, replication, NAT,
+  KMS, SES and the sign-in triggers) and notify the same topics directly. The Route 53 health check alarms live in
+  us-east-1 (NFR-21).
+- **The heartbeat.** Alertmanager's always-firing `Watchdog` publishes to a heartbeat topic every minute. A CloudWatch
+  alarm pages when that topic has been silent for 5 minutes, so a cluster that dies, or can no longer reach SNS,
+  still pages.
+- **Security events** (#256). EventBridge rules in each region page on CloudTrail events: a KMS key policy change,
+  disable or scheduled deletion by anyone but a deploy role; any use of the key-admin role; a root, emergency user,
+  `Admin` or `BreakGlass` sign-in; CloudTrail, GuardDuty or Config turned off; an `sft-*` rule disabled or deleted;
+  the cluster endpoint made public. Sign-ins and role assumptions that AWS records in us-east-1 are forwarded from
+  there. The break-glass database role and the retained stack have rules of their own (3.4). None of them passes
+  through the cluster.
+- **Runbooks.** Every alert and alarm links to its runbook (NFR-17). `deploy/tests/test_runbooks.py` fails the build
+  when an alert or alarm has none, and the alarms module's `terraform test` does the same for the EventBridge rules.
 
 ## 4. Key flows
 
@@ -719,7 +867,7 @@ sequenceDiagram
   after each file. The tenant's keyword lists and patterns travel with the file and are forgotten with it.
 - **The tenant's detectors, as built (#218).** In the transaction that reads the file, the worker reads the tenant's
   live, enabled detectors and the DLP policy version (`sft.data.dlp_policy.scan_detectors`), opens each definition
-  (M2's unencrypted stand-in until DLP-8, so no key is unwrapped yet) and sends them in the request frame. The file
+  with the tenant's DLP data key (#233, [KEYS] 3.3) and sends them in the request frame. The file
   records that version in `inspection_policy_version`, and a tenant detector's findings are `custom:<id>`. The API
   checks a keyword list with the detector library when it is saved, alone and with the tenant's other lists, so the
   inspector never gets a set it can't compile.
@@ -759,9 +907,10 @@ the policy and its rules, the recipients' domains (`transfer_recipients.domain`,
 and the findings' counts (never their details), and writes the decision (data model 2.7).
 
 - Step 1: domains are compared lowercase and IDNA-normalised, a subdomain of a trusted domain is trusted, and a domain
-  is new when `dlp_known_domains` has no send to it in 365 days. SSO domains don't count yet: `sso_domains` arrives with
-  M6. Step 2: the message's findings (FR-50) count as a file's, and a rule with `include_sender_24h` adds the
-  sender's transfers sent in the last 24 hours (FR-49, #221); a `not_inspected` rule counts files
+  is new when `dlp_known_domains` has no send to it in 365 days. The tenant's proven SSO domains count as trusted
+  (`sso_domains`, #231). Step 2: the message's findings (FR-50) count as a file's, and a rule with
+  `include_sender_24h` adds the sender's transfers sent in the last 24 hours (FR-49, #221); a `not_inspected` rule
+  counts files
   and a `new_domain` rule domains, and a rule scoped to untrusted recipients is tested only when one is (its new
   domains are theirs). The policy and its rules are read in one statement, so the version recorded names the rules
   applied. A tenant without a policy, which can't happen, fails closed: nothing is sent.
@@ -853,8 +1002,8 @@ and the `expiry` job expires requests (`sft.service.lifecycle`); data model 3.2 
   `dlp_approval.decided` and `dlp_approval.expired` (the sender), `dlp_approval.no_eligible_approver` (the admins), and
   `dlp_policy.changed.approvers_changed` (the admins, when `updateUser` changes a designation). The hourly digest
   past 20 requests an hour and the 10-minute coalescing of policy notices ([ABUSE] 7.1) arrived with #230 (below).
-- Finding details for approvers (location hints, masked previews) come with DLP-8. Two-approver rules (#221) wait for
-  two different approvers.
+- Approvers see the finding details (location hints, masked previews), sealed under the tenant's DLP data key and
+  audited at each read (#233). Two-approver rules (#221) wait for two different approvers.
 
 **As built (#221, DLP-6): the Should requirements.**
 
@@ -940,13 +1089,51 @@ Otherwise the file becomes available, and the member sees its findings.
 | UC-2, FR-10 to FR-13 | 4.3 |
 | UC-3, FR-20 | 4.4 |
 | UC-4, FR-27 to FR-29 | 5.2 (audit search and export read PostgreSQL) |
-| UC-5, FR-22 to FR-26 | API service and PostgreSQL; invitations go through the outbox; deactivations are security-critical records (5.2); sign-in through Cognito with tenant SSO ([AUTH] 2) |
+| UC-5, FR-22 to FR-26 | API service and PostgreSQL; invitations go through the outbox; deactivations are security-critical records (5.2); sign-in through Cognito with tenant SSO (4.8, [AUTH] 2) |
 | UC-6, FR-34 | Operator API in its own namespace (3.4); section 7 for disaster recovery |
 | FR-35 break-glass access | 3.4 and [AUTH] 8.3 |
 | FR-14, FR-15 verification | 4.2, [AUTH] 4 |
 | FR-16 to FR-19 scanning | 4.1, [ABUSE] 6.4 |
 | FR-21 lifecycle | 4.5 |
 | UC-7, FR-36 to FR-56 DLP | 4.6; inspection in 4.1 |
+
+### 4.8 Member sign-in (FR-25, FR-26)
+
+Every member sign-in takes this path, local or SSO. [AUTH] 2 has the full design: choosing the provider,
+invitations, just-in-time SSO members, the sign-in triggers and the standby pool.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Member, web app
+    participant API as API service
+    participant KV as Valkey store
+    participant C as Cognito managed login
+    participant DB as PostgreSQL
+    M->>API: GET /v1/auth/sign-in, same-site, with any session cookie the browser holds
+    API->>KV: pre-auth record for 10 min: state, PKCE verifier, nonce, connection, that cookie's SHA-256
+    API-->>M: 302 to Cognito, prompt=login
+    M->>C: password and TOTP or passkey, or the tenant's SSO provider
+    Note over C: the sign-in triggers count failures and queue each attempt for the audit log
+    C-->>M: 302 to the callback with code and state
+    M->>API: GET /v1/auth/callback, cross-site, so no session cookie arrives
+    API->>KV: take the record once, compare state
+    API->>C: exchange the code, through the egress proxy
+    API->>DB: resolve the identity, revoke the session the record names, create a new session, audit
+    API-->>M: new session cookie, 302 to the web app
+```
+
+- **No session fixation** (#159, [AUTH] 3.3). The callback arrives from the user pool's domain, so it is cross-site
+  and the browser leaves the `SameSite=Strict` session cookie off. The start is same-site and sees whatever session the
+  browser holds, so it records that cookie's hash, never the cookie, in the pre-auth record (step 2), and the callback
+  revokes that session before it issues a new one (step 9). A session planted in the browser before sign-in never
+  becomes a signed-in session.
+- **The pre-auth record** is single use and lives 10 minutes in the counter store; the sign-in routes fail closed
+  when the store is down. The code exchange needs the PKCE verifier and the client secret, neither of which leaves the
+  API.
+- **Failed sign-ins** are counted by the pre-authentication trigger, at most 10 per account in 15 minutes (NFR-14),
+  and every attempt and success reaches the audit log through SQS (5.2). After sign-in the API keeps its own session;
+  Cognito isn't asked again until the next sign-in or step-up.
 
 ## 5. Cross-cutting patterns
 
@@ -986,13 +1173,23 @@ across tenants fails to decrypt.
    [THREAT] R-05).
    As built (#177): `sft.service.audit_archive` writes each record once per region, keyed by its event ID (data
    model 2.5), and the deactivations, demotions, lockouts and unlocks of M1 and M2 go through it.
+
+   **While a region is lost** (#257). Writing both regions before answering would stop every new download grant, and
+   the archive job, for as long as one region is gone. So a regional failover sets
+   `auditArchive.survivingRegionOnly` (section 7): the API writes each security-critical record to the surviving
+   region alone, and the archive job writes each batch there alone and records its range. At failback the job
+   writes every recorded range to the other region as the same objects, with the window's security-critical records,
+   so the regions end identical with no gap and no duplicate. A grant's intent record, which is never in the database,
+   stays in the surviving region only; its committed record supersedes it (data model 2.5). The mode is never used
+   for an outage of Osaka's S3 alone while Tokyo serves: that stays the fail-closed case of section 6.
 4. Every API key call is audited on its own. Cognito sign-ins reach the audit log through the sign-in triggers: the
    pre-authentication trigger reports every attempt and the post-authentication trigger every success, through an SQS
    queue to the notification worker, so failed sign-ins are recorded within 60 s ([AUTH] 2.4).
-5. Audit search and export (FR-28, FR-29) read PostgreSQL. The table is partitioned by month; a daily job deletes rows
-   older than 365 days and drops partitions once they are empty. Archived objects carry a 365-day Object Lock
-   retention, and each archive bucket's own lifecycle rule, in Tokyo and Osaka, deletes them a day after it ends
-   (NFR-9).
+5. Audit search and export (FR-28, FR-29) read PostgreSQL. The table is partitioned by month, and the daily partition
+   job drops a month once its end is 365 days past and every row of it is archived in both regions, through a narrow
+   function that only `sft_jobs` may run; no application role can drop, detach or truncate a partition (#255, data
+   model 6). Archived objects carry a 365-day Object Lock retention, and each archive bucket's own lifecycle rule, in
+   Tokyo and Osaka, deletes them a day after it ends (NFR-9).
 
 ### 5.3 Transactional outbox
 
@@ -1048,6 +1245,8 @@ only there, with the SNS topic those alarms notify; that log delivery; and the K
 (DNSSEC). Load balancer access logs use SSE-S3, the one exception
 to KMS encryption in NFR-13 ([KEYS] 3.1).
 
+Where these signals are collected and kept, and how alerts reach a person, is section 3.5.
+
 ### 5.6 Operational data retention
 
 Data this design adds beyond the PRD's data lifecycle table; the data model
@@ -1071,7 +1270,7 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 | Outbox relay stopped | Outbox age | Messages wait in PostgreSQL; nothing is lost. | NFR-5 |
 | API pod or node lost | Probes, load balancer health checks | Traffic moves to healthy pods. Uploads resume from their parts; cut download streams resume under the same grant, uncounted. | NFR-1, NFR-3 |
 | One AZ lost | AWS health events, error rate | PostgreSQL fails over to another AZ, typically within a minute; pods are rescheduled in the other two AZs. | NFR-11: ≤ 5 min |
-| Tokyo region lost | Route 53 health checks, alarms | An operator decides and runs the regional failover (section 7). | NFR-11: ≤ 1 h |
+| Tokyo region lost | Route 53 health checks, the missing heartbeat, alarms | An operator decides and runs the regional failover (section 7). Until failback, the audit archive is written in Osaka alone (5.2). | NFR-11: ≤ 1 h |
 | Audit archive behind | Archive lag | Records are safe in PostgreSQL; the job catches up. | NFR-15 |
 | Osaka archive unreachable: S3 in Osaka, or the cross-region S3 endpoint to it, while Tokyo is healthy | Errors and latency on the cross-region write | New download grants fail closed: `503`, nothing counted. Streams under existing grants continue. The other security-critical changes (5.2) commit first and stand; their `503` means "done, archive record not yet confirmed" (4.4), and a retry or the archive job completes the record when Osaka returns. Sign-in, sending and uploads don't wait on Osaka. There is no degraded mode for grants: their `503`s count against NFR-1 and are reported, not excluded ([disaster-recovery.md](operations/disaster-recovery.md) section 5, gap 5; [THREAT] T-81, R-11). | NFR-10, NFR-15 |
 | Egress proxy down: both replicas | Proxy health, sign-in errors, Argo CD sync alerts | No new member sign-ins (code exchanges and Cognito admin calls fail) and Argo CD stops syncing. Sending, downloads, uploads and the Osaka writes use VPC endpoints and continue; existing sessions keep working. | NFR-1 |
@@ -1080,6 +1279,7 @@ Data this design adds beyond the PRD's data lifecycle table; the data model
 | File replication lagging | Replication latency metrics | An alert fires; Tokyo is unaffected. | NFR-10 |
 | Bad deploy | Error-rate and latency burn alerts | Revert the version change in the deploy config; Argo CD syncs the previous version. The web app bundle rolls back the same way. | NFR-18: ≤ 10 min |
 | Bad migration or data corruption | Errors, reconciliation report | Point-in-time restore to a new database, set the audit archive generation to one more than the highest in the archive (data model 2.5), re-import archived audit rows newer than the restore point, then re-apply security-critical changes from the audit archive with the `sft_recovery` role. Migrations are expand-only, so a bad one is fixed forward or by this restore, never by a down-migration (3.3). | NFR-11: ≤ 2 h |
+| A security control changed, or a privileged sign-in | EventBridge rules on CloudTrail events (3.5) | A page with the event, the caller and the source address, never the request's contents; the runbook tells planned work from an incident. | NFR-13; [THREAT] T-61, T-64, T-75 |
 
 ## 7. Disaster recovery outline
 
@@ -1088,17 +1288,64 @@ Losing the Tokyo region, in the order of the [regional failover runbook](runbook
 measurements; [disaster-recovery.md](operations/disaster-recovery.md) holds the drills, their results and the
 decisions below.
 
+```mermaid
+flowchart LR
+    op(["Operator<br/>ops/regional-failover.sh"])
+    git["Git: one commit<br/>Tokyo fenced, Osaka running,<br/>workers held, archive in Osaka"]
+    tf["Terraform inputs<br/>nodes, GuardDuty, alarms, DNS"]
+    rds["Aurora global<br/>database failover"]
+    subgraph tokyo["Tokyo: lost, then fenced"]
+        argoT["Argo CD"] --> zero["Every workload at zero"]
+    end
+    subgraph osaka["Osaka: serving"]
+        argoO["Argo CD"] --> apiO["API first,<br/>workers after step 7"]
+        lbO["Load balancer"] --> apiO
+        recovery["Recovery job"]
+        enrol["Standby enrolment job"]
+        dbO[("Aurora, promoted")]
+        archO[("Audit archive")]
+        pool["Standby user pool"]
+    end
+    r53["Route 53<br/>the API's record"]
+    cf["CloudFront<br/>origin group"]
+    webO[("Osaka web bundle")]
+    op --> git & tf & rds
+    op -->|"starts"| recovery & enrol
+    git --> argoT & argoO
+    rds --> dbO
+    recovery -->|"reads"| archO
+    recovery -->|"re-applies"| dbO
+    enrol --> pool
+    tf --> r53 --> lbO
+    apiO --> dbO & archO
+    cf -. "falls back by itself" .-> webO
+    classDef person fill:#e0e7ff,stroke:#4338ca,color:#1e1b4b
+    classDef app fill:#dbeafe,stroke:#1d4ed8,color:#0c1a3a
+    classDef job fill:#ede9fe,stroke:#6d28d9,color:#2e1065
+    classDef store fill:#dcfce7,stroke:#15803d,color:#052e16
+    classDef aws fill:#fef3c7,stroke:#b45309,color:#451a03
+    classDef ext fill:#f5f5f4,stroke:#78716c,color:#1c1917,stroke-dasharray:4 3
+    class op person
+    class argoT,argoO,apiO,zero app
+    class recovery,enrol job
+    class dbO,archO,webO store
+    class rds,lbO,pool,r53,cf aws
+    class git,tf ext
+    style tokyo fill:none,stroke:#64748b,stroke-dasharray:6 4
+    style osaka fill:none,stroke:#64748b,stroke-dasharray:6 4
+```
+
 | Step | Budget |
 |---|---|
-| Confirm the regional failure and decide to fail over | 10 min |
-| Fence Tokyo through Git: set Tokyo's Argo CD applications to zero replicas in the desired state, so a returning Tokyo cluster converges to no workloads. The same commit takes Osaka out of pilot-light mode with its workers held (`failover.holdWorkers`). This doesn't need Tokyo to answer. | 2 min |
-| Promote the Osaka PostgreSQL replica to primary | 5 min |
-| Scale the Osaka `system` node group from its one node to two; Karpenter adds the main and scan nodes, and Argo CD deploys the current versions with every worker scaled to zero. Turn on the GuardDuty plan for the Osaka large-files bucket and the Osaka heartbeat alarm, which is off during the pilot light. | 20 min |
-| Sign-in: the Osaka API signs members in through the standby user pool, where SSO members sign in as usual. Create every active member without SSO in that pool and record each new identity; the job sends their re-enrolment emails itself, since an outbox message can't carry the temporary password ([AUTH] 2.6, #258). | Alongside the next two steps |
-| Start the audit archive generation after the highest in the archive, so reused transaction IDs never overwrite or hide an archived record, with the cursor rewound an hour (data model 2.5). Then re-import the archived events and re-apply security-critical changes from the Osaka audit archive with the `sft_recovery` role: every record of 5.2 that takes access away, and only the grants that have a committed record or a database row (4.2) | 5 min |
-| Re-publish unprocessed outbox messages from the last 24 hours, then scale the workers up | 5 min |
-| Switch DNS and the CDN origin to Osaka | 5 min |
-| Verify with the synthetic probe, including a real email from Osaka, and a sign-in through the standby pool | 5 min |
+| 1. Confirm the regional failure and decide to fail over | 10 min |
+| 2. Fence Tokyo through Git. One commit puts Tokyo's clusters in the pilot light, so a returning Tokyo cluster converges to no workloads, and takes Osaka out of it with its workers held (`failover.holdWorkers`) and its audit archive written alone (`auditArchive.survivingRegionOnly`, 5.2). This doesn't need Tokyo to answer. | 2 min |
+| 3. Promote the Osaka database to primary: Aurora's global database failover, or a detach when Tokyo can't be reached | 5 min |
+| 4. Scale Osaka with Terraform inputs only (#261): the `system` node group from one node to two, after which Karpenter adds the main and scan nodes and Argo CD deploys the current versions with every worker at zero; the GuardDuty plan for the Osaka large-files bucket; Osaka's alarms and heartbeat, which are quiet during the pilot light | 20 min |
+| 5. The recovery job (`python -m sft.workers.recovery`, #258) starts the audit archive generation after the highest in Osaka's archive, so reused transaction IDs never overwrite or hide an archived record, with the cursor rewound an hour (data model 2.5). Then it re-imports the archived events and re-applies security-critical changes as `sft_recovery`: every record of 5.2 that takes access away, and only the grants that have a committed record or a database row (4.2) | 5 min |
+| 6. Sign-in: the Osaka API signs members in through the standby user pool, where SSO members sign in as usual. The standby enrolment job (`python -m sft.workers.standby_enrolment`, #258), run after step 5 so it never enrols a member the replay deactivated, creates every active member without SSO in that pool, records the new identity and emails the re-enrolment invitation ([AUTH] 2.6) | Alongside steps 7 and 8 |
+| 7. Re-publish unprocessed outbox messages from the last 24 hours, then release the workers | 5 min |
+| 8. Point the API's DNS record at Osaka's load balancer. CloudFront's origin group already serves Osaka's copy of the web app by itself | 5 min |
+| 9. Verify with the synthetic probe, including a real email from Osaka, and a sign-in through the standby pool | 5 min |
 | **Total** | **57 min**, a budget inside the 1-hour RTO, unmeasured until the first drill |
 
 Workers stay at zero until the security-critical changes are back, so no worker acts on a revocation the replica hadn't
@@ -1110,9 +1357,16 @@ can't send, so the member unlocks again. The gaps that matter only in a failover
 cursor after a failover, backups in Osaka, intake-queue events lost with Tokyo, failback replication, the degraded mode
 for grants, Cognito enrolment, grant byte counters within the replication lag, scans in flight) were tracked in
 [#42](https://github.com/codewithmuh/secure-file-transfer/issues/42); each now has a decision and the drill that proves
-it in [disaster-recovery.md](operations/disaster-recovery.md) section 5. Failing back is a planned switchover with no
-data loss ([regional-failback.md](runbooks/regional-failback.md)). The outline is a proven recovery only once the first
-drill has run, pending the AWS run.
+it in [disaster-recovery.md](operations/disaster-recovery.md) section 5. The outline is a proven recovery only once the
+first drill has run, pending the AWS run.
+
+**Failing back** is a planned switchover in an announced window, with no data loss
+([regional-failback.md](runbooks/regional-failback.md)). Osaka's files buckets replicate to Tokyo through a rule the
+failback turns on, and a batch replication job copies what Osaka wrote before the rule existed (#262). Aurora switches
+over to Tokyo; after a detach, Tokyo joins a new global database as its secondary first, set by Terraform inputs
+(#261). Osaka's workers are held, Tokyo takes over with its own held until the recovery job has run, and DNS moves
+back. Once both regions' archives are written again, the archive job back-fills Tokyo's with everything Osaka's alone
+received, and the last step checks the two are identical (5.2, #257).
 
 **Fencing assumes Tokyo may come back** ([THREAT] T-78). Failover is always an operator's decision, so health checks
 never move API traffic on their own. Git is the desired state for both clusters, so Tokyo is fenced without being

@@ -48,6 +48,7 @@ An issue is done when its PR:
 | **M5 Requests and administration** | The rest of the product, DLP decisions and approvals included | FR-8 to FR-13, FR-24, FR-28 (UI), FR-29, FR-32, FR-37 to FR-46, FR-48 to FR-52, FR-54 to FR-56 | The upload-request journey passes end to end in dev; audit search and export work; API keys pass the authorization matrix; a transfer with sensitive data is warned and confirmed, another is approved and sent, a third is blocked and held: locally, [the M5 journey](../services/api/tests/test_journey_m5.py) through the API (`make e2e`) and [in the browser](../web/e2e/m5-journey.e2e.ts) in English and Japanese (`make web-e2e`), with [the authorization matrix](../services/api/tests/test_authorization_matrix.py) in the same CI run (#223, [local development 7](local-development.md#7-seed-lifecycle-jobs-and-the-journeys)); in dev, pending the AWS run (the M4 follow-up of #223) |
 | **M6 Security hardening** | The full security design | FR-26, FR-35, FR-53, NFR-14 (all limits), NFR-26, ADR-0016 to ADR-0020, ADR-0022 | SSO, step-up and break-glass work and are audited; the WAF and every rate limit are tested; files over 2 GB are scanned by GuardDuty; file names, messages and DLP finding details are encrypted; every test in the threat model's section 6 is automated or scheduled |
 | **M7 Production and operations** | Staging, prod with the Osaka pilot light, and measured NFRs | NFR-1 to NFR-3, NFR-5, NFR-9 to NFR-11, NFR-16, NFR-17, NFR-20, NFR-23, #42 | SLO dashboards and alerts with runbooks; a load test at design load; a regional failover drill with measured RTO and RPO; the operating period; a timed teardown |
+| **M8 AWS run and follow-ups** | The AWS run, and the follow-ups M2 to M7 left open | The NFRs that need real AWS to measure | M4's and M7's exit criteria that need AWS, met in AWS: the environments applied, the synthetic probe passing, the load test, the drills with measured RTO and RPO, the operating period and the timed teardown; every follow-up issue closed |
 
 Every Must requirement in the PRD is placed above. The Should requirements (FR-8, FR-9, FR-24, FR-26, FR-29, FR-32, and
 for DLP FR-39, FR-44, FR-46, FR-49, FR-50, FR-52, FR-55, FR-56) sit in M5 and M6 and can move to after v1 if the
@@ -96,6 +97,12 @@ M5 completes the product on the M4 platform. M6 turns on the parts of the securi
 SSO, GuardDuty, WAF, KMS field encryption). M7 builds staging and prod, the Osaka pilot light, the SLOs and the drills,
 runs the operating period within the monthly cap (PRD open question 7: $6,500 today; capacity 7.3 recommends $7,500
 with DLP), and ends with a timed teardown that keeps only the audit archive (NFR-19).
+
+### M8 AWS run and follow-ups
+
+M4 to M7 were built and checked without an AWS account, as the principles allow until the maintainer names the AWS
+profiles. M8 applies them, measures what only AWS can show (apply, drills, probe, load test, operating period), and
+closes the follow-up issues the earlier milestones left open.
 
 ### Data loss prevention
 
