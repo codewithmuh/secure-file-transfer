@@ -11,9 +11,9 @@ dependencies = [
   "prometheus-client>=0.23",
   "pydantic-settings>=2.16",
   # SQLAlchemy 2.0 as ADR-0002 names it; 2.1 is a deliberate upgrade, not a Dependabot bump.
-  "sqlalchemy[asyncio]>=2.0.55,<2.1",
+  "sqlalchemy[asyncio]>=2.0.57,<2.1",
   # The binary wheel bundles libpq, so the slim image needs no system packages.
-  "psycopg[binary]>=3.3.7",
+  "psycopg[binary]>=3.3.8",
   "alembic>=1.20.1",
   # Traces (ADR-0009). The SDK and the exporter release in step with opentelemetry-api, which
   # FastAPI already needs, so all three move together: pinned, not bumped one at a time.
@@ -26,7 +26,7 @@ dependencies = [
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
-  "boto3>=1.43.123",
+  "boto3>=1.43.125",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
   # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
@@ -58,8 +58,8 @@ dev = [
   "pytest>=9.2.0",
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
-  "ruff>=0.17.3",
-  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.123",  # mypy types for the AWS clients
+  "ruff>=0.17.4",
+  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.125",  # mypy types for the AWS clients
   "types-pyyaml>=6.0.12.20261103",
 ]
 
