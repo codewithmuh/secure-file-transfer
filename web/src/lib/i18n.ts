@@ -494,11 +494,6 @@ const en = {
       clean: 'clean',
       unscannable: 'unscannable',
     },
-    notAvailable: {
-      title: 'Not available yet',
-      body: 'This part of the service isn\'t available yet. It arrives in a later release.',
-      home: 'Go to the dashboard',
-    },
     locales: {
       en: 'English',
       ja: 'Japanese',
@@ -2057,11 +2052,6 @@ const ja = {
       expired: '期限切れ',
       clean: 'スキャン済み',
       unscannable: 'スキャン不可',
-    },
-    notAvailable: {
-      title: 'まだ利用できません',
-      body: 'この機能はまだ利用できません。今後のリリースで提供されます。',
-      home: 'ダッシュボードへ',
     },
     locales: {
       en: '英語',

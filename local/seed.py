@@ -12,9 +12,13 @@ Run with `make seed` after `make up`. It writes, as the local server's superuser
 
 - the `local-keycloak` connection in `idp_connections`: the stack's Keycloak, standing in for the
   user pool (ADR-0016), which the API names in `OIDC_PROVIDER_NAME`;
-- a tenant, with its policy and its default DLP policy (#218);
-- an admin and a member, each with a `user_identities` row bound to its Keycloak subject in
-  local/keycloak/sft-realm.json, so both sign in through Keycloak as members do through Cognito;
+- a tenant, with its policy and its default DLP policy (#218), whose trusted domains are
+  `partner.example` (#223);
+- an admin, a member and an approver (a second member), each with a `user_identities` row bound to
+  its Keycloak subject in local/keycloak/sft-realm.json, so all sign in through Keycloak as members
+  do through Cognito. The admin and the approver are DLP approvers (#223): a rule that requires one
+  approval needs more active approvers than that, and the member, who sends, isn't one, so the M5
+  journey's approval rule can be made and the member's request has someone to decide it;
 - the tenant's SSO provider (#231): Keycloak's `customer` realm, brokered by the `sft` realm under
   the tenant's provider name (local/keycloak/sft-realm.json), and its proven domain
   `corp.localhost`, linked to it, so "Continue with SSO" for `sso.member@corp.localhost` signs in
@@ -60,6 +64,9 @@ CONNECTION_ID = "66666666-6666-4666-8666-666666666666"
 PROVIDER = "local-keycloak"
 ISSUER = "http://localhost:8180/realms/sft"
 WEB_APP = "http://localhost:3000"
+# The M5 journey's partner (#223): a trusted domain, so a rule scoped to untrusted recipients
+# leaves its transfers alone. Every journey sends to addresses at it.
+TRUSTED_DOMAIN = "partner.example"
 
 # Each user's ID is its Keycloak `username` (the ID token's `cognito:username`), and its identity's
 # subject is the Keycloak user's own ID (`sub`): local/keycloak/sft-realm.json.
@@ -71,6 +78,7 @@ USERS = (
         "subject": "55555555-5555-4555-8555-555555555555",
         "email": "dev.admin@example.com",
         "password": "local-only-admin-password",
+        "dlp_approver": True,
     },
     {
         "role": "member",
@@ -79,6 +87,15 @@ USERS = (
         "subject": "33333333-3333-4333-8333-333333333333",
         "email": "dev.member@example.com",
         "password": "local-only-member-password",
+    },
+    {
+        "role": "member",
+        "user_id": "12121212-1212-4212-8212-121212121212",
+        "identity_id": "14141414-1414-4414-8414-141414141414",
+        "subject": "13131313-1313-4313-8313-131313131313",
+        "email": "dev.approver@example.com",
+        "password": "local-only-approver-password",
+        "dlp_approver": True,
     },
 )
 
@@ -154,10 +171,10 @@ def seed(connection: psycopg.Connection, suppress: list[str]) -> dict[str, int]:
     for user in USERS:
         run(
             "users",
-            "INSERT INTO users (id, tenant_id, email, email_normalized, role, status) "
-            "VALUES (%(user_id)s, %(tenant)s, %(email)s, lower(%(email)s), %(role)s, 'active') "
-            "ON CONFLICT DO NOTHING",
-            {**user, "tenant": TENANT_ID},
+            "INSERT INTO users (id, tenant_id, email, email_normalized, role, status, "
+            "dlp_approver) VALUES (%(user_id)s, %(tenant)s, %(email)s, lower(%(email)s), "
+            "%(role)s, 'active', %(approver)s) ON CONFLICT DO NOTHING",
+            {**user, "tenant": TENANT_ID, "approver": user.get("dlp_approver", False)},
         )
         run(
             "user_identities",
@@ -174,6 +191,13 @@ def seed(connection: psycopg.Connection, suppress: list[str]) -> dict[str, int]:
         "SELECT dlp_default_policy(%(tenant)s, %(admin)s, 'en') "
         "WHERE NOT EXISTS (SELECT FROM dlp_policies WHERE tenant_id = %(tenant)s)",
         {"tenant": TENANT_ID, "admin": admin},
+    )
+    # Written only while the policy trusts nothing, so an admin's later change to the list stays.
+    run(
+        "dlp_policies",
+        "UPDATE dlp_policies SET trusted_domains = ARRAY[%(domain)s]::text[] "
+        "WHERE tenant_id = %(tenant)s AND cardinality(trusted_domains) = 0",
+        {"tenant": TENANT_ID, "domain": TRUSTED_DOMAIN},
     )
     run(
         "idp_connections",
@@ -257,7 +281,14 @@ def main() -> int:
         "keycloak": ISSUER,
         "tenant": {"id": TENANT_ID, "name": TENANT_NAME},
         # No passwords in the output, not even these fake ones: docs/local-development.md section 3 lists them.
-        "users": [{k: u[k] for k in ("role", "email", "user_id")} for u in USERS],
+        "users": [
+            {
+                **{k: u[k] for k in ("role", "email", "user_id")},
+                "dlp_approver": bool(u.get("dlp_approver")),
+            }
+            for u in USERS
+        ],
+        "trusted_domains": [TRUSTED_DOMAIN],
         "passwords": "docs/local-development.md, section 3",
         "added": added,
     }
@@ -270,7 +301,9 @@ def main() -> int:
         f"Sign in at {WEB_APP}, or start at {details['sign_in']}, through Keycloak ({ISSUER}):"
     )
     for user in USERS:
-        print(f"  {user['role']:6}  {user['email']}")
+        approver = ", DLP approver" if user.get("dlp_approver") else ""
+        print(f"  {user['role']:6}  {user['email']}{approver}")
+    print(f"Trusted domain: {TRUSTED_DOMAIN} (the DLP policy's)")
     print(
         "Their local-only, fake passwords are in docs/local-development.md, section 3."
     )

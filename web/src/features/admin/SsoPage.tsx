@@ -593,18 +593,14 @@ function GroupRolesCard({ list, onChange }: { list: SsoGroupRole[]; onChange: (l
                     <span className="break-all text-gray-900">{entry.group}</span>
                   </TableCell>
                   <TableCell>
-                    <select
-                      aria-label={t('sso.groups.roleFor', { group: entry.group })}
-                      className="input-field py-1"
+                    <Select
+                      label={t('sso.groups.roleFor', { group: entry.group })}
+                      hideLabel
+                      className="py-1"
                       value={entry.role}
                       onChange={(event) => onChange(setGroupRole(list, entry.group, event.target.value as Role))}
-                    >
-                      {ROLES.map((value) => (
-                        <option key={value} value={value}>
-                          {roleLabel(value)}
-                        </option>
-                      ))}
-                    </select>
+                      options={ROLES.map((value) => ({ value, label: roleLabel(value) }))}
+                    />
                   </TableCell>
                   <TableCell>
                     <Button

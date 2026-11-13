@@ -146,17 +146,27 @@ stand-ins with the real extraction and detectors in process, in CI.
 staging runs, the tool from a ConfigMap, 300 files up to 100 MB and 10 from 100 MB to 2 GB, during the load test's
 window so the engines share the node as they do at design load.
 
-## 3. The NFR-3 upload test in the browser (#251)
+## 3. The NFR-3 upload test in the browser (#251, #267)
 
-[`web/e2e/upload-resume.e2e.ts`](../../web/e2e/upload-resume.e2e.ts), a browser flow of `make web-e2e` that runs only
-with `E2E_UPLOAD_RESUME=1`; it is out of CI's Local stack job until #267 makes it reliable there. A member uploads a large file of words through the web app's upload engine over a link Chromium
-throttles through the DevTools protocol (`Network.emulateNetworkConditions`); when half the parts have landed the link
-goes offline, failing every request in flight, and comes back after the outage. It passes when:
+[`web/e2e/upload-resume.e2e.ts`](../../web/e2e/upload-resume.e2e.ts), a browser flow of `make web-e2e`, in CI's Local
+stack job on every pull request. A member uploads a large file through the web app's upload engine over a link the
+test controls (#267): every request of the page goes through `page.route`, and the part PUTs to the S3 stand-in go on
+through a small proxy in the test that sends each body at the line rate, shared by every part in flight as one link
+is, and times each part. When half the parts have landed the link drops: every request fails until it comes back, and
+each part in flight is cut half sent, so S3 never assembles it. Chromium's own throttle
+(`Network.emulateNetworkConditions`), which #251 used, didn't slow the part PUTs in CI, so every part had landed
+before the cut. The file is a PNG signature then pseudo-random bytes, which the DLP inspector names unsupported without
+decoding (`sft.dlp.extract._sniff`), so the scan takes seconds: #251's 40 MiB of words held the stack's one small-pool
+scan worker for 214 s and starved the specs beside it. It passes when:
 
-- every part was sent and none landed twice, and every part that had landed before the cut was sent exactly once
-  (counted per part number from the page's own requests, which are observed, never routed, so the throttle applies);
-- the cut failed at least one part in flight, so the test proved something;
-- `completeUpload` answers `200`, within the line rate plus 10 %, plus the outage and 20 s for the engine's retry wait.
+- the throttle reached the part PUTs: no part landed faster than its size at the line rate, and the link carried no
+  more than the rate (5 % for timer slack);
+- the cut stopped at least one part in flight, so the test proved something;
+- every part is in S3 and none landed twice, and no part was sent again after it landed: not one that landed before
+  the cut, not one whose answer the cut lost (the engine finds it with `listUploadedParts`), so the spec fails if a
+  completed part is sent again;
+- `completeUpload` answers `200`, within the line rate plus 10 %, plus the outage and 20 s for the engine's retry wait
+  and the bytes the cut threw away.
 
 | Run | File | Link | Outage |
 |---|---|---|---|
@@ -165,7 +175,7 @@ goes offline, failing every request in flight, and comes back after the outage. 
 
 ```bash
 make up && make seed
-E2E_UPLOAD_RESUME=1 E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
+E2E_ARGS='e2e/upload-resume.e2e.ts' E2E_UPLOAD_MIB=4769 E2E_UPLOAD_MBITS=100 make web-e2e
 ```
 
 The full run writes the 5 GB file to the Playwright container's temporary directory and needs that much free disk. The

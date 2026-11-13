@@ -147,8 +147,23 @@ check then fails, the web app relied on something the contract no longer says.
 | `/admin/sso` | Single sign-on (#231, FR-26): the connection an operator set up, email domains claimed and proven by a DNS TXT record (copy the record, verify, remove), the confirmation that the identity provider enforces MFA, "require SSO", members created at their first SSO sign-in, and the group-to-role list | Admin |
 
 Every M5 page is routed: upload requests and the uploader (#212, #213), the audit log and API keys (#215, #216), the
-DLP policy and approvals (#218, #220). `npm run check:mocks` (part of `npm run check`) walks the imports from
-`src/main.tsx` and fails on mock data or a simulated delay in any page the app can reach; none is pending since #198.
+DLP policy and approvals (#218, #220); the "not available yet" page of M3 is gone (#223). `npm run check:mocks` (part
+of `npm run check`) walks the imports from `src/main.tsx`, the routes' `import()` of each feature's chunk included, and
+fails on mock data or a simulated delay in any page the app can reach; none is pending since #198.
+
+**Code splitting** (#169). Each feature's pages are their own chunk, loaded by the route's `lazy` on its first visit
+(`src/app/router.tsx`): the sender's, the recipient's, the uploader's, the admin's, approvals, the audit log and DLP. The
+first load holds the shell (React, the router, TanStack Query, i18n with both languages, the layouts and the sign-in
+pages) and the visited page's chunk. Built with `vite build`, gzip:
+
+| First load | Before (one chunk) | After |
+|---|---|---|
+| A recipient's `/t` | 275.2 kB | 226.8 kB |
+| An uploader's `/u` | 275.2 kB | 231.7 kB |
+| A member's `/` (the sender chunk) | 275.2 kB | 250.1 kB |
+
+The largest chunk is now 459 kB before gzip, under Vite's 500 kB warning (it was 939 kB). Every select is the one
+`Select` of `components/ui`, with a generated ID; `Select.test.tsx` fails on a page that writes its own.
 
 **The recipient's link page** (`/t`, #198, `features/recipient/`). `captureLinkToken` reads the token from the
 fragment and removes it in `main.tsx`, before the config loads or React renders. `LinkGate` resolves the link, switches
@@ -217,7 +232,10 @@ dialog offers 1, 3, 7 and 14 days after the current expiry and the latest allowe
 `web/e2e/journey.e2e.ts` (#200) is M3's exit test: #182's M2 journey, steps 1 to 9, through the browser, in English
 and in Japanese (`playwright.e2e.config.ts`'s `en` and `ja` projects, browser locales `en-US` and `ja-JP`). It runs
 with `make web-e2e`, after `make up` and `make seed`, with the other browser flows (`*.e2e.ts`, English only), and in
-CI's Local stack job on every pull request. It uses only the browser, Mailpit's API, the seed, and the lifecycle jobs
+CI's Local stack job on every pull request. `web/e2e/m5-journey.e2e.ts` (#223) is M5's, in both languages too: the
+admin's DLP rules, an upload request with the uploader on `/u`, the three DLP outcomes (warned and confirmed, approved
+after a step-up by the seed's approver, blocked and held), the admin's audit search and export, and the blocked-file
+notices; its API twin is `services/api/tests/test_journey_m5.py`. It uses only the browser, Mailpit's API, the seed, and the lifecycle jobs
 with the clock's test hook: the container has no Docker, so `local/e2e-jobs.sh` runs the jobs on the host for it. Each
 step runs the same axe check as `make web-a11y` (`e2e/support/axe.ts`) on the live page. A failure names its step and
 keeps the trace and screenshots of every browser in `web/test-results/` (CI keeps them as the `web-e2e-results`
@@ -280,3 +298,5 @@ and export its decisions with the audit log (#222).
 Admins set up single sign-on and prove their email domains (#231); every step-up operation asks "Confirm it's you" and
 sends the change again after a sign-in in a popup (#232). The local stack offers "Continue with SSO"
 (`local/web/config.json`, `ssoSignIn: true`).
+M5 is done locally (#223): its browser journey runs in English and Japanese beside the API journey on every pull
+request; the run in dev waits for M4's AWS environment. Each feature's pages load as their own chunk (#169).

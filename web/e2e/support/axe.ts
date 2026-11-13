@@ -23,6 +23,9 @@ export async function checkAxe(page: Page, name: string, lang: string): Promise<
   // The page is in the language under test, so the Japanese run doesn't check English pages by mistake.
   await expect(page.locator('html')).toHaveAttribute('lang', lang);
 
+  // From the top of the page: a control scrolled under the sticky header reads as obscured to axe's target-size
+  // rule, which depends on where the last click left the scroll, not on the page.
+  await page.evaluate(() => window.scrollTo(0, 0));
   const results = await new AxeBuilder({ page }).withTags([...WCAG_TAGS, 'best-practice']).analyze();
   await test.info().attach(`axe-${name}.json`, { body: JSON.stringify(results.violations, null, 2), contentType: 'application/json' });
 
