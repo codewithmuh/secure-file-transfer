@@ -133,7 +133,8 @@ tag_search() {
 
 search_failed() {
   echo "   warning: $1 failed; nothing above proves that what it covers is gone" >&2
-  if $EXECUTE && [[ -n "$LOG_FILE" ]]; then
+  # The inventory reports and exits, with no list for after the run: the warning is its report.
+  if $EXECUTE && ! $INVENTORY && [[ -n "$LOG_FILE" ]]; then
     echo "- $1 failed: run it again by hand, or check Cost Explorer by the environment tag." >>"$LOG_FILE.todo"
   fi
 }
@@ -223,10 +224,33 @@ retained_apply() {
     "audit key's DisableKeyRotation (docs/runbooks/kms-key-change.md, retained-stack-change.md)."
 }
 
-protected_teardown_apply() {
-  local root="$1"
-  # prod only: deletion protection off before the destroy (TF_VAR_teardown, #263).
-  tf_root "$root" apply -var teardown=true "${APPROVE[@]+"${APPROVE[@]}"}"
+# teardown_apply <root>: the apply before a destroy that turns the stack's guards off (TF_VAR_teardown, #263). On a
+# stack with parts missing (a teardown run again after its destroy took some, or a build that stopped partway), a plain
+# apply would build them back only to destroy them. Then it goes to what's there only: everything a remaining resource
+# depends on remains too, as a destroy takes dependents first and a build makes them last (#299). teardown=true adds
+# nothing on these stacks (only the retained stack's does, which isn't destroyed here). An operator at the keyboard
+# reads the plan and types yes; an unattended run applies it.
+teardown_apply() {
+  local root="$1" plan adds list addr answer targets=()
+  plan="${SFT_TF_LOG_DIR:-${TMPDIR:-/tmp}/sft-$DRILL-$ENV_NAME-terraform}/${root//\//_}.teardown.tfplan"
+  tf_root "$root" plan -input=false -var teardown=true -out="$plan"
+  if $EXECUTE; then
+    adds="$(plan_count "$TF_LAST_LOG" add)"
+    if [[ "$adds" != 0 ]]; then
+      echo "   The plan would build $adds resource(s) back: the guards go off on what's there, and nothing else."
+      list="$(state_list "$root")" || exit 2
+      while IFS= read -r addr; do targets+=("-target=$addr"); done <<<"$list"
+      tf_run "$root" plan -input=false -var teardown=true -out="$plan" "${targets[@]}"
+      adds="$(plan_count "$TF_LAST_LOG" add)"
+      [[ "$adds" == 0 ]] ||
+        die "$root: its teardown plan still adds $adds resource(s), targeted at what's there; its log: $TF_LAST_LOG"
+    fi
+    if ! $UNATTENDED; then
+      read -r -p "   Apply this plan (above; its log: $TF_LAST_LOG)? Type yes: " answer
+      [[ "$answer" == yes ]] || die "stopped before $root's teardown apply"
+    fi
+  fi
+  tf_run "$root" apply -input=false "$plan"
 }
 
 drain_cluster() {
@@ -253,19 +277,11 @@ cluster_bootstrap_teardown() {
 }
 
 data_teardown_apply() {
-  local region="$1" tokyo keys
-  # Osaka's data stack takes Tokyo's key primaries, a required input with no default; Tokyo's data stack goes after
-  # it, so its state still has them (#299).
-  if [[ "$region" == "$OSAKA" ]]; then
-    tokyo="environments/$ENV_NAME/$TOKYO/data"
-    tf_init "$tokyo"
-    keys="$(tf_output "$tokyo" kms_key_arns)"
-    [[ -n "$keys" && "$keys" != null ]] || die "Tokyo's data stack has no kms_key_arns output, which Osaka's needs"
-    echo "   TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"
-    export TF_VAR_primary_key_arns="$keys"
-  fi
+  local region="$1"
+  # Osaka's data stack takes Tokyo's key primaries (primary_key_arns, ops/lib/common.sh, #299).
+  [[ "$region" != "$OSAKA" ]] || primary_key_arns
   # Aurora's deletion protection off, no final snapshot, the master secret without a recovery window (infra/README.md).
-  tf_root "environments/$ENV_NAME/$region/data" apply -var teardown=true "${APPROVE[@]+"${APPROVE[@]}"}"
+  teardown_apply "environments/$ENV_NAME/$region/data"
 }
 
 destroy_root() {
@@ -285,7 +301,8 @@ destroy_root() {
       return
       ;;
     environments/*/data) data_teardown_apply "$(basename "$(dirname "$root")")" ;;
-    environments/prod/*/cluster | environments/prod/*/identity | environments/prod/*/edge) protected_teardown_apply "$root" ;;
+    # prod only: deletion protection off before the destroy.
+    environments/prod/*/cluster | environments/prod/*/identity | environments/prod/*/edge) teardown_apply "$root" ;;
     bootstrap/prod/"$TOKYO")
       # The GitHub OIDC provider stays for the retained stack's deploy role, which adopted it in step 0.
       tf_root "$root" state rm 'module.terraform_roles.aws_iam_openid_connect_provider.github[0]'
