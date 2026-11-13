@@ -5,8 +5,7 @@
 # #102), so each permission needs both sides.
 #
 # clamd, the DLP inspector and the signature mirror get no role and no service account token (architecture 3.1).
-# The database bootstrap job (encryption 4.3) gets its role with the issue that builds it; the key rotation job's
-# (#185) and the recovery job's (#258) are below.
+# The key rotation job's (#185), the recovery job's (#258) and the database bootstrap job's (#278) are below.
 
 locals {
   # Namespaces and service accounts agreed with the Helm chart (#106) and cluster-bootstrap (#104).
@@ -18,6 +17,7 @@ locals {
     jobs             = { namespace = "sft", service_accounts = ["jobs"], description = "Lifecycle jobs" }
     archive          = { namespace = "sft", service_accounts = ["audit-archive"], description = "Audit archive job" }
     recovery         = { namespace = "sft", service_accounts = ["recovery"], description = "Recovery job" }
+    db_bootstrap     = { namespace = "sft", service_accounts = ["db-bootstrap"], description = "Database bootstrap job" }
     migrate          = { namespace = "sft", service_accounts = ["migrate"], description = "Migrations job" }
     key_rotation     = { namespace = "sft", service_accounts = ["key-rotation"], description = "Key rotation job" }
     synthetic_probe  = { namespace = "sft", service_accounts = ["synthetic-probe"], description = "Synthetic probe" }
@@ -108,6 +108,10 @@ locals {
   ]
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
+  ]
+  # The Aurora master password (encryption 6.3): Tokyo's secret and its read-only Osaka replica, the same name in both.
+  db_master_secrets = [
+    for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/db/master-??????"
   ]
   # The synthetic tenant's API key, which the probe reads as an environment variable (#248, encryption 6.4).
   probe_secrets = [
@@ -459,6 +463,27 @@ locals {
     ]
 
     migrate = [local.database["migrate"]]
+
+    # The database bootstrap job (#278, encryption 4.3 and 6.3): reads the master password, the only workload that may,
+    # and signs in with it as the master user to create the login roles, once per environment and whenever the role
+    # list changes. Not rds-db:connect: the master user signs in with its password, never an IAM token. The secret's
+    # own policy denies every other reader but BreakGlass and the deploy role (modules/aurora), and the secrets key
+    # names this role for this one secret (modules/kms-keys).
+    db_bootstrap = [
+      {
+        Sid      = "ReadTheMasterPassword"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = local.db_master_secrets
+      },
+      {
+        Sid       = "SecretsKeyForTheMasterPassword"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["secrets"], StringEquals = { "kms:ViaService" = local.via["secretsmanager"] }, StringLike = { "kms:EncryptionContext:SecretARN" = local.db_master_secrets } }
+      },
+    ]
 
     # The synthetic probe (#248): no database, no counter store, no queue. Its result to CloudWatch, in its own
     # namespace only, and its emails from the probe mailbox, read once and deleted (docs/runbooks/synthetic-probe.md).

@@ -28,6 +28,7 @@ locals {
       "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
       "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
       "external-secrets-platform", "external-secrets-app", "key-rotation", "synthetic-probe", "recovery",
+      "db-bootstrap",
     ]
     # modules/files-buckets and modules/events-delivery-role, Tokyo's data stack.
     data = ["s3-replication", "s3-batch-replication", "malware-protection", "events-delivery"]
@@ -35,8 +36,8 @@ locals {
     identity = ["signin-trigger", "loadtest"]
     # modules/observability, Tokyo's cluster-bootstrap stack.
     cluster_bootstrap = ["loki", "tempo", "alertmanager", "cloudwatch-exporter"]
-    # Named by the key policies for the job that will use it (encryption 4.3); no layer makes it yet.
-    planned = ["db-bootstrap"]
+    # modules/web-release, Tokyo's edge stack: the web app's release role (#283).
+    edge = ["web-release"]
   }
   workload_role_names = {
     for name in flatten(values(local.workload_roles)) : name => "${local.global_name_prefix}-${name}"

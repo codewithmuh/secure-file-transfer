@@ -47,3 +47,8 @@ output "break_glass_trail_role_arns" {
   description = "Each environment's read-only role for the break-glass reconciliation (#239): its operator API's BREAK_GLASS_TRAIL_ROLE_ARN, with permission_set_arns[\"BreakGlass\"] and identity_store_id."
   value       = { for env, role in aws_iam_role.break_glass_trail : env => role.arn }
 }
+
+output "scp_alerts_topic_arn" {
+  description = "The SCP change alerts' topic in us-east-1 (#277): the maintainer's addresses subscribe to it."
+  value       = aws_sns_topic.scp_alerts.arn
+}

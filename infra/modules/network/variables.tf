@@ -127,6 +127,12 @@ variable "dns_firewall_allowed_domains" {
     # Egress proxy, API and notification worker listeners: Cognito's API and managed login (ADR-0021, abuse 3.2).
     "cognito-idp.{region}.amazonaws.com",
     "*.auth.{region}.amazoncognito.com",
+    # Egress proxy, operator listener (#275): the break-glass reconciliation reads the management account's CloudTrail
+    # and identity store in Identity Center's home Region, Tokyo, with a role it assumes through Tokyo's STS (in Tokyo
+    # that name is the STS endpoint's already). Its drift check reads Cognito's API, the name above.
+    "cloudtrail.ap-northeast-1.amazonaws.com",
+    "identitystore.ap-northeast-1.amazonaws.com",
+    "sts.ap-northeast-1.amazonaws.com",
     # Egress proxy, Argo CD listener: Git and its notifications.
     "github.com",
     "api.github.com",

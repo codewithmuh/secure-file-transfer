@@ -85,6 +85,7 @@ Every rule's message names its runbook; the alarms module's `terraform test` fai
 | `security-service-off`, `alerting-or-endpoint-changed` (`SecurityServiceChanged`): CloudTrail, GuardDuty, Config, these rules, a public cluster endpoint | Page | [security-service-off.md](security-service-off.md) |
 | `break-glass-db-assumed` (`BreakGlassDatabaseRoleAssumed`) | Page | [break-glass.md](break-glass.md) |
 | `retained-bucket-changed`, `retained-key-changed`, `retained-trail-changed` (prod's retained stack) | Page | [retained-stack-change.md](retained-stack-change.md) |
+| `sft-management-scp-changed` (`ScpChanged`): any SCP change, in the management account's us-east-1, to its own topic ([`infra/organization/scp-alerts.tf`](../../infra/organization/scp-alerts.tf), #277) | Page | [scp-change.md](scp-change.md) |
 
 ## Procedures
 

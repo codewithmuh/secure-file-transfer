@@ -56,6 +56,10 @@ OVERRIDES = {
         "OPERATOR_ROLE_NAME",
         "VALKEY_URL",
         "DATABASE_URL",
+        "HTTPS_PROXY",
+        "BREAK_GLASS_TRAIL_ROLE_ARN",
+        "IDENTITY_STORE_ID",
+        "SSO_DRIFT_POOLS",
     ],
 }
 # Values key -> (part, Deployment names) it renders.

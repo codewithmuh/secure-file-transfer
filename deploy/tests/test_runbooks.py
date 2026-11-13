@@ -1,8 +1,9 @@
 """Every alert and every alarm links to a runbook that exists (NFR-17, #245).
 
-Reads the Prometheus rules (deploy/alerts/*.rules.yaml) and the CloudWatch alarms in Terraform (infra/**/*.tf) as
-files, so it needs neither Prometheus nor AWS. Also checks that each alert has the labels Alertmanager routes on and a
-promtool test that makes it fire (deploy/alerts/tests), and that the runbook index lists it. The last tests plant a
+Reads the Prometheus rules (deploy/alerts/*.rules.yaml), and the CloudWatch alarms and EventBridge alerts in Terraform
+(infra/**/*.tf), as files, so it needs neither Prometheus nor AWS. Also checks that each alert has the labels
+Alertmanager routes on and a promtool test that makes it fire (deploy/alerts/tests), and that the runbook index lists
+it. The last tests plant a
 bad alert and a bad alarm to show that the checks catch them.
 
 Run from the repository root: `uv run --project services/api --locked pytest deploy/tests` (`make deploy-check`).
@@ -160,6 +161,38 @@ def test_the_runbook_index_lists_every_alert_and_alarm_runbook() -> None:
             if f"({runbook}.md)" not in index:
                 missing.add(f"{runbook}.md")
     assert not missing, sorted(missing)
+
+
+def test_every_eventbridge_alert_links_to_a_runbook_that_exists_and_is_listed() -> None:
+    """The security alerts that are EventBridge rules, not alarms (#232, #256, #263, #277): every runbook a file with
+    an EventBridge target names, as a URL or, in the alarms module, as a rule's runbook, exists and is in the index."""
+    index = (RUNBOOKS / "README.md").read_text()
+    named: list[tuple[str, str]] = []
+    for path in sorted(INFRA.rglob("*.tf")):
+        if ".terraform" in path.parts:
+            continue
+        text = path.read_text()
+        if 'resource "aws_cloudwatch_event_target"' not in text:
+            continue
+        where = str(path.relative_to(INFRA))
+        named += [(where, runbook) for runbook in RUNBOOK_URL.findall(text)]
+        named += [
+            (where, runbook)
+            for runbook in re.findall(
+                r'^\s*runbook\s*=\s*"([a-z0-9-]+)"', text, re.MULTILINE
+            )
+        ]
+    assert ("organization/scp-alerts.tf", "scp-change") in named
+    problems = [
+        f"{where}: docs/runbooks/{runbook}.md doesn't exist"
+        for where, runbook in named
+        if not (RUNBOOKS / f"{runbook}.md").is_file()
+    ] + [
+        f"{where}: docs/runbooks/README.md doesn't list {runbook}.md"
+        for where, runbook in named
+        if f"({runbook}.md)" not in index
+    ]
+    assert problems == []
 
 
 # The planted alert and alarm of #245's acceptance criteria: the checks above must catch each.

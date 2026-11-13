@@ -818,7 +818,12 @@ What is deliberately not a secret here:
   version in a reviewed change; the runbook does that after every use and every 90 days.
 - The database bootstrap job (`sft-{env}-db-bootstrap`) reads the master password once per environment to create the
   login roles. After that only BreakGlass reads it, apart from the deploy role's read-back during data-layer applies.
-  Every other read raises an alert (authentication and authorization 8.3).
+  Every other read raises an alert (authentication and authorization 8.3). **As built (#278):** the role is the cluster
+  layer's (modules/eks-cluster), bound by Pod Identity to the service account `db-bootstrap` in `sft`, and may read only
+  `sft/{env}/db/master` (Tokyo's and its Osaka replica) and decrypt it through Secrets Manager. The job is a PreSync
+  hook of the chart that runs only in a sync whose values turn it on (`dbBootstrap.runOnSync`, deploy/README.md): it
+  reads the secret itself (`BOOTSTRAP_MASTER_SECRET`), so the password is never in a pod spec or a Kubernetes Secret,
+  and signs in with it, so the role has no `rds-db:connect`.
 
 ### 6.4 How workloads read and write secrets
 
@@ -1049,7 +1054,7 @@ teardown removes (decision 19). From the day prod is created it holds:
 | SCP and key policy (decision 13): `DisableKey` and `ScheduleKeyDeletion` only for the retained stack's deploy role, with the 30-day wait; `PutKeyPolicy` for it and for `Admin`, because the stack's first apply runs with `Admin` from local state (ADR-0005), and while prod runs also for the key-admin role (4.4) | Disabling or deleting the key, which would make the locked objects unreadable |
 | Multi-Region key: replica first, then primary | Destroying the key takes at least 60 days; a deleted replica can be re-created from the primary |
 | SCP, on the prod OU (ADR-0006): changes to the archive buckets' policy, lifecycle rules and Object Lock settings only by the retained stack's deploy role | BreakGlass and every other role in the prod account |
-| EventBridge alerts on those calls against the retained resources, and on any SCP change | A change nobody notices |
+| EventBridge alerts on those calls against the retained resources, and on any SCP change (the management account's own rule in us-east-1, where Organizations records its calls: `infra/organization/scp-alerts.tf`, #277) | A change nobody notices |
 
 Teardown, in order:
 

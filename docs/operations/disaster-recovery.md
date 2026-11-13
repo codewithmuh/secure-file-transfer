@@ -213,5 +213,7 @@ What the drills need from elsewhere, and where each landed:
 
   The retained stack has its own state bucket, deploy role, trail and alerts, and its teardown apply takes the
   environment's roles out of the audit key's and archive's policies and turns the key's rotation off (encryption 8.4).
-- **Still outside this repository's reach:** an alert on SCP changes, which only the management account's own trail
-  sees (encryption 8.4's table names it); the organization stack would need its own rule there. A follow-up issue.
+- **An alert on SCP changes** (encryption 8.4's table names it), which only the management account sees: the
+  organization stack's own rule in us-east-1, into a topic the maintainer subscribes to
+  (`infra/organization/scp-alerts.tf`, #277, [scp-change.md](../runbooks/scp-change.md)). Firing for real is pending
+  the AWS run.

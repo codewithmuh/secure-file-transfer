@@ -216,6 +216,10 @@ resource "helm_release" "argocd_root" {
                 appClientId         = var.cognito_app_client_id
                 standbyUserPoolId   = try(var.standby_user_pool.user_pool_id, null)
                 standbyAppClientId  = try(var.standby_user_pool.client_id, null)
+                # The operator API's break-glass reconciliation (#275), from the organization stack's outputs.
+                breakGlassTrailRoleArn     = try(var.break_glass_reconciliation.trail_role_arn, null)
+                breakGlassPermissionSetArn = try(var.break_glass_reconciliation.permission_set_arn, null)
+                identityStoreId            = try(var.break_glass_reconciliation.identity_store_id, null)
               } : k => v if v != null }
             }
           }

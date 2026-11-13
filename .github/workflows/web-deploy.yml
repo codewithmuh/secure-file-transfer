@@ -1,0 +1,118 @@
+name: web-deploy
+
+# Deploys the web app when an environment's pointer lands on main (ADR-0008, ADR-0005, #283): the merge of a promotion
+# pull request from web.yml, or the revert of one, which is the rollback (NFR-18). For each environment whose
+# deploy/environments/<env>/web.yaml changed, the deploy job assumes that environment's release role
+# (infra/modules/web-release) from the GitHub environment web-<env>, checks the manifest the pointer pins and every
+# file it lists, and copies them into the environment's web buckets, Osaka first, then config.json, and index.html last
+# in each Region (.github/scripts/web-release.sh deploy). Nothing is deleted and no distribution changes: a rollback is
+# the previous index.html, written in seconds, with no invalidation.
+#
+# An environment takes part only once it is listed in the repository variable LIVE_ENVIRONMENTS (its AWS side and its
+# GitHub environments exist, docs/runbooks/organization-and-bootstrap.md step 0), so no job ever names a GitHub
+# environment before it has its main-only rule.
+#
+# Variables (never literals in this file):
+#   LIVE_ENVIRONMENTS   repository: the environments whose AWS side exists, such as "dev staging"
+#   WEB_BUNDLE_BUCKET   repository: the shared account's bundle store (web.yml)
+#   AWS_ACCOUNT_ID      environment web-<env>: the environment's account, whose release role the job assumes
+#   WEB_CONFIG          environment web-<env>: its config.json, {apiOrigin, uploadOrigin, signInOrigin, ssoSignIn}
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/environments/*/web.yaml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy again, from its pointer on main
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+
+permissions: {}
+
+# In order, never cancelled: a run waiting here is replaced by a newer one, which deploys what main points at then.
+concurrency:
+  group: web-deploy
+  cancel-in-progress: false
+
+jobs:
+  changes:
+    name: Which environments' pointers changed
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      environments: ${{ steps.decide.outputs.environments }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the diff from the commit before the push
+          persist-credentials: false
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          REQUESTED: ${{ inputs.environment }}
+          LIVE: ${{ vars.LIVE_ENVIRONMENTS }}
+        run: |
+          if [[ $EVENT == workflow_dispatch ]]; then
+            changed=$REQUESTED
+          elif [[ $BEFORE =~ ^0+$ ]] || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            changed="dev staging prod" # no usable base: deploy what every pointer names, which is safe to repeat
+          else
+            changed=$(git diff --name-only "$BEFORE" HEAD -- 'deploy/environments/*/web.yaml' | cut -d/ -f3)
+          fi
+          environments=()
+          for env in dev staging prod; do
+            grep -qxw "$env" <<< "$(tr ' ' '\n' <<< "$changed")" || continue
+            if [[ " $LIVE " == *" $env "* ]]; then
+              environments+=("$env")
+            else
+              echo "$env's pointer changed, but $env isn't in LIVE_ENVIRONMENTS: not deployed." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "environments=$(jq -cn '$ARGS.positional' --args "${environments[@]}")" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy the web app to ${{ matrix.environment }}
+    needs: changes
+    if: needs.changes.outputs.environments != '[]'
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        environment: ${{ fromJSON(needs.changes.outputs.environments) }}
+      max-parallel: 1 # dev, staging, prod, in that order
+      fail-fast: false
+    environment: web-${{ matrix.environment }} # the release role's OIDC subject; main only (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the environment's release role
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Keep the account ID out of the public log
+        env:
+          ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+        run: echo "::add-mask::$ACCOUNT"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sft-${{ matrix.environment }}-web-release
+          role-session-name: web-deploy-${{ matrix.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+          mask-aws-account-id: true
+      - name: Copy the pinned bundle into the web buckets, index.html last
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          WEB_BUNDLE_BUCKET: ${{ vars.WEB_BUNDLE_BUCKET }}
+          WEB_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          WEB_CONFIG: ${{ vars.WEB_CONFIG }}
+        run: |
+          .github/scripts/web-release.sh deploy "$ENVIRONMENT"
+          read -r version digest <<< "$(.github/scripts/web-release.sh get "$ENVIRONMENT")"
+          echo "- $ENVIRONMENT serves the web app built from $version (manifest \`$digest\`)." >> "$GITHUB_STEP_SUMMARY"

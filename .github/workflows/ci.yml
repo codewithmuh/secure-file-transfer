@@ -54,6 +54,12 @@ jobs:
       - name: Dry-run the promotion scripts and build.yml's trigger filters (#107)
         if: ${{ !cancelled() }}
         run: .github/scripts/test-promotion.sh
+      - name: Dry-run the web release script and its workflows' triggers (#283)
+        if: ${{ !cancelled() }}
+        run: .github/scripts/test-web-release.sh
+      - name: Shellcheck the release and tunnel scripts (.github/scripts, #279, #283)
+        if: ${{ !cancelled() }}
+        run: shellcheck -x .github/scripts/web-release.sh .github/scripts/test-web-release.sh .github/scripts/cluster-tunnel.sh # the runner's shellcheck
       - name: Check the ruleset's required checks are jobs that report on every PR (#59)
         if: ${{ !cancelled() }}
         run: .github/scripts/check-ruleset.sh

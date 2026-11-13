@@ -168,8 +168,8 @@ yet; each is listed for the APP track and later issues, and the alert follows it
 
 | Promise | Status |
 |---|---|
-| Break-glass, field keys, operator records ([authn-authz](../security/authn-authz.md) 8, [encryption](../security/encryption-and-keys.md) 3) | Prometheus rules (`break-glass`, `break-glass-records`, `field-encryption`, `operator`), never inhibited; the break-glass role's EventBridge alert (#232); a break-glass assignment nobody recorded, `BreakGlassGrantUnrecorded` (#239; the reconciliation is off until its settings and way out exist) |
-| SSO providers that differ from the recorded configuration in a pool (authn-authz 2.5) | `SsoProviderDrift`, `SsoProviderUnrecorded`, `SsoDriftCheckStalled` (`sso.rules.yaml`, #239; the check is off until its settings and way out exist) |
+| Break-glass, field keys, operator records ([authn-authz](../security/authn-authz.md) 8, [encryption](../security/encryption-and-keys.md) 3) | Prometheus rules (`break-glass`, `break-glass-records`, `field-encryption`, `operator`), never inhibited; the break-glass role's EventBridge alert (#232); a break-glass assignment nobody recorded, `BreakGlassGrantUnrecorded` (#239; the reconciliation runs once the organization stack's trail role reaches the cluster facts, #275) |
+| SSO providers that differ from the recorded configuration in a pool (authn-authz 2.5) | `SsoProviderDrift`, `SsoProviderUnrecorded`, `SsoDriftCheckStalled` (`sso.rules.yaml`, #239; the check runs once the user pools exist, through the operator listener, #275) |
 | Audit partitions and their retention (data model 6, NFR-9) | `AuditPartitions`, an expired month still there included (#255) |
 | File deletion within 7 days (NFR-8), the lifecycle jobs running, grants awaiting their record (NFR-15) | `FileDeletionOverdue`, `FileDeletionLagging`, `LifecycleJobNotRunning`, `UnarchivedGrants` (`lifecycle.rules.yaml`) |
 | Metadata purge (NFR-9) | `MetadataPurgeBlocked`, `MetadataPurgeBehind`, `MetadataPurgeNotRunning` |
@@ -184,14 +184,15 @@ yet; each is listed for the APP track and later issues, and the alert follows it
 | Argo CD sync and health (architecture 6) | `ArgoCdApplicationUnhealthy` |
 | Kyverno background report violations (ADR-0007) | Pending: Kyverno's policy report metric, once the observability stack scrapes it |
 | The retained stack's EventBridge rules and NFR-19 budget (encryption 8.4) | [`infra/environments/prod/retained/alerts.tf`](../../infra/environments/prod/retained/alerts.tf) (#263) |
+| Any SCP change (encryption 8.4, ADR-0006) | EventBridge in the management account's us-east-1: `sft-management-scp-changed`, to the maintainer's addresses ([`infra/organization/scp-alerts.tf`](../../infra/organization/scp-alerts.tf), #277) |
 
 ## 7. Checks
 
 - `deploy/alerts/test.sh`: `promtool check rules` and `promtool test rules` on every rule file, with a test case that
   fires each rule; `amtool check-config` and route tests on `alertmanager.yaml`.
 - `deploy/tests/test_runbooks.py`: every alert and every CloudWatch alarm names a runbook that exists, every alert has
-  a page or ticket severity and a firing test, and the runbook index lists them; it plants an alert and an alarm
-  without a runbook to show that it fails.
+  a page or ticket severity and a firing test, and the runbook index lists them; so do the EventBridge alerts' messages
+  (#277); it plants an alert and an alarm without a runbook to show that it fails.
 - `infra/scripts/check.sh`: fmt, validate, tflint, Trivy and the `alarms` module's tests.
 - Pending the AWS run: each alarm's metric and dimensions against real resources, Alertmanager's SNS calls through the
   egress proxy, the heartbeat alarm's behaviour when the stack stops, the probe's metric in the promotion gate, and

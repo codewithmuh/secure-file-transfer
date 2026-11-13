@@ -105,6 +105,12 @@ module "edge" {
 
   managed_rules_in_count = true
   deletion_protection    = !var.teardown
+
+  # The web bucket's only writers (#283): the release role, which Tokyo's stack makes (modules/web-release), and the
+  # deploy role, which empties it at teardown.
+  web_writer_arns = [
+    module.conventions.workload_role_arns["web-release"], module.conventions.bootstrap_role_arns.terraform_deploy,
+  ]
 }
 
 module "web_cdn" {
@@ -133,4 +139,16 @@ module "web_cdn" {
   }
 
   managed_rules_in_count = true
+}
+
+# The web app's release role (ADR-0008, #283): the only writer of this environment's web buckets besides the deploy
+# role. IAM is global, so Tokyo's stack makes it for every Region with a web bucket.
+module "web_release" {
+  source = "../../../../modules/web-release"
+
+  conventions       = module.conventions
+  environment       = "prod"
+  account_id        = var.account_id
+  shared_account_id = var.shared_account_id
+  regions           = ["ap-northeast-1", "ap-northeast-3"]
 }

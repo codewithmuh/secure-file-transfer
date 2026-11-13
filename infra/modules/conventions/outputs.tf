@@ -77,7 +77,7 @@ output "sso_role_arn_patterns" {
 }
 
 output "workload_roles" {
-  description = "The environment's workload role short names, by the layer that makes them: cluster, data, identity, cluster_bootstrap, planned (#172)."
+  description = "The environment's workload role short names, by the layer that makes them: cluster, data, identity, cluster_bootstrap and edge (#172)."
   value       = local.workload_roles
 }
 

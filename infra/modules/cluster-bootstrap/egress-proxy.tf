@@ -43,6 +43,23 @@ locals {
       clients = [{ namespace = "sft", podLabels = { "app.kubernetes.io/component" = "synthetic-probe" } }]
     },
     {
+      # The operator API's two jobs (#239, #275; authn-authz 2.5, 8.3), namespace sft-operator:
+      # - the SSO drift check reads both pools' providers through Cognito's API: this Region's, and in Tokyo outside
+      #   dev Osaka's too (Osaka's stacks never read Tokyo's state, ADR-0005, so Osaka's operator API checks its own);
+      # - the break-glass reconciliation reads the management account's CloudTrail and identity store in Identity
+      #   Center's home Region, Tokyo (ADR-0006), with the role it assumes there through Tokyo's STS: the endpoint's in
+      #   Tokyo, the public one from Osaka.
+      name = "operator"
+      port = local.proxy_ports["operator"]
+      domains = concat(
+        ["cognito-idp.${var.region}.amazonaws.com"],
+        var.region == "ap-northeast-1" && var.environment != "dev" ? ["cognito-idp.ap-northeast-3.amazonaws.com"] : [],
+        ["cloudtrail.ap-northeast-1.amazonaws.com", "identitystore.ap-northeast-1.amazonaws.com"],
+        var.region == "ap-northeast-1" ? [] : ["sts.ap-northeast-1.amazonaws.com"],
+      )
+      clients = [{ namespace = "sft-operator", podLabels = { "app.kubernetes.io/component" = "operator-api" } }]
+    },
+    {
       # The signature mirror: ClamAV's database (ADR-0019).
       name    = "signature-mirror"
       port    = local.proxy_ports["signature-mirror"]

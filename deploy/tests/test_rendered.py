@@ -20,6 +20,7 @@ import yaml
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
     ArchiveJobSettings,
+    BootstrapSettings,
     InspectorSettings,
     JobSettings,
     KeyRotationSettings,
@@ -58,6 +59,7 @@ PROXIED = {
     "standby-enrolment": 3129,  # #258, as the notification worker: Cognito through its listener
     "key-rotation": 3133,
     "synthetic-probe": 3134,
+    "operator-api": 3135,  # #275: its jobs' Cognito, CloudTrail and identity store
 }
 # The DLP inspector speaks its own framed protocol, one file per connection, on a port of its own (ADR-0022); its
 # probes are on the internal port like everyone's (#184).
@@ -86,6 +88,10 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.audit_archive": ArchiveJobSettings,  # #183
     "sft.probe": ProbeSettings,  # #248, rendered on (deploy/tests/cluster-facts.sh)
 }
+# The database bootstrap job (#278) reads the master password from the secret BOOTSTRAP_MASTER_SECRET names, a setting
+# the APP track's change of #278 adds to BootstrapSettings: checked here as soon as that setting exists.
+if "bootstrap_master_secret" in BootstrapSettings.model_fields:
+    SETTINGS["sft.data.bootstrap"] = BootstrapSettings
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 
 Manifest = dict[str, Any]
@@ -455,23 +461,34 @@ def test_pilot_light(rendered: dict[tuple[str, str, str], list[Manifest]]) -> No
         if region == OSAKA:
             assert jobs == []
         else:
-            (job,) = jobs
-            assert (
-                job["metadata"]["annotations"]["argocd.argoproj.io/hook"] == "PreSync"
-            )  # ADR-0005
-            assert pod_spec(job)["containers"][0]["command"] == [
-                "python",
-                "-m",
-                "sft.data.migrate",
-            ]
-            hooks = [
-                o
+            # The migration, and before it the database bootstrap, which the cluster facts switch on for the checks
+            # (#278): both PreSync hooks, each with its service account a wave earlier (ADR-0005).
+            jobs_by_name = {j["metadata"]["name"]: j for j in jobs}
+            assert set(jobs_by_name) == {"migrate", "db-bootstrap"}
+            hooks = {
+                o["metadata"]["name"]: o["metadata"]["annotations"]
                 for o in objects
                 if o["kind"] == "ServiceAccount" and o["metadata"].get("annotations")
-            ]
-            assert [h["metadata"]["name"] for h in hooks] == [
-                pod_spec(job)["serviceAccountName"]
-            ]
+            }
+            waves = {}
+            for name, module in (
+                ("db-bootstrap", "sft.data.bootstrap"),
+                ("migrate", "sft.data.migrate"),
+            ):
+                job = jobs_by_name[name]
+                annotations = job["metadata"]["annotations"]
+                assert annotations["argocd.argoproj.io/hook"] == "PreSync"
+                assert pod_spec(job)["containers"][0]["command"] == [
+                    "python",
+                    "-m",
+                    module,
+                ]
+                account = hooks[pod_spec(job)["serviceAccountName"]]
+                assert account["argocd.argoproj.io/hook"] == "PreSync"
+                waves[name] = int(annotations.get("argocd.argoproj.io/sync-wave", "0"))
+                assert int(account["argocd.argoproj.io/sync-wave"]) < waves[name]
+            assert waves["db-bootstrap"] < waves["migrate"]
+            assert set(hooks) == {"db-bootstrap", "migrate"}
 
 
 def test_one_image_per_cluster(
@@ -682,6 +699,83 @@ def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_
         'local.app_secrets["code-hmac"], local.app_secrets["email-hmac"], local.app_secrets["link-hmac"]'
         in roles
     )
+
+
+def test_the_operator_api_jobs_are_on_and_reach_aws_through_their_own_listener(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """The break-glass reconciliation and the SSO drift check (#239, #275) get their settings from the cluster facts:
+    the trail role, the permission set and the identity store together, and the pools Tokyo checks (both outside dev)
+    or Osaka checks (its own). Their way out is the operator listener, the port the egress proxy gives it, with the
+    names it allows; the network policy reaches that listener and no other (ADR-0021). test_environment_settings.py
+    loads the settings themselves."""
+    main = (ROOT / "infra/modules/cluster-bootstrap/main.tf").read_text()
+    ports = {
+        name: int(port)
+        for name, port in re.findall(
+            r"^    ([a-z-]+)\s+= (31[0-9]{2})", main, re.MULTILINE
+        )
+    }
+    chart = yaml.safe_load((ROOT / "deploy/charts/sft/values.yaml").read_text())
+    chart_ports = chart["network"]["egressProxy"]["ports"]
+    # Every listener the chart names is the cluster-bootstrap stack's, on the same port (#106).
+    names = {
+        "api": "api",
+        "notifier": "notifier",
+        "signatureMirror": "signature-mirror",
+        "keyRotation": "key-rotation",
+        "operator": "operator",
+    }
+    assert names.keys() == chart_ports.keys()
+    for key, name in names.items():
+        assert chart_ports[key] == ports[name], key
+    proxy = (ROOT / "infra/modules/cluster-bootstrap/egress-proxy.tf").read_text()
+    listener = proxy[proxy.index('name = "operator"') :]
+    listener = listener[: listener.index("\n    },")]
+    for name in (
+        "cognito-idp.${var.region}.amazonaws.com",
+        "cognito-idp.ap-northeast-3.amazonaws.com",
+        "cloudtrail.ap-northeast-1.amazonaws.com",
+        "identitystore.ap-northeast-1.amazonaws.com",
+        "sts.ap-northeast-1.amazonaws.com",
+        '"sft-operator"',
+    ):
+        assert name in listener, name
+    allowed = (ROOT / "infra/modules/network/variables.tf").read_text()
+    for name in ("cloudtrail", "identitystore", "sts"):
+        assert f'"{name}.ap-northeast-1.amazonaws.com",' in allowed, name
+
+    for env, region in CLUSTERS:
+        objects = rendered[(env, region, "operator")]
+        (deployment,) = [o for o in objects if o["kind"] == "Deployment"]
+        settings = env_of(pod_spec(deployment)["containers"][0])
+        assert settings["HTTPS_PROXY"].endswith(":3135")
+        assert settings["BREAK_GLASS_TRAIL_ROLE_ARN"].endswith(
+            f":role/sft-{env}-break-glass-trail"
+        )
+        assert settings["BREAK_GLASS_PERMISSION_SET_ARN"].startswith(
+            "arn:aws:sso:::permissionSet/"
+        )
+        assert settings["IDENTITY_STORE_ID"].startswith("d-")
+        pools = json.loads(settings["SSO_DRIFT_POOLS"])
+        expected = [region] + (
+            ["ap-northeast-3"] if region != OSAKA and env != "dev" else []
+        )
+        assert [p["region"] for p in pools] == expected, (env, region)
+        assert all(p["user_pool_id"].startswith(f"{p['region']}_") for p in pools)
+        (policy,) = [
+            o
+            for o in objects
+            if o["kind"] == "NetworkPolicy" and o["metadata"]["name"] == "operator-api"
+        ]
+        proxied = [
+            rule["ports"]
+            for rule in policy["spec"]["egress"]
+            for peer in rule["to"]
+            if peer.get("namespaceSelector", {}).get("matchLabels", {})
+            == {"kubernetes.io/metadata.name": "egress-proxy"}
+        ]
+        assert proxied == [[{"port": 3135, "protocol": "TCP"}]], (env, region)
 
 
 def test_tls_to_the_pods_and_iam_tokens_match_the_edge_and_the_data_layer(

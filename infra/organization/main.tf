@@ -1,12 +1,14 @@
 # AWS Organizations, the OUs and member accounts, IAM Identity Center and its permission sets, the SCPs and the budgets,
 # in the management account (ADR-0006, NFR-20, NFR-21). Applied by the maintainer with MFA, never by CI; CI only checks
 # it and plans it read-only through the management account's plan role (ADR-0006). SCPs don't bind this account, so
-# nothing else lives here but the break-glass reconciliation's read-only roles (break-glass-trail.tf). The apply order
-# and the manual steps AWS requires are in docs/runbooks/organization-and-bootstrap.md.
+# nothing else lives here but the break-glass reconciliation's read-only roles (break-glass-trail.tf) and the alert on
+# SCP changes, which only this account's events show (scp-alerts.tf). The apply order and the manual steps AWS requires
+# are in docs/runbooks/organization-and-bootstrap.md.
 #
 # Files: main.tf (organization, OUs, accounts, trusted access), scps.tf (the five SCPs), identity-center.tf
 # (permission sets, groups, assignments), budgets.tf (budgets and cost allocation tags), break-glass-trail.tf (each
-# environment's read-only role for its break-glass reconciliation, #239).
+# environment's read-only role for its break-glass reconciliation, #239), scp-alerts.tf (the alert on any SCP change,
+# in us-east-1, #277).
 #
 # What this stack deliberately doesn't hold:
 # - The organization trail. The shared account is CloudTrail's delegated administrator (below) and the shared stack
@@ -54,6 +56,18 @@ provider "aws" {
 
   default_tags {
     tags = module.conventions.tags
+  }
+}
+
+# Organizations records its events in us-east-1, the Region of global services, so the alert on SCP changes lives
+# there (scp-alerts.tf). SCPs don't bind this account; nothing else is made there.
+provider "aws" {
+  alias               = "us_east_1"
+  region              = "us-east-1"
+  allowed_account_ids = [var.account_id]
+
+  default_tags {
+    tags = merge(module.conventions.tags, { "region" = "us-east-1" })
   }
 }
 

@@ -177,6 +177,9 @@ module "cluster_bootstrap" {
     user_pool_id = data.terraform_remote_state.identity_osaka.outputs.user_pool_id
     client_id    = data.terraform_remote_state.identity_osaka.outputs.app_client_id
   }
+
+  # The operator API's break-glass reconciliation, from the organization stack's outputs (#275); null keeps it off.
+  break_glass_reconciliation = var.break_glass_reconciliation
 }
 
 # The AWS side of the observability stack (ADR-0009, #243): Loki's and Tempo's buckets in this Region under the logs

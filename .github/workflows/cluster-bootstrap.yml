@@ -1,0 +1,104 @@
+name: cluster-bootstrap
+
+# The cluster-bootstrap layer's apply (ADR-0004, ADR-0005, ADR-0021, #279): the only way the platform Terraform installs
+# in a cluster (the egress proxy, Kyverno, Karpenter, External Secrets, the Load Balancer Controller, the Prometheus
+# Operator and Argo CD with its root Applications) reaches a cluster. It is planned and applied only here, on main,
+# through the Systems Manager tunnel, so no pull request plan reaches a cluster API, and people's permission sets may
+# not change cluster-scoped objects (authn-authz 8.1). Each cluster's apply first server-side applies the Prometheus
+# Operator's CRDs from deploy/observability/crds (cluster-bootstrap-apply.yml).
+#
+# The apply order (infra/README.md): dev; then staging and prod, Tokyo before Osaka (Tokyo's stack makes the
+# observability roles Osaka's binds), each environment after the one before it. prod waits for its environment's
+# approval. Run by hand from main for one environment, or on every push to main that changes the layer, its modules,
+# or the CRD bundle.
+#
+# An environment takes part only once it is listed in the repository variable LIVE_ENVIRONMENTS (its AWS side and its
+# GitHub environment exist with the main-only rule, docs/runbooks/organization-and-bootstrap.md step 0), so no job
+# names a GitHub environment before it has that rule, and main stays green until then.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/modules/cluster-bootstrap/**"
+      - "infra/modules/observability/**"
+      - "infra/modules/conventions/**"
+      - "infra/environments/*/*/cluster-bootstrap/**"
+      - "deploy/observability/crds/**"
+      - ".github/scripts/cluster-tunnel.sh"
+      - ".github/workflows/cluster-bootstrap.yml"
+      - ".github/workflows/cluster-bootstrap-apply.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to apply, both its Regions in order
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+
+permissions: {}
+
+# One apply at a time, never cancelled: an apply stopped halfway leaves a cluster half upgraded.
+concurrency:
+  group: cluster-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  dev:
+    if: contains(format(' {0} ', vars.LIVE_ENVIRONMENTS), ' dev ') && (github.event_name == 'push' || inputs.environment == 'dev')
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: dev
+      region: ap-northeast-1
+    permissions:
+      contents: read
+      id-token: write
+
+  staging-tokyo:
+    needs: dev
+    if: >-
+      !cancelled() && needs.dev.result != 'failure'
+      && contains(format(' {0} ', vars.LIVE_ENVIRONMENTS), ' staging ')
+      && (github.event_name == 'push' || inputs.environment == 'staging')
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: staging
+      region: ap-northeast-1
+    permissions:
+      contents: read
+      id-token: write
+
+  staging-osaka:
+    needs: staging-tokyo
+    if: ${{ !cancelled() && needs.staging-tokyo.result == 'success' }}
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: staging
+      region: ap-northeast-3
+    permissions:
+      contents: read
+      id-token: write
+
+  prod-tokyo:
+    needs: [staging-tokyo, staging-osaka]
+    if: >-
+      !cancelled() && needs.staging-tokyo.result != 'failure' && needs.staging-osaka.result != 'failure'
+      && contains(format(' {0} ', vars.LIVE_ENVIRONMENTS), ' prod ')
+      && (github.event_name == 'push' || inputs.environment == 'prod')
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: prod
+      region: ap-northeast-1
+    permissions:
+      contents: read
+      id-token: write
+
+  prod-osaka:
+    needs: prod-tokyo
+    if: ${{ !cancelled() && needs.prod-tokyo.result == 'success' }}
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: prod
+      region: ap-northeast-3
+    permissions:
+      contents: read
+      id-token: write

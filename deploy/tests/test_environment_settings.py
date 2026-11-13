@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
     ArchiveJobSettings,
+    BootstrapSettings,
     FieldKeySettings,
     InspectorSettings,
     JobSettings,
@@ -56,6 +57,7 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.api.operator": OperatorSettings,
     "sft.workers.relay": RelaySettings,
     "sft.data.migrate": MigrationSettings,
+    "sft.data.bootstrap": BootstrapSettings,  # #278, always suspended, run by hand once per environment
     "sft.dlp.inspector": InspectorSettings,
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,

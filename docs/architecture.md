@@ -232,7 +232,9 @@ The observability stack that watches all of this, and how its alerts reach a per
 - **Egress goes through an allowlisting proxy, never to NAT directly.** Envoy runs as an HTTPS `CONNECT` proxy on the
   `system` nodes, with one listener and allowlist per workload: the API (our managed login domain and Cognito's API, for
   code exchanges and signing keys), the notification worker (Cognito's admin API), Argo CD (GitHub), the signature
-  mirror (ClamAV's database) and the platform controllers (AWS APIs with no endpoint here). Default-deny network
+  mirror (ClamAV's database), the platform controllers (AWS APIs with no endpoint here) and the operator API (Cognito's
+  API for the SSO drift check, and the management account's CloudTrail and identity store in Tokyo for the break-glass
+  reconciliation, #275). Default-deny network
   policies allow each pod only CoreDNS, its own proxy listener, the endpoint subnets on 443 and the data-store ports it
   needs; pods that use S3 may also reach 443 outside the VPC, which the node security groups narrow to S3's prefix list
   (the gateway endpoint). The DLP inspector's pods get no egress at all, not even CoreDNS. No pod but the proxy reaches
@@ -329,11 +331,12 @@ flowchart TB
 ```
 
 Each environment's cluster runs Argo CD, which syncs that environment's values file from `main`: a deploy is a merged
-pull request that changes a digest. The same image digests move from dev to staging to prod (NFR-18). Terraform owns
-AWS resources; Argo CD owns what runs in Kubernetes. A rollback reverts the digest change in the deploy config, and the
-promotion gate passes a revert at once, so it merges within NFR-18's 10 minutes (ADR-0005). The web app bundle is
-built and checked on every pull request; ADR-0008's release workflow, which uploads one versioned bundle per build and
-promotes it the same way, isn't written yet, nor is the shared stack's store it writes to (infra/shared).
+pull request that changes a digest. The same image digests and the same web app bundle move from dev to staging to prod
+(NFR-18). Terraform owns AWS resources; Argo CD owns what runs in Kubernetes; the delivery pipeline promotes the web app
+bundle (a versioned copy that CloudFront points to). A rollback reverts the digest or version change in the deploy
+config, and the promotion gate passes a revert at once, so it merges within NFR-18's 10 minutes (ADR-0005). The web
+app's version is `deploy/environments/<env>/web.yaml`, its manifest's digest beside it, promoted by its own pull
+requests (`.github/workflows/web.yml`, `web-deploy.yml`, ADR-0008, #283).
 
 - **Promotion gate.** A promotion is a pull request that changes the next environment's deploy config. Its required
   `promotion-gate` job runs on the pull request's own head commit and passes only if the previous environment is
@@ -358,9 +361,9 @@ promotes it the same way, isn't written yet, nor is the shared stack's store it 
 
 **Accounts (open question 4).** One AWS account per environment (dev, staging, prod) under AWS Organizations, with
 Rashid's personal account as the management account, which holds no workloads. A shared account holds the container
-registry, the web bundle artifacts, the organization's log archive and the public DNS zone `sft.<domain>`, into which
-each environment writes its own records through a narrow cross-account role; no environment has a zone of its own, so no
-delegation can point at a torn-down zone. People reach AWS only through IAM Identity Center with MFA; deploys run from
+registry, the web app's versioned bundle store, the organization's log archive and the public DNS zone
+`sft.<domain>`, into which each environment writes its own records through a narrow cross-account role; no environment
+has a zone of its own, so no delegation can point at a torn-down zone. People reach AWS only through IAM Identity Center with MFA; deploys run from
 GitHub Actions through OIDC roles. Service control policies keep workloads to Tokyo, Osaka and the exempt services of
 NFR-21, and deny changing a KMS key policy, disabling a key or scheduling its deletion to everyone except the Terraform
 deploy roles (the retained stack's included), the bootstrap `Admin` role and the key-admin role `sft-{env}-keyadmin`

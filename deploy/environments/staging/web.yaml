@@ -1,0 +1,7 @@
+# The web app's bundle this environment serves (ADR-0008, #283): the build of main it was made from and the digest of
+# its manifest in the shared account's bundle store, as a cluster's values file pins an image digest. Only the web
+# release workflows edit it: the build points dev at each new bundle, a promotion pull request copies the previous
+# environment's pointer, and reverting a merge is the rollback. Merging deploys it (.github/workflows/web-deploy.yml).
+# The zeros mean "never released".
+version: 0000000000000000000000000000000000000000
+manifest: sha256:0000000000000000000000000000000000000000000000000000000000000000

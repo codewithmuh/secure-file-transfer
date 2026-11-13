@@ -201,7 +201,7 @@ on every pod the charts render; `deploy/observability/tests` checks the rest, th
 | A request's trace is in Tempo, with its logs linked | Explore, a `trace_id` from a log line | Pending the AWS run |
 | An error trace is always kept; a fast trace about one time in ten | Tempo search over a load test | Pending the AWS run |
 | A page reaches its SNS topic; the heartbeat publishes every minute and its alarm fires when it stops | Fire a test alert; scale Alertmanager to zero in staging | Pending the AWS run (#246) |
-| A chart bump's CRDs apply server-side and the new operator reconciles (section 11) | The procedure's checks, on the first bump | Pending the AWS run |
+| A chart bump's CRDs apply server-side and the new operator reconciles (section 11) | The cluster-bootstrap job's CRD steps and the operator release's precondition (#279), on the first bump | Pending the AWS run |
 | Grafana answers on the port-forward and nowhere else | Port-forward as ReadOnly; the synthetic probe from outside (T-05) | Pending the AWS run |
 | Loki and Tempo objects are under the logs key | `aws s3api head-object` on one of each | Pending the AWS run |
 
@@ -255,11 +255,12 @@ pull request's diff of the bundle can't be read as text: compare the two version
 change matters to our charts. `deploy/check.sh` and the tests must pass.
 
 **The apply**, after the merge, in each cluster in the apply order (dev; then staging and prod, Tokyo before Osaka,
-the pilot light too, since its operator runs), before that cluster's cluster-bootstrap apply. It runs as the
-identity that applies cluster-bootstrap, the deploy role through the Systems Manager tunnel
-([modules/cluster-bootstrap](../../infra/modules/cluster-bootstrap/README.md)): people's permission sets may not
-change cluster-scoped objects (authn-authz 8.1), and break-glass is not for planned changes. From a checkout of the
-merged commit, with the tunnel's kubeconfig:
+the pilot light too, since its operator runs), before that cluster's cluster-bootstrap apply. The cluster-bootstrap
+job does it, every time (`.github/workflows/cluster-bootstrap-apply.yml`, #279): the merge of the bump starts it,
+since the bundle and `images.tf` are among its paths. It runs as the identity that applies cluster-bootstrap, the
+deploy role through the Systems Manager tunnel
+([modules/cluster-bootstrap](../../infra/modules/cluster-bootstrap/README.md)): people's permission sets may not change
+cluster-scoped objects (authn-authz 8.1), and break-glass is not for planned changes. Its steps, from a checkout of the merged commit with the tunnel's kubeconfig:
 
 ```bash
 deploy/observability/crds/check.sh   # the bundle is the pinned chart's
@@ -271,8 +272,10 @@ kubectl get crd prometheuses.monitoring.coreos.com \
 ```
 
 `--force-conflicts` takes the fields over from Helm, the manager that installed them; Helm never writes them again,
-so nothing fights over them. Then apply cluster-bootstrap, which upgrades the operator, and check that its logs show
-no errors and that Argo CD's `observability` Applications are Synced and Healthy.
+so nothing fights over them. Then the job applies cluster-bootstrap, which upgrades the operator; check that its logs
+show no errors and that Argo CD's `observability` Applications are Synced and Healthy. Terraform holds any other apply
+to the same order: the operator's release has a precondition that the cluster's CRDs are the pinned operator's version
+(`operator.prometheus.io/version`), so an apply that skipped the CRDs stops before the operator moves.
 
 The order is what makes it safe. A newer CRD only adds fields and versions, so the old operator keeps working
 between the two steps; the reverse order would run the new operator against the old schema. A rollback of the chart
@@ -283,5 +286,5 @@ chart's CRDs, which the check proves are the bundle's.
 Decided in #264 over two alternatives. The chart's own `crds.upgradeJob` applies the CRDs from a Helm hook Job at
 every upgrade, but it needs two more images (kubectl and busybox) mirrored and admitted, and a Job in the cluster that
 may write any CRD. A separate CRD chart with the CRDs as templates, as Karpenter's are, lets Helm upgrade them, but
-uninstalling that release would delete every CRD and every object of their kinds. Both stay options for when the
-cluster-bootstrap apply job exists; until then the bundle and the two commands above are the whole procedure.
+uninstalling that release would delete every CRD and every object of their kinds. The cluster-bootstrap job (#279)
+runs the two commands above instead, so neither is needed.

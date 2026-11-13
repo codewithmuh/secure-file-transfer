@@ -8,8 +8,9 @@ dashes. This page is the runbook of the three alerts in [`deploy/alerts/sso.rule
 > [!IMPORTANT]
 > **Pending the AWS run.** The check reads Cognito with the operator API's role, which holds
 > `cognito-idp:ListIdentityProviders`, `DescribeIdentityProvider` and `DescribeUserPoolClient` on both pools
-> (modules/eks-cluster). It stays off until the environment sets `SSO_DRIFT_POOLS` (`operatorApi.env`) and the operator
-> API has a way out to Cognito (an egress proxy listener, a follow-up). The local stack has no check.
+> (modules/eks-cluster), through the egress proxy's `operator` listener (#275). The chart sets `SSO_DRIFT_POOLS` from
+> the cluster facts once the identity layer's pool exists: in Tokyo this Region's pool and, outside dev, Osaka's; in
+> Osaka its own (Osaka's stacks never read Tokyo's state). The local stack has no check.
 
 ## What the check reports
 

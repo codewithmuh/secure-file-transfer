@@ -51,6 +51,7 @@ inspector gets no egress at all.
   (dict "component" "invite-backlog" "ingress" (list) "egress" (concat $base (list $proxy.notifier $rules.valkey)))
   (dict "component" "standby-enrolment" "ingress" (list) "egress" (append $base $proxy.notifier))
   (dict "component" "recovery" "ingress" (list) "egress" (append $base $rules.s3))
+  (dict "component" "db-bootstrap" "ingress" (list) "egress" $base)
 }}
 {{- if eq .Values.region "ap-northeast-1" }}
 {{- /* No database: the endpoints (Secrets Manager, and the cluster API, whose ENIs share their subnets), its listener. */}}
@@ -70,8 +71,9 @@ inspector gets no egress at all.
 {{- $policies = append $policies (dict "component" $name "ingress" (list) "egress" (ternary (append $jobBase $rules.s3) $jobBase $job.s3)) }}
 {{- end }}
 {{- else }}
-{{- /* The operator API writes its security-critical records to the audit archive (#239): S3, as the API. */}}
-{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (concat $traced (list $rules.valkey $rules.s3))) }}
+{{- /* The operator API writes its security-critical records to the audit archive (#239): S3, as the API; its jobs
+reach Cognito, CloudTrail and the identity store through its own proxy listener (#275). */}}
+{{- $policies = list (dict "component" "operator-api" "ingress" (list $rules.fromMonitoring) "egress" (concat $traced (list $proxy.operator $rules.valkey $rules.s3))) }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -143,3 +143,13 @@ variable "web_distribution_arn" {
   type        = string
   default     = null
 }
+
+variable "web_writer_arns" {
+  description = "The only principals that may write or delete the web bucket's objects (ADR-0008, #283): the environment's release role, sft-<env>-web-release (modules/web-release), and the Terraform deploy role, which empties the bucket at teardown."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.web_writer_arns) > 0 && alltrue([for a in var.web_writer_arns : can(regex("^arn:aws:iam::[0-9]{12}:role/", a))])
+    error_message = "web_writer_arns must name the release role and the deploy role by role ARN."
+  }
+}

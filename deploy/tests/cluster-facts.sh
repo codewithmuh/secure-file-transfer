@@ -7,7 +7,8 @@
 #   (`cluster`, #106) and what the observability Applications pass their charts (`global`, #243).
 # - The workloads that stay off until their environment's AWS side exists, switched on, so every check (helm lint,
 #   kubeconform, Kyverno, Trivy, deploy/tests) sees them before a values file turns them on: the synthetic probe
-#   (#248).
+#   (#248), the operator API's break-glass reconciliation, whose facts come from the organization stack (#275), and
+#   the database bootstrap job, which a values file turns on for one sync (#278).
 #
 # Usage: deploy/tests/cluster-facts.sh ENV REGION   (ENV dev, staging or prod; REGION ap-northeast-1 or -3)
 set -euo pipefail
@@ -36,6 +37,9 @@ cluster:
   cognitoLoginDomain: sft-$env-example.auth.$region.amazoncognito.com
   sesConfigurationSet: sft-$env
   appClientId: example0client0id
+  breakGlassTrailRoleArn: arn:aws:iam::$account:role/sft-$env-break-glass-trail
+  breakGlassPermissionSetArn: arn:aws:sso:::permissionSet/ssoins-0000000000000000/ps-0000000000000000
+  identityStoreId: d-0000000000
 EOF
 # Tokyo's key rotation job also rotates Osaka's standby client (staging and prod).
 if [[ $region == ap-northeast-1 && $env != dev ]]; then
@@ -53,4 +57,6 @@ global:
     accountId: "$account"
 probe:
   enabled: true
+dbBootstrap:
+  runOnSync: true
 EOF

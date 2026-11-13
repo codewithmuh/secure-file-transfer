@@ -11,10 +11,11 @@ all labelled `security: "true"`, so Alertmanager never inhibits them during a dr
 > [!IMPORTANT]
 > **The AWS steps are pending the AWS run.** The reconciliation reads the management account's CloudTrail through a
 > read-only role there (`BREAK_GLASS_TRAIL_ROLE_ARN`: `sft-<env>-break-glass-trail`, infra/organization, not applied
-> yet). It stays off until the environment sets that role, the `BreakGlass` permission set and the identity store
-> (`operatorApi.env`) and the operator API has a way out to CloudTrail and the identity store (an egress proxy
-> listener, a follow-up). The break-glass tool isn't built.
-> The first drill checks these steps and corrects this page.
+> yet), through the egress proxy's `operator` listener (#275). It runs once the environment's GitHub environment holds
+> `TF_VAR_BREAK_GLASS_RECONCILIATION` (that role, the `BreakGlass` permission set and the identity store, from the
+> organization stack's outputs, [organization-and-bootstrap.md](organization-and-bootstrap.md) step 8) and the
+> cluster-bootstrap job has applied it: the root Application hands the three to the operator API. The break-glass tool
+> isn't built. The first drill checks these steps and corrects this page.
 
 ## How a grant is recorded
 

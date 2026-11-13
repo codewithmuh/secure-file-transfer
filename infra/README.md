@@ -17,7 +17,7 @@ Argo CD, not Terraform, owns what runs inside the clusters.
 infra/
   bootstrap/<account>/<region>/        state bucket and tfstate key; in Tokyo also the OIDC provider and roles
   organization/                        AWS Organizations, Identity Center, SCPs, budgets (management account, #55)
-  shared/                              registry, web bundle artifacts, DNS zone, log archive (shared account)
+  shared/                              registry, the web app's bundle store, DNS zone, log archive (shared account)
   environments/<env>/<region>/<layer>/ network, data, cluster, cluster-bootstrap, edge
   environments/prod/retained/          the audit archive and what guards it after teardown (prod only)
   modules/                             reusable modules: every stack is built from these
@@ -35,8 +35,8 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 |---|---|---|---|---|
 | `bootstrap/<account>/ap-northeast-1` | each | Tokyo | The state bucket and tfstate key for Tokyo; the GitHub OIDC provider; the Terraform plan and deploy roles; the key-admin role and the emergency user (none of the last three in the management account) | The maintainer, `Admin` permission set, local state first |
 | `bootstrap/<account>/ap-northeast-3` | staging, prod | Osaka | The state bucket for Osaka and the Osaka replica of the tfstate key | The maintainer, `Admin` permission set, local state first; in a Tokyo outage, the account's emergency user |
-| `organization` | management | Tokyo (Organizations is global) | Organizations, OUs and accounts, Identity Center and permission sets, SCPs, budgets: [#55](https://github.com/codewithmuh/secure-file-transfer/issues/55); each environment's read-only role for the break-glass reconciliation (#239) | The maintainer with MFA, never CI; CI plans it read-only (ADR-0006) |
-| `shared` | shared | Tokyo, with Osaka and us-east-1 aliases when needed | ECR and the registry key, web bundle artifacts, the public DNS zone, the organization's log archive | CI, `shared` environment |
+| `organization` | management | Tokyo (Organizations is global) | Organizations, OUs and accounts, Identity Center and permission sets, SCPs, budgets: [#55](https://github.com/codewithmuh/secure-file-transfer/issues/55); each environment's read-only role for the break-glass reconciliation (#239); the alert on SCP changes, in us-east-1 (#277) | The maintainer with MFA, never CI; CI plans it read-only (ADR-0006) |
+| `shared` | shared | Tokyo, with Osaka and us-east-1 aliases when needed | ECR and the registry key, the web app's versioned bundle store and its publish role ([`modules/web-bundles`](modules/web-bundles/README.md), ADR-0008, #283), the public DNS zone, the organization's log archive | CI, `shared` environment |
 | `environments/<env>/<region>/<layer>` | dev, staging, prod | dev: Tokyo; staging and prod: Tokyo and Osaka | Architecture 3.1 and 3.2, split into layers (below) | CI, the environment's GitHub environment |
 | `environments/prod/retained` | prod | Tokyo, with an Osaka alias | The audit archive buckets and key in both Regions and what guards them after teardown (encryption 8.4) | CI, through its own deploy role; local state first |
 
@@ -45,8 +45,8 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 | `network` | VPC, subnets, NAT gateways, VPC endpoints and their policies, the egress security groups, DNS Firewall, the flow log (ADR-0021) | [`modules/network`](modules/network/README.md); dev has two AZs, one NAT gateway and its endpoints in one AZ |
 | `data` | Aurora, the files buckets, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
-| `cluster-bootstrap` | Argo CD and its root Applications, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021); the observability stack's operator, namespaces and storage class, and its buckets and roles ([`modules/observability`](modules/observability/README.md), ADR-0009, #243) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, through the Systems Manager tunnel (ADR-0021); pull request plans never reach a cluster API |
-| `edge` | Load balancer, WAF, the environment's DNS records; in Tokyo, CloudFront and its us-east-1 certificate and web ACL | [`modules/edge`](modules/edge/README.md) and [`modules/web-cdn`](modules/web-cdn/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
+| `cluster-bootstrap` | Argo CD and its root Applications, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021); the observability stack's operator, namespaces and storage class, and its buckets and roles ([`modules/observability`](modules/observability/README.md), ADR-0009, #243) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, by `.github/workflows/cluster-bootstrap.yml` through the Systems Manager tunnel (ADR-0021, #279), which applies the Prometheus Operator's CRDs first; pull request plans never reach a cluster API |
+| `edge` | Load balancer, WAF, the environment's DNS records, the web bucket; in Tokyo, CloudFront and its us-east-1 certificate and web ACL, and the web app's release role (#283) | [`modules/edge`](modules/edge/README.md), [`modules/web-cdn`](modules/web-cdn/README.md) and [`modules/web-release`](modules/web-release/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
 | `identity` | SES (the `mail.<domain>` identity with DKIM and MAIL FROM, the configuration set `sft-<env>`, its SNS topic into the `ses-events` queue), the member user pool with its domain and app client and its sign-in triggers (#238), the `sft/<env>/app/*` secrets without values (ADR-0015, ADR-0016, encryption 6.4), and the probe mailbox: SES receiving for `probe.` (and `loadtest.` in staging) into the Region's mailbox bucket, with staging's load-test role (#259) | [`modules/ses`](modules/ses/README.md), [`modules/user-pool`](modules/user-pool/README.md), [`modules/signin-triggers`](modules/signin-triggers/README.md), [`modules/app-secrets`](modules/app-secrets/README.md), [`modules/probe-mailbox`](modules/probe-mailbox/README.md); after `data` and `edge`, before `cluster-bootstrap`, which reads its outputs (#185) |
 | `alarms` | The AWS-side alarms and the watchdog (ADR-0009, A34): the Region's page, ticket and heartbeat topics, alarms on Aurora, the queues, S3 replication, the load balancer, the NAT gateways, KMS, SES and the sign-in triggers, the security alerts' EventBridge rules (#256), and in Tokyo the Route 53 health check alarms and the rule that forwards global sign-in events, in us-east-1 | [`modules/alarms`](modules/alarms/README.md); applied last in its Region, reading its `network`, `data` and `edge` states; Tokyo's in staging and prod after Osaka's `edge`. `TF_VAR_alert_emails` names who the alerts reach (#246) |
 | `retained` | See above | prod only, one root for both Regions |
@@ -90,7 +90,9 @@ and key outlive prod and keep their state in their own bucket (encryption 8.4).
 | `registry` | ECR repositories, the registry key, the cross-account pull policy, the lifecycle rules, the push role and Osaka replication ([README](modules/registry/README.md), #105) |
 | `user-pool` | One Region's member user pool: Plus tier with threat protection, MFA, admin-only sign-up, managed login on a Cognito prefix domain, the API's app client, the sign-in web ACL ([README](modules/user-pool/README.md), #185) |
 | `valkey` | One Region's counter store: ElastiCache Serverless for Valkey, its IAM-authenticated users and security group ([README](modules/valkey/README.md), #101) |
+| `web-bundles` | The web app's versioned bundle store in the shared account and its publish role, which only the registry environment may assume ([README](modules/web-bundles/README.md), ADR-0008, #283) |
 | `web-cdn` | The CloudFront distribution for the web bundle, with Osaka failover, its us-east-1 certificate and web ACL, its logs and the app record ([README](modules/web-cdn/README.md), #105) |
+| `web-release` | `sft-<env>-web-release`, the web app's release role: reads the bundle store, writes the environment's web buckets, from the GitHub environment `web-<env>` only ([README](modules/web-release/README.md), #283) |
 
 ## Apply order
 
@@ -124,10 +126,13 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    (`terraform import 'module.data.aws_iam_service_linked_role.volumes["autoscaling"]' <role ARN>`).
    Tokyo's `cluster` makes the account's IAM roles and Osaka's refers to them, so Osaka's goes after it; both need
    `data` first, for the keys' aliases and EventBridge's delivery role. `cluster-bootstrap` reaches the cluster API
-   only through the Systems Manager tunnel, as the deploy role (modules/cluster-bootstrap). It needs
+   only through the Systems Manager tunnel, as the deploy role, in CI's `cluster-bootstrap` workflow (#279), which
+   server-side applies the Prometheus Operator's CRDs before each apply (modules/cluster-bootstrap). It needs
    `TF_VAR_domain` for the application's names, and reads the user pool, its login domain, its app client and the SES
    configuration set from the Region's `identity` state; Tokyo's in staging and prod also reads Osaka's (the key
-   rotation job rotates Osaka's client too), so both Regions' `identity` go before Tokyo's `cluster-bootstrap`.
+   rotation job rotates Osaka's client too, and the operator API's drift check reads both pools), so both Regions'
+   `identity` go before Tokyo's `cluster-bootstrap`. `TF_VAR_break_glass_reconciliation`, from the organization stack's
+   outputs, switches on the operator API's break-glass reconciliation (#275).
    `identity` needs `data` (the `ses-events` queue, Osaka's secrets key) and `edge` (the sign-in web ACL), and
    `TF_VAR_shared_account_id`, `TF_VAR_domain`, `TF_VAR_dmarc_report_address` and, in an apply job,
    `TF_VAR_terraform_role=deploy`. Its secrets have no value until the key rotation job's first run, so after the first
@@ -223,7 +228,11 @@ organization stack, passed in as `plan_policy_json`.
 ## Organization and guardrails
 
 `organization` holds everything that binds the accounts from above ([ADR-0006](../docs/adr/0006-aws-account-per-environment.md)).
-SCPs never bind the management account, so it holds nothing else and is applied only by the maintainer with MFA.
+SCPs never bind the management account, so it holds nothing else and is applied only by the maintainer with MFA. The
+one alert it holds watches the SCPs themselves: `sft-management-scp-changed`, an EventBridge rule in us-east-1, where
+Organizations records its calls, on any attach, detach, update or delete of a policy and any change of a policy type,
+into the topic `sft-management-scp-alerts` that `TF_VAR_alert_emails` subscribe to (scp-alerts.tf, #277,
+docs/runbooks/scp-change.md).
 
 | | |
 |---|---|

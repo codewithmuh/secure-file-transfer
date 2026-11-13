@@ -1,14 +1,14 @@
 # The shared account's stack: the container registry and its key (ADR-0007), the public DNS zone with DNSSEC and the
-# environments' DNS roles (ADR-0021), and the organization's log archive with the organization trail (ADR-0006). It
-# lives from the bootstrap until the last environment is torn down (capacity 5.4). Built by #105.
+# environments' DNS roles (ADR-0021), the organization's log archive with the organization trail (ADR-0006), and the
+# web app's bundle store (ADR-0008, #283). It lives from the bootstrap until the last environment is torn down
+# (capacity 5.4). Built by #105.
 #
 # One root for three Regions, one of the two deliberate exceptions (infra/README.md): Tokyo for everything that holds
 # data; ap-northeast-3 for the registry key's replica and ECR's replication template, once staging exists
 # (replicate_to_osaka); us-east-1 for the zone's DNSSEC signing key, which Route 53 requires there (NFR-21). None of
 # them is in a failover path.
 #
-# The account IDs and the domain come in as variables (TF_VAR_*), never committed. The web bundle's versioned store
-# (ADR-0008) is not here yet: it arrives with the web release workflow that writes it.
+# The account IDs and the domain come in as variables (TF_VAR_*), never committed.
 
 terraform {
   required_version = "~> 1.17.0"
@@ -140,4 +140,17 @@ module "log_archive" {
   key_admin_role_arn                 = local.bootstrap_role_arns.key_admin
   admin_principal_arn_patterns       = [module.conventions.sso_role_arn_patterns.admin]
   break_glass_principal_arn_patterns = local.break_glass
+}
+
+module "web_bundles" {
+  source = "../modules/web-bundles"
+
+  bucket_name        = "${module.conventions.name_prefix}-web-bundles-${var.account_id}"
+  member_account_ids = var.member_account_ids
+  deploy_role_arn    = local.bootstrap_role_arns.terraform_deploy
+
+  github_oidc_provider_arn = local.github_oidc_provider_arn
+  github_repository        = module.conventions.github_repository
+  publish_role_name        = "${module.conventions.global_name_prefix}-web-publish"
+  iam_path                 = local.iam_path
 }

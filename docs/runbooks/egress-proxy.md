@@ -25,6 +25,8 @@ The proxy (Envoy, two replicas on the `system` nodes, namespace `egress-proxy`) 
 | `argocd` | 3131 | Argo CD repo server and notifications | Syncs from GitHub, and the deployment statuses the promotion gate reads |
 | `platform` | 3132 | Karpenter, Load Balancer Controller, Kyverno, Alertmanager | New nodes' AMI lookups, target registration, signature reads, alert delivery |
 | `key-rotation` | 3133 | Key rotation job | Rotating the user pools' client secrets |
+| `synthetic-probe` | 3134 | Synthetic probe | The probe's runs from outside, and its `ProbeSuccess` metric |
+| `operator` | 3135 | Operator API | The SSO drift check and the break-glass reconciliation (Cognito; Tokyo's CloudTrail, identity store and, from Osaka, STS); operators' own calls keep working |
 
 Sending, downloads, uploads, scanning, email through SES, and the Osaka writes use VPC endpoints and continue; existing
 sessions keep working (architecture 6).

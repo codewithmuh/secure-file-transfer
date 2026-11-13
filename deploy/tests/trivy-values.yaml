@@ -15,6 +15,9 @@ cluster:
   cognitoLoginDomain: sft-dev-example.auth.ap-northeast-1.amazoncognito.com
   sesConfigurationSet: sft-dev
   appClientId: example0client0id
+  breakGlassTrailRoleArn: arn:aws:iam::000000000000:role/sft-dev-break-glass-trail
+  breakGlassPermissionSetArn: arn:aws:sso:::permissionSet/ssoins-0000000000000000/ps-0000000000000000
+  identityStoreId: d-0000000000
 image:
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 network:
@@ -32,3 +35,5 @@ global:
 # The workloads that are off until their AWS side exists, switched on as in cluster-facts.sh.
 probe:
   enabled: true
+dbBootstrap:
+  runOnSync: true

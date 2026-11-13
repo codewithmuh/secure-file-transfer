@@ -163,6 +163,9 @@ module "cluster_bootstrap" {
   cognito_user_pool_id  = data.terraform_remote_state.identity.outputs.user_pool_id
   ses_configuration_set = data.terraform_remote_state.identity.outputs.ses_configuration_set
   cognito_app_client_id = data.terraform_remote_state.identity.outputs.app_client_id
+
+  # The operator API's break-glass reconciliation, from the organization stack's outputs (#275); null keeps it off.
+  break_glass_reconciliation = var.break_glass_reconciliation
 }
 
 # The AWS side of the observability stack (ADR-0009, #243): Loki's and Tempo's buckets in this Region under the logs

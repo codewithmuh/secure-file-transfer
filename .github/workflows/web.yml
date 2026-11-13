@@ -1,0 +1,173 @@
+name: web
+
+# The web app's release (ADR-0008, ADR-0005, #283): one versioned bundle per build of main, promoted and rolled back
+# like an image, by moving a pointer in Git (deploy/environments/<env>/web.yaml). The logic is
+# .github/scripts/web-release.sh; .github/scripts/test-web-release.sh dry-runs it.
+#
+# - On a push to main that changes the web app: `build` builds it once with npm, with no AWS credentials and no OIDC
+#   token, and writes its manifest (every file's SHA-256, content type and cache header); `publish`, in the registry
+#   environment (main only, T-71), uploads it to the shared account's bundle store under bundles/<git-sha>/ through the
+#   publish role, manifest last, or finds it already there on a re-run; `promote-dev` opens the pull request that
+#   points dev at it. Merging that pull request deploys (web-deploy.yml).
+# - Run by hand from main (`promote`): copies the previous environment's pointer, dev → staging or staging → prod, and
+#   opens the promotion pull request as the bot. promotion-gate (promote.yml) passes it once the previous environment
+#   serves that version; merging the prod pull request is prod's approval.
+#
+# Until the shared stack exists, the repository variables below are unset and the run does nothing, so main stays
+# green.
+#
+# Repository variables (never literals in this file):
+#   WEB_BUNDLE_BUCKET     the bundle store, sft-shared-apne1-web-bundles-<shared account> (infra/shared output)
+#   WEB_PUBLISH_ROLE_ARN  the shared stack's publish role, which trusts only the registry environment
+#   BOT_APP_CLIENT_ID     the promotion bot (#6); secret BOT_APP_PRIVATE_KEY, its private key
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to promote the web app to (it copies the one before it)
+        type: choice
+        options: [staging, prod]
+        required: true
+
+permissions: {}
+
+# One build at a time, oldest first, so dev's proposal moves forward in order; promotions apart, per environment.
+concurrency:
+  group: web-${{ github.event_name == 'push' && 'build' || inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the bundle and its manifest
+    if: github.event_name == 'push' && vars.WEB_BUNDLE_BUCKET != '' && vars.WEB_PUBLISH_ROLE_ARN != ''
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: web/.nvmrc
+      - name: Install
+        working-directory: web
+        run: npm ci --ignore-scripts # no install scripts (threat model T-68)
+      - name: Build (content-hashed file names, ADR-0008)
+        working-directory: web
+        run: npm run build
+      - name: Write the manifest
+        run: |
+          mkdir -p "$RUNNER_TEMP/bundle"
+          .github/scripts/web-release.sh manifest web/dist "$GITHUB_SHA" > "$RUNNER_TEMP/bundle/manifest.json"
+          cp -R web/dist "$RUNNER_TEMP/bundle/dist"
+          echo "Built the web app from $GITHUB_SHA: $(jq '.files | length' "$RUNNER_TEMP/bundle/manifest.json") files." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-bundle
+          path: ${{ runner.temp }}/bundle
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Publish the bundle to the shared account's store
+    needs: build
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    environment: registry # the publish role's OIDC subject; main only (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the publish role; no other job here has it
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-bundle
+          path: ${{ runner.temp }}/bundle
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.WEB_PUBLISH_ROLE_ARN }}
+          role-session-name: web-publish-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+      - name: Publish (once per commit; the manifest goes last)
+        id: publish
+        env:
+          WEB_BUNDLE_BUCKET: ${{ vars.WEB_BUNDLE_BUCKET }}
+        run: |
+          digest=$(.github/scripts/web-release.sh publish "$RUNNER_TEMP/bundle/dist" "$RUNNER_TEMP/bundle/manifest.json" "$GITHUB_SHA")
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published the web app $GITHUB_SHA, manifest \`$digest\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # No OIDC token and no AWS: it only edits dev's pointer and opens the pull request as the bot.
+  promote-dev:
+    name: Open the dev web promotion pull request
+    needs: publish
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main # the proposal is one change on top of the latest main
+          persist-credentials: false
+      - name: Point dev at the bundle
+        env:
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: .github/scripts/web-release.sh set dev "$GITHUB_SHA" "$DIGEST"
+      - id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+        run: .github/scripts/web-release.sh open-pr dev
+
+  promote:
+    name: Open the ${{ inputs.environment }} web promotion pull request
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Copy the previous environment's pointer
+        env:
+          TARGET: ${{ inputs.environment }}
+        run: |
+          case $TARGET in
+            staging) from=dev ;;
+            prod) from=staging ;;
+            *) echo "::error::unknown environment $TARGET"; exit 1 ;;
+          esac
+          .github/scripts/web-release.sh copy "$from" "$TARGET"
+      - id: bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open or update the pull request
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
+          TARGET: ${{ inputs.environment }}
+        run: .github/scripts/web-release.sh open-pr "$TARGET"

@@ -338,8 +338,9 @@ only read the pools' identity providers and app clients, for the SSO drift check
   isn't checked. Each finding is a platform audit event (`sso_provider.drift_found`) and counts in
   `sft_sso_provider_drift{pool,problem}`: `missing` and `changed` page, `unrecorded` and a check that hasn't run for 26
   hours open tickets (deploy/alerts/sso.rules.yaml, docs/runbooks/sso-provider-drift.md). It never changes a pool. It
-  runs where `SSO_DRIFT_POOLS` names the pools; the local stack, with Keycloak as its one pool, has none. Reading
-  Cognito is pending the AWS run.
+  runs where `SSO_DRIFT_POOLS` names the pools, which the chart sets from the identity layer's outputs (Tokyo's pool
+  and, outside dev, Osaka's; in Osaka its own), and reaches Cognito through the egress proxy's `operator` listener
+  (#275); the local stack, with Keycloak as its one pool, has none. Reading Cognito is pending the AWS run.
 
 ### 2.6 Regional failover
 
@@ -1089,8 +1090,10 @@ tenant IDs that don't exist are dropped and counted. One it can't record an hour
 (`BreakGlassGrantUnrecorded`), and so does a job that hasn't completed for 45 minutes; a grant the job had to record
 opens a ticket (deploy/alerts/break-glass-records.rules.yaml, docs/runbooks/break-glass-records.md). The management
 account's role is `sft-<env>-break-glass-trail` (infra/organization/break-glass-trail.tf), which trusts only the
-environment's `sft-<env>-operator`. The tool, the role's apply, and the operator API's way out to CloudTrail, the
-identity store and Cognito (a proxy listener; until then the jobs stay off) are pending the AWS run.
+environment's `sft-<env>-operator`. The operator API reaches CloudTrail and the identity store in Tokyo through the
+egress proxy's `operator` listener, and gets the role, the permission set and the identity store from the cluster facts
+(the organization stack's outputs, passed to cluster-bootstrap as `TF_VAR_break_glass_reconciliation`, #275); without
+them the job stays off. The tool and the role's apply are pending the AWS run.
 
 ### 8.4 When Identity Center is unavailable
 

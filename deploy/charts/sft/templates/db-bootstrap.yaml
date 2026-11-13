@@ -1,0 +1,79 @@
+{{- if and (eq .Values.part "application") (not .Values.pilotLight) .Values.dbBootstrap.runOnSync }}
+{{- /*
+The database bootstrap job (#278; sft.data.bootstrap, sft.core.settings.BootstrapSettings; encryption 6.3, data model
+7): it creates the login roles that every other workload signs in as, the migration's sft_migrate included. So it runs
+as an Argo CD PreSync hook, before the migration job, but only in a sync whose values turn it on
+(dbBootstrap.runOnSync): once per environment, at its first deploy, and again when the role list changes, each time by
+a reviewed commit that a second commit turns off again. Every statement can run again safely. Not in the pilot light:
+Osaka's database is a read-only replica until a failover promotes it.
+
+It signs in as the Aurora master user, whose password it reads from Secrets Manager itself (BOOTSTRAP_MASTER_SECRET),
+as its own role sft-<env>-db-bootstrap, the only workload the secret's policy lets read it (infra/modules/aurora). The
+URL names the user and no password, so the password is never in the pod spec, a Kubernetes Secret or Git. Each login
+role gets rds_iam (BOOTSTRAP_IAM_AUTH). Its service account is a hook too, a wave earlier, so it exists on a first
+sync; its network policy is the chart's like any workload's.
+*/}}
+{{- $j := .Values.dbBootstrap }}
+{{- $ctx := dict "root" $ "component" "db-bootstrap" "serviceAccount" $j.serviceAccount }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $j.serviceAccount }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-3"
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-bootstrap
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # Kept until the next sync that runs it, so its log can be read; before the migration's service account (-1).
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "-2"
+spec:
+  backoffLimit: 0 # a failure stops the sync before the migration; every statement is idempotent, so a re-sync retries
+  activeDeadlineSeconds: {{ $j.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      {{- include "sft.podCommon" $ctx | nindent 6 }}
+      restartPolicy: Never
+      securityContext:
+        {{- include "sft.podSecurityContext" 10001 | nindent 8 }}
+      containers:
+        - name: db-bootstrap
+          image: {{ include "sft.appImage" . }}
+          imagePullPolicy: IfNotPresent
+          command: [python, -m, {{ $j.module }}]
+          env:
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: AWS_REGION
+              value: {{ .Values.region | quote }}
+            - name: BOOTSTRAP_DATABASE_URL # the master user, no password: the job reads it from the secret below
+              value: {{ include "sft.databaseUrl" (dict "root" $ "role" $j.masterUser) | quote }}
+            - name: BOOTSTRAP_MASTER_SECRET
+              value: {{ printf "secretsmanager:sft/%s/db/master" .Values.environment | quote }}
+            - name: BOOTSTRAP_IAM_AUTH # every login role signs in with IAM tokens (encryption 6.3)
+              value: "true"
+          resources:
+            {{- toYaml $j.resources | nindent 12 }}
+          securityContext:
+            {{- include "sft.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        {{- include "sft.tmpVolume" . | nindent 8 }}
+{{- end }}
