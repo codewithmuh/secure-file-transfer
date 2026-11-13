@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.1.0](https://github.com/codewithmuh/secure-file-transfer/compare/v1.0.0...v1.1.0) (2026-11-13)
+
+
+### Features
+
+* **ops:** one command to bring an AWS environment up or down ([#295](https://github.com/codewithmuh/secure-file-transfer/issues/295)) ([#296](https://github.com/codewithmuh/secure-file-transfer/issues/296)) ([e41fc3b](https://github.com/codewithmuh/secure-file-transfer/commit/e41fc3b533ab03f60a955a40d3467feff6335bd7))
+
+
+### Bug Fixes
+
+* **ops:** [#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)'s review fixes, which missed its merge ([#301](https://github.com/codewithmuh/secure-file-transfer/issues/301)) ([#302](https://github.com/codewithmuh/secure-file-transfer/issues/302)) ([8dcddf0](https://github.com/codewithmuh/secure-file-transfer/commit/8dcddf0c46ea35a1529ade3c075d5b23d61fe7e3))
+* **ops:** review fixes for aws-up/aws-down, and the flow-log bucket that missed [#296](https://github.com/codewithmuh/secure-file-transfer/issues/296) ([#299](https://github.com/codewithmuh/secure-file-transfer/issues/299)) ([#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)) ([820f673](https://github.com/codewithmuh/secure-file-transfer/commit/820f673948ae9bdf698278477eae8bcc87f9ae71))
+
 ## [1.0.0](https://github.com/codewithmuh/secure-file-transfer/compare/v0.1.0...v1.0.0) (2026-11-13)
 
 
