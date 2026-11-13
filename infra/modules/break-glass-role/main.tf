@@ -17,7 +17,7 @@
 # Osaka's stack runs after Tokyo's (infra/README.md, "Apply order"). Every assumption pages (alerts.tf).
 
 locals {
-  region_short = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }[var.region]
+  region_short = var.conventions.region_shorts[var.region]
 
   role_name = "sft-${var.environment}-break-glass-db"
   role_arn  = "arn:aws:iam::${var.account_id}:role/${local.role_name}"

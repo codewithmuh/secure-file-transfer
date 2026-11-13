@@ -8,8 +8,8 @@
 #   this stack's own replication role. The Osaka bucket is made first, because S3 needs the destination to exist.
 # - SCP 5 lets only this stack's deploy role and Admin change the buckets' guards.
 #
-# The deploy role, sft-prod-retained-terraform-deploy under /sft-bootstrap/, is named here before its issue makes it:
-# the key and bucket policies match it by ARN, so they don't need it to exist yet.
+# The deploy role, sft-prod-retained-terraform-deploy under /sft-bootstrap/, is made in deploy-role.tf; the key and
+# bucket policies match it by ARN, so they don't need it to exist first.
 
 locals {
   retained_deploy_role_arn = "arn:aws:iam::${var.account_id}:role${module.conventions.bootstrap_iam_path}sft-prod-retained-terraform-deploy"
@@ -25,6 +25,8 @@ locals {
 module "audit_key" {
   source = "../../../modules/kms-keys"
 
+  conventions = module.conventions
+
   environment    = "prod"
   account_id     = var.account_id
   classes        = ["audit"]
@@ -39,6 +41,9 @@ module "audit_key" {
   key_admin_role_arn                 = local.key_admin_role_arn
   break_glass_principal_arn_patterns = local.break_glass_patterns
   replication_role_name              = local.retained_replication
+
+  # From the teardown apply on: the environment's workload roles leave the key policy, and rotation stops (8.4, #263).
+  environment_retired = var.teardown
 }
 
 module "audit_key_osaka" {
@@ -47,6 +52,8 @@ module "audit_key_osaka" {
   providers = {
     aws = aws.osaka
   }
+
+  conventions = module.conventions
 
   environment      = "prod"
   account_id       = var.account_id
@@ -62,6 +69,9 @@ module "audit_key_osaka" {
   key_admin_role_arn                 = local.key_admin_role_arn
   break_glass_principal_arn_patterns = local.break_glass_patterns
   replication_role_name              = local.retained_replication
+
+  # From the teardown apply on: the environment's workload roles leave the key policy, and rotation stops (8.4, #263).
+  environment_retired = var.teardown
 }
 
 module "audit_archive_osaka" {
@@ -71,7 +81,8 @@ module "audit_archive_osaka" {
     aws = aws.osaka
   }
 
-  environment = "prod"
+  conventions = module.conventions
+
   account_id  = var.account_id
   kms_key_arn = module.audit_key_osaka.key_arns["audit"]
 
@@ -85,12 +96,16 @@ module "audit_archive_osaka" {
   deploy_role_arn                    = local.retained_deploy_role_arn
   admin_principal_arn_patterns       = local.admin_patterns
   break_glass_principal_arn_patterns = local.break_glass_patterns
+
+  # From the teardown apply on: the environment's workload roles leave the bucket policy (8.4, #263).
+  environment_retired = var.teardown
 }
 
 module "audit_archive" {
   source = "../../../modules/audit-archive"
 
-  environment = "prod"
+  conventions = module.conventions
+
   account_id  = var.account_id
   kms_key_arn = module.audit_key.key_arns["audit"]
 
@@ -108,6 +123,9 @@ module "audit_archive" {
   deploy_role_arn                    = local.retained_deploy_role_arn
   admin_principal_arn_patterns       = local.admin_patterns
   break_glass_principal_arn_patterns = local.break_glass_patterns
+
+  # From the teardown apply on: the environment's workload roles leave the bucket policy (8.4, #263).
+  environment_retired = var.teardown
 
   depends_on = [module.audit_archive_osaka]
 }

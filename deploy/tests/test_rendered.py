@@ -1,13 +1,13 @@
 """Checks every rendered manifest against the runtime contract (architecture 8) and the pod rules of ADR-0004.
 
-Renders every cluster with deploy/render.sh (helm on PATH), the way Argo CD will, then inspects the objects. Run from
-the repository root: `uv run --project services/api --locked pytest deploy/tests` (`make deploy-check` does it all).
+Inspects every cluster as deploy/render.sh renders it, the way Argo CD will (the `rendered` fixture, deploy/conftest.py;
+helm on PATH). Run from the repository root: `uv run --project services/api --locked pytest deploy/tests`
+(`make deploy-check` does it all).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from collections.abc import Iterator
@@ -20,12 +20,14 @@ import yaml
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
     ArchiveJobSettings,
+    BootstrapSettings,
     InspectorSettings,
     JobSettings,
     KeyRotationSettings,
     MigrationSettings,
     NotifySettings,
     OperatorSettings,
+    RecoverySettings,
     RelaySettings,
     ScanSettings,
     Settings,
@@ -54,8 +56,10 @@ PROXIED = {
     "api": 3128,
     "notifier": 3129,
     "invite-backlog": 3129,
+    "standby-enrolment": 3129,  # #258, as the notification worker: Cognito through its listener
     "key-rotation": 3133,
     "synthetic-probe": 3134,
+    "operator-api": 3135,  # #275: its jobs' Cognito, CloudTrail and identity store
 }
 # The DLP inspector speaks its own framed protocol, one file per connection, on a port of its own (ADR-0022); its
 # probes are on the internal port like everyone's (#184).
@@ -70,6 +74,8 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,
     "sft.workers.invite_backlog": NotifySettings,  # the notification worker's one-off pass (#193)
+    "sft.workers.standby_enrolment": NotifySettings,  # #258
+    "sft.workers.recovery": RecoverySettings,  # #258
     "sft.workers.key_rotation": KeyRotationSettings,
     # The lifecycle jobs (#181), one module per CronJob, all reading JobSettings.
     "sft.workers.expiry": JobSettings,
@@ -80,32 +86,15 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.purge": JobSettings,  # #224
     "sft.workers.audit_partitions": JobSettings,
     "sft.workers.audit_archive": ArchiveJobSettings,  # #183
-    "sft.probe": ProbeSettings,  # #248, rendered on here (the fixture)
+    "sft.probe": ProbeSettings,  # #248, rendered on (deploy/tests/cluster-facts.sh)
 }
+# The database bootstrap job (#278) reads the master password from the secret BOOTSTRAP_MASTER_SECRET names, a setting
+# the APP track's change of #278 adds to BootstrapSettings: checked here as soon as that setting exists.
+if "bootstrap_master_secret" in BootstrapSettings.model_fields:
+    SETTINGS["sft.data.bootstrap"] = BootstrapSettings
 REGION_SHORT = {"ap-northeast-1": "apne1", "ap-northeast-3": "apne3"}
 
 Manifest = dict[str, Any]
-
-
-@pytest.fixture(scope="session")
-def rendered(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> dict[tuple[str, str, str], list[Manifest]]:
-    out = tmp_path_factory.mktemp("rendered")
-    # The synthetic probe is off by default until each environment's AWS side exists (#248): rendered on here, so its
-    # pod, policy and identity are checked like every other workload's before a values file turns it on.
-    subprocess.run(
-        [str(ROOT / "deploy" / "render.sh"), str(out)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "SFT_RENDER_SET": "probe.enabled=true"},
-    )
-    result = {}
-    for env, region in CLUSTERS:
-        for part in [*PARTS, "argocd"]:
-            text = (out / f"{env}-{region}-{part}.yaml").read_text()
-            result[(env, region, part)] = [d for d in yaml.safe_load_all(text) if d]
-    return result
 
 
 def chart_objects(
@@ -457,8 +446,12 @@ def test_pilot_light(rendered: dict[tuple[str, str, str], list[Manifest]]) -> No
                 region,
                 obj["metadata"]["name"],
             )
-        if obj["kind"] == "CronJob" and obj["metadata"]["name"] == "invite-backlog":
-            assert obj["spec"]["suspend"] is True  # run by hand, once (#193)
+        if obj["kind"] == "CronJob" and obj["metadata"]["name"] in {
+            "invite-backlog",
+            "recovery",
+            "standby-enrolment",
+        }:
+            assert obj["spec"]["suspend"] is True  # run by hand (#193, #258)
         elif obj["kind"] == "CronJob":
             assert obj["spec"]["suspend"] is osaka
             assert obj["spec"]["concurrencyPolicy"] == "Forbid"
@@ -468,23 +461,34 @@ def test_pilot_light(rendered: dict[tuple[str, str, str], list[Manifest]]) -> No
         if region == OSAKA:
             assert jobs == []
         else:
-            (job,) = jobs
-            assert (
-                job["metadata"]["annotations"]["argocd.argoproj.io/hook"] == "PreSync"
-            )  # ADR-0005
-            assert pod_spec(job)["containers"][0]["command"] == [
-                "python",
-                "-m",
-                "sft.data.migrate",
-            ]
-            hooks = [
-                o
+            # The migration, and before it the database bootstrap, which the cluster facts switch on for the checks
+            # (#278): both PreSync hooks, each with its service account a wave earlier (ADR-0005).
+            jobs_by_name = {j["metadata"]["name"]: j for j in jobs}
+            assert set(jobs_by_name) == {"migrate", "db-bootstrap"}
+            hooks = {
+                o["metadata"]["name"]: o["metadata"]["annotations"]
                 for o in objects
                 if o["kind"] == "ServiceAccount" and o["metadata"].get("annotations")
-            ]
-            assert [h["metadata"]["name"] for h in hooks] == [
-                pod_spec(job)["serviceAccountName"]
-            ]
+            }
+            waves = {}
+            for name, module in (
+                ("db-bootstrap", "sft.data.bootstrap"),
+                ("migrate", "sft.data.migrate"),
+            ):
+                job = jobs_by_name[name]
+                annotations = job["metadata"]["annotations"]
+                assert annotations["argocd.argoproj.io/hook"] == "PreSync"
+                assert pod_spec(job)["containers"][0]["command"] == [
+                    "python",
+                    "-m",
+                    module,
+                ]
+                account = hooks[pod_spec(job)["serviceAccountName"]]
+                assert account["argocd.argoproj.io/hook"] == "PreSync"
+                waves[name] = int(annotations.get("argocd.argoproj.io/sync-wave", "0"))
+                assert int(account["argocd.argoproj.io/sync-wave"]) < waves[name]
+            assert waves["db-bootstrap"] < waves["migrate"]
+            assert set(hooks) == {"db-bootstrap", "migrate"}
 
 
 def test_one_image_per_cluster(
@@ -697,6 +701,83 @@ def test_keyrings_are_read_from_secrets_manager_and_the_client_through_external_
     )
 
 
+def test_the_operator_api_jobs_are_on_and_reach_aws_through_their_own_listener(
+    rendered: dict[tuple[str, str, str], list[Manifest]],
+) -> None:
+    """The break-glass reconciliation and the SSO drift check (#239, #275) get their settings from the cluster facts:
+    the trail role, the permission set and the identity store together, and the pools Tokyo checks (both outside dev)
+    or Osaka checks (its own). Their way out is the operator listener, the port the egress proxy gives it, with the
+    names it allows; the network policy reaches that listener and no other (ADR-0021). test_environment_settings.py
+    loads the settings themselves."""
+    main = (ROOT / "infra/modules/cluster-bootstrap/main.tf").read_text()
+    ports = {
+        name: int(port)
+        for name, port in re.findall(
+            r"^    ([a-z-]+)\s+= (31[0-9]{2})", main, re.MULTILINE
+        )
+    }
+    chart = yaml.safe_load((ROOT / "deploy/charts/sft/values.yaml").read_text())
+    chart_ports = chart["network"]["egressProxy"]["ports"]
+    # Every listener the chart names is the cluster-bootstrap stack's, on the same port (#106).
+    names = {
+        "api": "api",
+        "notifier": "notifier",
+        "signatureMirror": "signature-mirror",
+        "keyRotation": "key-rotation",
+        "operator": "operator",
+    }
+    assert names.keys() == chart_ports.keys()
+    for key, name in names.items():
+        assert chart_ports[key] == ports[name], key
+    proxy = (ROOT / "infra/modules/cluster-bootstrap/egress-proxy.tf").read_text()
+    listener = proxy[proxy.index('name = "operator"') :]
+    listener = listener[: listener.index("\n    },")]
+    for name in (
+        "cognito-idp.${var.region}.amazonaws.com",
+        "cognito-idp.ap-northeast-3.amazonaws.com",
+        "cloudtrail.ap-northeast-1.amazonaws.com",
+        "identitystore.ap-northeast-1.amazonaws.com",
+        "sts.ap-northeast-1.amazonaws.com",
+        '"sft-operator"',
+    ):
+        assert name in listener, name
+    allowed = (ROOT / "infra/modules/network/variables.tf").read_text()
+    for name in ("cloudtrail", "identitystore", "sts"):
+        assert f'"{name}.ap-northeast-1.amazonaws.com",' in allowed, name
+
+    for env, region in CLUSTERS:
+        objects = rendered[(env, region, "operator")]
+        (deployment,) = [o for o in objects if o["kind"] == "Deployment"]
+        settings = env_of(pod_spec(deployment)["containers"][0])
+        assert settings["HTTPS_PROXY"].endswith(":3135")
+        assert settings["BREAK_GLASS_TRAIL_ROLE_ARN"].endswith(
+            f":role/sft-{env}-break-glass-trail"
+        )
+        assert settings["BREAK_GLASS_PERMISSION_SET_ARN"].startswith(
+            "arn:aws:sso:::permissionSet/"
+        )
+        assert settings["IDENTITY_STORE_ID"].startswith("d-")
+        pools = json.loads(settings["SSO_DRIFT_POOLS"])
+        expected = [region] + (
+            ["ap-northeast-3"] if region != OSAKA and env != "dev" else []
+        )
+        assert [p["region"] for p in pools] == expected, (env, region)
+        assert all(p["user_pool_id"].startswith(f"{p['region']}_") for p in pools)
+        (policy,) = [
+            o
+            for o in objects
+            if o["kind"] == "NetworkPolicy" and o["metadata"]["name"] == "operator-api"
+        ]
+        proxied = [
+            rule["ports"]
+            for rule in policy["spec"]["egress"]
+            for peer in rule["to"]
+            if peer.get("namespaceSelector", {}).get("matchLabels", {})
+            == {"kubernetes.io/metadata.name": "egress-proxy"}
+        ]
+        assert proxied == [[{"port": 3135, "protocol": "TCP"}]], (env, region)
+
+
 def test_tls_to_the_pods_and_iam_tokens_match_the_edge_and_the_data_layer(
     rendered: dict[tuple[str, str, str], list[Manifest]],
 ) -> None:
@@ -835,12 +916,9 @@ def test_the_key_rotation_job_runs_in_tokyo_with_a_token_for_the_reload_only(
         assert [c["region"] for c in clients] == (
             ["ap-northeast-1"] if env == "dev" else ["ap-northeast-1", OSAKA]
         )
-    for objects in rendered.values():
-        for obj in objects:
-            if obj["kind"] in POD_KINDS and component(obj) != "key-rotation":
-                assert not any(
-                    "projected" in v for v in pod_spec(obj).get("volumes", [])
-                )
+    for _, _, _, obj in pods(rendered):
+        if component(obj) != "key-rotation":
+            assert not any("projected" in v for v in pod_spec(obj).get("volumes", []))
 
 
 def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cognito(
@@ -852,11 +930,12 @@ def test_the_notifier_sends_with_the_configuration_set_and_invites_through_cogni
             if obj["kind"] in POD_KINDS and component(obj) in {
                 "notifier",
                 "invite-backlog",
+                "standby-enrolment",
             }:
                 container = pod_spec(obj)["containers"][0]
                 settings = env_of(container)
-                if component(obj) == "invite-backlog":
-                    # A run-to-completion pass with no listener: no port and no probes (#193).
+                if component(obj) in {"invite-backlog", "standby-enrolment"}:
+                    # Run-to-completion passes with no listener: no port and no probes (#193, #258).
                     assert not {
                         "ports",
                         "startupProbe",
@@ -901,3 +980,18 @@ def test_only_the_api_identity_unwraps_field_data_keys_and_never_the_stand_in(
         if component(obj) == "field-keys"
     ]
     assert len(jobs) == len({env for env, _ in CLUSTERS})
+
+
+def test_trivy_values_are_the_one_source_of_facts() -> None:
+    """Trivy renders the charts with trivy-values.yaml (trivy.yaml), which holds dev's cluster facts and switches in
+    Tokyo exactly as deploy/tests/cluster-facts.sh writes them, the one source render.sh and check.sh use (#186)."""
+    facts = yaml.safe_load(
+        subprocess.run(
+            [str(ROOT / "deploy/tests/cluster-facts.sh"), "dev", "ap-northeast-1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
+    trivy = yaml.safe_load((ROOT / "deploy/tests/trivy-values.yaml").read_text())
+    assert {key: trivy.get(key) for key in facts} == facts

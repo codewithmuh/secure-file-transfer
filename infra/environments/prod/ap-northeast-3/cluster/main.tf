@@ -64,6 +64,8 @@ locals {
 module "cluster" {
   source = "../../../../modules/eks-cluster"
 
+  conventions = module.conventions
+
   environment        = "prod"
   region             = module.conventions.region
   account_id         = var.account_id
@@ -84,9 +86,10 @@ module "cluster" {
   karpenter_discovery_tag = local.network.karpenter_discovery_tag
 
   kubernetes_version = "1.37"
-  # prod's clusters can't be deleted until an apply turns this off (NFR-19's teardown starts there).
-  deletion_protection = true
+  # prod's clusters can't be deleted until the teardown apply turns this off (TF_VAR_teardown, NFR-19, #263).
+  deletion_protection = !var.teardown
 
-  # One always-on system node in the pilot light; the failover runbook raises it to 2 (ADR-0004).
-  system_node_count = 1
+  # One always-on system node in the pilot light; the failover runbook raises it to 2 with TF_VAR_system_node_count
+  # and the failback lowers it again (ADR-0004, #261).
+  system_node_count = var.system_node_count
 }

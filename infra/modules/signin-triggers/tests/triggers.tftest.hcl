@@ -29,6 +29,11 @@ variables {
   regions          = ["ap-northeast-1", "ap-northeast-3"]
   image_uri        = "registry.test/sft/app@sha256:${join("", [for i in range(64) : "a"])}"
   user_pool_arn    = "arn:aws:cognito-idp:ap-northeast-1:aws:userpool/ap-northeast-1_testonly"
+  # What the root passes as module.conventions (modules/conventions, #172).
+  conventions = {
+    region_shorts       = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+    workload_role_names = { "signin-trigger" = "sft-staging-signin-trigger" }
+  }
   valkey = {
     cache_arn         = "arn:aws:elasticache:ap-northeast-1:aws:serverlesscache:sft-staging-apne1-valkey"
     address           = "sft-staging-apne1-valkey.serverless.apne1.cache.amazonaws.com"

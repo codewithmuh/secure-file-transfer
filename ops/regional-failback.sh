@@ -10,6 +10,9 @@
 # Script options, besides the common ones (ops/lib/common.sh):
 #   --failed-over-at <time>  when the failover happened, ISO 8601 UTC: the files written in Osaka since then are
 #                            copied back to Tokyo. Required with --execute.
+#   --after-detach           the failover detached Osaka's cluster rather than failing over: Osaka's cluster becomes
+#                            a new global database, sft-<env>-aurora-2, and Tokyo's is made again as its secondary
+#                            (runbook step 1, #261).
 #
 # No NFR sets a failback time. The budgets are a first estimate for a maintenance window, for the first drill to
 # measure and correct. Pending the AWS run.
@@ -21,17 +24,19 @@ STEPS_DOC=docs/runbooks/regional-failback.md
 source "$(dirname "$0")/lib/common.sh"
 
 usage() {
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
   echo
   common_usage
 }
 
 parse_common "$@"
 FAILED_OVER_AT=""
+AFTER_DETACH=false
 set -- "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --failed-over-at) FAILED_OVER_AT="${2:-}"; shift 2 ;;
+    --after-detach) AFTER_DETACH=true; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
@@ -50,20 +55,40 @@ T0=$(date +%s)
 ready() {
   manual "Tokyo is healthy: AWS Health shows ap-northeast-1 recovered, and Tokyo's stacks are applied again in the" \
     "order of infra/README.md with its cluster in pilot light (the fenced values). Tokyo's state bucket answers."
+  if $AFTER_DETACH; then
+    # Inputs only (#261): Osaka's detached cluster becomes a new global database; Tokyo's old cluster goes, with its
+    # final snapshot, and a new one joins as Osaka's secondary.
+    local old="sft-$ENV_NAME-aurora"
+    SFT_AURORA_GENERATION=2
+    run aws rds create-global-cluster --region "$OSAKA" --global-cluster-identifier "$(global_cluster)" \
+      --source-db-cluster-identifier "arn:aws:rds:$OSAKA:$ACCOUNT_ID:cluster:$(db_cluster "$OSAKA")"
+    manual "Apply infra/environments/$ENV_NAME/$OSAKA/data with TF_VAR_aurora_global_generation=2 (no change to the" \
+      "cluster; the input records the new global database)."
+    run aws rds modify-db-cluster --region "$TOKYO" --db-cluster-identifier "$(db_cluster "$TOKYO")" \
+      --no-deletion-protection --apply-immediately
+    run aws rds modify-global-cluster --region "$TOKYO" --global-cluster-identifier "$old" --no-deletion-protection
+    manual "Apply infra/environments/$ENV_NAME/$TOKYO/data with TF_VAR_aurora_role=secondary" \
+      "TF_VAR_aurora_global_generation=2: the old cluster goes with its final snapshot (kept 30 days, #42 gap 10), the" \
+      "old global database $old with it, and a new cluster joins $(global_cluster). Keep both inputs in the apply" \
+      "checklist until the next rebuild, and SFT_AURORA_GENERATION=2 for these scripts."
+  else
+    manual "After a managed failover Aurora brought Tokyo's old cluster back as Osaka's secondary by itself; its" \
+      "snapshot from before stays 30 days for the reconciliation report (#42 gap 10)."
+  fi
   run aws rds describe-global-clusters --region "$OSAKA" --global-cluster-identifier "$(global_cluster)"
-  manual "Tokyo's database is Osaka's secondary and caught up: after a managed failover Aurora brings the old cluster" \
-    "back as a secondary by itself; after a detach, delete it (its snapshot stays 30 days for the reconciliation" \
-    "report) and apply Tokyo's data root as the secondary (runbook step 2). Wait for AuroraGlobalDBReplicationLag < 1 s."
+  manual "Wait for AuroraGlobalDBReplicationLag under a second on Tokyo's cluster."
 }
 
 files_back() {
-  # Objects written in Osaka while it was primary: S3 Batch Replication along the Osaka-to-Tokyo rule that the
-  # failback apply adds (runbook step 3). Replicas keep their tags, so `scan` comes back with them.
+  # The reverse rule first (#262), so uploads during the window replicate too; then the objects written in Osaka
+  # since the failover, by S3 Batch Replication along that rule. Replicas keep their tags, so `scan` comes back.
+  manual "Apply infra/environments/$ENV_NAME/$OSAKA/data with TF_VAR_replicate_to_tokyo=true (and the failover's" \
+    "TF_VAR_malware_protection_enabled=true): the to-tokyo rule on both files buckets."
   for bucket in files large-files; do
     run aws s3control create-job --region "$OSAKA" --account-id "$ACCOUNT_ID" --no-confirmation-required \
       --priority 10 --operation '{"S3ReplicateObject":{}}' --report '{"Enabled":false}' \
       --role-arn "arn:aws:iam::$ACCOUNT_ID:role/sft-$ENV_NAME-s3-batch-replication" \
-      --manifest-generator "{\"S3JobManifestGenerator\":{\"SourceBucket\":\"arn:aws:s3:::sft-$ENV_NAME-apne3-$bucket-$ACCOUNT_ID\",\"EnableManifestOutput\":false,\"Filter\":{\"EligibleForReplication\":true,\"CreatedAfter\":\"$FAILED_OVER_AT\"}}}"
+      --manifest-generator "{\"S3JobManifestGenerator\":{\"SourceBucket\":\"arn:aws:s3:::$(region_prefix "$OSAKA")-$bucket-$ACCOUNT_ID\",\"EnableManifestOutput\":false,\"Filter\":{\"EligibleForReplication\":true,\"CreatedAfter\":\"$FAILED_OVER_AT\"}}}"
   done
   manual "Wait for both jobs to complete (aws s3control describe-job), and write their object counts in the drill log."
 }
@@ -85,14 +110,23 @@ switchover() {
 
 values_back() {
   run "$OPS_ROOT/failover-values.sh" failback --env "$ENV_NAME" --write
+  # Both archives again (#257): the archive job back-fills Tokyo's with what Osaka's alone holds.
+  run "$OPS_ROOT/failover-values.sh" both-regions --env "$ENV_NAME" --write
   manual "Commit and push 'ops: fence $ENV_NAME Osaka and take Tokyo out of pilot light'."
   run kubectl --context "$TOKYO_CTX" -n sft rollout status deploy/api --timeout=20m
 }
 
 generation_and_outbox() {
-  # A new writer region starts a new archive generation; the re-import of the hour finds every record present
-  # (nothing was lost) and proves it. Then the outbox since the hold, for what sat in Osaka's queues.
-  recovery_job "$TOKYO" "generation,partitions,replay" "$HELD_AT" "$HELD_AT"
+  # Tokyo's archive gets the failover's generation only with the back-fill (runbook step 10), so the generation step,
+  # on Tokyo's own archive, keeps the cursor's, which a switchover needs no more than. The replay reads Osaka's archive
+  # (#276): it alone holds the records Osaka wrote between the hold and the fence, and every one since the fence went
+  # to both. Each must be in the database (the switchover lost nothing): its report's missing is 0. Then the outbox
+  # since the hold, for what sat in Osaka's queues.
+  recovery_job "$TOKYO" "generation" "" "$HELD_AT"
+  recovery_job "$TOKYO" "partitions,replay" "$HELD_AT" "" "$OSAKA"
+  manual "The replay's report reads archive_region $OSAKA and missing 0: every record since the hold is present but" \
+    "the grant intents (download.grant_intent:ignored), which are never in the database. A missing record fails the" \
+    "drill: the switchover lost it, and the job re-imported it. Write records, present and missing in the drill log."
   recovery_job "$TOKYO" "outbox" "$HELD_AT"
   run "$OPS_ROOT/failover-values.sh" release-tokyo --env "$ENV_NAME" --write
   manual "Commit and push 'ops: start $ENV_NAME Tokyo's workers after the failback'."
@@ -105,10 +139,19 @@ dns_back() {
 }
 
 osaka_pilot_light() {
-  run aws eks update-nodegroup-config --region "$OSAKA" --cluster-name "$(eks_cluster "$OSAKA")" \
-    --nodegroup-name "$(eks_cluster "$OSAKA")-system" --scaling-config minSize=1,maxSize=1,desiredSize=1
-  manual "Apply Osaka's data root without TF_VAR_malware_protection_enabled (the plan goes), the alarms with the" \
-    "heartbeat off, and drop the Osaka-to-Tokyo replication rule (runbook step 8)."
+  # Inputs only (#261, #262): every root back to its defaults.
+  manual "Apply infra/environments/$ENV_NAME/$OSAKA/cluster without TF_VAR_system_node_count (one node);" \
+    "infra/environments/$ENV_NAME/$OSAKA/data without TF_VAR_malware_protection_enabled and TF_VAR_replicate_to_tokyo" \
+    "(the plan and the to-tokyo rule go); infra/environments/$ENV_NAME/$OSAKA/alarms and $TOKYO/alarms without" \
+    "TF_VAR_heartbeat_enabled, TF_VAR_pilot_light and TF_VAR_database_role (runbook step 8)."
+}
+
+backfill_check() {
+  # #257's drill step: Tokyo's archive holds every batch Osaka's alone held during the failover, once, under its key.
+  manual "max(audit_archive_single_region_ranges) is 0 and the archive job's last report shows backfilled. With the" \
+    "ReadOnly profile, list both regions' audit archive under the failover's generation (list-objects-v2 --prefix" \
+    "g<n>/, Key and Size, sorted) and diff them: empty, no gap and no duplicate. Tokyo's security-critical/v1/ holds" \
+    "every record Osaka's does but the download.grant_intent ones. Write the counts in the drill log (runbook step 10)."
 }
 
 verify() {
@@ -125,10 +168,11 @@ step 300 "Hold Osaka's workers" hold_osaka
 step 300 "Switch the database over to Tokyo (no data loss)" switchover
 step 600 "Fence Osaka, take Tokyo out of pilot light with its workers held" values_back
 drill_marker start "$TOKYO"
-step 600 "New archive generation, the outbox since the hold, then Tokyo's workers" generation_and_outbox
+step 600 "Archive generation, the replay of Osaka's archive, the outbox since the hold, then Tokyo's workers" generation_and_outbox
 step 300 "Switch DNS back to Tokyo" dns_back
 step 600 "Osaka back to its pilot light" osaka_pilot_light
 step 300 "Verify with the synthetic probe and an original sign-in" verify
+step 600 "Prove the archive back-fill: Tokyo's archive holds what Osaka's alone held (#257)" backfill_check
 
 measure "Failback, first step to verified" "$(minutes $(($(date +%s) - T0)))"
 drill_marker end "$TOKYO"

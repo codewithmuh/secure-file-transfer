@@ -1,0 +1,17 @@
+{% extends "ja/_layout.txt" %}
+{% block subject %}{{ tenant_name }}の管理者のサインインが復旧されました{% endblock %}
+{% block body %}
+{{ tenant_name }}からの依頼により、Secure File Transferの運用担当者が、{{ recovered_at }}に管理者 {{ admin_email }} のサインインを復旧しました。依頼は、アカウント開設時に{{ tenant_name }}が登録した復旧用の連絡先で確認済みです。
+{% if temporary_until %}
+
+この管理者は、パスワードによる一時的なサインインを使えます。{{ tenant_name }}がシングルサインオンを必須にしていても、{{ temporary_until }}まで有効です。サインインしている間に、予備の管理者を指定するよう依頼してください。
+{% else %}
+
+この管理者のセッションは終了し、以前のサインイン情報は削除されました。パスワードと2つ目の認証要素を設定するための新しい招待が届きます。
+{% endif %}
+
+このメールは{{ tenant_name }}のすべての管理者に送られます。{{ tenant_name }}の誰もこの依頼をしていない場合は、アカウント乗っ取りの試みとして扱ってください。監査ログを確認し、アカウント開設時に案内された連絡先から、ただちにSecure File Transferの運用担当者に連絡してください。
+
+監査ログを開く：
+{{ audit_log_url }}
+{% endblock %}

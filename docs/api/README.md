@@ -207,7 +207,11 @@ different gets `409 idempotency_conflict`, so a key reused with the same body on
 answered with the first transfer. A JSON body is compared as JSON: the same members in another order, or other white
 space, are the same body. A retry while the first request is still running gets `409 idempotency_in_progress`
 straight away; retry it once that request has answered. A request that fails keeps no key, so its retry runs afresh.
-A key belongs to its caller: a member (whichever of their sessions sends it), an API key or a link session.
+A key belongs to its caller: a member (whichever of their sessions sends it), an API key or a link session. An
+operator's key belongs to the operator, by their Identity Center user name, not to the 15-minute operator token, so a
+retry with a new token still gets the first answer (#160). It is looked up across tenants, since `createTenant`'s
+tenant doesn't exist yet, so a key the operator used before is never written again, even more than 24 hours later
+until the daily job has deleted it: `409 idempotency_conflict`. An operator sends a new key for each new call.
 
 These take no `Idempotency-Key`:
 
@@ -428,7 +432,7 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-20 | Revoke transfers and upload requests | `revokeTransfer`, `revokeUploadRequest` |
 | FR-22 | Invite, deactivate and assign roles | `inviteUser`, `listUsers`, `getUser`, `updateUser`, `deactivateUser`, `signOutUser`, `resetUserSignIn`, `getCurrentMember` |
 | FR-23 | Tenant policy | `getTenantPolicy`, `updateTenantPolicy` |
-| FR-25 | Sign in with MFA | `startSignIn`, `completeSignIn`, `signOut`, `getCurrentMember`; `resetUserSignIn` for a lost factor; `recoverTenantAdmin` for a tenant's last admin |
+| FR-25 | Sign in with MFA | `startSignIn`, `completeSignIn`, `signOut`, `getCurrentMember`; `resetUserSignIn` for a lost factor; `recoverTenantAdmin` for a tenant's last admin, confirmed through `getTenantRecoveryContact` |
 | FR-28 | Search the audit log | `searchAuditEvents` |
 | FR-33 | English and Japanese recipient and uploader pages and emails, in v1 | `locale` on recipients and upload requests; `default_locale` in the tenant policy |
 | FR-34 | Provision a tenant and its first admin | `createTenant`; the operator API's `createOperatorToken` |

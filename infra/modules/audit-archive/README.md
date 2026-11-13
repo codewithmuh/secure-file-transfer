@@ -24,6 +24,10 @@ reader and BreakGlass, writes to all but the archive job, the API, the operator 
 writes to all but the replication role, and changes to the bucket's settings to all but the owning deploy role and
 Admin.
 
+**After prod's teardown** (`environment_retired`, from the retained stack's teardown apply on, #263): the environment's
+workload roles leave the policy. Nothing may write any more, and only the audit reader and BreakGlass read, so a role
+re-created later under one of those names matches nothing (encryption 8.4).
+
 **Who writes what, in both Regions.** The archive job (#183) writes each batch to Tokyo's and Osaka's bucket itself,
 and moves its cursor only once both hold it ([data model](../../../docs/design/data-model.md) 2.5), so "archived" means
 both Regions. The API and the operator API write each security-critical record to both too (architecture 5.2).

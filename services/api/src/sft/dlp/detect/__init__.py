@@ -12,8 +12,8 @@ never a matched value (FR-53, NFR-26).
 
 `DETECTORS_VERSION` changes with any change to a built-in detector or its data (issuer ranges, TLDs,
 credential patterns, the bank and branch code list); it is part of the inspection engine version
-each file records ([DLP] 9). The code list's part is its retrieval date, `banks-none` while none is
-bundled (`bank_codes`).
+each file records ([DLP] 9). The code list's part is its retrieval date, `banks-none` where there is
+no list: from a checkout, or in an image built with `BANK_CODES=none` (`bank_codes`).
 """
 
 from sft.dlp.detect import bank_codes

@@ -41,3 +41,22 @@ tests:
             exp_annotations:
               summary: A tenant's DLP rules need approval but it has no eligible approver; its transfers wait (FR-43).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md
+
+  # Abuse 8.2 (#260): a pending request past half its timeout for 10 minutes opens a ticket.
+  - interval: 1m
+    input_series:
+      - series: 'dlp_approval_pending_timeout_used_ratio{job="expiry"}'
+        values: '0.2 0.4 0.6x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DlpApprovalBacklog
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: DlpApprovalBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: pending_half_timeout
+            exp_annotations:
+              summary: A DLP approval request has waited more than half its tenant's approval timeout (FR-43).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md

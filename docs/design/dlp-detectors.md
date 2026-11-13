@@ -64,6 +64,10 @@ has a logo, and v1 inspects no images at all, which the PRD states (non-goals) a
 **Encodings for text.** In this order: a byte order mark (UTF-8, UTF-16 LE or BE); strict UTF-8; ISO-2022-JP when its
 escape sequences appear; strict CP932, which covers Shift_JIS; strict EUC-JP. Bytes that decode as none of these are
 binary, so `unsupported_type`. Zip member names without the UTF-8 flag are read as CP932, which Japanese archivers use.
+A text file is decoded once, strictly, in the best of these for its first 64 KiB, as it is read (#166). If a later byte
+doesn't decode, the lines already inspected stay inspected and the file is read again in the first other candidate that
+decodes all of it, inspecting only the lines after them; if none does, the best one reads it with undecodable bytes
+replaced, and the file is `partial` with `parse_error`.
 
 **Office files** are parsed part by part as XML, streamed, with DTDs, entities and network access off. Spreadsheets are
 read in row order so each cell knows its column header. Embedded Office files and archives are members, and count
@@ -154,17 +158,58 @@ branch code before its bank code, leaves the account medium. Japan Post Bank acc
 medium.
 
 The list is data: a sorted set of 7-digit codes (bank, then branch) with its source, licence and retrieval date in its
-header, bundled with the detectors (`sft/dlp/detect/bank_codes.txt`) and read once per process. Japan's roughly
-30,000 branches make about 240 KB on disk and 2 MB in memory, and parse in tens of milliseconds, inside the
-inspector's start-up and memory budgets. `tools/bank_codes.py` writes it from a CSV the maintainer obtained under
-terms that allow bundling; the service README gives the steps. It is refreshed before each release and at least every
-three months, since banks merge and branches close; a stale list only leaves some accounts at medium.
+header (`sft/dlp/detect/bank_codes.txt`), read once per process into a frozen set: once when the inspector starts, and
+once in each file's child (a fresh interpreter, ADR-0022). A list that fails its checks stops the inspector at start
+rather than let it inspect without it. Measured on the inspector image (arm64, Docker Desktop, 2026-11-09 and 10) with
+the 31,229 codes of the pinned list below:
 
-**No list is bundled yet (#146).** No source whose licence allows redistribution has been confirmed: the Zengin-Net
-data is distributed under contract, and the open lists found online (for example `zengin-code/source-data`, MIT for
-the repository) are compiled from third-party sites whose own terms say nothing about reuse. Until one is, the
-bundled file holds only its header, high is never reached, and a bank account is medium at most, which is the
-confidence the default rule uses (section 6). The tests and the accuracy corpus use a synthetic list.
+| | Without the list | With it | Limit |
+|---|---|---|---|
+| Image size | 361.54 MB | 361.79 MB (+250 KB) | About 0.4 GB an image, 30 kept in 20 GB of registry ([CAP] A40) |
+| Parsing the list | | 10 ms | |
+| A child's start, to its detectors loaded (medians of 40, two runs) | 170 and 168 ms | 178 and 189 ms | 0.5 s per file, all of a file's fixed cost ([CAP] A45) |
+| A child's peak memory at that point | 43.6 and 42.6 MiB | 48.6 and 47.4 MiB | 2 GiB per child, 3 GiB per inspector (ADR-0022) |
+
+**Where the list comes from (#146, checked 2026-11-09).** No source could be confirmed whose licence clearly allows
+redistributing the data:
+
+- **Zengin-Net and the Japanese Bankers Association** publish no open list of branch codes; their file of
+  institution and branch codes is distributed under contract, and no terms allowing redistribution were found. The
+  government open lists found (the Digital Agency's list of banks, the e-Gov data catalogue) hold bank codes, not
+  branch codes.
+- **zengin-code/source-data** (<https://github.com/zengin-code/source-data>) is the one maintained open list. Its README
+  says: "This repository is available as open source under the terms of the MIT License." The repository has no
+  LICENSE file. The README also says "Source data by http://ykaku.net/ginkokensaku/index.php": its update script
+  (`bin/zengin`) downloads `ginkositen.zip` from that personal site, which states no terms of use and couldn't be
+  reached on 2026-11-09. So the MIT grant covers the repository, but where its data comes from has no stated terms.
+
+A code is a fact, and Japanese copyright protects a database only for a creative choice or arrangement of its contents
+(Copyright Act, article 12-2), which a complete, sorted list of codes hardly has. That makes reusing the codes low risk,
+but it is a legal reading, not a licence, so **the list is not committed to git**. The image build fetches it instead:
+
+- **Fetched at build time, pinned.** The Dockerfile's build stage downloads zengin-code/source-data at one commit
+  (`BANK_CODES_REF`, the repository's `2026-08-24` tag), and `tools/bank_codes.py zengin-code` takes the branch codes
+  from `data/branches/NNNN.json` (only the codes: no names) and writes the list into the package before it is built.
+  The build fails unless the codes' SHA-256 (sorted, one per line) is `BANK_CODES_SHA256`. The digest pins the codes
+  rather than the archive because GitHub doesn't promise byte-stable archives. A changed or tampered upstream can
+  therefore never change an image without a reviewed change to the Dockerfile, and the worst a bad list can do is move
+  accounts between medium and high.
+- **Git holds only the header**, with `none` for its source, licence and date, and the tests and the accuracy corpus
+  use a synthetic list (`tests/bank_codes_fixture.txt`), so their results never depend on the real one. Code run from
+  a checkout, rather than from the image, has no list and stays at medium.
+- **Built without it.** `--build-arg BANK_CODES=none` builds an image with no list, in which a bank account is medium
+  at most: for building offline, and for any image published outside our own registry. The deployed images go to the
+  private ECR repository (ADR-0007); the release workflow's public GHCR copy, kept until the first ECR build passes,
+  is built with `none` (`release.yml`).
+- **The licence the list carries** is recorded in its header: the repository's MIT grant, and that its source states
+  no terms. If a source with a clear licence appears (or a contract for Zengin-Net's file), `tools/bank_codes.py csv`
+  writes the same format from a CSV, and the fetch goes.
+
+**Refresh.** Before each release and at least every three months, since banks merge and branches close; a stale list
+only leaves some accounts at medium. The steps are in the service README ("DLP bank and branch codes"): take the newest
+tag of zengin-code/source-data that is at least 7 days old, run the tool on its commit to see the count and the
+digest, check that the count moved by about what the news explains, and change the three pins in the Dockerfile. The
+list's retrieval date is part of the detectors' version (section 9).
 
 ### 4.5 Phone numbers
 

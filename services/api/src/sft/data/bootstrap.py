@@ -5,6 +5,14 @@ statement can run again safely. In AWS that is the `sft-{env}-db-bootstrap` job,
 of the master password in Secrets Manager outside break-glass (encryption and keys 6.3). Locally
 and in CI it runs as a superuser. It needs `BOOTSTRAP_DATABASE_URL` and `BOOTSTRAP_IAM_AUTH`.
 
+**The master password** (#278). In AWS, `BOOTSTRAP_MASTER_SECRET` names the master user's secret
+(`secretsmanager:sft/<env>/db/master`, the JSON `{"username": …, "password": …}` the aurora
+module writes) and `BOOTSTRAP_DATABASE_URL` names the user and no password. The job reads the
+secret once, as its own role, in `AWS_REGION`, checks that it is the URL's user, and puts the
+password into the connection in memory only: never into a log, an environment variable or a
+Kubernetes Secret. A read that fails exits 1 naming the secret ID and the error code, never a
+value. Locally the URL holds the superuser's password and no secret is named.
+
 What it sets up (authentication and authorization 7.3):
 
 - `sft_owner` and `sft_lookup`, which can't log in. `sft_owner` may create tables in `public`.
@@ -27,12 +35,19 @@ It grants no table: each migration grants its own tables (`sft.data.rls`).
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol
 
-from sqlalchemy import Connection, text
+import boto3
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
+from sqlalchemy import URL, Connection, make_url, text
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
+from sft.core.keyrings import SECRET_REFERENCE
 from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, BootstrapSettings, load_settings
 from sft.data.database import sync_engine
@@ -118,12 +133,68 @@ def bootstrap(connection: Connection, *, iam_auth: bool) -> None:
         connection.execute(text(statement))
 
 
-def main() -> int:
+class SecretsClient(Protocol):
+    """The one Secrets Manager call the job makes (boto3's client, or a fake in the tests)."""
+
+    def get_secret_value(self, *, SecretId: str) -> Mapping[str, Any]: ...  # noqa: N803
+
+
+class MasterSecretError(Exception):
+    """The master user's secret couldn't be used. The message names no value."""
+
+
+def _secrets_client(region: str) -> SecretsClient:
+    client: SecretsClient = boto3.client(
+        "secretsmanager",
+        region_name=region,
+        config=Config(retries={"mode": "standard", "max_attempts": 3}),
+    )
+    return client
+
+
+def with_master_password(url: str, secret_id: str, client: SecretsClient) -> URL:
+    """`url` with the password of the master user's secret `secret_id`, which must be the URL's
+    user. In memory only; `MasterSecretError` names what is wrong, never a value."""
+    try:
+        answer = client.get_secret_value(SecretId=secret_id)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", "ClientError"))
+        raise MasterSecretError(f"Secrets Manager refused the read ({code})") from None
+    except BotoCoreError as exc:
+        reason = type(exc).__name__
+        raise MasterSecretError(f"Secrets Manager can't be reached ({reason})") from None
+    raw = answer.get("SecretString")
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise MasterSecretError("the secret isn't a JSON object")
+    username, password = parsed.get("username"), parsed.get("password")
+    if not isinstance(username, str) or not isinstance(password, str) or not password:
+        raise MasterSecretError("the secret needs a username and a password")
+    parsed_url = make_url(url)
+    if parsed_url.username != username:
+        raise MasterSecretError("the secret's user isn't BOOTSTRAP_DATABASE_URL's")
+    return parsed_url.set(password=password)
+
+
+def main(secrets_client: Callable[[str], SecretsClient] = _secrets_client) -> int:
     settings = load_settings(BootstrapSettings)
     if settings is None:
         return EXIT_BAD_SETTINGS
     configure_logging(settings.log_level)
-    engine = sync_engine(settings.bootstrap_database_url.get_secret_value())
+    url: str | URL = settings.bootstrap_database_url.get_secret_value()
+    if settings.bootstrap_master_secret is not None:
+        secret_id = settings.bootstrap_master_secret.removeprefix(SECRET_REFERENCE)
+        try:
+            url = with_master_password(str(url), secret_id, secrets_client(settings.aws_region))
+        except MasterSecretError as exc:
+            # The reason names what is wrong, never a value; the secret's ID is the chart's
+            # BOOTSTRAP_MASTER_SECRET, so the log needn't repeat it.
+            log.critical("the master user's secret can't be used", extra={"reason": str(exc)})
+            return EXIT_FAILED
+    engine = sync_engine(url)
     try:
         with engine.begin() as connection:
             bootstrap(connection, iam_auth=settings.bootstrap_iam_auth)

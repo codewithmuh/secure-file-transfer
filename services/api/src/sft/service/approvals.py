@@ -87,6 +87,7 @@ from sft.service.transfers import (
     effective_state,
     encode_cursor,
     tenant_scope,
+    terminal_conflict,
 )
 
 MAX_PAGE: Final = 100
@@ -379,10 +380,10 @@ async def _decide(
 
 def _check_decidable(request: Request, locked: transfers.Locked, now: datetime) -> None:
     state = effective_state(locked.state, locked.expires_at, now)
-    if state is TransferState.REVOKED:
-        raise Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        raise Conflict("transfer_expired", current_state=state.value)
+    if (ended := terminal_conflict(state)) is not None:
+        raise ended
+    # Not state_conflict: past the terminal states, the 409 names the request's state, not the
+    # transfer's.
     shown = shown_state(request, now)
     if shown is not ApprovalState.PENDING or state is not TransferState.PENDING_APPROVAL:
         raise Conflict(

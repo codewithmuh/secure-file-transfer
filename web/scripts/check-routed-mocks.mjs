@@ -1,6 +1,6 @@
-// No mock data or simulated delay in a routed page (#196). Walks the static imports from src/main.tsx, so it checks
-// exactly the code the app can run, and fails on mock data or a timer standing in for the API. M5's pages stay in the
-// repository unrouted (#195) and are not reached, so they aren't checked.
+// No mock data or simulated delay in a routed page (#196). Walks the imports from src/main.tsx, static ones and the
+// routes' `import()` of each feature's chunk (#169), so it checks exactly the code the app can run, and fails on mock
+// data or a timer standing in for the API.
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +37,11 @@ while (queue.length > 0) {
   seen.add(file);
   const code = readFileSync(file, 'utf8');
   for (const match of code.matchAll(/^\s*(?:import|export)\s+(?!type\b)(?:[^'";]*?\sfrom\s+)?['"]([^'"]+)['"]/gm)) {
+    const target = resolveImport(file, match[1]);
+    if (target) queue.push(target);
+  }
+  // A lazy route's chunk (#169): `import('@/features/sender')`, which the static pattern above doesn't see.
+  for (const match of code.matchAll(/\bimport\(\s*['"]([^'"]+)['"]\s*\)/g)) {
     const target = resolveImport(file, match[1]);
     if (target) queue.push(target);
   }

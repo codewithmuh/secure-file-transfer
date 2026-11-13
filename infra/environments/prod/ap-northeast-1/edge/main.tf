@@ -77,10 +77,10 @@ provider "aws" {
 locals {
   # The files buckets the browser uploads parts to (ADR-0012, #102), for the web app's CSP.
   upload_origins = [
-    "https://sft-prod-apne1-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
-    "https://sft-prod-apne1-large-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
-    "https://sft-prod-apne3-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
-    "https://sft-prod-apne3-large-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
+    "https://${module.conventions.name_prefix}-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
+    "https://${module.conventions.name_prefix}-large-files-${var.account_id}.s3.ap-northeast-1.amazonaws.com",
+    "https://${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
+    "https://${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-large-files-${var.account_id}.s3.ap-northeast-3.amazonaws.com",
   ]
 }
 
@@ -104,7 +104,13 @@ module "edge" {
   web_distribution_arn = module.web_cdn.distribution_arn
 
   managed_rules_in_count = true
-  deletion_protection    = true
+  deletion_protection    = !var.teardown
+
+  # The web bucket's only writers (#283): the release role, which Tokyo's stack makes (modules/web-release), and the
+  # deploy role, which empties it at teardown.
+  web_writer_arns = [
+    module.conventions.workload_role_arns["web-release"], module.conventions.bootstrap_role_arns.terraform_deploy,
+  ]
 }
 
 module "web_cdn" {
@@ -128,9 +134,21 @@ module "web_cdn" {
   }
 
   failover_bucket = {
-    region_short         = "apne3"
-    regional_domain_name = "sft-prod-apne3-web-${var.account_id}.s3.ap-northeast-3.amazonaws.com"
+    region_short         = module.conventions.region_shorts["ap-northeast-3"]
+    regional_domain_name = "${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-web-${var.account_id}.s3.ap-northeast-3.amazonaws.com"
   }
 
   managed_rules_in_count = true
+}
+
+# The web app's release role (ADR-0008, #283): the only writer of this environment's web buckets besides the deploy
+# role. IAM is global, so Tokyo's stack makes it for every Region with a web bucket.
+module "web_release" {
+  source = "../../../../modules/web-release"
+
+  conventions       = module.conventions
+  environment       = "prod"
+  account_id        = var.account_id
+  shared_account_id = var.shared_account_id
+  regions           = ["ap-northeast-1", "ap-northeast-3"]
 }

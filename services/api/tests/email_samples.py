@@ -25,6 +25,7 @@ from sft.service.email.catalog import (
     MemberReenrolment,
     PolicyChange,
     RecipientLocked,
+    TenantAdminRecovered,
     TransferHeld,
     TransferLink,
     TransferReturnedToDraft,
@@ -39,6 +40,8 @@ EXPIRES = datetime(2026, 11, 20, 3, 0, tzinfo=UTC)  # 12:00 in Japan
 TRANSFER_ID = UUID("5f0c1f6e-1d7b-4a43-9a43-1c1c7f0a0001")
 REQUEST_ID = UUID("5f0c1f6e-1d7b-4a43-9a43-1c1c7f0a0002")
 KEY_PREFIX = "sft_dev_" + "Ab3dEf7h"  # a prefix only, never a key
+ADMIN = "admin@customer.example"
+RECOVERED = datetime(2026, 11, 17, 3, 0, tzinfo=UTC)
 
 # Secrets, each distinct, so a test sees exactly where each one appears.
 LINK_TOKEN = "LINKtokenLINKtokenLINKtokenLINKtokenLINKtok"  # noqa: S105 - fake
@@ -76,6 +79,7 @@ SAMPLES: dict[EmailType, Email] = {
         ApiKeyExpiring(tenant_name=TENANT, key_prefix=KEY_PREFIX, expires_at=EXPIRES),
         ApiKeyFirstExport(tenant_name=TENANT, key_prefix=KEY_PREFIX),
         DlpApproverDeactivated(tenant_name=TENANT, none_left=True),
+        TenantAdminRecovered(tenant_name=TENANT, admin_email=ADMIN, recovered_at=RECOVERED),
     )
 }
 
@@ -92,6 +96,9 @@ VARIANTS: list[Email] = [
     DlpApprovalDecided(tenant_name=TENANT, transfer_id=TRANSFER_ID, decision="rejected"),
     DlpPolicyChanged(tenant_name=TENANT, changes=tuple(PolicyChange)),
     DlpApproverDeactivated(tenant_name=TENANT, none_left=False),
+    TenantAdminRecovered(
+        tenant_name=TENANT, admin_email=ADMIN, recovered_at=RECOVERED, temporary_until=EXPIRES
+    ),
 ]
 
 SECRETS: dict[str, EmailType] = {

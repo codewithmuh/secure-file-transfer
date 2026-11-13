@@ -65,14 +65,16 @@ Each deploy role trusts one GitHub environment of this repository, and only the 
 keeps a pull request or another branch from getting that subject (T-71, ADR-0005). GitHub creates an environment with
 no rules the first time a job names it, so the environments must exist, with the rule, **before** step 11
 creates the first deploy role. `registry` is the fifth: the shared account's image push role trusts it, and the build,
-promotion and mark-deployed workflows name it (ADR-0007, #107). `can_admins_bypass: false` keeps the rule for admins
+promotion and mark-deployed workflows name it (ADR-0007, #107); so does the web app's publish role (#283). `web-dev`,
+`web-staging` and `web-prod` are the web app's release roles' (infra/modules/web-release), apart from `<env>` so a web
+job can never become a deploy role. `can_admins_bypass: false` keeps the rule for admins
 too. prod also waits for a reviewer, you; with one maintainer you approve your own deployments, so self-review stays
 allowed (R-08).
 
 ```bash
 repo=codewithmuh/secure-file-transfer
 
-for env in dev staging shared registry; do
+for env in dev staging shared registry web-dev web-staging web-prod; do
   gh api --method PUT "repos/$repo/environments/$env" --input - <<'EOF'
 {"can_admins_bypass": false,
  "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
@@ -93,8 +95,9 @@ The `PUT` is safe to repeat and fixes an environment a job already created. The 
 there, which is fine. Then check:
 
 ```bash
-gh api "repos/$repo/environments" --jq '[.environments[].name] | sort'   # ["dev","prod","registry","shared","staging"], no others
-for env in dev staging prod shared registry; do
+# These eight, and prod-retained and loadtest-staging once their stacks need them:
+gh api "repos/$repo/environments" --jq '[.environments[].name] | sort'
+for env in dev staging prod shared registry web-dev web-staging web-prod; do
   gh api "repos/$repo/environments/$env" \
     --jq '{name, can_admins_bypass, deployment_branch_policy, rules: [.protection_rules[].type]}'
   gh api "repos/$repo/environments/$env/deployment-branch-policies" --jq '[.branch_policies[] | {name, type}]'
@@ -150,6 +153,7 @@ cd infra/organization
 export AWS_PROFILE=sft-bootstrap TF_VAR_account_id=<management account id>
 export TF_VAR_account_emails='{shared="...",dev="...",staging="...",prod="..."}'
 export TF_VAR_budget_notification_emails='["..."]'
+export TF_VAR_alert_emails='["..."]'   # the alert on SCP changes (#277)
 export TF_VAR_identity_center_enabled=false TF_VAR_activate_cost_allocation_tags=false
 terraform init -backend-config="bucket=sft-management-apne1-tfstate-${TF_VAR_account_id}"
 
@@ -165,6 +169,10 @@ account as CloudTrail's delegated administrator. Read the plan before you type `
 Then check:
 
 - The budget emails don't need confirming, but check spam for the first one.
+- Each address in `TF_VAR_alert_emails` gets an SNS confirmation for `sft-management-scp-alerts` (us-east-1): confirm
+  it, or the alert on SCP changes reaches nobody ([scp-change.md](scp-change.md), #277). This apply's own SCP
+  attachments page through it once the shared stack's organization trail exists, not before: the rule sees nothing
+  until then.
 - `terraform output account_ids` lists all five accounts. Note them; every other stack takes its `TF_VAR_account_id`
   from here.
 - **Organizations → Policies → Service control policies**: the root has `FullAWSAccess` and four `sft-management-scp-*`
@@ -205,6 +213,20 @@ terraform apply
 It creates the six permission sets (`Admin`, `BreakGlass`, `BreakGlassApprover`, `ReadOnly`, `Operator`,
 `AuditReader`), the four groups, your memberships and the group assignments. It assigns nothing for `Admin` or
 `BreakGlass`: those are never standing.
+
+It also creates each environment's `sft-<env>-break-glass-trail`, the read-only role the operator API's break-glass
+reconciliation assumes (#239). For each environment, put its role, the `BreakGlass` permission set and the identity
+store in the GitHub environment `<env>` as the variable `TF_VAR_BREAK_GLASS_RECONCILIATION`, which the cluster-bootstrap
+job passes to Terraform (#275, #279), so its next apply switches the job on:
+
+```bash
+env=dev   # then staging, prod
+jq -n --arg role "$(terraform output -json break_glass_trail_role_arns | jq -r --arg e "$env" '.[$e]')" \
+  --arg set "$(terraform output -json permission_set_arns | jq -r .BreakGlass)" \
+  --arg store "$(terraform output -raw identity_store_id)" \
+  '{trail_role_arn: $role, permission_set_arn: $set, identity_store_id: $store}' |
+  gh variable set TF_VAR_BREAK_GLASS_RECONCILIATION --env "$env" --repo codewithmuh/secure-file-transfer
+```
 
 ### 9. Move the management account to Identity Center
 

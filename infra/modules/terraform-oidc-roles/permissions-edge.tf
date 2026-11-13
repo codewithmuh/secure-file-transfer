@@ -19,7 +19,7 @@ locals {
   edge_environment = one(regex("^sft-([a-z]+)-terraform-plan$", var.plan_role_name))
 
   edge_regions         = concat(var.network_regions, ["us-east-1"])
-  edge_region_shorts   = [for region in var.network_regions : { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }[region]]
+  edge_region_shorts   = [for region in var.network_regions : var.conventions.region_shorts[region]]
   edge_dns_role_prefix = var.shared_account_id == null ? null : "arn:aws:iam::${var.shared_account_id}:role/sft-shared/sft-shared-dns-${local.edge_environment}"
 
   # The edge's buckets: the WAF and CloudFront logs, the load balancer's access logs and the web bundle.
@@ -32,6 +32,12 @@ locals {
   ])
 
   edge_elb_arns = [for region in var.network_regions : "arn:aws:elasticloadbalancing:${region}:${var.account_id}:*"]
+
+  # The web app's release role (modules/web-release, #283), from the edge layer's list in conventions; Tokyo's edge
+  # stack makes it.
+  edge_role_arns = [
+    for name in lookup(var.conventions.workload_roles, "edge", []) : "arn:aws:iam::${var.account_id}:role/${var.conventions.workload_role_names[name]}"
+  ]
 }
 
 data "aws_iam_policy_document" "edge_read" {
@@ -98,6 +104,12 @@ data "aws_iam_policy_document" "edge_read" {
       "s3:ListBucket",
     ]
     resources = local.edge_bucket_arns
+  }
+
+  statement {
+    sid       = "WebReleaseRoleRead"
+    actions   = ["iam:GetRole", "iam:GetRolePolicy", "iam:ListAttachedRolePolicies", "iam:ListRolePolicies"]
+    resources = local.edge_role_arns
   }
 
   dynamic "statement" {
@@ -246,6 +258,16 @@ data "aws_iam_policy_document" "edge_write" {
       "s3:PutLifecycleConfiguration",
     ]
     resources = concat(local.edge_bucket_arns, [for arn in local.edge_bucket_arns : "${arn}/*"])
+  }
+
+  # The web app's release role (#283): created and changed here, never passed; GitHub's OIDC token assumes it.
+  statement {
+    sid = "WebReleaseRole"
+    actions = [
+      "iam:CreateRole", "iam:DeleteRole", "iam:DeleteRolePolicy", "iam:ListInstanceProfilesForRole", "iam:PutRolePolicy",
+      "iam:TagRole", "iam:UntagRole", "iam:UpdateAssumeRolePolicy", "iam:UpdateRole", "iam:UpdateRoleDescription",
+    ]
+    resources = local.edge_role_arns
   }
 
   # The account's first load balancer creates Elastic Load Balancing's service-linked role.

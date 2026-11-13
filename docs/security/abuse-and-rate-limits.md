@@ -639,6 +639,11 @@ PostgreSQL holding the security state. The phase 4 ADR confirms it.
 - **Timeouts.** 50 ms per call. After 5 errors in a row, the API stops calling the store for 10 seconds and applies
   each group's failure mode, so a sick cache doesn't add latency to every request. After the rest, one failed call
   starts the next rest at once; one success ends it.
+- **Connections.** A call that times out leaves its answer unread, so its connection is closed, as are connections
+  ElastiCache closes after 12 hours or in a failover. The call that needs a new one opens it before its 50 ms start,
+  with 250 ms of its own (#282). Opened inside the 50 ms, a connection (TCP, TLS, AUTH: two round trips or more)
+  didn't fit on a slow host, so one slow answer made every later call time out too and the breaker kept resting.
+  250 ms is also the most a cache that never answers adds to a call that must connect.
 - **Retry-After.** After the first refusal the wider limits are only read, never counted, so the answer can still
   give the largest wait (2.4) without spending a tenant's budget.
 
@@ -928,6 +933,7 @@ the inspector on every attempt ends `failed`: blocked, with an operator alert, a
 | Verification code | Anyone holding a valid link token | Only that link's invited address | Per address 5 an hour and 50 a day; per link 20 a day and 1 every 30 s; 1,000 an hour per tenant |
 | Member invitation | A tenant admin (`inviteUser`), or an operator for the first admin (`createTenant`) | The new member | 100 an hour per tenant; 3 a day per address |
 | Sign-in and MFA emails | Cognito (#23), sending through our SES identity with the same DKIM and DMARC (ADR-0015) | The member | Cognito's quotas and lockout; the same SES quota and reputation as ours |
+| Admin recovery notice (#273) | An operator (`recoverTenantAdmin`), after confirming through the tenant's recovery contact | Every active tenant admin | Once per recovery; operators only, audited |
 | First-download notice (FR-8) | The system, on the first download | The member | Once per transfer |
 | Files-arrived and blocked-file notices (FR-12) | The system, on scan results | The member; for blocked files also the uploader | Coalesced: at most one per upload request every 10 minutes |
 | Held-transfer and lockout notices (NFR-14) | The system | The member; for a lockout also the tenant admins | Once per hold or lockout |

@@ -4,8 +4,9 @@ The scheduled jobs (architecture 4.5, 5.2; #181, #183, #224): expiry, deletion i
 daily storage audit, cleanup and purge, audit partition upkeep, and the audit archive every minute. A lifecycle job's
 settings (sft.core.settings.JobSettings) come from sft.lifecycleJobEnv: with `lifecycle` its environment and this
 region's files buckets, with `s3` and outside dev Osaka's replicas too (architecture 3.3), with `archive` both regions'
-audit archive. The audit archive job (ArchiveJobSettings) takes `archive` alone. Every job gets the Pushgateway's URL
-when metricsPushgateway.url is set. Each is a CronJob; a run never overlaps the one before it, and a missed run waits
+audit archive, or during a regional loss the surviving region's alone (auditArchive.survivingRegionOnly, #257). The
+audit archive job (ArchiveJobSettings) takes `archive` alone. Every job gets the Pushgateway's URL when
+metricsPushgateway.url is set. Each is a CronJob; a run never overlaps the one before it, and a missed run waits
 for the next. Suspended in the pilot light, where the database is a read-only replica, and while a failover holds
 the workers (failover.holdWorkers).
 */}}
@@ -67,6 +68,10 @@ spec:
 {{- end }}
 {{- if and $job.archive (ne $root.Values.environment "dev") }}
 {{- $_ := set $files "AUDIT_ARCHIVE_OSAKA_BUCKET" (printf "sft-%s-apne3-audit-archive-%s" $root.Values.environment $account) }}
+{{- end }}
+{{- if $job.archive }}
+{{- /* During a regional loss, the surviving region's archive alone (#257). */}}
+{{- $files = merge $files (include "sft.survivingRegionEnv" $root | fromJson) }}
 {{- end }}
 {{- with $root.Values.metricsPushgateway.url }}
 {{- $_ := set $files "METRICS_PUSHGATEWAY_URL" . }}

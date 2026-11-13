@@ -51,6 +51,8 @@ locals {
 module "terraform_roles" {
   source = "../../../modules/terraform-oidc-roles"
 
+  conventions = module.conventions
+
   account_id         = var.account_id
   github_repository  = module.conventions.github_repository
   github_environment = "prod"

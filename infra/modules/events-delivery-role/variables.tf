@@ -1,13 +1,3 @@
-variable "environment" {
-  description = "The environment: dev, staging or prod. The role is sft-<env>-events-delivery."
-  type        = string
-
-  validation {
-    condition     = contains(["dev", "staging", "prod"], var.environment)
-    error_message = "environment must be dev, staging or prod."
-  }
-}
-
 variable "account_id" {
   description = "ID of the account the role lives in."
   type        = string
@@ -58,4 +48,13 @@ variable "permissions_boundary_arn" {
     condition     = can(regex("^arn:aws:iam::[0-9]{12}:policy/sft-bootstrap/sft-(dev|staging|prod)-workload-boundary$", var.permissions_boundary_arn))
     error_message = "permissions_boundary_arn must be sft-<env>-workload-boundary under /sft-bootstrap/."
   }
+}
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the role and the queues it delivers to, from their one definition (#172)."
+  type = object({
+    global_name_prefix  = string
+    region_shorts       = map(string)
+    workload_role_names = map(string)
+  })
 }

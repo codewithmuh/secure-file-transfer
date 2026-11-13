@@ -3,8 +3,9 @@
 A user belongs to one tenant, with one role (`admin` or `member`) and one status (`invited` until
 their first sign-in, then `active`, or `deactivated`). The invitation lives on the user's row:
 `invitation_token_hash`, the SHA-256 of a one-time invitation link, and when it stops working
-(authentication and authorization 2.5). A local member gets no link; their first sign-in
-activates them.
+(authentication and authorization 2.5). The notification worker mints it for a tenant with an
+active SSO connection that requires SSO or proved the address's domain (`issue_invitation_link`,
+#273). A local member gets no link; their first sign-in activates them.
 
 Every function that changes a user writes its audit event in the same transaction (FR-27), and the
 database refuses to commit the change otherwise (`audit_required`, revision 0004). The caller says
@@ -21,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID
 
@@ -254,6 +255,32 @@ async def accept_invitation(
     return user
 
 
+async def issue_invitation_link(
+    session: AsyncSession, user_id: UUID, token_hash: bytes
+) -> datetime | None:
+    """A new one-time invitation link for an invited user of an SSO tenant (authn and authz 2.5,
+    #273): its SHA-256, working for `INVITATION_LIFETIME` from now, replacing any earlier link.
+    When it stops working; None if the scope doesn't reach the user or they aren't `invited` any
+    more. The notification worker's (revision 0042); the caller writes the audit event in the same
+    transaction."""
+    require_scope(session, ScopeKind.TENANT)
+    expires_at: datetime | None = await session.scalar(
+        update(User)
+        .where(
+            User.id == user_id,
+            User.status == UserStatus.INVITED.value,
+            in_scope(User, session),
+        )
+        .values(
+            invitation_token_hash=_token_hash(token_hash),
+            invitation_expires_at=func.now() + INVITATION_LIFETIME,
+        )
+        .returning(User.invitation_expires_at)
+        .execution_options(synchronize_session=False)
+    )
+    return expires_at
+
+
 # ---- changes ----
 
 
@@ -398,6 +425,21 @@ async def invited_everywhere(
     0017). System scope, read only."""
     require_scope(session, ScopeKind.SYSTEM)
     statement = select(User.tenant_id, User.id).where(User.status == UserStatus.INVITED.value)
+    if after is not None:
+        statement = statement.where(User.id > after)
+    rows = await session.execute(statement.order_by(User.id).limit(limit))
+    return [(row[0], row[1]) for row in rows]
+
+
+async def active_everywhere(
+    session: AsyncSession, *, after: UUID | None = None, limit: int = MAX_PAGE
+) -> Sequence[tuple[UUID, UUID]]:
+    """`(tenant ID, user ID)` of up to `limit` active users, in every tenant, after the user
+    `after`, oldest first: the standby enrolment after a regional failover (#258, authn and authz
+    2.6), as the notification worker, through revision 0017's `notify_find` policy. System scope,
+    read only."""
+    require_scope(session, ScopeKind.SYSTEM)
+    statement = select(User.tenant_id, User.id).where(User.status == UserStatus.ACTIVE.value)
     if after is not None:
         statement = statement.where(User.id > after)
     rows = await session.execute(statement.order_by(User.id).limit(limit))

@@ -2,7 +2,8 @@
 # buckets, the audit archive in dev and staging (prod keeps it in the retained stack, encryption 8.4), EventBridge's
 # delivery role and the account's EBS default key. Like the rest of this module, every data root gets them from here,
 # and what differs between roots follows from the environment and Region: Tokyo makes the key primaries and the IAM
-# roles, Osaka the key replicas and the replica buckets, and prod has the longer deletion wait and no teardown rights.
+# roles, Osaka the key replicas and the replica buckets, and prod has the longer deletion wait and no teardown rights
+# until its teardown apply.
 
 locals {
   tokyo = local.region == "ap-northeast-1"
@@ -38,7 +39,7 @@ locals {
 
   # sft-<env>-events-delivery. The queues module admits it as the only sender to the queues it delivers to, and the
   # role may send to exactly those queues (encryption 4.4, modules/queues).
-  events_delivery_role_arn = "${local.role_arn_prefix}events-delivery"
+  events_delivery_role_arn = var.conventions.workload_role_arns["events-delivery"]
 }
 
 # The service-linked roles that create EBS volumes under the platform and files keys: Auto Scaling for the system node
@@ -60,6 +61,7 @@ module "kms" {
 
   environment      = local.environment
   account_id       = var.account_id
+  conventions      = var.conventions
   classes          = local.key_classes
   primary_key_arns = var.primary_key_arns
   osaka_replicas   = local.tokyo && local.with_osaka
@@ -93,8 +95,8 @@ module "events_delivery" {
   source = "../events-delivery-role"
   count  = local.tokyo ? 1 : 0
 
-  environment = local.environment
   account_id  = var.account_id
+  conventions = var.conventions
   regions     = local.with_osaka ? ["ap-northeast-1", "ap-northeast-3"] : ["ap-northeast-1"]
 
   permissions_boundary_arn = "arn:aws:iam::${var.account_id}:policy${var.conventions.bootstrap_iam_path}${var.conventions.global_name_prefix}-workload-boundary"
@@ -115,13 +117,16 @@ module "files_buckets" {
 
   environment = local.environment
   account_id  = var.account_id
+  conventions = var.conventions
   kms_key_arn = module.kms.key_arns["files"]
 
   with_osaka         = local.with_osaka
   create_iam_roles   = local.tokyo
   osaka_kms_key_arn  = local.tokyo ? lookup(module.kms.osaka_key_arns, "files", null) : null
   replicate_to_osaka = local.replicate_to_osaka
-  teardown_allowed   = local.teardown_allowed
+  replicate_to_tokyo = !local.tokyo && var.replicate_to_tokyo
+  # prod's files buckets too, from its teardown apply on (#263, #42 gap 11): never while prod runs.
+  teardown_allowed = local.teardown_allowed || var.teardown
 
   # On in Tokyo. In Osaka no plan in the pilot light; the failover runbook's apply creates it (ADR-0019).
   malware_protection_enabled = local.tokyo || var.osaka_malware_protection_enabled
@@ -135,8 +140,8 @@ module "audit_archive" {
   source = "../audit-archive"
   count  = local.archive_here ? 1 : 0
 
-  environment = local.environment
   account_id  = var.account_id
+  conventions = var.conventions
   kms_key_arn = module.kms.key_arns["audit"]
 
   # Governance mode for a day, so the environment can be torn down (encryption 3.1, NFR-15).

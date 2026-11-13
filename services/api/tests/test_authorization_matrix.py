@@ -644,10 +644,11 @@ EXPECTED: dict[str, dict[str, int]] = {
 DLP_OPERATIONS = frozenset(name for name in EXPECTED if "Dlp" in name) - {"getTransferDlp"}
 
 # The session's own operations read the session cookie itself, not a caller the matrix can put in
-# its place, and two are public. tests/test_signin.py runs them with real sessions: no credential,
-# a bearer, both, a revoked or expired session, a missing CSRF token, and the sign-in refusals.
+# its place, and three are public. tests/test_signin.py runs them with real sessions: no credential,
+# a bearer, both, a revoked or expired session, a missing CSRF token, and the sign-in refusals;
+# tests/test_invitation_sign_in.py runs the invitation's start (#239) with every origin check.
 COVERED_BY_SIGN_IN_TESTS = frozenset(
-    {"startSignIn", "completeSignIn", "signOut", "getCurrentMember"}
+    {"startSignIn", "completeSignIn", "signOut", "getCurrentMember", "startInvitationSignIn"}
 )
 # The link steps are public, and the /session routes read the link cookie and `X-Link-Session`
 # themselves (#179): tests/test_links.py runs each with every caller of authn and authz 9.2 that

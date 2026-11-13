@@ -28,6 +28,30 @@ variables {
   deploy_role_arn  = "arn:aws:iam::aws:role/sft-bootstrap/sft-staging-terraform-deploy"
   alert_emails     = ["oncall@example.com", "ops@example.com"]
 
+  # What the root passes as module.conventions (modules/conventions), for a placeholder account.
+  conventions = {
+    region_shorts = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+    workload_role_arns = {
+      alertmanager      = "arn:aws:iam::aws:role/sft-staging-alertmanager"
+      "events-delivery" = "arn:aws:iam::aws:role/sft-staging-events-delivery"
+    }
+    bootstrap_iam_path = "/sft-bootstrap/"
+    bootstrap_role_arns = {
+      terraform_deploy = "arn:aws:iam::aws:role/sft-bootstrap/sft-staging-terraform-deploy"
+      terraform_plan   = "arn:aws:iam::aws:role/sft-bootstrap/sft-staging-terraform-plan"
+      key_admin        = "arn:aws:iam::aws:role/sft-bootstrap/sft-staging-keyadmin"
+    }
+    emergency_user = {
+      name = "sft-staging-emergency"
+      path = "/sft-emergency/"
+      arn  = "arn:aws:iam::aws:user/sft-emergency/sft-staging-emergency"
+    }
+    sso_role_arn_patterns = {
+      admin       = "arn:aws:iam::aws:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_Admin_*"
+      break_glass = "arn:aws:iam::aws:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_BreakGlass_*"
+    }
+  }
+
   database = {
     cluster_identifier          = "sft-staging-apne1-aurora"
     role                        = "primary"
@@ -125,6 +149,77 @@ run "tokyo" {
   }
 }
 
+run "security_events_tokyo" {
+  command = plan
+
+  assert {
+    condition     = toset(keys(aws_cloudwatch_event_rule.security)) == toset(["kms-key-changed", "key-admin-used", "human-sign-in", "security-service-off", "alerting-or-endpoint-changed"])
+    error_message = "Each Region pages on KMS changes, the key-admin role, privileged sign-ins and security services turned off (#256); the prod-only rule is prod's."
+  }
+
+  assert {
+    condition = alltrue([
+      for t in aws_cloudwatch_event_target.security : t.role_arn == "arn:aws:iam::aws:role/sft-staging-events-delivery" && t.target_id == "alerts-page"
+    ])
+    error_message = "Every security rule pages through the environment's delivery role (encryption 4.4)."
+  }
+
+  assert {
+    condition = alltrue([
+      for t in aws_cloudwatch_event_target.security :
+      fileexists("../../../docs/runbooks/${regex("docs/runbooks/([a-z0-9-]+)\\.md", t.input_transformer[0].input_template)[0]}.md")
+    ])
+    error_message = "Every security rule names a runbook that exists in docs/runbooks (NFR-17)."
+  }
+
+  assert {
+    condition = alltrue([
+      for t in aws_cloudwatch_event_target.security :
+      alltrue([for p in values(t.input_transformer[0].input_paths) : !strcontains(p, "requestParameters") && !strcontains(p, "responseElements")])
+    ])
+    error_message = "No alert carries requestParameters or responseElements, where policies, access key IDs and tokens can be."
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_event_rule.global_events) == 1 && aws_cloudwatch_event_target.global_events[0].arn == "arn:aws:events:ap-northeast-1:${var.account_id}:event-bus/default"
+    error_message = "Tokyo forwards the us-east-1 sign-in and STS events to its own bus."
+  }
+
+  assert {
+    condition     = !strcontains(aws_cloudwatch_event_rule.security["human-sign-in"].event_pattern, "\"region\"")
+    error_message = "Tokyo's rules see the forwarded us-east-1 events too."
+  }
+}
+
+run "security_events_prod_osaka_failover" {
+  command = plan
+
+  variables {
+    environment        = "prod"
+    region             = "ap-northeast-3"
+    name_prefix        = "sft-prod-apne3"
+    platform_key_arn   = "arn:aws:kms:ap-northeast-3:aws:key/test-only"
+    pilot_light        = false
+    replicated_buckets = {}
+    region_health      = null
+  }
+
+  assert {
+    condition     = alltrue([for r in aws_cloudwatch_event_rule.security : length(r.event_pattern) <= 4096])
+    error_message = "Each pattern fits EventBridge's 4,096 characters, prod's longer deploy role list included."
+  }
+
+  assert {
+    condition     = contains(keys(aws_cloudwatch_event_rule.security), "kms-key-destroyed")
+    error_message = "In prod a deploy role disabling or deleting a key pages too (encryption 4.4 rule 7)."
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_event_rule.global_events) == 1 && aws_cloudwatch_event_target.global_events[0].arn == "arn:aws:events:ap-northeast-3:${var.account_id}:event-bus/default"
+    error_message = "Out of the pilot light, Osaka forwards the us-east-1 events to its own bus, so a failover keeps them."
+  }
+}
+
 run "osaka_pilot_light" {
   command = plan
 
@@ -160,8 +255,15 @@ run "osaka_pilot_light" {
   }
 
   assert {
-    condition     = length(aws_cloudwatch_metric_alarm.region_health) == 0 && length(aws_kms_key.region_health) == 0
-    error_message = "Osaka makes nothing in us-east-1: Tokyo's stack watches its health check."
+    condition     = length(aws_cloudwatch_metric_alarm.region_health) == 0 && length(aws_kms_key.region_health) == 0 && length(aws_cloudwatch_event_rule.global_events) == 0
+    error_message = "Osaka makes nothing in us-east-1 in the pilot light: Tokyo's stack watches its health check and forwards the global events."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in aws_cloudwatch_event_rule.security : jsondecode(r.event_pattern).region == ["ap-northeast-3"]
+    ])
+    error_message = "In the pilot light Osaka's security rules look at Osaka's own events only, so nothing pages twice."
   }
 }
 

@@ -15,6 +15,7 @@ from sft.data.audit_required import require_audit_sql
 from sft.data.database import sync_engine
 from sft.data.migrate import alembic_config, become_owner, compatible_with, include_name
 from sft.data.models import (
+    AdminRecoveryKind,
     ApiKeyRevokedReason,
     ApiKeyScope,
     ApprovalDecisionKind,
@@ -1331,3 +1332,162 @@ def test_break_glass_reaches_nothing_without_an_active_grant(migrated_db: Scratc
     # (tests/test_break_glass.py tries an unknown grant, an ended one and an expired one).
     rows = migrated_db.sql("SELECT cardinality(break_glass_tenants())")
     assert rows == [(0,)]
+
+
+def test_the_break_glass_records_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #239: the drift check's platform read of tenants' connections, and a break-glass function
+    # that a grant recorded from Identity Center never satisfies. Found by its contents.
+    [module] = [s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "SSO_DRIFT_READ")]
+    assert list(module.SSO_DRIFT_READ) == [
+        policy_sql(
+            "sso_drift_read",
+            "idp_connections",
+            roles=["sft_operator"],
+            command="SELECT",
+            using="app_scope() = 'platform' AND tenant_id IS NOT NULL",
+        )
+    ]
+    [revision_0030] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "READ_TABLES")
+    ]
+    # Revision 0030's body with one more condition, nothing else.
+    expected = revision_0030.BREAK_GLASS_TENANTS_BODY.replace(
+        "AND g.state = 'active' ", "AND g.state = 'active' AND g.recorded_by = 'service' "
+    )
+    assert expected == module.BREAK_GLASS_TENANTS_BODY
+
+
+def test_a_recorded_grant_is_not_a_service_grant(migrated_db: ScratchDatabase) -> None:
+    [(body,)] = migrated_db.sql("SELECT prosrc FROM pg_proc WHERE proname = 'break_glass_tenants'")
+    assert "recorded_by = 'service'" in str(body)
+
+
+def test_the_operator_keys_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #160: the operator's own idempotency keys, in a tenant's scope and found in platform scope.
+    [module] = [s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "OPERATOR_KEYS")]
+    assert list(module.OPERATOR_KEYS) == [
+        grant_sql("idempotency_keys", "sft_operator", "SELECT, INSERT, UPDATE"),
+        policy_sql(
+            "operator_keys",
+            "idempotency_keys",
+            roles=["sft_operator"],
+            using=module.OPERATOR_TENANT,
+            with_check=module.OPERATOR_TENANT,
+        ),
+        policy_sql(
+            "operator_find",
+            "idempotency_keys",
+            roles=["sft_operator"],
+            command="SELECT",
+            using="app_scope() = 'platform' AND caller_type = 'operator'",
+        ),
+    ]
+
+
+def test_the_admin_recovery_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #239: the recoveries, and what the operator, the worker and the job need for them.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "ADMIN_RECOVERIES_RLS")
+    ]
+    table = "admin_recoveries"
+    enable, operator, notify, jobs, policy = tenant_rls_sql(
+        table,
+        grants={"sft_operator": "SELECT, INSERT", "sft_notify": "SELECT", "sft_jobs": "SELECT"},
+    )
+    assert list(module.ADMIN_RECOVERIES_RLS) == [
+        *tenant_keys_sql(table),
+        tenant_foreign_key_sql(table, "user_id", "users"),
+        enable,
+        operator,
+        notify,
+        jobs,
+        policy,
+        grant_sql(table, "sft_jobs", "UPDATE", columns=["ended_at"]),
+        policy_sql(
+            "jobs_find", table, roles=["sft_jobs"], command="SELECT", using="app_scope() = 'system'"
+        ),
+        require_audit_sql(table),
+    ]
+    tenant_rows = "tenant_id = app_tenant_id()"
+    assert list(module.OPERATOR_RECOVERY) == [
+        grant_sql("users", "sft_operator", "UPDATE", columns=["sign_in_reset_id", "updated_at"]),
+        grant_sql("member_sessions", "sft_operator", "SELECT", columns=["user_id"]),
+        grant_sql(
+            "user_identities",
+            "sft_operator",
+            "SELECT",
+            columns=["id", "tenant_id", "user_id", "idp_connection_id"],
+        ),
+        grant_sql("user_identities", "sft_operator", "DELETE"),
+        policy_sql(
+            "operator_recovery", "user_identities", roles=["sft_operator"], using=tenant_rows
+        ),
+        grant_sql(
+            "audit_events", "sft_operator", "SELECT", columns=list(module.OPERATOR_AUDIT_COLUMNS)
+        ),
+        policy_sql(
+            "operator_read_own_critical",
+            "audit_events",
+            roles=["sft_operator"],
+            command="SELECT",
+            using=f"{tenant_rows} AND actor_type = 'operator' AND security_critical",
+        ),
+    ]
+    assert list(module.JOBS_TEMPORARY) == [
+        grant_sql(
+            "user_identities",
+            "sft_jobs",
+            "SELECT",
+            columns=["id", "tenant_id", "user_id", "idp_connection_id", "expires_at"],
+        ),
+        grant_sql("user_identities", "sft_jobs", "DELETE"),
+        policy_sql("jobs_temporary", "user_identities", roles=["sft_jobs"], using=tenant_rows),
+    ]
+    assert f"({', '.join(repr(k.value) for k in AdminRecoveryKind)})" == module.KINDS
+
+
+def test_the_sso_invitation_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #273: the worker mints an SSO tenant's invitation links, and reads its tenant's connection.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "NOTIFY_INVITATION_LINKS")
+    ]
+    assert list(module.NOTIFY_INVITATION_LINKS) == [
+        grant_sql(
+            "users",
+            "sft_notify",
+            "UPDATE",
+            columns=["invitation_token_hash", "invitation_expires_at", "updated_at"],
+        ),
+        policy_sql(
+            "notify_connection",
+            "idp_connections",
+            roles=["sft_notify"],
+            command="SELECT",
+            using="tenant_id = app_tenant_id()",
+        ),
+    ]
+
+
+def test_the_sso_invitation_rule_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #273: the worker reads whether its tenant requires SSO, and its proven, linked domains.
+    [module] = [
+        s.module
+        for s in SCRIPTS.walk_revisions()
+        if hasattr(s.module, "NOTIFY_SSO_INVITATION_RULE")
+    ]
+    assert list(module.NOTIFY_SSO_INVITATION_RULE) == [
+        grant_sql("tenants", "sft_notify", "SELECT", columns=["sso_required"]),
+        grant_sql(
+            "sso_domains",
+            "sft_notify",
+            "SELECT",
+            columns=["tenant_id", "domain", "idp_connection_id", "verified_at"],
+        ),
+        policy_sql(
+            "notify_domains",
+            "sso_domains",
+            roles=["sft_notify"],
+            command="SELECT",
+            using="tenant_id = app_tenant_id()",
+        ),
+    ]

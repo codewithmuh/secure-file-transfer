@@ -1,7 +1,9 @@
 """Data access for tenant single sign-on (#231; FR-26; data model 2.1; authn and authz 2.4, 2.5).
 
 - **The tenant's connection** (`idp_connections`, a tenant's row): at most one per tenant. The
-  operator API writes it (`put_connection`); the API reads it, in the tenant's scope.
+  operator API writes it (`put_connection`); the API reads it, in the tenant's scope, and the
+  notification worker whether it is active (`active_connection_id`, #273) and whether an
+  invitation is an SSO link (`invites_through_sso`).
 - **Domains** (`sso_domains`): a tenant claims an email domain with a token it publishes in a DNS
   TXT record, then proves it. A proven domain is the tenant's alone (a unique index), routes
   "Continue with SSO" once an operator links it to the connection, and is a trusted recipient domain
@@ -65,6 +67,48 @@ async def get_connection(session: AsyncSession) -> IdpConnection | None:
         )
     )
     return connection
+
+
+async def active_connection_id(session: AsyncSession) -> UUID | None:
+    """The scope's tenant's SSO connection, if it is active: its ID. The notification worker's
+    test for an SSO invitation (#273): it reads only the ID, tenant and status of the tenant's
+    own row (revision 0042), never its issuer."""
+    require_scope(session, *_TENANT)
+    found: UUID | None = await session.scalar(
+        select(IdpConnection.id).where(
+            IdpConnection.tenant_id.is_not(None),
+            IdpConnection.status == "active",
+            in_scope(IdpConnection, session),
+        )
+    )
+    return found
+
+
+async def invites_through_sso(session: AsyncSession, connection_id: UUID, email: str) -> bool:
+    """Whether an invitation to `email` in the scope's tenant is an SSO link (authn and authz 2.5,
+    #273): the tenant requires SSO, or the address's domain is one of its proven domains linked to
+    `connection_id`, the tenant's active connection. Anyone else may sign in locally, and a link
+    to an address outside those domains would be no use: its owner has no identity at the
+    tenant's provider. The notification worker's read (revision 0043): `tenants.sso_required` and
+    the domains' tenant, name, link and proof, of its own tenant only."""
+    require_scope(session, *_TENANT)
+    required = await session.scalar(
+        select(Tenant.sso_required).where(
+            Tenant.id == tenant_of(session), in_scope(Tenant, session)
+        )
+    )
+    if required:
+        return True
+    domain = email.rpartition("@")[2].lower()
+    linked: UUID | None = await session.scalar(
+        select(SsoDomain.tenant_id).where(
+            SsoDomain.domain == domain,
+            SsoDomain.idp_connection_id == connection_id,
+            SsoDomain.verified_at.is_not(None),
+            in_scope(SsoDomain, session),
+        )
+    )
+    return linked is not None
 
 
 async def put_connection(

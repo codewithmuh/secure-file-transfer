@@ -70,6 +70,19 @@ resource "kubernetes_storage_class_v1" "observability" {
   }
 }
 
+# The CRDs the cluster serves now (#279). Helm installs the chart's CRDs on the first install only, so a chart bump
+# needs the new chart's CRDs applied first (docs/operations/observability.md, section 11): the cluster-bootstrap job
+# server-side applies the vendored bundle before every plan (.github/workflows/cluster-bootstrap.yml). The
+# precondition below holds any other apply to the same rule: on a cluster that has the CRDs, the operator's release
+# moves only when they are the pinned operator's version, so a bump without the CRD step can't reach a cluster. A new
+# cluster has none, and its first install brings the chart's, which deploy/observability/crds/check.sh proves are the
+# bundle's.
+data "kubernetes_resources" "prometheus_crds" {
+  api_version    = "apiextensions.k8s.io/v1"
+  kind           = "CustomResourceDefinition"
+  field_selector = "metadata.name=prometheuses.monitoring.coreos.com"
+}
+
 resource "helm_release" "prometheus_operator" {
   name             = "prometheus-operator"
   repository       = local.charts.kube_prometheus_stack.repository
@@ -146,6 +159,15 @@ resource "helm_release" "prometheus_operator" {
   })]
 
   depends_on = [helm_release.kyverno_policies, kubernetes_namespace_v1.observability]
+
+  lifecycle {
+    precondition {
+      condition = length(data.kubernetes_resources.prometheus_crds.objects) == 0 || try(
+        data.kubernetes_resources.prometheus_crds.objects[0].metadata.annotations["operator.prometheus.io/version"], ""
+      ) == trimprefix(local.images.prometheus_operator.tag, "v")
+      error_message = "The cluster's Prometheus Operator CRDs aren't the pinned operator's version (${local.images.prometheus_operator.tag}). Apply the vendored bundle first, as the cluster-bootstrap job does (docs/operations/observability.md, section 11)."
+    }
+  }
 }
 
 # Prometheus' service discovery and the kubelet scrape (deploy/observability/charts/prometheus): read only, no Secrets.

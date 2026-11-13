@@ -14,7 +14,6 @@ Run from the repository root: `uv run --project services/api --locked pytest dep
 from __future__ import annotations
 
 import os
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -25,6 +24,7 @@ from pydantic import ValidationError
 from pydantic_settings import BaseSettings
 from sft.core.settings import (
     ArchiveJobSettings,
+    BootstrapSettings,
     FieldKeySettings,
     InspectorSettings,
     JobSettings,
@@ -32,6 +32,7 @@ from sft.core.settings import (
     MigrationSettings,
     NotifySettings,
     OperatorSettings,
+    RecoverySettings,
     RelaySettings,
     ScanSettings,
     Settings,
@@ -56,10 +57,13 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.api.operator": OperatorSettings,
     "sft.workers.relay": RelaySettings,
     "sft.data.migrate": MigrationSettings,
+    "sft.data.bootstrap": BootstrapSettings,  # #278, always suspended, run by hand once per environment
     "sft.dlp.inspector": InspectorSettings,
     "sft.workers.scan": ScanSettings,
     "sft.workers.notify": NotifySettings,
     "sft.workers.invite_backlog": NotifySettings,
+    "sft.workers.standby_enrolment": NotifySettings,  # #258, as the notification worker
+    "sft.workers.recovery": RecoverySettings,  # #258, always suspended, run by the runbooks
     "sft.workers.key_rotation": KeyRotationSettings,
     "sft.workers.field_keys": FieldKeySettings,
     "sft.workers.expiry": JobSettings,
@@ -72,10 +76,6 @@ SETTINGS: dict[str, type[BaseSettings]] = {
     "sft.workers.audit_archive": ArchiveJobSettings,
     "sft.probe": ProbeSettings,
 }
-
-# Off by default in the chart until each environment's AWS side exists, so the fixture renders them switched on: their
-# settings must load in every cluster before a values file turns them on (#248).
-SWITCHED_ON = "probe.enabled=true"
 
 # What staging and prod need beyond the code's defaults, by entry point: both Regions' audit archive for the
 # security-critical records (architecture 5.2) and the files buckets' Osaka replicas for the lifecycle jobs (NFR-8).
@@ -107,23 +107,15 @@ Manifest = dict[str, Any]
 
 @pytest.fixture(scope="module")
 def containers(
-    tmp_path_factory: pytest.TempPathFactory,
+    rendered: dict[tuple[str, str, str], list[Manifest]],
 ) -> list[tuple[str, str, str, str, Manifest]]:
-    """(env, region, workload, module, container) for every container of ours in every cluster, as rendered."""
-    out = tmp_path_factory.mktemp("rendered")
-    subprocess.run(
-        [str(ROOT / "deploy" / "render.sh"), str(out)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "SFT_RENDER_SET": SWITCHED_ON},
-    )
+    """(env, region, workload, module, container) for every container of ours in every cluster, as rendered
+    (deploy/conftest.py)."""
     found = []
     for env, region in CLUSTERS:
         for part in ("application", "operator"):
-            for obj in yaml.safe_load_all(
-                (out / f"{env}-{region}-{part}.yaml").read_text()
-            ):
-                if not obj or obj["kind"] not in {"Deployment", "CronJob", "Job"}:
+            for obj in rendered[(env, region, part)]:
+                if obj["kind"] not in {"Deployment", "CronJob", "Job"}:
                     continue
                 spec = (
                     obj["spec"]["jobTemplate"]["spec"]["template"]["spec"]

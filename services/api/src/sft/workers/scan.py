@@ -65,6 +65,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import math
 import sys
 import time
 import uuid
@@ -74,7 +75,7 @@ from datetime import UTC, datetime, timedelta
 from typing import ClassVar, Final
 from uuid import UUID
 
-from prometheus_client import CollectorRegistry, Counter, Histogram
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.logs import configure_logging
@@ -116,7 +117,7 @@ from sft.service.dlp_definitions import inspector_spec, open_definition
 from sft.service.evaluation import evaluate
 from sft.service.objects import SCAN_TAG, ObjectStoreError, ScannedObjects
 from sft.service.scans import InspectionResult, ScanResult, SystemActor
-from sft.workers.clamd import ClamdError, ClamdResult, Verdict, instream
+from sft.workers.clamd import ClamdError, ClamdResult, Verdict, instream, signatures_built
 from sft.workers.consumer import (
     LONG_POLL_SECONDS,
     Consumer,
@@ -255,6 +256,66 @@ class Engines:
     inspector_host: str
     inspector_port: int
     connect_timeout: float = 5.0
+
+
+SIGNATURE_CHECK_SECONDS: Final = 300.0
+"""How often the worker asks its clamd which signatures it runs (#260)."""
+
+
+@dataclass(frozen=True)
+class SignatureMetrics:
+    """The age of the signatures this node's clamd scans with (#260; threat model T-27). Made by
+    the scan worker alone, so no other process exports it."""
+
+    age: Gauge
+
+    @classmethod
+    def create(cls, registry: CollectorRegistry) -> SignatureMetrics:
+        return cls(
+            Gauge(
+                "clamav_signature_age_seconds",
+                "Age of the ClamAV signature database this node's clamd scans with, from its build "
+                "time (T-27: the alert fires above a day). NaN until clamd first answers.",
+                registry=registry,
+            )
+        )
+
+
+class SignatureWatch:
+    """Asks clamd's `VERSION` every `SIGNATURE_CHECK_SECONDS` and exports the signatures' age at
+    each scrape, from the last build time clamd gave. A clamd that stops answering leaves the last
+    time, so the age keeps growing and the alert still fires; the scans' own alerts say clamd is
+    down."""
+
+    def __init__(
+        self,
+        engines: Engines,
+        metrics: SignatureMetrics,
+        *,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.engines = engines
+        self.clock = clock
+        self.built: float | None = None
+        metrics.age.set_function(self.age)
+
+    def age(self) -> float:
+        return math.nan if self.built is None else max(0.0, self.clock() - self.built)
+
+    async def check(self) -> None:
+        try:
+            async with asyncio.timeout(self.engines.connect_timeout):
+                built = await signatures_built(self.engines.clamd_host, self.engines.clamd_port)
+        except (ClamdError, TimeoutError) as exc:
+            log.warning("clamd's signature version unknown", extra={"error": type(exc).__name__})
+            return
+        self.built = built.timestamp()
+
+    async def run(self, stopping: asyncio.Event) -> None:
+        while not stopping.is_set():
+            await self.check()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stopping.wait(), SIGNATURE_CHECK_SECONDS)
 
 
 class Leases:
@@ -972,19 +1033,18 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
     )
     consumer_type = CONSUMERS[settings.scan_pool]
     leases = Leases(store, consumer_type.queue, settings.tenant_cap, time.time)
-    consumer = consumer_type(
-        database,
-        objects,
-        Engines(
-            clamd_host=settings.clamd_host,
-            clamd_port=settings.clamd_port,
-            inspector_host=settings.inspector_host,
-            inspector_port=settings.inspector_port,
-            connect_timeout=settings.clamd_connect_timeout_seconds,
-        ),
-        ScanMetrics.create(process.registry),
-        leases,
+    engines = Engines(
+        clamd_host=settings.clamd_host,
+        clamd_port=settings.clamd_port,
+        inspector_host=settings.inspector_host,
+        inspector_port=settings.inspector_port,
+        connect_timeout=settings.clamd_connect_timeout_seconds,
     )
+    consumer = consumer_type(
+        database, objects, engines, ScanMetrics.create(process.registry), leases
+    )
+    # The signatures' age (#260, T-27), from the clamd beside this worker.
+    signatures = SignatureWatch(engines, SignatureMetrics.create(process.registry))
     visibility = int(scan_timing.VISIBILITY[consumer_type.queue].total_seconds())
     loop = ConsumerLoop(
         consumer,
@@ -1014,7 +1074,7 @@ async def run_scan_worker(settings: ScanSettings, *, handle_signals: bool = True
         )
 
     async def every_loop(stopping: asyncio.Event) -> None:
-        await asyncio.gather(*(each.run(stopping) for each in loops))
+        await asyncio.gather(*(each.run(stopping) for each in loops), signatures.run(stopping))
 
     closers: list[Callable[[], Awaitable[None]]] = [queues.close, objects.close, database.dispose]
     if store is not None:

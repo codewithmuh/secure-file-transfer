@@ -19,7 +19,6 @@ sessions in the HttpOnly `__Host-sft_link` cookie; the database holds only each 
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from sqlalchemy import ColumnElement, delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
+from sft.core.tokens import token_hash
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.models import DownloadGrant, LinkSession, TransferRecipient
 from sft.data.scope import ScopeKind, Subject, SubjectKind
@@ -46,10 +46,6 @@ MAX_PER_BROWSER: Final = 10
 def new_token() -> str:
     """A new session token: 256 bits from the operating system's generator, base64url."""
     return secrets.token_urlsafe(TOKEN_BYTES)
-
-
-def token_hash(token: str) -> bytes:
-    return hashlib.sha256(token.encode()).digest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,5 +350,4 @@ __all__ = [
     "revoke_for_transfer",
     "revoke_for_upload_request",
     "tenants_with_expired",
-    "token_hash",
 ]

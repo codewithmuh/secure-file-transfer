@@ -82,5 +82,11 @@ module "edge" {
   web_distribution_arn = var.web_distribution_arn
 
   managed_rules_in_count = true
-  deletion_protection    = true
+  deletion_protection    = !var.teardown
+
+  # The web bucket's only writers (#283): the release role, which Tokyo's stack makes (modules/web-release), and the
+  # deploy role, which empties it at teardown.
+  web_writer_arns = [
+    module.conventions.workload_role_arns["web-release"], module.conventions.bootstrap_role_arns.terraform_deploy,
+  ]
 }

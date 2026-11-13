@@ -44,7 +44,8 @@ Two halves, split by who may grant what:
   EBS key, the platform key), the Prometheus Operator with its CRDs and kube-state-metrics from the pinned
   kube-prometheus-stack chart with everything else in it switched off, and Prometheus' read-only discovery role
   `sft:prometheus`. Both controllers need cluster-wide RBAC, which a project synced from Git should not be able to
-  grant. In an Osaka pilot light they sit idle on its one system node, so a failover needs no apply.
+  grant. In an Osaka pilot light they sit idle on its one system node, so a failover needs no apply. Helm installs
+  the chart's CRDs on the first install only, so a chart bump applies the new CRDs first (section 11).
   The layer's [`infra/modules/observability`](../../infra/modules/observability/README.md) makes the AWS side: Loki's
   and Tempo's buckets in the cluster's Region, the four roles (from Tokyo) and their Pod Identity associations.
 - **Argo CD** syncs everything else from `main`. Terraform's root release adds a second root Application,
@@ -190,6 +191,7 @@ on every pod the charts render; `deploy/observability/tests` checks the rest, th
 | Kyverno admits every pod | `deploy/policies.sh` | Every pull request |
 | Images, pod rules, network policies, budgets, rule files, scrape targets, sizes, vendored charts | `deploy/observability/tests` | Every pull request |
 | Dashboards parse and query only known metrics | `deploy/observability/tests/test_dashboards.py` | Every pull request |
+| The vendored CRDs are the pinned chart's, byte for byte, for the operator `images.tf` pins, and serve every kind the stack renders (section 11) | `deploy/observability/crds/check.sh` (in `deploy/check.sh`), `deploy/observability/tests/test_crds.py` | Every pull request |
 | Terraform (the module, cluster-bootstrap, the deploy role's permissions) validates; tflint and Trivy | `infra/scripts/check.sh` | Every pull request |
 | Prometheus scrapes every target (`up == 1` for each PodMonitor and ServiceMonitor) | Grafana or `kubectl port-forward` to Prometheus | Pending the AWS run |
 | A rule from each `deploy/alerts` file is loaded and evaluating | Prometheus' rules page | Pending the AWS run |
@@ -199,6 +201,7 @@ on every pod the charts render; `deploy/observability/tests` checks the rest, th
 | A request's trace is in Tempo, with its logs linked | Explore, a `trace_id` from a log line | Pending the AWS run |
 | An error trace is always kept; a fast trace about one time in ten | Tempo search over a load test | Pending the AWS run |
 | A page reaches its SNS topic; the heartbeat publishes every minute and its alarm fires when it stops | Fire a test alert; scale Alertmanager to zero in staging | Pending the AWS run (#246) |
+| A chart bump's CRDs apply server-side and the new operator reconciles (section 11) | The cluster-bootstrap job's CRD steps and the operator release's precondition (#279), on the first bump | Pending the AWS run |
 | Grafana answers on the port-forward and nowhere else | Port-forward as ReadOnly; the synthetic probe from outside (T-05) | Pending the AWS run |
 | Loki and Tempo objects are under the logs key | `aws s3api head-object` on one of each | Pending the AWS run |
 
@@ -213,4 +216,75 @@ on every pod the charts render; `deploy/observability/tests` checks the rest, th
   (`deploy/charts/sft`), then add its component to `application.scraped`; the test checks the two agree.
 - **An image or chart upgrade:** the digest in `infra/modules/cluster-bootstrap/images.tf` and in the chart's values
   together (and `infra/shared`'s mirror list for a new repository); for Loki or Tempo, the vendored archive, its
-  version in `Chart.yaml` and its line in `charts/SHA256SUMS`. At least 7 days old (T-68).
+  version in `Chart.yaml` and its line in `charts/SHA256SUMS`; for kube-prometheus-stack, its CRDs and the
+  procedure in section 11. At least 7 days old (T-68).
+
+## 11. Upgrading the Prometheus Operator's CRDs
+
+Terraform installs the operator from the kube-prometheus-stack chart pinned in cluster-bootstrap's `images.tf`, with
+its CRDs. Helm installs a chart's CRDs only on its first install and never upgrades them
+([#264](https://github.com/codewithmuh/secure-file-transfer/issues/264)), so a bump on its own would leave the
+cluster's CRDs at the old version under the new operator: fields that it, or our charts, start to use would be
+pruned or refused, and the observability Applications' syncs would fail or silently lose settings. So every bump
+applies the new chart's CRDs first, by server-side apply. Client-side `kubectl apply` can't: it stores the whole
+object in the `last-applied-configuration` annotation, and the largest of these CRDs is over its 256 KiB limit.
+
+The CRDs come from Git, not from the chart repository at apply time: `deploy/observability/crds/` holds the pinned
+chart's own CRD bundle, `kube-prometheus-stack-<version>.crds.bz2` (the chart's `charts/crds/files/crds.bz2`, all ten
+CRDs, 0.2 MB). Two checks run on every pull request: `deploy/observability/crds/check.sh`, from `deploy/check.sh`,
+pulls the version `images.tf` pins and fails unless the bundle is that chart's byte for byte and the only one; the
+tests in `deploy/observability/tests/test_crds.py` fail unless every CRD in it is for the operator image `images.tf`
+pins, and unless it serves every kind and version the stack renders.
+
+**The bump**, one pull request, at least 7 days after the chart's release (T-68):
+
+```bash
+version=<the new chart version>
+work=$(mktemp -d)
+helm pull kube-prometheus-stack --repo https://prometheus-community.github.io/helm-charts --version "$version" \
+  --untar --untardir "$work"
+rm deploy/observability/crds/kube-prometheus-stack-*.crds.bz2
+cp "$work/kube-prometheus-stack/charts/crds/files/crds.bz2" \
+  "deploy/observability/crds/kube-prometheus-stack-$version.crds.bz2"
+grep appVersion "$work/kube-prometheus-stack/Chart.yaml"   # the operator version it runs
+```
+
+Then, in `infra/modules/cluster-bootstrap/images.tf`, the chart's `version` and the `prometheus_operator` and
+`prometheus_config_reloader` images (tag and digest) at that operator version, which the mirror workflow copies. The
+pull request's diff of the bundle can't be read as text: compare the two versions' CRDs with `bzcat` if a schema
+change matters to our charts. `deploy/check.sh` and the tests must pass.
+
+**The apply**, after the merge, in each cluster in the apply order (dev; then staging and prod, Tokyo before Osaka,
+the pilot light too, since its operator runs), before that cluster's cluster-bootstrap apply. The cluster-bootstrap
+job does it, every time (`.github/workflows/cluster-bootstrap-apply.yml`, #279): the merge of the bump starts it,
+since the bundle and `images.tf` are among its paths. It runs as the identity that applies cluster-bootstrap, the
+deploy role through the Systems Manager tunnel
+([modules/cluster-bootstrap](../../infra/modules/cluster-bootstrap/README.md)): people's permission sets may not change
+cluster-scoped objects (authn-authz 8.1), and break-glass is not for planned changes. Its steps, from a checkout of the merged commit with the tunnel's kubeconfig:
+
+```bash
+deploy/observability/crds/check.sh   # the bundle is the pinned chart's
+bundle=$(ls deploy/observability/crds/kube-prometheus-stack-*.crds.bz2)
+bzcat "$bundle" | kubectl apply --server-side --force-conflicts --field-manager=sft-crds -f -
+bzcat "$bundle" | kubectl wait --for condition=Established --timeout=120s -f -
+kubectl get crd prometheuses.monitoring.coreos.com \
+  -o jsonpath='{.metadata.annotations.operator\.prometheus\.io/version}'   # the new operator version
+```
+
+`--force-conflicts` takes the fields over from Helm, the manager that installed them; Helm never writes them again,
+so nothing fights over them. Then the job applies cluster-bootstrap, which upgrades the operator; check that its logs
+show no errors and that Argo CD's `observability` Applications are Synced and Healthy. Terraform holds any other apply
+to the same order: the operator's release has a precondition that the cluster's CRDs are the pinned operator's version
+(`operator.prometheus.io/version`), so an apply that skipped the CRDs stops before the operator moves.
+
+The order is what makes it safe. A newer CRD only adds fields and versions, so the old operator keeps working
+between the two steps; the reverse order would run the new operator against the old schema. A rollback of the chart
+leaves the newer CRDs in place, which is safe for the same reason: never apply an older bundle over newer CRDs,
+which would prune what the newer schema allowed. A new cluster needs none of this: its first install brings the
+chart's CRDs, which the check proves are the bundle's.
+
+Decided in #264 over two alternatives. The chart's own `crds.upgradeJob` applies the CRDs from a Helm hook Job at
+every upgrade, but it needs two more images (kubectl and busybox) mirrored and admitted, and a Job in the cluster that
+may write any CRD. A separate CRD chart with the CRDs as templates, as Karpenter's are, lets Helm upgrade them, but
+uninstalling that release would delete every CRD and every object of their kinds. The cluster-bootstrap job (#279)
+runs the two commands above instead, so neither is needed.

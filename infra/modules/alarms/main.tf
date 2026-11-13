@@ -10,7 +10,11 @@
 locals {
   # Alertmanager's Pod Identity role (deploy/observability, #243), which publishes the in-cluster alerts and the
   # heartbeat (ADR-0009). Matched by name, since it may not exist when this stack is applied.
-  alertmanager_role_arn = "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-alertmanager"
+  alertmanager_role_arn = var.conventions.workload_role_arns["alertmanager"]
+
+  # The environment's EventBridge delivery role (modules/events-delivery-role), which the security alert rules publish
+  # to the page topic through (security-events.tf, #256).
+  events_delivery_role_arn = var.conventions.workload_role_arns["events-delivery"]
 
   # Notification targets by severity.
   notify = {

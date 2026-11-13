@@ -1,9 +1,11 @@
 """Audit events after the #50 review: no backdating, no audit reads in resource scope, and what
-the helper cleans or refuses before it reaches the database."""
+the helper cleans or refuses before it reaches the database. And after #255: no application role
+drops, detaches or truncates a partition; only the partition job's narrow function drops one."""
 
 import re
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from enum import Enum, IntEnum
 
 import pytest
@@ -14,9 +16,9 @@ from pg import ScratchDatabase
 from sft.data import audit
 from sft.data.access import ScopeNotAllowedError
 from sft.data.audit import Actor, ActorType, Origin, Outcome, Target
-from sft.data.database import Database
+from sft.data.database import Database, sync_engine
 from sft.data.models import Tenant
-from sft.data.roles import RECOVERY
+from sft.data.roles import JOBS, OWNER, RECOVERY, WORKLOAD_ROLES
 from sft.data.scope import Scope, Subject
 
 pytestmark = pytest.mark.anyio
@@ -98,6 +100,52 @@ def test_only_recovery_may_set_tx_id_or_occurred_at(migrated_db: ScratchDatabase
         """
     )
     assert {role for role, _ in rows} == {"sft_owner", RECOVERY}
+
+
+# ---- #255: no application role drops, detaches or truncates an audit partition ----
+
+
+def _this_month() -> str:
+    now = datetime.now(UTC)
+    return f"audit_events_y{now.year:04d}m{now.month:02d}"
+
+
+@pytest.mark.parametrize("role", WORKLOAD_ROLES)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DROP TABLE {partition}",
+        "TRUNCATE {partition}",
+        "TRUNCATE audit_events",
+        "TRUNCATE audit_events_default",
+        "ALTER TABLE audit_events DETACH PARTITION {partition}",
+        "DROP TABLE audit_events_default",
+    ],
+)
+def test_no_application_role_can_drop_detach_or_truncate_an_audit_partition(
+    migrated_db: ScratchDatabase, role: str, statement: str
+) -> None:
+    engine = sync_engine(migrated_db.url(role))
+    try:
+        with pytest.raises(DBAPIError) as refused, engine.begin() as connection:
+            connection.execute(text(statement.format(partition=_this_month())))
+    finally:
+        engine.dispose()
+    assert getattr(refused.value.orig, "sqlstate", None) == INSUFFICIENT_PRIVILEGE
+
+
+def test_only_the_partition_job_may_run_the_retentions_drop(migrated_db: ScratchDatabase) -> None:
+    # The one way a month goes: revision 0040's function, which drops only a month past its 365
+    # days and archived in both regions, by the database's clock.
+    rows = migrated_db.sql(
+        """
+        SELECT r.rolname FROM pg_roles r
+         WHERE r.rolname LIKE 'sft\\_%'
+           AND has_function_privilege(r.oid, 'audit_drop_expired_partitions(timestamptz)',
+                                      'EXECUTE')
+        """
+    )
+    assert {role for (role,) in rows} == {JOBS, OWNER}
 
 
 # The columns each credential lookup reads, as sft_lookup (data model 4.2), and nothing else.
@@ -212,6 +260,31 @@ def test_column_grants_follow_the_table_rules(migrated_db: ScratchDatabase) -> N
             assert columns == [("occurred_at",), ("tx_id",)], (
                 f"sft_recovery reads {columns} of audit_events"
             )
+        elif table == "audit_events" and (role, privilege) == ("sft_operator", "SELECT"):
+            # recoverTenantAdmin (#239, revision 0037) reads back its own security-critical events
+            # in the tenant's scope, as their archive records hold them: never an address, a user
+            # agent or a request ID (`operator_read_own_critical`).
+            columns = migrated_db.sql(
+                """
+                SELECT a.attname FROM pg_attribute a, aclexplode(a.attacl) g
+                 WHERE a.attrelid = 'audit_events'::regclass
+                   AND g.grantee = 'sft_operator'::regrole AND g.privilege_type = 'SELECT'
+                 ORDER BY 1
+                """
+            )
+            assert {str(c) for (c,) in columns} == {
+                "id",
+                "tenant_id",
+                "occurred_at",
+                "action",
+                "actor_type",
+                "actor_id",
+                "target_type",
+                "target_id",
+                "outcome",
+                "details",
+                "security_critical",
+            }, f"sft_operator reads {columns} of audit_events"
         elif table == "audit_events":
             assert privilege == "INSERT", f"{role} may {privilege} columns of audit_events"
         policies = migrated_db.sql(

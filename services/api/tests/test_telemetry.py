@@ -504,10 +504,18 @@ def test_the_api_process_exports_its_request_spans_and_flushes_at_shutdown(
         for scope_spans in resource_spans.scope_spans
         for span in scope_spans.spans
     ]
-    [span] = exported  # the probes on the internal port aren't traced
+    # The probes on the internal port aren't traced. Besides the request's own span, only the
+    # counter store's client spans under it (#136), which carry no key and no query.
+    [span] = [s for s in exported if s.kind == s.SpanKind.SPAN_KIND_SERVER]
     assert span.trace_id.hex() == TRACE
     assert span.name == "GET"
     assert "123456" not in str(span)
+    for child in exported:
+        if child is not span:
+            assert child.kind == child.SpanKind.SPAN_KIND_CLIENT, child.name
+            assert child.name.startswith("counter."), child.name
+            assert child.parent_span_id == span.span_id
+            assert "123456" not in str(child)
 
 
 def test_the_propagator_names_only_traceparent() -> None:

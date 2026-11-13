@@ -16,6 +16,12 @@ Lock archive bucket. One integration test runs it against S3Mock (tests/test_aud
 
 In AWS the Osaka client reaches Osaka's S3 from Tokyo's VPC through the network layer's cross-Region
 S3 endpoint (ADR-0021); both Regions' archive admit the API's role (modules/audit-archive, #185).
+
+`open_audit_archive` is what the API, the lifecycle jobs and the archive job open: both regions'
+buckets, or Tokyo's alone in dev, and the surviving region alone while a regional loss's toggle
+names it (#257, `sft.service.audit_archive.SurvivingRegion`). `S3ArchiveReader` reads one region's
+archive for the recovery job (#258): it lists and gets objects, which only the recovery role may
+(infra modules/audit-archive).
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from sft.service.audit_archive import ArchiveWriteError, Region
+from sft.service.audit_archive import ArchiveStore, ArchiveWriteError, Region, SurvivingRegion
+from sft.service.recovery import ArchiveReadError
 
 if TYPE_CHECKING:
     from types_boto3_s3.client import S3Client
@@ -119,3 +126,102 @@ class S3AuditArchive:
         await asyncio.to_thread(self._executor.shutdown, wait=True)
         for client in self._clients.values():
             client.close()
+
+
+def open_audit_archive(
+    *,
+    tokyo_bucket: str,
+    osaka_bucket: str | None,
+    tokyo_endpoint: str | None = None,
+    osaka_endpoint: str | None = None,
+    surviving_region: str | None = None,
+    threads: int = 4,
+) -> ArchiveStore:
+    """Both regions' archive, or Tokyo's alone where there is no Osaka (dev); with
+    `surviving_region`, that region's alone (module docstring). Opening makes no connection."""
+    buckets = {Region.TOKYO: tokyo_bucket}
+    endpoints = {Region.TOKYO: tokyo_endpoint}
+    if osaka_bucket is not None:
+        buckets[Region.OSAKA] = osaka_bucket
+        endpoints[Region.OSAKA] = osaka_endpoint
+    store = S3AuditArchive.create(buckets, endpoints, threads=threads)
+    if surviving_region is None:
+        return store
+    return SurvivingRegion(store, Region(surviving_region))
+
+
+class S3ArchiveReader:
+    """One region's archive bucket, read (`sft.service.recovery.ArchiveReader`): the recovery
+    job's, through boto3 in a thread pool. Errors name S3's code only."""
+
+    def __init__(self, client: S3Client, bucket: str, *, threads: int = 4) -> None:
+        self._client = client
+        self._bucket = bucket
+        self._executor = ThreadPoolExecutor(max_workers=threads, thread_name_prefix="archive-read")
+
+    @classmethod
+    def create(
+        cls, *, region: str, bucket: str, endpoint: str | None = None, threads: int = 4
+    ) -> S3ArchiveReader:
+        """A reader of `bucket` in `region`. Credentials come from the pod's IAM role."""
+        config = Config(
+            region_name=region,
+            signature_version="s3v4",
+            connect_timeout=2,
+            read_timeout=30,
+            retries={"mode": "standard", "max_attempts": 5},
+            max_pool_connections=threads,
+            s3={"addressing_style": "path" if endpoint else "virtual"},
+        )
+        client = boto3.session.Session().client("s3", endpoint_url=endpoint, config=config)
+        return cls(client, bucket, threads=threads)
+
+    async def _call[T](self, fn: Callable[..., T], /, **kwargs: object) -> T:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(self._executor, functools.partial(fn, **kwargs))
+        except ClientError as exc:
+            raise ArchiveReadError(
+                str(exc.response.get("Error", {}).get("Code", "ClientError"))
+            ) from None
+        except BotoCoreError as exc:
+            raise ArchiveReadError(type(exc).__name__) from None
+
+    async def _pages(self, **kwargs: object) -> list[dict[str, object]]:
+        pages: list[dict[str, object]] = []
+        token: str | None = None
+        while True:
+            more = {"ContinuationToken": token} if token else {}
+            page = await self._call(
+                self._client.list_objects_v2, Bucket=self._bucket, **kwargs, **more
+            )
+            pages.append(dict(page))
+            token = page.get("NextContinuationToken")
+            if not page.get("IsTruncated") or not token:
+                return pages
+
+    async def prefixes(self, prefix: str) -> list[str]:
+        return [
+            str(found["Prefix"])
+            for page in await self._pages(Prefix=prefix, Delimiter="/")
+            for found in page.get("CommonPrefixes", []) or []  # type: ignore[attr-defined]
+        ]
+
+    async def keys(self, prefix: str) -> list[str]:
+        return [
+            str(found["Key"])
+            for page in await self._pages(Prefix=prefix)
+            for found in page.get("Contents", []) or []  # type: ignore[attr-defined]
+        ]
+
+    async def get(self, key: str) -> bytes:
+        answer = await self._call(self._client.get_object, Bucket=self._bucket, Key=key)
+        body = answer["Body"]
+        try:
+            return await asyncio.get_running_loop().run_in_executor(self._executor, body.read)
+        finally:
+            body.close()
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._executor.shutdown, wait=True)
+        self._client.close()

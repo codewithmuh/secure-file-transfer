@@ -111,6 +111,7 @@ from sft.data.users import (
     find_invitation,
     get_user,
     get_user_by_email,
+    issue_invitation_link,
     list_users,
     lock_active_admins,
     set_dlp_approver,
@@ -334,11 +335,7 @@ async def find_another_tenants_session(session: AsyncSession, tenants: Tenants) 
 
 @cases.add(scopes={API: [TENANT, RESOURCE], OPERATOR: [TENANT]})
 async def read_another_tenants_session(session: AsyncSession, tenants: Tenants) -> object:
-    their_session = tenants.theirs.rows["session"]
-    return [
-        await get_live_session(session, their_session),
-        await member_sessions.expires_at(session, their_session),
-    ]
+    return await get_live_session(session, tenants.theirs.rows["session"])
 
 
 @cases.add(scopes=SESSION_WRITERS)
@@ -2086,6 +2083,39 @@ async def bind_an_identity_to_another_tenants_user(
 async def route_another_tenants_domain(session: AsyncSession, tenants: Tenants) -> object:
     # A credential lookup, across tenants in lookup scope by design: it returns IDs and status.
     return await sso.route_domain(session, f"pending-{tenants.theirs.marker}.example")
+
+
+# ---- the notification worker's SSO invitations (#273, revision 0042) ----
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def read_another_tenants_connection_as_the_worker(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # The worker's test for an SSO invitation: the scope's own tenant's connection, by its ID.
+    return await sso.active_connection_id(session)
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def match_an_address_on_another_tenants_domain_as_the_worker(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    # Revision 0043: their proven domain, linked to their connection, never makes this tenant's
+    # invitation an SSO link. A yes is returned as their marker, so the harness sees the leak.
+    theirs = tenants.theirs
+    address = f"someone@{theirs.marker}.example"
+    linked = await sso.invites_through_sso(session, theirs.rows["connection"], address)
+    return theirs.marker if linked else None
+
+
+@cases.add(scopes={NOTIFY: [TENANT]})
+async def issue_a_link_to_another_tenants_invited_user(
+    session: AsyncSession, tenants: Tenants
+) -> object:
+    issued = await issue_invitation_link(session, tenants.theirs.rows["user"], bytes(32))
+    # As the worker does: the change's event in its transaction, which the audit trigger requires.
+    await audit.record(session, action="user.invitation_link_issued", actor=Actor(ActorType.SYSTEM))
+    return issued
 
 
 test_isolation = cases.test()

@@ -80,10 +80,11 @@ data "aws_iam_policy_document" "topic" {
       identifiers = ["*"]
     }
 
+    # The page topic also takes the security alerts' EventBridge rules, through their delivery role (#256).
     condition {
       test     = "ArnNotEquals"
       variable = "aws:PrincipalArn"
-      values   = [local.alertmanager_role_arn]
+      values   = concat([local.alertmanager_role_arn], each.key == "alerts-page" ? [local.events_delivery_role_arn] : [])
     }
 
     dynamic "condition" {

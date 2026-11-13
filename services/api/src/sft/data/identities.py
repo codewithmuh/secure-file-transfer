@@ -16,9 +16,14 @@ The writes run in a tenant's scope (revision 0016):
 - `pool_connection`: the user pool's own connection by its provider name, which the notification
   worker reads to record an identity; it reaches the pool rows only, never a tenant's provider.
 - `record_identity`: the notification worker records `(pool connection, sub)` for a member once
-  it has created their user in the pool, replacing their earlier identity on that pool.
+  it has created their user in the pool, replacing their earlier identity on that pool. For the
+  sign-in reset of an operator's temporary local sign-in (`recoverTenantAdmin`, #239), the
+  identity expires when the recovery ends (`admin_recoveries`, revision 0037), so sign-in refuses
+  it after 72 hours.
 - `delete_identities`: a sign-in reset removes the member's identities on the pool connections,
   so no old credential maps to them; the caller writes the reset's own audit event.
+- `delete_pool_identities`: the same for the operator API (`recoverTenantAdmin`, #239), which
+  reads no pool row: every identity of the user on a connection that isn't the tenant's own.
 """
 
 from __future__ import annotations
@@ -107,7 +112,10 @@ async def record_identity(
     leaves no orphan behind. False when the identity is there already: a redelivery of the
     message that wrote it, which writes nothing again. The caller writes the audit event of the
     transaction (the trigger requires one): the worker records it with the invitation's email,
-    so the tenant's log reads the same whatever the pool answered (authn and authz 2.5)."""
+    so the tenant's log reads the same whatever the pool answered (authn and authz 2.5).
+
+    It expires at the end of the operator's temporary sign-in whose reset is the user's current
+    one (#239, revision 0037), and never otherwise (NULL)."""
     require_scope(session, ScopeKind.TENANT)
     tenant_id = tenant_of(session)
     await session.execute(
@@ -121,8 +129,14 @@ async def record_identity(
     inserted = (
         await session.execute(
             text(
-                "INSERT INTO user_identities (id, tenant_id, user_id, idp_connection_id, subject) "
-                "VALUES (:id, :tenant, :user, :connection, :subject) "
+                "INSERT INTO user_identities "
+                "(id, tenant_id, user_id, idp_connection_id, subject, expires_at) "
+                "VALUES (:id, :tenant, :user, :connection, :subject, ("
+                "SELECT r.temporary_sign_in_expires_at FROM admin_recoveries r JOIN users u "
+                "ON u.tenant_id = r.tenant_id AND u.id = r.user_id "
+                "AND u.sign_in_reset_id = r.sign_in_reset_id "
+                "WHERE r.tenant_id = :tenant AND r.user_id = :user AND r.ended_at IS NULL "
+                "AND r.temporary_sign_in_expires_at IS NOT NULL)) "
                 "ON CONFLICT (idp_connection_id, subject) DO NOTHING RETURNING id"
             ),
             {
@@ -166,3 +180,36 @@ async def has_identity(session: AsyncSession, *, user_id: UUID, connection_id: U
         {"tenant": tenant_of(session), "user": user_id, "connection": connection_id},
     )
     return found is not None
+
+
+async def has_other_pool_identity(
+    session: AsyncSession, *, user_id: UUID, connection_id: UUID
+) -> bool:
+    """Whether the user has an identity on a user pool other than `connection_id`, in the scope's
+    tenant: a local member, who signs in with a password the other pool holds (#258, authn and
+    authz 2.6). An SSO member's identities are on their tenant's provider, never a pool."""
+    require_scope(session, ScopeKind.TENANT)
+    found = await session.scalar(
+        text(
+            "SELECT 1 FROM user_identities i JOIN idp_connections c ON c.id = i.idp_connection_id "
+            "WHERE i.tenant_id = :tenant AND i.user_id = :user AND i.idp_connection_id <> "
+            ":connection AND c.tenant_id IS NULL AND c.kind = 'local' LIMIT 1"
+        ),
+        {"tenant": tenant_of(session), "user": user_id, "connection": connection_id},
+    )
+    return found is not None
+
+
+async def delete_pool_identities(session: AsyncSession, user_id: UUID) -> int:
+    """Delete the user's identities on any connection but the tenant's own SSO connection: the
+    pools' ones, in the scope's tenant; how many went. The caller writes the audit event."""
+    require_scope(session, ScopeKind.TENANT)
+    result = await session.execute(
+        text(
+            "DELETE FROM user_identities WHERE tenant_id = :tenant AND user_id = :user "
+            "AND idp_connection_id NOT IN "
+            "(SELECT id FROM idp_connections WHERE tenant_id = :tenant)"
+        ),
+        {"tenant": tenant_of(session), "user": user_id},
+    )
+    return int(result.rowcount)  # type: ignore[attr-defined]

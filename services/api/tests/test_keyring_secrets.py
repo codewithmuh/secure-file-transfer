@@ -17,7 +17,12 @@ from starlette.testclient import TestClient
 from api_settings import API_SETTINGS, CSRF_KEYRING, EMAIL_HMAC_KEYRING
 from sft.api.app import create_app
 from sft.core.hmac_keyrings import CodeKeyring, LinkKeyring
-from sft.core.keyrings import KeyringError, check_keyring_setting, secret_reference
+from sft.core.keyrings import (
+    KeyringError,
+    active_since,
+    check_keyring_setting,
+    secret_reference,
+)
 from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.runtime.secrets import Keyrings, KeyringUnavailableError, SecretsClient
@@ -139,6 +144,66 @@ async def test_a_malformed_version_or_a_failed_read_keeps_the_loaded_keyring(
     reasons = [r.__dict__.get("reason") for r in caplog.records if "refresh failed" in r.message]
     assert reasons == ["the CSRF keyring needs exactly one active key", "InternalServiceError"]
     assert key("x") not in caplog.text
+
+
+def dated(*entries: tuple[str, str, str]) -> str:
+    """A keyring whose keys carry `created_at`, as the key rotation job writes them."""
+    return json.dumps(
+        [{"id": i, "state": s, "key": key(i[-1]), "created_at": c} for i, s, c in entries]
+    )
+
+
+AGE = "keyring_active_key_age_seconds"
+EPOCH_1000 = "1970-01-01T00:16:40+00:00"  # 1000 seconds after the epoch
+EPOCH_1200 = "1970-01-01T00:20:00+00:00"
+
+
+@pytest.mark.anyio
+async def test_the_active_keys_age_follows_each_version(stubbed: tuple[Any, Stubber]) -> None:
+    """#162, #260: the gauge counts from the active key's `created_at` (or `activated_at`), at
+    the scrape's time, and moves to the new active key when a reload activates it."""
+    client, stubber = stubbed
+    answer(stubber, dated(("k1", "active", EPOCH_1000)), "v1")
+    answer(stubber, dated(("k2", "active", EPOCH_1200), ("k1", "verify", EPOCH_1000)), "v2")
+    answer(stubber, ring(("k3", "active")), "v3")  # no times: no age to report
+    rings, registry = keyrings(client)  # its clock reads 1234
+    await rings.load(REFERENCE, CsrfKeyring.from_json, name="CSRF")
+    assert registry.get_sample_value(AGE, {"keyring": "CSRF"}) == 234.0
+    await rings.refresh()
+    assert registry.get_sample_value(AGE, {"keyring": "CSRF"}) == 34.0
+    await rings.refresh()
+    assert registry.get_sample_value(AGE, {"keyring": "CSRF"}) is None
+
+
+@pytest.mark.anyio
+async def test_a_keyring_in_the_setting_reports_its_age_too() -> None:
+    def no_client() -> SecretsClient:
+        raise AssertionError("no secret is named")
+
+    registry = CollectorRegistry()
+    rings = Keyrings(no_client, _metrics(registry), clock=lambda: 1234.0)
+    raw = json.dumps(
+        [
+            {
+                "id": "t1",
+                "state": "active",
+                "key": key("e"),
+                "created_at": EPOCH_1000,
+                "activated_at": EPOCH_1200,
+            }
+        ]
+    )
+    await rings.load(SecretStr(raw), EmailKeyring.from_json, name="email")
+    # `activated_at` wins: the period counts from the switch, as the rotation job counts it.
+    assert registry.get_sample_value(AGE, {"keyring": "email"}) == 34.0
+
+
+def test_active_since_reads_no_malformed_time() -> None:
+    assert active_since("not JSON") is None
+    assert active_since(json.dumps({"id": "k1"})) is None
+    assert active_since(json.dumps([{"state": "active", "created_at": "yesterday"}])) is None
+    naive = json.dumps([{"state": "active", "created_at": "2026-01-01T00:00:00"}])
+    assert active_since(naive) is None
 
 
 @pytest.mark.anyio

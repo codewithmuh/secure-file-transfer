@@ -36,10 +36,14 @@ where the signals are: `database-rpo-lag` pages when Osaka's database replica is
 5 minutes (NFR-10 allows 5), and the files buckets' `replication-latency` and `replication-failed` alarms page past
 S3 Replication Time Control's 15 minutes or on any failed object. The drills measure it (NFR-10, NFR-11).
 
+**NFR-7 (email hand-off)** is measured since #260 (`send_latency_seconds{type}`, [metrics](metrics.md) 1) and
+alerted on as a threshold, not an error budget: `EmailSendSlow` pages when more than 5 % of verification codes and link
+emails take over 10 seconds from their message to SES for 10 minutes, which is NFR-7's p95 exactly, since 10 s is a
+bucket edge. A failing send is `EmailDeliveryFailing`; a queue left waiting, the `notify-age` alarm.
+
 **Not yet measured as objectives**, each for want of a metric (section 6): NFR-5's 60 seconds from a confirmation or
-approval to the recipient emails; NFR-7's 10 seconds to hand an email to SES (the `notify-age` alarm and
-`EmailDeliveryFailing` stand in); NFR-4's 1 second to the first byte, which comes from the web app's timing and the
-probe.
+approval to the recipient emails (the outbox age and `send_latency_seconds` cover its two legs); NFR-4's 1 second to
+the first byte, which comes from the web app's timing and the probe.
 
 The histograms behind NFR-5 and NFR-23 come from the API and the scan worker (#242,
 [metrics](metrics.md)). Their buckets must include each threshold above (120, 900, 60, 180 and 600 seconds),
@@ -107,6 +111,7 @@ it should do. A real regional failure is not a drill and is expected to breach N
 | CloudWatch alarms | The Region's page or ticket topic directly, never through the cluster |
 | Route 53 health check alarms | `sft-<env>-apne1-region-health-page` and `-ticket` in us-east-1, where Route 53 publishes (NFR-21) |
 | Break-glass EventBridge alerts | `sft-<env>-<rs>-break-glass-alerts` (infra/modules/break-glass-role) |
+| Security EventBridge alerts | The Region's `alerts-page` topic through `sft-<env>-events-delivery` (#256) |
 
 The operators' addresses (`TF_VAR_alert_emails`) subscribe to every topic but the heartbeat. A pager service, when
 there is one, subscribes to the page topics. Routing is [`deploy/alerts/alertmanager.yaml`](../../deploy/alerts/alertmanager.yaml),
@@ -130,13 +135,13 @@ yet; each is listed for the APP track and later issues, and the alert follows it
 |---|---|
 | Scan engine down or slow | `ScanFailed`; `scan-small-age`, `scan-large-age`; `ErrorBudgetBurn` for `scan-pass-*` and `time-to-shareable-*` |
 | DLP inspector down, slow or crashing | `DlpInspectorFailing`; `ErrorBudgetBurn` for `scan-pass-*` (NFR-23's p95, which abuse 8.2 lists under `DlpInspectorFailing`) |
-| Approvals not decided | `DlpApprovalBacklog` (no eligible approver); the oldest pending request's age is pending a metric |
-| Email provider failing or throttling | `EmailDeliveryFailing`, `notify-age`, `notify-dlq`, `ses-events-dlq`, `ses-reputation` |
+| Approvals not decided | `DlpApprovalBacklog`: no eligible approver, or a request past half its tenant's timeout (#260) |
+| Email provider failing or throttling | `EmailDeliveryFailing`, `EmailSendSlow` (NFR-7, #260), `notify-age`, `notify-dlq`, `ses-events-dlq`, `ses-reputation` |
 | Outbox relay stopped | `OutboxBacklog` (age over 2 minutes, or no relay reporting) |
 | API pod or node lost | `ErrorBudgetBurn` (`availability`), `api-no-healthy-targets`, `SyntheticProbeFailing` |
 | One AZ lost | The same, with `database-*` alarms; AWS Health events aren't alerted on (below) |
 | Tokyo region lost | `apne1-region-health`, `heartbeat-missing`, `api-lb-5xx` |
-| Audit archive behind | `AuditArchiveLagging`, `AuditArchiveJobNotRunning` (`lifecycle.rules.yaml`, #183) |
+| Audit archive behind | `AuditArchiveLagging`, `AuditArchiveJobNotRunning` (`lifecycle.rules.yaml`, #183); during a regional loss the surviving region's archive alone, and `AuditArchiveSingleRegion` until the back-fill ends (#257) |
 | Osaka archive unreachable | `AuditArchiveWriteFailing` |
 | Egress proxy down | `EgressProxyDown`; `heartbeat-missing` when Alertmanager can't reach SNS through it |
 | Rate-limit counters unavailable | `RateLimitStoreUnavailable` |
@@ -150,9 +155,9 @@ yet; each is listed for the APP track and later issues, and the alert follows it
 | Alert | Status |
 |---|---|
 | `RateLimitStoreUnavailable`, `LinkProbing`, `VerificationGuessing`, `EmailBombing`, `DownloadCapacity` | Prometheus rules, as specified. `EmailBombing` counts cap hits, not distinct addresses: no metric carries an address. |
-| `ApiKeyMisuse` | The "held at its limit" half. Bearer authentication failures are pending a metric (`auth_failures_total{scheme}`). |
+| `ApiKeyMisuse` | Both halves: more than 50 bearer authentication failures in 5 minutes (`auth_failures_total{scheme="api_key"}`, #260), and a key held at its limit. |
 | `SesReputation` | CloudWatch alarm `ses-reputation` |
-| `DlpApprovalBacklog` | The "no eligible approver" half; the age half is pending a metric (`dlp_oldest_pending_approval_seconds`) |
+| `DlpApprovalBacklog` | Both halves: no eligible approver, and a pending request past half its tenant's timeout (`dlp_approval_pending_timeout_used_ratio`, #260) |
 | `ScanFailed`, `DlpInspectorFailing` | Prometheus rules (#175, #176) |
 | `TenantSendingPaused`, `TenantSendingSpike` | Pending: SES's tenant status rule and its consumer, and our worker's own pause, aren't built; a per-tenant rate needs the logs (Loki), as abuse 8.1 says |
 | `CredentialStuffing`, `SignInWafBlocks` | Pending: Cognito's sign-in metrics and the sign-in web ACL's `rate-token-nat` blocks, as CloudWatch alarms with the `credential-stuffing` runbook |
@@ -163,32 +168,31 @@ yet; each is listed for the APP track and later issues, and the alert follows it
 
 | Promise | Status |
 |---|---|
-| Break-glass, field keys, operator records ([authn-authz](../security/authn-authz.md) 8, [encryption](../security/encryption-and-keys.md) 3) | Prometheus rules (`break-glass`, `field-encryption`, `operator`), never inhibited; the break-glass role's EventBridge alert (#232) |
-| Audit partitions (data model 6) | `AuditPartitions` |
+| Break-glass, field keys, operator records ([authn-authz](../security/authn-authz.md) 8, [encryption](../security/encryption-and-keys.md) 3) | Prometheus rules (`break-glass`, `break-glass-records`, `field-encryption`, `operator`), never inhibited; the break-glass role's EventBridge alert (#232); a break-glass assignment nobody recorded, `BreakGlassGrantUnrecorded` (#239; the reconciliation runs once the organization stack's trail role reaches the cluster facts, #275) |
+| SSO providers that differ from the recorded configuration in a pool (authn-authz 2.5) | `SsoProviderDrift`, `SsoProviderUnrecorded`, `SsoDriftCheckStalled` (`sso.rules.yaml`, #239; the check runs once the user pools exist, through the operator listener, #275) |
+| Audit partitions and their retention (data model 6, NFR-9) | `AuditPartitions`, an expired month still there included (#255) |
 | File deletion within 7 days (NFR-8), the lifecycle jobs running, grants awaiting their record (NFR-15) | `FileDeletionOverdue`, `FileDeletionLagging`, `LifecycleJobNotRunning`, `UnarchivedGrants` (`lifecycle.rules.yaml`) |
 | Metadata purge (NFR-9) | `MetadataPurgeBlocked`, `MetadataPurgeBehind`, `MetadataPurgeNotRunning` |
 | The synthetic probe (NFR-1) | `SyntheticProbeFailing`, `SyntheticProbeStale`; the `probe-failing` alarm once the probe runs |
-| Keyring refresh (encryption 6.4) | `KeyringRefreshFailing`. "A keyring's active key older than its period plus 7 days" (encryption 6) is pending a metric. |
-| KMS: key policy, disable, deletion and grant changes, the key-admin role, use of a key pending deletion (encryption 4.4, 8.3; T-61) | Pending: EventBridge rules on CloudTrail, like the break-glass role's |
-| People: BreakGlass and Admin sign-ins, the emergency user, root sign-in, exec into application pods (authn-authz 8.3, 8.4; T-64, T-74) | Pending: EventBridge rules and an EKS audit log metric filter |
-| Security services turned off (T-75), the cluster endpoint opened (ADR-0021) | Pending: EventBridge rules |
+| Keyring refresh and rotation (encryption 6.4, 6.5) | `KeyringRefreshFailing`; `KeyringKeyTooOld`, a keyring's active key older than its period plus 7 days (#260) |
+| KMS: key policy, disable, deletion and grant changes, the key-admin role (encryption 4.4, 8.3; T-61) | EventBridge: `kms-key-changed`, `kms-key-destroyed` (prod), `key-admin-used` ([`infra/modules/alarms/security-events.tf`](../../infra/modules/alarms/security-events.tf), #256). Use of a key pending deletion: pending a rule on its refused calls |
+| People: BreakGlass and Admin sign-ins, the emergency user, root sign-in (authn-authz 8.3, 8.4; T-64, T-74) | EventBridge: `human-sign-in`, with us-east-1 forwarding (#256). Exec into application pods: pending an EKS audit log metric filter |
+| Security services turned off (T-75), the cluster endpoint opened (ADR-0021) | EventBridge: `security-service-off`, `alerting-or-endpoint-changed` (#256) |
 | CloudFront's 5xx rate, in us-east-1 (architecture 5.5) | Pending: an alarm beside the region-health ones |
-| ClamAV signatures over 24 hours old (T-27) | Pending a metric |
+| ClamAV signatures over 24 hours old (T-27) | `ClamavSignaturesStale` (#260) |
 | Valkey near its size limit ([valkey](../../infra/modules/valkey/README.md)) | Pending: an `ElastiCache BytesUsedForCache` alarm |
 | Argo CD sync and health (architecture 6) | `ArgoCdApplicationUnhealthy` |
 | Kyverno background report violations (ADR-0007) | Pending: Kyverno's policy report metric, once the observability stack scrapes it |
-| The retained stack's EventBridge rules and NFR-19 budget (encryption 8.4) | The DR track (#254, `infra/environments/prod/retained`) |
-
-The security EventBridge rules are the largest gap. They need no new metric, only rules, an alert topic per Region and
-their runbooks, and they are the next issue after M7's alerting.
+| The retained stack's EventBridge rules and NFR-19 budget (encryption 8.4) | [`infra/environments/prod/retained/alerts.tf`](../../infra/environments/prod/retained/alerts.tf) (#263) |
+| Any SCP change (encryption 8.4, ADR-0006) | EventBridge in the management account's us-east-1: `sft-management-scp-changed`, to the maintainer's addresses ([`infra/organization/scp-alerts.tf`](../../infra/organization/scp-alerts.tf), #277) |
 
 ## 7. Checks
 
 - `deploy/alerts/test.sh`: `promtool check rules` and `promtool test rules` on every rule file, with a test case that
   fires each rule; `amtool check-config` and route tests on `alertmanager.yaml`.
 - `deploy/tests/test_runbooks.py`: every alert and every CloudWatch alarm names a runbook that exists, every alert has
-  a page or ticket severity and a firing test, and the runbook index lists them; it plants an alert and an alarm
-  without a runbook to show that it fails.
+  a page or ticket severity and a firing test, and the runbook index lists them; so do the EventBridge alerts' messages
+  (#277); it plants an alert and an alarm without a runbook to show that it fails.
 - `infra/scripts/check.sh`: fmt, validate, tflint, Trivy and the `alarms` module's tests.
 - Pending the AWS run: each alarm's metric and dimensions against real resources, Alertmanager's SNS calls through the
   egress proxy, the heartbeat alarm's behaviour when the stack stops, the probe's metric in the promotion gate, and

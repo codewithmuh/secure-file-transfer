@@ -12,6 +12,10 @@
 #   failback         Osaka: pilotLight true (fenced). Tokyo: pilotLight false, failover.holdWorkers true.
 #   hold-tokyo       Tokyo: failover.holdWorkers true (a point-in-time restore holds the workers while it runs).
 #   release-tokyo    Tokyo: failover.holdWorkers false.
+#   surviving-osaka  Osaka: auditArchive.survivingRegionOnly "ap-northeast-3" (a failover: the API's security-critical
+#                    records and the archive job write Osaka's archive alone while Tokyo's can't be reached, #257).
+#   both-regions     Osaka: auditArchive.survivingRegionOnly "" (a failback: both archives again; the archive job
+#                    back-fills Tokyo with what Osaka alone holds, #257).
 #   show             print both files' toggles.
 #
 # Without --write it prints the change as a diff and writes nothing. It only edits files under deploy/environments/;
@@ -19,14 +23,15 @@
 # one commit, and Argo CD applies it in both clusters (deploy/README.md, "Nobody syncs or changes an Application by
 # hand").
 #
-# The chart reads failover.holdWorkers (deploy/charts/sft/values.yaml); a values file without the block gets it
-# appended. Only the lines `pilotLight: <bool>` and `  holdWorkers: <bool>` under `failover:` are touched.
+# The chart reads failover.holdWorkers and auditArchive.survivingRegionOnly (deploy/charts/sft/values.yaml); a values
+# file without a block gets it appended. Only the lines `pilotLight: <bool>`, `  holdWorkers: <bool>` under
+# `failover:` and `  survivingRegionOnly: "<region>"` under `auditArchive:` are touched.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 usage() {
-  sed -n '5,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '5,22p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 change="${1:-}"
@@ -43,6 +48,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ "$env_name" =~ ^(dev|staging|prod)$ ]] || { echo "error: --env must be dev, staging or prod" >&2; exit 2; }
+OSAKA_REGION=ap-northeast-3
 if [[ "$env_name" == dev && ! "$change" =~ ^(hold-tokyo|release-tokyo|show)$ ]]; then
   echo "error: dev has no Osaka: only hold-tokyo, release-tokyo and show apply there" >&2
   exit 2
@@ -77,6 +83,25 @@ set_hold_workers() {
   fi
 }
 
+# set_surviving <file> <region|none>: `survivingRegionOnly:` inside the top-level `auditArchive:` block (#257, the
+# chart's AUDIT_ARCHIVE_SURVIVING_REGION), the block or the line added if missing. "none" writes "", both regions.
+set_surviving() {
+  local file="$1" value="$2" haskey
+  [[ "$value" != none ]] || value=""
+  haskey="$(awk '/^[^ #]/ { b = ($0 ~ /^auditArchive:/) } b && /^  survivingRegionOnly:/ { print 1; exit }' "$file")"
+  if grep -Eq '^auditArchive:' "$file"; then
+    awk -v value="$value" -v haskey="${haskey:-0}" '
+      /^[^ #]/ { inblock = ($0 ~ /^auditArchive:/) }
+      inblock && /^  survivingRegionOnly:/ { print "  survivingRegionOnly: \"" value "\""; next }
+      { print }
+      /^auditArchive:/ && haskey != 1 { print "  survivingRegionOnly: \"" value "\"" }
+    ' "$file"
+  else
+    cat "$file"
+    printf '\n# The audit archive while a region is lost (docs/runbooks/regional-failover.md), set by ops/failover-values.sh.\nauditArchive:\n  survivingRegionOnly: "%s"\n' "$value"
+  fi
+}
+
 # apply <file> <filter...>: run the filters over the file, then show or write the result.
 apply() {
   local file="$1"
@@ -102,9 +127,11 @@ apply() {
 }
 
 show() {
-  local file="$1" hold
+  local file="$1" hold surviving
   hold="$(awk '/^[^ #]/ { b = ($0 ~ /^failover:/) } b && /^  holdWorkers:/ { print $2 }' "$file" | head -1)"
-  printf '%s: %s; holdWorkers: %s\n' "${file#"$root"/}" "$(grep -E '^pilotLight:' "$file" | head -1)" "${hold:-absent (false)}"
+  surviving="$(awk '/^[^ #]/ { b = ($0 ~ /^auditArchive:/) } b && /^  survivingRegionOnly:/ { print $2 }' "$file" | head -1)"
+  printf '%s: %s; holdWorkers: %s; survivingRegionOnly: %s\n' "${file#"$root"/}" \
+    "$(grep -E '^pilotLight:' "$file" | head -1)" "${hold:-absent (false)}" "${surviving:-absent (\"\")}"
 }
 
 case "$change" in
@@ -120,6 +147,8 @@ case "$change" in
     ;;
   hold-tokyo) apply "$tokyo" set_hold_workers true ;;
   release-tokyo) apply "$tokyo" set_hold_workers false ;;
+  surviving-osaka) apply "$osaka" set_surviving "$OSAKA_REGION" ;;
+  both-regions) apply "$osaka" set_surviving none ;;
   show)
     show "$tokyo"
     [[ "$env_name" == dev ]] || show "$osaka"

@@ -100,3 +100,34 @@ tests:
             exp_annotations:
               summary: The audit partition step has never reported its metrics (data model 6).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+  # #255, NFR-9: an expired month still there after two daily runs opens a ticket; one the next run dropped doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'sft_audit_expired_partitions{job="audit-partitions"}'
+        values: '1x1800'
+      - series: 'sft_audit_partition_last_success_timestamp_seconds{job="audit-partitions"}'
+        values: '0+60x1800'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: AuditPartitions
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: AuditPartitions
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              condition: expired_present
+            exp_annotations:
+              summary: An audit partition past the 365-day retention hasn't been dropped for a day (NFR-9).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+  - interval: 1m
+    input_series:
+      - series: 'sft_audit_expired_partitions{job="audit-partitions"}'
+        values: '1x1380 0x600'
+      - series: 'sft_audit_partition_last_success_timestamp_seconds{job="audit-partitions"}'
+        values: '0+60x1980'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: AuditPartitions
+        exp_alerts: []

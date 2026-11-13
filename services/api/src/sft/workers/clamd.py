@@ -15,6 +15,9 @@ is `ClamdError`: a failed attempt, retried, and `scan_failed` on the last (FR-19
 clamd may answer and close before it has read the whole stream (a stream over its limit); the
 worker then stops sending and reads the answer clamd sent before it closed, as the inspector
 client does (`sft.dlp.client`).
+
+The worker also asks clamd's `VERSION` every few minutes, for the age of the signatures it scans
+with (`signatures_built`, #260): the alert fires when they are a day old (threat model T-27).
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ import contextlib
 import struct
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Final
 
@@ -114,3 +118,44 @@ async def instream(
         writer.close()
         with contextlib.suppress(OSError, ConnectionError):
             await writer.wait_closed()
+
+
+# ---- the signatures' age (#260; threat model T-27) ----
+
+_VERSION_DATE: Final = "%a %b %d %H:%M:%S %Y"
+
+
+def parse_version(raw: bytes) -> datetime:
+    """When the signature database clamd loaded was built, from its `VERSION` answer:
+
+        ClamAV 1.5.4/27820/Sun Nov  8 09:24:12 2026
+
+    The time is the daily database's build time, as clamd prints it in its own time zone, which is
+    UTC in its container. `ClamdError` for any other answer."""
+    text = raw.rstrip(b"\0").decode("utf-8", "replace").strip()
+    parts = text.split("/", 2)
+    if len(parts) != 3 or not parts[0].startswith("ClamAV "):
+        raise ClamdError("clamd's VERSION answer names no signature database")
+    try:
+        built = datetime.strptime(" ".join(parts[2].split()), _VERSION_DATE)
+    except ValueError as exc:
+        raise ClamdError("clamd's VERSION answer has no database time") from exc
+    return built.replace(tzinfo=UTC)
+
+
+async def signatures_built(host: str, port: int) -> datetime:
+    """Ask clamd which signature database it runs: its build time (`parse_version`). The caller
+    bounds the call in time."""
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        try:
+            writer.write(b"zVERSION\0")
+            await writer.drain()
+            raw = await reader.readuntil(b"\0")
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError, ConnectionError):
+                await writer.wait_closed()
+    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+        raise ClamdError(f"clamd's VERSION failed: {type(exc).__name__}") from exc
+    return parse_version(raw[:MAX_ANSWER])

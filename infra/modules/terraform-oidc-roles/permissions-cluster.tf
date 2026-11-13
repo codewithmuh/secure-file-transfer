@@ -20,23 +20,22 @@ locals {
   # sft-<env>, from the plan role's name (the conventions module's bootstrap_role_names).
   cluster_env_prefix = trimsuffix(var.plan_role_name, "-terraform-plan")
 
-  # The roles modules/eks-cluster creates, by name (its locals.role_names).
-  cluster_role_names = [
-    for r in [
-      "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
-      "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
-      "external-secrets-platform", "external-secrets-app", "key-rotation", "synthetic-probe",
-    ] : "${local.cluster_env_prefix}-${r}"
-  ]
-  cluster_role_arns = [for n in local.cluster_role_names : "arn:aws:iam::${var.account_id}:role/${n}"]
+  # The roles modules/eks-cluster creates, from their one list (modules/conventions, workload_roles.cluster, #172).
+  cluster_role_names = [for r in var.conventions.workload_roles.cluster : var.conventions.workload_role_names[r]]
+  cluster_role_arns  = [for n in local.cluster_role_names : "arn:aws:iam::${var.account_id}:role/${n}"]
 
   cluster_boundary_name = "${local.cluster_env_prefix}-workload-boundary"
   cluster_boundary_arn  = "arn:aws:iam::${var.account_id}:policy${var.iam_path}${local.cluster_boundary_name}"
 
-  # The External Secrets stores' roles: the one thing a cluster-layer role may assume (encryption 6.4).
+  # The External Secrets stores' roles: the one thing a cluster-layer role may assume (encryption 6.4); and the
+  # management account's read-only role for the operator API's break-glass reconciliation (#239), by name.
   cluster_secret_store_role_arns = [
     for r in ["external-secrets-platform", "external-secrets-app"] : "arn:aws:iam::${var.account_id}:role/${local.cluster_env_prefix}-${r}"
   ]
+  cluster_assumable_role_arns = concat(
+    local.cluster_secret_store_role_arns,
+    ["arn:aws:iam::*:role/${local.cluster_env_prefix}-break-glass-trail"],
+  )
 
   cluster_managed_policy_arns = [
     "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy",
@@ -334,14 +333,15 @@ data "aws_iam_policy_document" "workload_boundary" {
   count = local.cluster_enabled ? 1 : 0
 
   # The services the cluster, its nodes, its controllers and its workloads use (architecture 3.1, ADR-0004),
-  # cloudwatch:PutMetricData for the synthetic probe's result (#248), and sns:Publish for the data layer's EventBridge
-  # delivery role, which carries this boundary too: no IAM change, no sts:AssumeRole but into the secret stores' roles,
-  # no Organizations, CloudTrail, Config or GuardDuty.
+  # cloudwatch:PutMetricData for the synthetic probe's result (#248), and sns:Publish and events:PutEvents for the data
+  # layer's EventBridge delivery role, which carries this boundary too and forwards global events to our Regions'
+  # default buses (#256): no IAM change, no sts:AssumeRole but into the secret stores' roles, no Organizations,
+  # CloudTrail, Config or GuardDuty.
   statement {
     sid = "WorkloadServices"
     actions = [
       "autoscaling:*", "cloudwatch:PutMetricData", "cognito-idp:*", "ec2:*", "ec2messages:*", "ecr:*", "eks:*",
-      "eks-auth:*", "elasticache:Connect", "elasticloadbalancing:*", "kms:*", "rds-db:connect", "secretsmanager:*",
+      "eks-auth:*", "elasticache:Connect", "elasticloadbalancing:*", "events:PutEvents", "kms:*", "rds-db:connect", "secretsmanager:*",
       "ses:*", "sns:Publish", "sqs:*", "ssm:GetParameter", "ssm:UpdateInstanceInformation", "ssmmessages:*",
       # S3 by action: only the object and listing calls the workloads make (architecture 3.1), never a bucket
       # setting, policy or ACL.
@@ -375,18 +375,19 @@ data "aws_iam_policy_document" "workload_boundary" {
   }
 
   # External Secrets assumes its stores' roles, each of which reads only its own secrets (encryption 6.4). Each store
-  # role trusts only the controller's role, and only the controller's own policy asks for this.
+  # role trusts only the controller's role, and only the controller's own policy asks for this. The operator API
+  # assumes the management account's break-glass trail reader (#239), which trusts only that role.
   statement {
     sid       = "AssumeOnlySecretStoreRoles"
     actions   = ["sts:AssumeRole"]
-    resources = local.cluster_secret_store_role_arns
+    resources = local.cluster_assumable_role_arns
   }
 
   statement {
     sid           = "NeverAssumeAnyOtherRole"
     effect        = "Deny"
     actions       = ["sts:AssumeRole"]
-    not_resources = local.cluster_secret_store_role_arns
+    not_resources = local.cluster_assumable_role_arns
   }
 
   # Changing IAM is not something any workload does, even if a policy above ever allowed it.

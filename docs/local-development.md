@@ -81,7 +81,8 @@ over all of them.
 | Valkey | `sft-local` / `local-only-valkey-password` |
 | OIDC client | `sft-api-local` / `local-only-oidc-client-secret`, callback `http://localhost:8000/v1/auth/callback` |
 | Test member | `dev.member@example.com` / `local-only-member-password`. User ID (`cognito:username`) `22222222-2222-4222-8222-222222222222`, tenant (`custom:tenant_id`) `11111111-1111-4111-8111-111111111111`, subject (`sub`) `33333333-3333-4333-8333-333333333333`. `make seed` writes this user and its identity (section 7). |
-| Test admin | `dev.admin@example.com` / `local-only-admin-password`. User ID `44444444-4444-4444-8444-444444444444`, the same tenant, subject `55555555-5555-4555-8555-555555555555`. `make seed` writes it too. |
+| Test admin | `dev.admin@example.com` / `local-only-admin-password`. User ID `44444444-4444-4444-8444-444444444444`, the same tenant, subject `55555555-5555-4555-8555-555555555555`. `make seed` writes it too, as a DLP approver (#223). |
+| Test approver | `dev.approver@example.com` / `local-only-approver-password`: a member who is a DLP approver (#223). User ID `12121212-1212-4212-8212-121212121212`, the same tenant, subject `13131313-1313-4313-8313-131313131313`. `make seed` writes it too. |
 | Notification worker's pool client | `sft-notify-local` / `local-only-notify-pool-secret`: a Keycloak client whose service account may only manage the realm's users (#197) |
 | Keycloak admin console | `admin` / `local-only-admin` at <http://localhost:8180/admin> |
 | SSO members (#231) | `sso.member@corp.localhost` / `local-only-sso-member-password` (group `staff`) and `sso.admin@corp.localhost` / `local-only-sso-admin-password` (group `sft-admins`, which the seed maps to `admin`), in Keycloak's `customer` realm, the local tenant's own identity provider. Choose "Continue with SSO" with that address; the first sign-in creates the member. |
@@ -294,13 +295,17 @@ expiry, signature checks and CORS.
 | Cognito | **Keycloak 26.8.1**: Apache-2.0, a CNCF project, released monthly | The only candidate with real users and passwords, an enforced confidential client with PKCE S256, `prompt=login`, token revocation and per-user claims that mimic Cognito's. It costs about 700 MB of memory and 20 s to start. | **Dex 2.46** (Apache-2.0) is small, but its static users have only an email, a name, groups and an ID, so it can't issue `custom:tenant_id` or `token_use`; claim mapping with CEL is still a 2026 enhancement proposal. **mock-oauth2-server 6.1** (MIT) is light, but its login page takes any username with no password and lets the caller add claims, so there is no seeded member to sign in as. |
 | PostgreSQL | **The official PostgreSQL 17 image** | The major version Aurora runs (ADR-0011); the Debian variant uses glibc collations, like most servers | — |
 
-## 7. Seed, lifecycle jobs and the M2 journey
+## 7. Seed, lifecycle jobs and the journeys
 
-**The seed** (#182). `make seed` runs [`local/seed.py`](../local/seed.py) against the stack's database, as `sft`. It
-writes the `local-keycloak` connection in `idp_connections` (the pool's row, with no tenant), the tenant
-`Local Example Co` with its policy, and the test admin and member of section 3, each with a `user_identities` row
-bound to its Keycloak subject, so both sign in through Keycloak as members do through Cognito. Every row has a fixed
-ID and is written with `ON CONFLICT DO NOTHING`: run it twice and nothing changes. `--suppress ADDRESS` adds a
+**The seed** (#182, #223). `make seed` runs [`local/seed.py`](../local/seed.py) against the stack's database, as
+`sft`. It writes the `local-keycloak` connection in `idp_connections` (the pool's row, with no tenant), the tenant
+`Local Example Co` with its policy and its default DLP policy, and the test admin, member and approver of section 3,
+each with a `user_identities` row bound to its Keycloak subject, so all sign in through Keycloak as members do through
+Cognito. The admin and the approver are DLP approvers, and the DLP policy trusts `partner.example` (#223): a rule that
+requires one approval needs more active approvers than that, the member who sends isn't one, and the journeys send to
+`partner.example` as the trusted partner. The trusted domain is written only while the policy trusts none, so an
+admin's later change stays. Every row has a fixed ID and is written with `ON CONFLICT DO NOTHING`: run it twice and
+nothing changes. A database seeded before #223 has no approver: `make reset`, `make up` and `make seed` again. `--suppress ADDRESS` adds a
 suppression for that address in the tenant (#174), to show `422 recipient_undeliverable`. It refuses any database but
 the local stack's (the loopback address, the `sft` database, the stack's roles and schema), and it prints the sign-in
 details:
@@ -348,6 +353,33 @@ it sends part URLs, which name `localhost:9090` (section 4), to `127.0.0.1:9090`
 database until an audit search operation exists. It is skipped unless `SFT_E2E=1` (`make e2e` sets it), so `make test`
 never starts it. CI's Local stack job runs `make seed` and `make e2e` after the smoke checks, on every pull request.
 
+**The M5 journey** (#223, [`services/api/tests/test_journey_m5.py`](../services/api/tests/test_journey_m5.py)) is
+M5's exit criterion as one test, run by `make e2e` after the M2 journey and the probe, the same way: only the public
+API, Mailpit's, S3's, the job commands and the clock's hook. The member, the admin and the approver sign in through
+Keycloak, and:
+
+1. the admin adds two rules: My Numbers to an untrusted recipient require approval, credentials and private keys block;
+2. the member creates an upload request; the uploader verifies with the code from Mailpit and uploads two files in
+   parts, one resumed after `listSessionUploadedParts`, one EICAR;
+3. the member sees one file `clean` and one `infected` and not shareable, and downloads the clean one;
+4. transfer 1, a spreadsheet with a synthetic My Number to `partner.example`, is warned; the member confirms and the
+   recipient verifies and downloads;
+5. transfer 2, the same file to an untrusted domain, needs approval: the member asks with a reason, the approvers are
+   emailed and the recipient isn't, the member can't approve it, and the approver approves after a fresh sign-in (the
+   step-up of authn and authz 3.3); then the recipient is emailed;
+6. transfer 3, a note with a synthetic private key, is `held` with `dlp_blocked` and the rule named; no recipient is
+   emailed;
+7. an API key with `transfers:write` and `audit:read` sends a transfer with no findings;
+8. the admin's audit search finds `dlp_approval.approved` by the approver; the key exports the log as CSV, which holds
+   the decisions of the four transfers, the confirmations, the approval, the hold and the upload-request events, and no
+   link token or code; the admins get the key's first-export email;
+9. both sides get the notice of the blocked file (sent 5 minutes after the files settle, so it is checked last), the
+   uploader's without a file name; the deletion job, with the clock moved a day past the file's retention, deletes the
+   received file and every copy of it.
+
+It deletes its rules at the end, so the browser flows after it see the default policy. A failure names its step. Its
+browser twin is section 8's M5 journey.
+
 ## 8. The web app and how to test locally
 
 **The `web` service** (#195) serves the production bundle the way CloudFront does in AWS ([ADR-0008](adr/0008-web-app-s3-cloudfront.md),
@@ -374,7 +406,7 @@ origin's doesn't).
 (`web/public/config.json`) and `WEB_ORIGIN` doesn't change. Vite injects inline scripts, so the CSP is checked only on
 the compose build. `make up` starts the built app again.
 
-**Browser flows** (`make web-e2e`, #195 to #200): Playwright, in the image pinned in the Makefile, against the running,
+**Browser flows** (`make web-e2e`, #195 to #200, #223, #267): Playwright, in the image pinned in the Makefile, against the running,
 seeded stack, so no browser is installed on the host. The browser must see `localhost:3000`, `:8000`, `:8180`,
 `:8025` and `:9090` exactly as a person does. On Linux (CI) the container shares the host's network. Docker Desktop
 (macOS) has no host networking by default, so there `web/e2e/support/forward.mjs` listens on those ports inside the
@@ -382,6 +414,11 @@ container and forwards them to `host.docker.internal`, which reaches the stack's
 sees `localhost`. CI's Local stack job runs it after `make e2e`. It includes the M3 journey (#200) in English and
 Japanese, which runs the expiry and deletion jobs with the clock moved on: the container has no Docker, so
 `local/e2e-jobs.sh` runs them on the host while `make web-e2e` runs, answering request files in a temporary folder.
+The M5 journey (#223, `web/e2e/m5-journey.e2e.ts`), in English and Japanese, is the API journey's twin through the
+pages, each person in their own browser: the admin's rules, the uploader on `/u` and the member's download on the
+request's page, the three DLP outcomes with the approver deciding from `/approvals` after "Confirm it's you" in a popup,
+the admin's audit search and export, and the blocked-file notices; axe runs on every page it visits. The NFR-3 upload
+resume (#267, `web/e2e/upload-resume.e2e.ts`) runs in it too: docs/operations/performance.md, section 3.
 Traces, screenshots and the HTML report land in `web/test-results/`. `E2E_ARGS='--project ja'` runs the Japanese
 journey alone. The lockout test's 20 wrong codes count against the per-IP quota of 30 failed codes an hour
 (abuse-and-rate-limits 2.2 A), so run the whole suite at most once an hour, or `make down && make up` first: Valkey
@@ -402,6 +439,7 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
 |---|---|---|
 | Member | `dev.member@example.com` / `local-only-member-password` | http://localhost:3000 |
 | Admin | `dev.admin@example.com` / `local-only-admin-password` | http://localhost:3000 |
+| Approver | `dev.approver@example.com` / `local-only-approver-password`: decides DLP approvals ("Approvals") | http://localhost:3000 |
 | Recipient | no sign-in: the link and the code arrive in Mailpit | http://localhost:8025 |
 | Uploader | no sign-in: the upload link and the code arrive in Mailpit | http://localhost:8025 |
 | Keycloak console | `admin` / `local-only-admin` | http://localhost:8180/admin |
@@ -446,6 +484,7 @@ Open **http://localhost:3000** (always `localhost`, never `127.0.0.1`).
    `CLOCK_OFFSET_SECONDS=7200 make jobs JOB=expiry`. Its link then shows "This link has expired", and the member's
    list shows it `Expired`.
 7. **Automated.** `make web-a11y` (axe on every page, dialog and link state, no backend), then `make web-e2e` (every
-   browser flow and the M3 journey in both languages, against the seeded stack).
+   browser flow, and the M3 and M5 journeys in both languages, against the seeded stack).
 
-Not available locally yet: SSO, passkeys and step-up prompts beyond "Sign in again" (M6).
+Not available locally: passkeys and MFA (section 4, member sign-in). SSO ("Continue with SSO", #231) and the step-up's
+"Confirm it's you" popup (#232) work against the stack's Keycloak.

@@ -59,8 +59,8 @@ web-check: ## Web app: clean install, type check, lint, tests, build and generat
 # is mounted read-only and copied, without node_modules, dist and test-results, to a path inside the container, so the
 # run writes nothing to the host: no root-owned files on a Linux host, and the host's node_modules is untouched.
 # PLAYWRIGHT_VERSION must equal @playwright/test in web/package.json: the target checks that first.
-PLAYWRIGHT_VERSION := 1.64.0
-PLAYWRIGHT_IMAGE := mcr.microsoft.com/playwright:v$(PLAYWRIGHT_VERSION)-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
+PLAYWRIGHT_VERSION := 1.64.1
+PLAYWRIGHT_IMAGE := mcr.microsoft.com/playwright:v$(PLAYWRIGHT_VERSION)-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
 .PHONY: web-a11y
 web-a11y: ## Web app: axe accessibility checks on every page, in English and Japanese (needs Docker)
 	docker run --rm --init --ipc=host --volume "$(CURDIR)/web:/src/web:ro" --workdir /web \
@@ -70,9 +70,9 @@ web-a11y: ## Web app: axe accessibility checks on every page, in English and Jap
 	    && test "$$(npx playwright --version)" = "Version $(PLAYWRIGHT_VERSION)" \
 	    && npm run build && npx playwright test'
 
-# Browser flows against the running stack (#195 to #200; after `make up` and `make seed`), in the same pinned
-# Playwright image, so no browser is installed on the host: #200's M3 journey in English and Japanese, and the other
-# flows in English. The browser must see the stack as a person does, at http://localhost:3000, :8000, :8180, :8025 and
+# Browser flows against the running stack (#195 to #200, #223, #267; after `make up` and `make seed`), in the same
+# pinned Playwright image, so no browser is installed on the host: the M3 and M5 journeys (#200, #223) and the DLP flows
+# in English and Japanese, and the other flows, the NFR-3 upload resume (#267) among them, in English. The browser must see the stack as a person does, at http://localhost:3000, :8000, :8180, :8025 and
 # :9090. On Linux (CI) the container shares the host's network. Docker Desktop (macOS) has no host networking by
 # default, so there web/e2e/support/forward.mjs listens on those ports inside the container and forwards them to
 # host.docker.internal, where the stack's 127.0.0.1 ports are. The journey runs the lifecycle jobs with the clock moved
@@ -88,7 +88,7 @@ E2E_NETWORK :=
 E2E_FORWARD := (node e2e/support/forward.mjs &) && sleep 1
 endif
 .PHONY: web-e2e
-web-e2e: ## Web app: browser flows and the M3 journey against the running local stack (needs make up and make seed, and Docker)
+web-e2e: ## Web app: browser flows and the M3 and M5 journeys against the running local stack (needs make up and make seed, and Docker)
 	@mkdir -p web/test-results
 	@jobs="$$(mktemp -d)"; runner=""; \
 	trap '[[ -z "$$runner" ]] || kill "$$runner" 2>/dev/null; rm -rf "$$jobs"' EXIT; \
@@ -96,7 +96,7 @@ web-e2e: ## Web app: browser flows and the M3 journey against the running local 
 	docker run --rm --init --ipc=host $(E2E_NETWORK) --volume "$(CURDIR)/web:/src/web:ro" \
 	  --volume "$$jobs:/jobs" --env E2E_JOBS_DIR=/jobs --volume "$(CURDIR)/web/test-results:/out" \
 	  --env HOST_IDS="$$(id -u):$$(id -g)" --workdir /web \
-	  --env E2E_UPLOAD_RESUME --env E2E_UPLOAD_MIB --env E2E_UPLOAD_MBITS --env E2E_UPLOAD_OUTAGE_SECONDS \
+	  --env E2E_UPLOAD_MIB --env E2E_UPLOAD_MBITS --env E2E_UPLOAD_OUTAGE_SECONDS \
 	  $(PLAYWRIGHT_IMAGE) bash -euo pipefail -c 'tar -C /src/web --exclude=./node_modules --exclude=./dist \
 	    --exclude=./test-results -cf - . | tar -xf - \
 	    && npm ci --ignore-scripts \
@@ -170,10 +170,13 @@ STEP ?= backfill
 field-keys: ## Run one field key job step against the local stack: make field-keys STEP=backfill (after make up)
 	docker compose --profile jobs run --build --rm --no-deps field-keys $(STEP)
 
-# The M2 journey test (#182) against `make up` and `make seed`: one test, steps 1 to 9 of the M2 exit
-# criterion, through the public API, Mailpit's API, S3's API, the job commands and the clock hook.
-e2e: ## The end-to-end journey test and the synthetic probe against the local stack (after make up and make seed)
-	cd $(PY) && SFT_E2E=1 uv run pytest -m e2e --no-cov -p no:cacheprovider tests/test_journey.py tests/test_probe_local.py
+# The journey tests against `make up` and `make seed`, through the public API, Mailpit's API, S3's API, the job
+# commands and the clock hook: M2's (#182, steps 1 to 9 of its exit criterion), the synthetic probe, then M5's (#223:
+# the upload request, the three DLP outcomes, an API key, audit search and export). In that order: M5's waits about
+# five minutes for the upload request's notices, and its rules are gone again when it ends.
+e2e: ## The M2 and M5 journey tests and the synthetic probe against the local stack (after make up and make seed)
+	cd $(PY) && SFT_E2E=1 uv run pytest -m e2e --no-cov -p no:cacheprovider tests/test_journey.py tests/test_probe_local.py \
+	  tests/test_journey_m5.py
 
 logs: ## Follow logs of all services
 	docker compose logs --follow

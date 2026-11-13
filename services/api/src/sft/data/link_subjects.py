@@ -17,8 +17,8 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sft.core.tokens import token_hash
 from sft.data.access import require_scope
-from sft.data.recipients import token_hash
 from sft.data.scope import ScopeKind, Subject
 
 

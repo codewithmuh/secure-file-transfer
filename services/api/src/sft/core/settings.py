@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from pydantic import (
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -100,9 +101,48 @@ def _iam_valkey(url: SecretStr) -> None:
         raise ValueError("with VALKEY_IAM_CACHE, VALKEY_URL names its user and no password")
 
 
+# The audit archive's surviving-region mode (#257): the region left after a regional loss, which
+# the failover runbook names in the chart (`auditArchive.survivingRegionOnly`). The API, the
+# lifecycle jobs and the archive job then write that region's archive alone.
+ArchiveRegion = Literal["ap-northeast-1", "ap-northeast-3"]
+_SURVIVING_REGION = (
+    "The region whose audit archive alone takes writes during a regional loss (#257): set by the "
+    "failover runbook through the chart's `auditArchive.survivingRegionOnly`, cleared at "
+    "failback, when the archive job back-fills the other. Unset: both regions."
+)
+
+
+def _surviving_region(region: str | None, osaka_bucket: str | None) -> None:
+    # Only an environment with both regions can lose one; dev has Tokyo alone (architecture 3.3).
+    if region is not None and osaka_bucket is None:
+        raise ValueError(
+            "AUDIT_ARCHIVE_SURVIVING_REGION needs AUDIT_ARCHIVE_OSAKA_BUCKET: only an environment "
+            "with both regions' archive can lose one"
+        )
+
+
 _CACHE_NAME = r"^[a-z][a-z0-9-]{0,39}$"
 # A keyring setting holds the keyring, or `secretsmanager:<id>` (sft.core.keyrings).
 _KEYRING_SETTING = "a JSON list of keys with `id`, `state` and base64 `key`, or secretsmanager:<id>"
+
+
+# Read when the settings load, so a bad keyring stops the process at startup; the message holds no
+# key. A secret it names is read, and checked the same way, when the process starts. The API and
+# the notification worker read the same two keyrings, so each rule is written once, here (#192).
+def _email_keyring(value: SecretStr) -> SecretStr:
+    check_keyring_setting(
+        value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
+    )
+    return value
+
+
+def _code_keyring(value: SecretStr) -> SecretStr:
+    check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
+    return value
+
+
+EmailKeyringSetting = Annotated[SecretStr, AfterValidator(_email_keyring)]
+CodeKeyringSetting = Annotated[SecretStr, AfterValidator(_code_keyring)]
 
 
 # The fields key (#236, encryption and keys 3.2, 4.1): its alias or ARN, or `local` for the
@@ -335,7 +375,7 @@ class Settings(ServerSettings, ClockSettings):
         description="K_csrf, the keyring CSRF tokens are derived with (sft/{env}/app/csrf-hmac, "
         f"encryption and keys 6.5): {_KEYRING_SETTING}, read again every 5 minutes.",
     )
-    email_hmac_keyring: SecretStr = Field(
+    email_hmac_keyring: EmailKeyringSetting = Field(
         description="The keyring of email pseudonyms (sft/{env}/app/email-hmac, encryption and "
         "keys 6.2): what per-address rate limits count under, so the counters never hold an "
         "address. Like CSRF_KEYRING, with `activated_at` on the active key.",
@@ -403,7 +443,7 @@ class Settings(ServerSettings, ClockSettings):
         "endpoint, through the cross-region S3 endpoint (ADR-0021).",
     )
     # Verification codes (#179, data model 2.4): the API checks what the notification worker made.
-    code_hmac_keyring: SecretStr = Field(
+    code_hmac_keyring: CodeKeyringSetting = Field(
         description="K_code, the keyring of verification codes' HMACs (sft/{env}/app/code-hmac, "
         "encryption and keys 6.2): like CSRF_KEYRING.",
     )
@@ -501,20 +541,6 @@ class Settings(ServerSettings, ClockSettings):
         check_keyring_setting(value.get_secret_value(), name="CSRF", key_id=CSRF_KEY_ID)
         return value
 
-    @field_validator("email_hmac_keyring")
-    @classmethod
-    def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        check_keyring_setting(
-            value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
-        )
-        return value
-
-    @field_validator("code_hmac_keyring")
-    @classmethod
-    def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
-        return value
-
     @model_validator(mode="after")
     def _trusted_proxies_behind_the_load_balancer(self) -> Self:
         # #129: behind the load balancer with no trusted proxy, every client's address would be
@@ -525,6 +551,15 @@ class Settings(ServerSettings, ClockSettings):
                 "TRUSTED_PROXIES is required unless ENVIRONMENT=local or test: the load "
                 "balancer's subnets, so per-IP limits count clients, not the load balancer"
             )
+        return self
+
+    audit_archive_surviving_region: ArchiveRegion | None = Field(
+        default=None, description=_SURVIVING_REGION
+    )
+
+    @model_validator(mode="after")
+    def _surviving_archive_region(self) -> Self:
+        _surviving_region(self.audit_archive_surviving_region, self.audit_archive_osaka_bucket)
         return self
 
 
@@ -749,6 +784,15 @@ class JobSettings(ClockSettings):
             )
         return self
 
+    audit_archive_surviving_region: ArchiveRegion | None = Field(
+        default=None, description=_SURVIVING_REGION
+    )
+
+    @model_validator(mode="after")
+    def _surviving_archive_region(self) -> Self:
+        _surviving_region(self.audit_archive_surviving_region, self.audit_archive_osaka_bucket)
+        return self
+
 
 class ArchiveJobSettings(_Base):
     """The audit archive job's settings (#183; architecture 5.2, data model 2.5): its database
@@ -793,6 +837,15 @@ class ArchiveJobSettings(_Base):
             _iam_database(self.database_url, "DATABASE_URL")
         return self
 
+    audit_archive_surviving_region: ArchiveRegion | None = Field(
+        default=None, description=_SURVIVING_REGION
+    )
+
+    @model_validator(mode="after")
+    def _surviving_archive_region(self) -> Self:
+        _surviving_region(self.audit_archive_surviving_region, self.audit_archive_osaka_bucket)
+        return self
+
 
 class OperatorSettings(ServerSettings):
     """The operator API's settings (FR-34, authentication and authorization 8.2).
@@ -834,6 +887,98 @@ class OperatorSettings(ServerSettings):
         description="How often the operator API records expired and lapsed break-glass requests "
         "and refreshes the break-glass metrics.",
     )
+    # Break-glass records (#239, authn and authz 8.3): the reconciliation job reads the Identity
+    # Center assignments from the management account's CloudTrail through a read-only role there.
+    # Without the role it doesn't run (dev and the local stack).
+    break_glass_trail_role_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$",
+        description="The management account's role the reconciliation job assumes to read "
+        "CloudTrail and the identity store. Empty: no reconciliation.",
+    )
+    break_glass_permission_set_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:aws:sso:::permissionSet/ssoins-[0-9a-f]{16}/ps-[0-9a-f]{16}$",
+        description="The `BreakGlass` permission set, whose assignments to this account count.",
+    )
+    identity_store_id: str | None = Field(
+        default=None,
+        pattern=r"^d-[0-9a-f]{10}$",
+        description="Identity Center's identity store, for the requester's user name.",
+    )
+    identity_center_region: str = Field(
+        default="ap-northeast-1",
+        pattern=r"^[a-z]{2}(-[a-z]+)+-\d$",
+        description="Identity Center's home Region (ADR-0006), where its CloudTrail events are.",
+    )
+    break_glass_reconcile_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        le=3600,
+        description="How often the reconciliation job records missing break-glass grants.",
+    )
+    # The daily SSO drift check (#239, authn and authz 2.5): each tenant's recorded provider
+    # against both user pools. Without pools it doesn't run (the local stack).
+    sso_drift_pools: list[IdpClient] = Field(
+        default_factory=list,
+        description="JSON: each user pool and its app client, Tokyo's and in staging and prod "
+        "Osaka's, as [{region, user_pool_id, client_id}]. Empty: no drift check.",
+    )
+    sso_drift_check_seconds: float = Field(
+        default=86400.0,
+        gt=0,
+        le=86400,
+        description="How often the operator API compares the tenants' SSO providers with the "
+        "pools.",
+    )
+    # The audit archive (#239): `recoverTenantAdmin` is a security-critical record, in both
+    # regions' archive before the `202`, as the public API's are (architecture 5.2).
+    audit_archive_tokyo_bucket: str | None = Field(
+        default=None,
+        pattern=_BUCKET,
+        description="The audit archive bucket in Tokyo. Unset: `recoverTenantAdmin` takes effect "
+        "and answers 503, since its record can't reach the archive.",
+    )
+    audit_archive_osaka_bucket: str | None = Field(
+        default=None,
+        pattern=_BUCKET,
+        description="The audit archive bucket in Osaka. Unset only in an environment without "
+        "Osaka (dev).",
+    )
+    audit_archive_tokyo_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock.",
+    )
+    audit_archive_osaka_endpoint_url: str | None = Field(
+        default=None,
+        pattern=r"^https?://[^\s/]+(:\d+)?/?$",
+        description="Local only, for S3Mock's Osaka stand-in.",
+    )
+    # During a regional loss the operator's records go to the surviving region alone, as the
+    # public API's do (#257), so `recoverTenantAdmin` works in Osaka with Tokyo lost.
+    audit_archive_surviving_region: ArchiveRegion | None = Field(
+        default=None, description=_SURVIVING_REGION
+    )
+
+    @model_validator(mode="after")
+    def _surviving_archive_region(self) -> Self:
+        _surviving_region(self.audit_archive_surviving_region, self.audit_archive_osaka_bucket)
+        return self
+
+    @model_validator(mode="after")
+    def _the_trail_names_its_parts(self) -> Self:
+        parts = (
+            self.break_glass_trail_role_arn,
+            self.break_glass_permission_set_arn,
+            self.identity_store_id,
+        )
+        if any(parts) and not all(parts):
+            raise ValueError(
+                "BREAK_GLASS_TRAIL_ROLE_ARN, BREAK_GLASS_PERMISSION_SET_ARN and IDENTITY_STORE_ID "
+                "go together"
+            )
+        return self
 
     @property
     def operator_audience(self) -> str:
@@ -876,6 +1021,28 @@ class BootstrapSettings(_Base):
         description="True on Aurora: the login roles sign in with IAM database authentication. "
         "False locally, where they get passwords some other way. No default: choose.",
     )
+    # In AWS (#278): the master password is read from Secrets Manager by the job's own role, never
+    # handed to it through a Kubernetes Secret (encryption and keys 6.3).
+    bootstrap_master_secret: str | None = Field(
+        default=None,
+        pattern=r"^secretsmanager:[A-Za-z0-9/_+=.@-]{1,512}$",
+        description="`secretsmanager:<id>` of the master user's secret (`sft/<env>/db/master`, "
+        "JSON with `username` and `password`): the job reads the password once, in `AWS_REGION`, "
+        "and `BOOTSTRAP_DATABASE_URL` names the user and no password. Unset locally.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+
+    @model_validator(mode="after")
+    def _master_secret_alone(self) -> Self:
+        parts = urlsplit(self.bootstrap_database_url.get_secret_value())
+        if self.bootstrap_master_secret is not None and (
+            not parts.username or parts.password is not None
+        ):
+            raise ValueError(
+                "with BOOTSTRAP_MASTER_SECRET, BOOTSTRAP_DATABASE_URL names the master user and "
+                "no password"
+            )
+        return self
 
 
 # Email stays in Japan (NFR-21): Tokyo, and Osaka for failover (ADR-0015).
@@ -959,7 +1126,7 @@ class NotifySettings(WorkerSettings, MailSettings):
         description="The counter store, for the 100 link emails a day to one address across "
         "tenants (abuse 7.2). Unreachable, the cap counts in this pod (abuse 4.5).",
     )
-    email_hmac_keyring: SecretStr = Field(
+    email_hmac_keyring: EmailKeyringSetting = Field(
         description="The email-hmac keyring (sft/{env}/app/email-hmac): the suppression list's "
         "pseudonyms and the cap's key, like the API's.",
     )
@@ -967,18 +1134,10 @@ class NotifySettings(WorkerSettings, MailSettings):
         description="K_link (sft/{env}/app/link-hmac, data model 2.2), which only this worker "
         "reads: it derives each link token. Keep an old key loaded at least 14 days.",
     )
-    code_hmac_keyring: SecretStr = Field(
+    code_hmac_keyring: CodeKeyringSetting = Field(
         description="K_code (sft/{env}/app/code-hmac, data model 2.4): the HMAC of each new "
         "verification code.",
     )
-
-    @field_validator("email_hmac_keyring")
-    @classmethod
-    def _email_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        check_keyring_setting(
-            value.get_secret_value(), name="email", key_id=EMAIL_KEY_ID, needs_activation=True
-        )
-        return value
 
     # The user pool's admin side (#197, #193; authn and authz 2.5): the worker creates an invited
     # member's pool user and records the identity. Cognito's admin API in AWS; locally Keycloak's
@@ -1050,12 +1209,6 @@ class NotifySettings(WorkerSettings, MailSettings):
         check_keyring_setting(value.get_secret_value(), name="link", key_id=LINK_KEY_ID)
         return value
 
-    @field_validator("code_hmac_keyring")
-    @classmethod
-    def _code_hmac_keyring(cls, value: SecretStr) -> SecretStr:
-        check_keyring_setting(value.get_secret_value(), name="code", key_id=CODE_KEY_ID)
-        return value
-
     valkey_iam_cache: str | None = Field(
         default=None,
         pattern=_CACHE_NAME,
@@ -1120,6 +1273,10 @@ class IdpClient(BaseModel):
         if not self.user_pool_id.startswith(f"{self.region}_"):
             raise ValueError("a user pool ID starts with its region")
         return self
+
+
+# The operator API's SSO drift pools (#239) are `IdpClient`s, defined after its settings.
+OperatorSettings.model_rebuild()
 
 
 class KeyRotationSettings(_Base):
@@ -1277,6 +1434,92 @@ class SignInTriggerSettings(_Base):
         if self.valkey_iam_cache is not None:
             _iam_valkey(self.valkey_url)
         return self
+
+
+class RecoverySettings(_Base):
+    """The recovery job's settings (#258; `sft.workers.recovery`, disaster-recovery.md 4): the
+    `sft_recovery` role, this region's audit archive, which it reads, and the steps and times
+    the runbook renders into the `recovery` CronJob's run. A one-shot command, run by hand. The
+    CronJob carries the three `RECOVERY_*` variables and `AUDIT_ARCHIVE_REGION` empty, so a
+    runbook's `yq` finds them; empty means unset."""
+
+    app_version: str = Field(default="0.0.0", description="Set by the image build.")
+    database_url: PostgresUrl = Field(
+        description="The `sft_recovery` login role: recovery scope only (data model 4.2).",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+    audit_archive_bucket: str = Field(
+        pattern=_BUCKET,
+        description="This region's audit archive bucket, which the job lists and reads: the "
+        "surviving region's after a failover, Tokyo's after a restore; Osaka's for the failback's "
+        "replay, with `AUDIT_ARCHIVE_REGION`.",
+    )
+    audit_archive_endpoint_url: str | None = Field(
+        default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
+    )
+    recovery_steps: str = Field(
+        default="",
+        description="Comma-separated: generation, partitions, replay, outbox. They run in that "
+        "order, whatever order they are named in. Empty as the CronJob is rendered: the runbook "
+        "names them, and a run with none refuses to start.",
+    )
+    recovery_since: AwareDatetime | None = Field(
+        default=None,
+        description="Records and outbox messages after this time, with its offset: the restore "
+        "point, an hour before a failure, or 24 hours back for the outbox.",
+    )
+    recovery_rewind_to: AwareDatetime | None = Field(
+        default=None,
+        description="The archive cursor goes back to the oldest event since this time, with its "
+        "offset, under the new generation.",
+    )
+    database_iam_auth: bool = Field(
+        default=False,
+        description="Sign an IAM token for each new database connection (encryption and keys "
+        "6.3). Off locally.",
+    )
+
+    @field_validator("recovery_since", "recovery_rewind_to", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("recovery_steps")
+    @classmethod
+    def _known_steps(cls, value: str) -> str:
+        names = {part.strip() for part in value.split(",") if part.strip()}
+        if names - {"generation", "partitions", "replay", "outbox"}:
+            raise ValueError("name steps from: generation, partitions, replay, outbox")
+        return value
+
+    @model_validator(mode="after")
+    def _times_for_the_steps(self) -> Self:
+        names = {part.strip() for part in self.recovery_steps.split(",")}
+        if "generation" in names and self.recovery_rewind_to is None:
+            raise ValueError("RECOVERY_STEPS=generation needs RECOVERY_REWIND_TO")
+        if names & {"partitions", "replay", "outbox"} and self.recovery_since is None:
+            raise ValueError("RECOVERY_STEPS partitions, replay and outbox need RECOVERY_SINCE")
+        return self
+
+    @model_validator(mode="after")
+    def _iam_database_url(self) -> Self:
+        if self.database_iam_auth:
+            _iam_database(self.database_url, "DATABASE_URL")
+        return self
+
+    # The failback's replay (#276): Tokyo's job reads Osaka's archive, which alone holds what Osaka
+    # wrote between the hold and the fence until the back-fill (regional-failback.md step 6).
+    audit_archive_region: ArchiveRegion | None = Field(
+        default=None,
+        description="The S3 Region of `AUDIT_ARCHIVE_BUCKET` when it isn't this one "
+        "(`AWS_REGION`), which stays the database's. Empty, as the CronJob is rendered: this "
+        "Region's archive.",
+    )
+
+    @field_validator("audit_archive_region", mode="before")
+    @classmethod
+    def _empty_region_is_this_one(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 EXIT_BAD_SETTINGS = 2

@@ -137,6 +137,63 @@ jobs:
           done <<< "$decisions"
           echo "promotions=${promotions% }" >> "$GITHUB_OUTPUT"
 
+      # The web app's pointers (deploy/environments/<env>/web.yaml, ADR-0008, #283), by the same rules as the digests:
+      # one environment per pull request; dev's new build passes; a revert to a version the environment ran before
+      # passes at once (NFR-18); a promotion must copy the previous environment's pointer on main, and passes once that
+      # environment serves it (its release.json, which the deploy job writes after index.html). The logic comes from
+      # the base commit, as above; a base from before the web release has none, and nothing to check.
+      - name: What the pull request changes in the web app's pointers
+        id: web
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gate="$RUNNER_TEMP/web-release.sh"
+          if ! git show "$BASE:.github/scripts/web-release.sh" > "$gate" 2>/dev/null; then
+            echo "The base commit predates the web release (#283): no web pointer to check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          chmod +x "$gate"
+          decision=$("$gate" gate "$BASE" "$HEAD")
+          read -r env mode prev version <<< "$decision"
+          case $mode in
+            "") echo "No web pointer moves: nothing to check." >> "$GITHUB_STEP_SUMMARY" ;;
+            build) echo "- $env: points at a new web build." >> "$GITHUB_STEP_SUMMARY" ;;
+            rollback) echo "- $env: restores a web version it ran before (a revert): passes at once." >> "$GITHUB_STEP_SUMMARY" ;;
+            promote)
+              echo "- $env: copies $prev's web version $version; $prev must serve it." >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo "gate=$gate"
+                echo "prev=$prev"
+                echo "version=$version"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+      - name: Previous environment serves the web version
+        if: ${{ !cancelled() && steps.web.outputs.prev != '' }}
+        env:
+          GATE: ${{ steps.web.outputs.gate }}
+          PREV: ${{ steps.web.outputs.prev }}
+          VERSION: ${{ steps.web.outputs.version }}
+          SFT_DOMAIN: ${{ vars.SFT_DOMAIN }}
+        run: |
+          if [[ -z $SFT_DOMAIN ]]; then
+            echo "::error::SFT_DOMAIN is not set, so $PREV's web app can't be checked; not promoted."
+            exit 1
+          fi
+          for attempt in $(seq 1 30); do
+            served=$("$GATE" served "$PREV" 2>&1) || served="unreachable: $served"
+            echo "attempt $attempt: $PREV serves ${served%% *}"
+            if [[ ${served%% *} == "$VERSION" ]]; then
+              echo "- $PREV serves the web version $VERSION." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "::error::$PREV doesn't serve the web version $VERSION within 30 minutes; not promoted."
+          exit 1
+
       # TODO(ADR-0005, needs AWS): read the previous environment's Argo CD state from the GitHub deployment statuses
       # that Argo CD notifications post per environment and region (#104), and pass when every application is Synced
       # and Healthy on the digest; poll for up to 30 minutes. Needs `deployments: read`. Until then a promotion to

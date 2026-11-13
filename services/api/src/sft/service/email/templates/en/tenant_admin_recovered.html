@@ -1,0 +1,12 @@
+{% extends "en/_layout.html" %}
+{% from "_macros.html" import button, secret %}
+{% block body %}
+<p style="margin:0 0 16px;">At the request of {{ tenant_name }}, a Secure File Transfer operator recovered the sign-in of the admin <strong>{{ admin_email }}</strong> on {{ recovered_at }}. The request was confirmed through the recovery contact {{ tenant_name }} gave when its account was set up.</p>
+{% if temporary_until %}
+<p style="margin:0 0 16px;">They have a temporary sign-in with a password, which works until {{ temporary_until }}, even if {{ tenant_name }} requires single sign-on. Ask them to name a fallback admin while they are signed in.</p>
+{% else %}
+<p style="margin:0 0 16px;">Their sessions were ended and their old sign-in removed. They will get a new invitation to choose a password and a second factor.</p>
+{% endif %}
+<p style="margin:0 0 16px;">Every admin of {{ tenant_name }} gets this email. If nobody at {{ tenant_name }} asked for it, treat it as an attempt to take over the account: check the audit log, and tell the Secure File Transfer operators at once, through the contact details you were given when the account was set up.</p>
+{{ button(audit_log_url, 'Open the audit log', 'Or copy this address into your browser:') }}
+{% endblock %}

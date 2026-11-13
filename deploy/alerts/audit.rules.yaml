@@ -4,7 +4,8 @@
 #
 # The series: audit_archive_write_failures_total{region}, each security-critical record's write to one Region's archive
 # that failed, from the API and the operator API (sft.service.audit_archive), both labels made at zero at start; and the
-# audit partition step's gauges (sft.service.audit_partitions), which the lifecycle jobs push to the Pushgateway.
+# audit partition step's gauges (sft.service.audit_partitions), which the lifecycle jobs push to the Pushgateway,
+# sft_audit_expired_partitions among them (#255).
 groups:
   - name: audit
     rules:
@@ -66,4 +67,17 @@ groups:
           condition: never_reported
         annotations:
           summary: The audit partition step has never reported its metrics (data model 6).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md
+
+      # NFR-9 (#255): a monthly partition past the 365-day retention is still there after two daily runs. The step drops
+      # a month only once every row of it is archived in both regions, so this is an archive that is behind, a range
+      # waiting for its back-fill after a regional loss, or a drop that keeps failing on its lock.
+      - alert: AuditPartitions
+        expr: max(sft_audit_expired_partitions) > 0
+        for: 25h
+        labels:
+          severity: ticket
+          condition: expired_present
+        annotations:
+          summary: An audit partition past the 365-day retention hasn't been dropped for a day (NFR-9).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-partitions.md

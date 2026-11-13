@@ -268,3 +268,35 @@ variable "host_access_namespaces" {
   type        = list(string)
   default     = []
 }
+
+variable "break_glass_reconciliation" {
+  description = <<-EOT
+    What the operator API's break-glass reconciliation reads in the management account (#239, #275; authn-authz 8.3),
+    from the organization stack's outputs: this environment's read-only role there (break_glass_trail_role_arns), the
+    BreakGlass permission set (permission_set_arns["BreakGlass"]) and the identity store (identity_store_id). Handed
+    to the operator API as BREAK_GLASS_TRAIL_ROLE_ARN, BREAK_GLASS_PERMISSION_SET_ARN and IDENTITY_STORE_ID. Null until
+    the organization stack has made the role: the reconciliation stays off.
+  EOT
+  type = object({
+    trail_role_arn     = string
+    permission_set_arn = string
+    identity_store_id  = string
+  })
+  default = null
+
+  validation {
+    condition = var.break_glass_reconciliation == null ? true : alltrue([
+      can(regex("^arn:aws:iam::[0-9]{12}:role/sft-(dev|staging|prod)-break-glass-trail$", var.break_glass_reconciliation.trail_role_arn)),
+      can(regex("^arn:aws:sso:::permissionSet/ssoins-[0-9a-f]{16}/ps-[0-9a-f]{16}$", var.break_glass_reconciliation.permission_set_arn)),
+      can(regex("^d-[0-9a-f]{10}$", var.break_glass_reconciliation.identity_store_id)),
+    ])
+    error_message = "break_glass_reconciliation needs the organization stack's sft-<env>-break-glass-trail role ARN, the BreakGlass permission set ARN and the identity store ID (d-<10 hex>)."
+  }
+
+  validation {
+    condition = var.break_glass_reconciliation == null ? true : endswith(
+      var.break_glass_reconciliation.trail_role_arn, ":role/sft-${var.environment}-break-glass-trail"
+    )
+    error_message = "break_glass_reconciliation.trail_role_arn must be this environment's own trail role."
+  }
+}

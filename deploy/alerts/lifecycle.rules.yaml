@@ -3,7 +3,8 @@
 # deploy/alerts/tests/lifecycle.test.yaml.
 #
 # Every job is a CronJob that pushes its registry to the Pushgateway after each run, grouped by `job`, so every value
-# is the one the last run left (docs/operations/metrics.md 7): audit_archive_lag_seconds, metadata_purge_blocked{kind},
+# is the one the last run left (docs/operations/metrics.md 7): audit_archive_lag_seconds,
+# audit_archive_single_region_ranges (#257), metadata_purge_blocked{kind},
 # metadata_purge_lag_seconds, and lifecycle_job_last_success_timestamp_seconds{job="audit-archive"|"purge"}. A job
 # that stops running leaves its last values in place, so each job also has a staleness alert on its last success.
 # Prometheus scrapes the Pushgateway with honor_labels (OBS, #243), so `job` is the job's own name.
@@ -31,6 +32,18 @@ groups:
         annotations:
           summary: The audit archive job hasn't finished a run for 5 minutes (NFR-15).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-lag.md
+
+      # #257: ranges the archive job wrote to one region alone during a regional loss (auditArchive.survivingRegionOnly),
+      # waiting for the back-fill. Expected while the failover runs on one region; once the toggle is off, the next runs
+      # write them to the other region and this clears. Still above 0 half an hour after failback, the back-fill is stuck.
+      - alert: AuditArchiveSingleRegion
+        expr: max(audit_archive_single_region_ranges) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: The audit archive holds events in one region only, waiting for the back-fill to the other (#257).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/audit-archive-single-region.md
 
       # Data model 6: a transfer or upload request due for the purge still has a file that isn't deleted, so the purge
       # skips it rather than orphan the object. Only a bug gets here.

@@ -82,8 +82,8 @@ rpo_evidence() {
   for bucket in files large-files; do
     # RTC's replication metrics on Tokyo's rule: the latency and what was still pending (ADR-0012).
     run aws cloudwatch get-metric-statistics --region "$TOKYO" --namespace AWS/S3 \
-      --metric-name ReplicationLatency --dimensions "Name=SourceBucket,Value=sft-$ENV_NAME-apne1-$bucket-$ACCOUNT_ID" \
-      "Name=DestinationBucket,Value=sft-$ENV_NAME-apne3-$bucket-$ACCOUNT_ID" "Name=RuleId,Value=to-osaka" \
+      --metric-name ReplicationLatency --dimensions "Name=SourceBucket,Value=$(region_prefix "$TOKYO")-$bucket-$ACCOUNT_ID" \
+      "Name=DestinationBucket,Value=$(region_prefix "$OSAKA")-$bucket-$ACCOUNT_ID" "Name=RuleId,Value=to-osaka" \
       --start-time "$start" --end-time "$end" --period 60 --statistics Maximum
   done
   manual "Write the largest AuroraGlobalDBRPOLag (database RPO) and ReplicationLatency (files RPO) above into the" \
@@ -93,6 +93,10 @@ rpo_evidence() {
 
 fence() {
   run "$OPS_ROOT/failover-values.sh" fence --env "$ENV_NAME" --write
+  # The surviving region's archive alone (#257): the API's security-critical records and the archive job write
+  # Osaka's archive only, so download grants work while Tokyo's S3 can't be reached. A drill sets it too, so the
+  # failback's back-fill of Tokyo is proved every time.
+  run "$OPS_ROOT/failover-values.sh" surviving-osaka --env "$ENV_NAME" --write
   manual "Commit the two values files as one commit, 'ops: fence Tokyo and take $ENV_NAME Osaka out of pilot light'," \
     "and push it to main (the maintainer commits). Argo CD in Osaka syncs it; Tokyo converges to zero whenever it answers."
 }
@@ -119,13 +123,14 @@ promote() {
 }
 
 scale_osaka() {
-  run aws eks update-nodegroup-config --region "$OSAKA" --cluster-name "$(eks_cluster "$OSAKA")" \
-    --nodegroup-name "$(eks_cluster "$OSAKA")-system" --scaling-config minSize=2,maxSize=3,desiredSize=2
-  # GuardDuty's plan for Osaka's large-files bucket and the Osaka heartbeat alarm, both off in the pilot light: an
-  # apply of Osaka's data and alarms roots with the inputs of the apply checklist (#247), which the operator holds.
-  manual "Apply infra/environments/$ENV_NAME/$OSAKA/data with TF_VAR_malware_protection_enabled=true, and" \
-    "infra/environments/$ENV_NAME/$OSAKA/alarms with TF_VAR_heartbeat_enabled=true TF_VAR_pilot_light=false (and" \
-    "TF_VAR_probe_enabled=true where the probe runs; runbook step 4). Record the system node count in Git too."
+  # Inputs only (#261): the system node group, GuardDuty's plan for Osaka's large-files bucket, and Osaka's alarms,
+  # all set for the pilot light, by applies of Osaka's roots with the apply checklist's inputs (#247), which the
+  # operator holds. Nothing in Git changes for them: the inputs are the failover's.
+  manual "Apply infra/environments/$ENV_NAME/$OSAKA/cluster with TF_VAR_system_node_count=2;" \
+    "infra/environments/$ENV_NAME/$OSAKA/data with TF_VAR_malware_protection_enabled=true; and" \
+    "infra/environments/$ENV_NAME/$OSAKA/alarms with TF_VAR_heartbeat_enabled=true TF_VAR_pilot_light=false" \
+    "TF_VAR_database_role=primary (and TF_VAR_probe_enabled=true where the probe runs; runbook step 4). In a drill," \
+    "also Tokyo's alarms with TF_VAR_database_role=secondary."
   run kubectl --context "$OSAKA_CTX" -n sft rollout status deploy/api --timeout=20m
   run kubectl --context "$OSAKA_CTX" -n sft-operator rollout status deploy/operator-api --timeout=10m
 }

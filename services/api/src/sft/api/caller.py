@@ -41,6 +41,7 @@ from sft.api.client_ip import client_address
 from sft.api.dependencies import get_database
 from sft.core.errors import Forbidden, Unauthenticated
 from sft.data.audit import Origin
+from sft.data.member_sessions import LiveSession
 from sft.service import api_keys
 from sft.service.caller import Caller, CallerKind
 from sft.service.signin import SessionEnd, SignIn
@@ -58,10 +59,12 @@ _BEARER: Final = "bearer"
 
 @dataclass(frozen=True, slots=True)
 class SessionContext:
-    """What the sign-in routes need beyond the caller: the raw token, for its CSRF token."""
+    """What the sign-in routes need beyond the caller: the raw token, for its CSRF token, and the
+    session as the request's check found it, which `GET /me` answers from (#161)."""
 
     caller: Caller
     token: str
+    live: LiveSession
 
 
 def sign_in_service(request: Request) -> SignIn:
@@ -133,10 +136,10 @@ async def get_session(request: Request) -> SessionContext:
         raise Unauthenticated("credentials_invalid")
     if resolved is SessionEnd.ENDED:
         raise Unauthenticated("session_expired")
-    caller, _ = resolved
+    caller, live = resolved
     if request.method in UNSAFE_METHODS:
         check_csrf(request, service, token)
-    context = SessionContext(caller, token)
+    context = SessionContext(caller, token, live)
     setattr(request.state, _SESSION, context)
     return context
 
@@ -155,6 +158,14 @@ def check_unsafe_request(
 ) -> None:
     """The checks of authn and authz 3.4 on an unsafe request of a cookie session, a member's or
     a link session's: the origin, `Sec-Fetch-Site`, a JSON body and the session's CSRF token."""
+    check_origin(request, web_origin)
+    if not csrf_valid(request.headers.get(CSRF_HEADER)):
+        raise Forbidden("csrf_failed")
+
+
+def check_origin(request: Request, web_origin: str) -> None:
+    """The checks of authn and authz 3.4 that need no session: the origin, `Sec-Fetch-Site` and a
+    JSON body. Alone for the public unsafe `startInvitationSignIn` (#239)."""
     headers = request.headers
     if headers.get("origin") != web_origin:
         raise Forbidden("csrf_failed")
@@ -164,8 +175,6 @@ def check_unsafe_request(
     has_body = headers.get("content-length", "0") != "0" or "transfer-encoding" in headers
     media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if has_body and media_type != "application/json":
-        raise Forbidden("csrf_failed")
-    if not csrf_valid(headers.get(CSRF_HEADER)):
         raise Forbidden("csrf_failed")
 
 

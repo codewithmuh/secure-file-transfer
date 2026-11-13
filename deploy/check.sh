@@ -1,45 +1,29 @@
 #!/usr/bin/env bash
 # The deploy config's static checks, as CI's `deploy` job runs them: helm lint for every cluster and part, the
-# observability stack's charts included, helm template for every values file (render.sh), and kubeconform on the
-# output, Argo CD's and the Prometheus Operator's kinds included. The
-# runtime-contract test runs after it: `uv run --project services/api --locked pytest deploy/tests`.
-# Needs helm 3 and kubeconform; their versions are pinned in .github/workflows/ci.yml. With an argument, the rendered
-# manifests are kept in that directory (CI scans them with Trivy); without one they go to a temporary directory.
+# observability stack's charts included, helm template for every values file (render.sh), kubeconform on the output,
+# Argo CD's and the Prometheus Operator's kinds included, and the vendored Prometheus Operator CRDs against the pinned
+# chart (deploy/observability/crds/check.sh, #264). Every cluster is rendered once (#186): the runtime-contract tests
+# run after it on the same directory, `SFT_RENDERED=DIR uv run --project services/api --locked pytest deploy/tests
+# deploy/observability/tests` (deploy/conftest.py), and so do deploy/policies.sh and CI's Trivy scan.
+# Needs helm 3, kubeconform and the network; their versions are pinned in .github/workflows/ci.yml. With an argument,
+# the rendered manifests are kept in that directory; without one they go to a temporary directory.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-if [[ $# -gt 0 ]]; then
-  out="$1"
-else
-  out="$(mktemp -d)"
-  trap 'rm -rf "$out"' EXIT
-fi
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+out="${1:-$work/rendered}"
 
 # The Kubernetes version kubeconform checks against, and the CRD schemas for Argo CD's kinds, pinned to a commit.
 kube_version=1.34.0
 crds=https://raw.githubusercontent.com/datreeio/CRDs-catalog/501527ab9c40c827144c8f45945b25a023e344ce
 
-fake_account=000000000000
 for values in "$root"/deploy/environments/*/*/values.yaml; do
   region="$(basename "$(dirname "$values")")"
   env="$(basename "$(dirname "$(dirname "$values")")")"
-  cluster=(
-    --set "environment=$env" --set "region=$region"
-    --set "cluster.registry=$fake_account.dkr.ecr.$region.amazonaws.com"
-    --set "cluster.databaseHost=sft-$env.cluster-example.$region.rds.amazonaws.com"
-    --set-string "cluster.accountId=$fake_account"
-    --set "cluster.operatorRoleName=AWSReservedSSO_Operator_0000000000000000"
-    --set "cluster.serviceDomain=$([[ $env == prod ]] || echo "$env.")sft.example.com"
-    --set "cluster.valkeyHost=sft-$env-valkey-example.serverless.$region.cache.amazonaws.com"
-    --set "cluster.filesKeyArn=arn:aws:kms:$region:$fake_account:key/mrk-00000000000000000000000000000000"
-    --set "cluster.userPoolId=${region}_Example0"
-    --set "cluster.cognitoLoginDomain=sft-$env-example.auth.$region.amazoncognito.com"
-    --set "cluster.sesConfigurationSet=sft-$env"
-    --set "cluster.appClientId=example0client0id"
-  )
-  if [[ $region == ap-northeast-1 && $env != dev ]]; then
-    cluster+=(--set "cluster.standbyUserPoolId=ap-northeast-3_Example0" --set "cluster.standbyAppClientId=example0standby0id")
-  fi
+  # The same fake facts and switches as render.sh (#186).
+  "$root/deploy/tests/cluster-facts.sh" "$env" "$region" > "$work/$env-$region.yaml"
+  cluster=(--values "$work/$env-$region.yaml")
   echo "== helm lint: $env $region"
   helm lint --strict --quiet "$root/deploy/argocd" "${cluster[@]}"
   for part in application operator; do
@@ -48,16 +32,12 @@ for values in "$root"/deploy/environments/*/*/values.yaml; do
 
   # The observability stack (#243): its root's chart, then each chart with the values its Application names, unless
   # the cluster is a pilot light, which runs none of it.
-  helm lint --strict --quiet "$root/deploy/observability/argocd" --values "$values" \
-    --set "environment=$env" --set "region=$region" \
-    --set "cluster.registry=$fake_account.dkr.ecr.$region.amazonaws.com" --set-string "cluster.accountId=$fake_account"
+  helm lint --strict --quiet "$root/deploy/observability/argocd" --values "$values" "${cluster[@]}"
   if ! grep -q '^pilotLight: true' "$values"; then
     for chart in prometheus loki tempo collectors grafana; do
       helm lint --strict --quiet "$root/deploy/observability/charts/$chart" \
-        --values "$values" --values "$root/deploy/observability/environments/$env.yaml" \
-        --set "global.imageRegistry=$fake_account.dkr.ecr.$region.amazonaws.com" \
-        --set "global.sft.environment=$env" --set "global.sft.region=$region" \
-        --set-string "global.sft.accountId=$fake_account" 2> >(grep -v 'symbolic link' >&2)
+        --values "$values" --values "$root/deploy/observability/environments/$env.yaml" "${cluster[@]}" \
+        2> >(grep -v 'symbolic link' >&2)
     done
   fi
 done
@@ -70,3 +50,6 @@ kubeconform -strict -summary -kubernetes-version "$kube_version" \
   -schema-location default \
   -schema-location "$crds/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json" \
   "$out"/*.yaml
+
+echo "== the Prometheus Operator's CRDs"
+"$root/deploy/observability/crds/check.sh"

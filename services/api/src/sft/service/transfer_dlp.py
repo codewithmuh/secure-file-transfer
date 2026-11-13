@@ -105,6 +105,7 @@ from sft.service.transfers import (
     require_reach,
     require_visible,
     tenant_scope,
+    terminal_conflict,
     transfer_view,
 )
 
@@ -291,11 +292,11 @@ def _finding_views(
 
 
 def _not_confirmable(transfer: Transfer, state: TransferState, decision_id: UUID) -> Conflict:
-    """The 409 for a transfer that isn't awaiting confirmation of `decision_id` (step 2)."""
-    if state is TransferState.REVOKED:
-        return Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        return Conflict("transfer_expired", current_state=state.value)
+    """The 409 for a transfer that isn't awaiting confirmation of `decision_id` (step 2). Not
+    `state_conflict` alone: `dlp_decision_changed` comes between the terminal states and
+    `invalid_state`."""
+    if (ended := terminal_conflict(state)) is not None:
+        return ended
     if state is not TransferState.CANCELLED and transfer.dlp_decision_id not in (None, decision_id):
         return Conflict(
             "dlp_decision_changed",

@@ -63,6 +63,7 @@ from sft.api import (
     upload_requests,
 )
 from sft.api import approvals as approval_routes
+from sft.api.auth_failures import AuthFailures
 from sft.api.dependencies import get_database as get_database  # its home before dependencies.py
 from sft.api.errors import register_error_handlers
 from sft.api.rate_limits import install_rate_limits
@@ -72,13 +73,13 @@ from sft.core.pseudonyms import EmailKeyring
 from sft.core.settings import Settings
 from sft.data.counters import CounterMetrics, CounterStore, ValkeyIam
 from sft.data.database import Database
-from sft.runtime.archive import S3AuditArchive
+from sft.runtime.archive import open_audit_archive
 from sft.runtime.content import S3Content
 from sft.runtime.kms import open_field_keys
 from sft.runtime.s3 import S3Objects
 from sft.runtime.secrets import Keyrings
 from sft.service import fields, sli
-from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
+from sft.service.audit_archive import ArchiveMetrics, ArchiveStore, AuditArchive
 from sft.service.audit_search import ExportLeases
 from sft.service.csrf import CsrfKeyring
 from sft.service.downloads import DownloadMetrics, DownloadServices
@@ -155,6 +156,8 @@ def _lifespan(
             storage_quota=settings.tenant_storage_quota_bytes,
             small_pool_max=settings.scan_small_pool_max_bytes,
         )
+        # auth_failures_total{scheme} (#260), counted with group H's failures.
+        app.state.auth_failures = AuthFailures.create(registry)
         archive = AuditArchive(open_archive(settings), ArchiveMetrics.create(registry))
         app.state.audit_archive = archive
         app.state.link_services = LinkServices(
@@ -206,14 +209,16 @@ def _lifespan(
     return lifespan
 
 
-def open_archive(settings: Settings) -> S3AuditArchive:
-    """Both regions' audit archive buckets (#177), or Tokyo's alone where there is no Osaka."""
-    buckets = {Region.TOKYO: settings.audit_archive_tokyo_bucket}
-    endpoints = {Region.TOKYO: settings.audit_archive_tokyo_endpoint_url}
-    if settings.audit_archive_osaka_bucket is not None:
-        buckets[Region.OSAKA] = settings.audit_archive_osaka_bucket
-        endpoints[Region.OSAKA] = settings.audit_archive_osaka_endpoint_url
-    return S3AuditArchive.create(buckets, endpoints)
+def open_archive(settings: Settings) -> ArchiveStore:
+    """Both regions' audit archive buckets (#177), or Tokyo's alone where there is no Osaka; the
+    surviving region's alone during a regional loss (#257)."""
+    return open_audit_archive(
+        tokyo_bucket=settings.audit_archive_tokyo_bucket,
+        osaka_bucket=settings.audit_archive_osaka_bucket,
+        tokyo_endpoint=settings.audit_archive_tokyo_endpoint_url,
+        osaka_endpoint=settings.audit_archive_osaka_endpoint_url,
+        surviving_region=settings.audit_archive_surviving_region,
+    )
 
 
 def create_app(

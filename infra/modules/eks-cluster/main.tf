@@ -10,44 +10,25 @@
 locals {
   cluster_name = "${var.name_prefix}-eks"
 
-  region_short = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
-
-  # sft-<env>-<region-short> of every Region with a cluster, for names in the IAM policies.
-  regional_prefixes = { for r in var.cluster_regions : r => "${var.global_name_prefix}-${local.region_short[r]}" }
+  # sft-<env>-<region-short> of every Region with a cluster, for names in the IAM policies. The short names are the
+  # conventions module's (#172).
+  regional_prefixes = { for r in var.cluster_regions : r => "${var.global_name_prefix}-${var.conventions.region_shorts[r]}" }
 
   # Every cluster in the account, which the Pod Identity roles trust (their eks-cluster-arn session tag).
   cluster_arns = [for r, p in local.regional_prefixes : "arn:aws:eks:${r}:${var.account_id}:cluster/${p}-eks"]
 
   # The account's roles, all at path "/": queue, bucket and key policies in the data layer name them exactly (#101,
-  # #102), and encryption 4.3 gives the workload names.
+  # #102), and encryption 4.3 gives the workload names. They come from the one list in modules/conventions
+  # (workload_roles.cluster, #172), keyed as the resources here always were: the name with underscores, and `cluster`
+  # for the cluster's own role.
   role_names = {
-    cluster          = "${var.global_name_prefix}-eks-cluster"
-    system_node      = "${var.global_name_prefix}-system-node"
-    karpenter_node   = "${var.global_name_prefix}-karpenter-node"
-    karpenter        = "${var.global_name_prefix}-karpenter"
-    vpc_cni          = "${var.global_name_prefix}-vpc-cni"
-    ebs_csi          = "${var.global_name_prefix}-ebs-csi"
-    lb_controller    = "${var.global_name_prefix}-lb-controller"
-    external_secrets = "${var.global_name_prefix}-external-secrets"
-    # The two secret stores' roles, which only the External Secrets controller may assume (workload-roles.tf).
-    external_secrets_platform = "${var.global_name_prefix}-external-secrets-platform"
-    external_secrets_app      = "${var.global_name_prefix}-external-secrets-app"
-    kyverno                   = "${var.global_name_prefix}-kyverno"
-    api                       = "${var.global_name_prefix}-api"
-    relay                     = "${var.global_name_prefix}-relay"
-    scan                      = "${var.global_name_prefix}-scan"
-    notify                    = "${var.global_name_prefix}-notify"
-    jobs                      = "${var.global_name_prefix}-jobs"
-    archive                   = "${var.global_name_prefix}-archive"
-    migrate                   = "${var.global_name_prefix}-migrate"
-    operator                  = "${var.global_name_prefix}-operator"
-    key_rotation              = "${var.global_name_prefix}-key-rotation"    # #185; the KMS and IAM policies name it
-    synthetic_probe           = "${var.global_name_prefix}-synthetic-probe" # #248
+    for r in var.conventions.workload_roles.cluster :
+    (r == "eks-cluster" ? "cluster" : replace(r, "-", "_")) => var.conventions.workload_role_names[r]
   }
   role_arns = { for k, n in local.role_names : k => "arn:aws:iam::${var.account_id}:role/${n}" }
 
   # The data layer's execution role for EventBridge targets (#102, encryption 4.4), created by the Tokyo data stack.
-  events_delivery_role_arn = "arn:aws:iam::${var.account_id}:role/${var.global_name_prefix}-events-delivery"
+  events_delivery_role_arn = "arn:aws:iam::${var.account_id}:role/${var.conventions.workload_role_names["events-delivery"]}"
 
   # Every log type: the audit log records each exec and port-forward, which break-glass alerts on (authn-authz 8.3),
   # and the others are what an incident needs (capacity A19 prices all of them). SCP 3 keeps logging and the log group

@@ -12,7 +12,8 @@ variable "cluster_role" {
   description = <<-EOT
     What this Region's cluster is (ADR-0011): standalone (dev, no global database), primary (Tokyo in staging and
     prod: it creates the global database and holds the master password) or secondary (Osaka: it joins the global
-    database and has no master password of its own).
+    database and has no master password of its own; Tokyo too after a failback that followed a detach, #261).
+    Changing it replaces the cluster.
   EOT
   type        = string
 
@@ -23,13 +24,13 @@ variable "cluster_role" {
 }
 
 variable "global_cluster_identifier" {
-  description = "Name of the Aurora global database, sft-<env>-aurora: created by the primary, joined by the secondary. Null for standalone."
+  description = "Name of the Aurora global database, sft-<env>-aurora, or sft-<env>-aurora-<n> for the one a failback after a detach makes from Osaka's cluster (#261): created by the primary, joined by the secondary. Null for standalone."
   type        = string
   default     = null
 
   validation {
-    condition     = var.global_cluster_identifier == null || can(regex("^sft-(staging|prod)-aurora$", var.global_cluster_identifier))
-    error_message = "global_cluster_identifier must be sft-<staging|prod>-aurora, or null."
+    condition     = var.global_cluster_identifier == null || can(regex("^sft-(staging|prod)-aurora(-[2-9])?$", var.global_cluster_identifier))
+    error_message = "global_cluster_identifier must be sft-<staging|prod>-aurora, sft-<staging|prod>-aurora-<2-9>, or null."
   }
 }
 

@@ -47,6 +47,19 @@ to the API or the files buckets, so file contents never reach an edge.
   `Cache-Control: public, max-age=31536000, immutable`; `index.html` and `config.json` with `no-cache`.
 - **Rollback** writes the previous version's `index.html` back: seconds, with no distribution change and no
   invalidation, well inside NFR-18.
+- **As built (#283).** The bundle store is the shared stack's `sft-shared-apne1-web-bundles-<account>`
+  (infra/modules/web-bundles): `bundles/<git-sha>/`, with a `manifest.json` written last that lists every file's
+  SHA-256, content type and cache header. Each environment's pointer is `deploy/environments/<env>/web.yaml`, the
+  version and the manifest's digest, as a values file pins an image digest. `.github/workflows/web.yml` builds on main
+  with no AWS credentials, publishes once per commit through a publish role only the `registry` environment may
+  assume, and opens dev's pull request; its `promote` copies the previous environment's pointer. Merging a pointer
+  runs `web-deploy.yml`: the environment's release role (`sft-<env>-web-release`, from the GitHub environment
+  `web-<env>`, infra/modules/web-release) checks the manifest against Git and every file against the manifest, copies
+  them Osaka first, writes `config.json` from the environment's `WEB_CONFIG`, then `index.html` and a `release.json`
+  naming what is served. Reverting the merge is the rollback. promotion-gate checks a web promotion by the same rules
+  as a digest's, and passes it once the previous environment's `release.json` names the version. The web buckets'
+  policy denies object writes to everyone but that role and the deploy role. The image and the web app are promoted by
+  separate pull requests, so each can roll back on its own.
 - **One bundle for every environment.** Environment settings (the API origin, the upload endpoints, the sign-in
   domain) come from a `config.json` that the pipeline writes per environment, never from the build.
 - **Routing.** A CloudFront Function rewrites app routes, paths without a file extension, to `/index.html`, so error

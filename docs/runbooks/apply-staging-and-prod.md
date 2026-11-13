@@ -19,13 +19,18 @@ environment, and the stacks refuse to plan without the ones that have no default
 |---|---|---|
 | An AWS CLI profile per account: management, shared, dev, staging, prod, each through IAM Identity Center with MFA | The maintainer's shell (`AWS_PROFILE`), never the default identity | Every local apply (bootstrap, organization) |
 | The account IDs | `TF_VAR_account_id`, `TF_VAR_shared_account_id` | Every root |
-| The domain, `sft.<domain>` under it | `TF_VAR_domain` | `edge`, `identity`, `cluster-bootstrap` |
+| The domain, `sft.<domain>` under it | `TF_VAR_domain` | `edge`, `identity`, `cluster-bootstrap`, and every `network` root (DNS Firewall's `api.` and `app.` names, #259) |
 | SES: production access (out of the sandbox) in Tokyo and Osaka for staging and prod, requested after `identity` makes the domain identity; a mailbox for DMARC reports | AWS Support case per account and Region; `TF_VAR_dmarc_report_address` | `identity` (ADR-0015) |
-| The operators' alert addresses (each confirms its SNS subscription by email) | `TF_VAR_alert_emails`, a list | `alarms` |
+| The operators' alert addresses (each confirms its SNS subscription by email) | `TF_VAR_alert_emails`, a list | `alarms`, and prod's `retained` (its own alert topics, #263) |
 | The API image digest that the sign-in triggers run | `TF_VAR_signin_trigger_image` | `identity` (#238) |
-| Argo CD's GitHub App for deployment statuses (needed by the promotion gate) and its Identity Center SAML application | `TF_VAR_github_app`, `TF_VAR_identity_center_saml` | `cluster-bootstrap` |
+| Argo CD's GitHub App for deployment statuses (needed by the promotion gate) and its Identity Center SAML application | `TF_VAR_github_app`, `TF_VAR_identity_center_saml`: in CI, the GitHub environment `<env>`'s variables `TF_VAR_GITHUB_APP` and `TF_VAR_IDENTITY_CENTER_SAML` (JSON) | `cluster-bootstrap` |
+| The operator API's break-glass reconciliation: the environment's trail role, the `BreakGlass` permission set and the identity store, from the organization stack's outputs (#275) | `TF_VAR_break_glass_reconciliation`: in CI, the GitHub environment `<env>`'s variable `TF_VAR_BREAK_GLASS_RECONCILIATION` ([organization-and-bootstrap.md](organization-and-bootstrap.md) step 8); the job stays off without it | `cluster-bootstrap` |
+| The CI apply of `cluster-bootstrap` (#279) and the web release (#283): the repository variables `SHARED_ACCOUNT_ID`, `SFT_DOMAIN`, `WEB_BUNDLE_BUCKET` and `WEB_PUBLISH_ROLE_ARN` (the shared stack's outputs), and `LIVE_ENVIRONMENTS`, the environments whose AWS side exists (`dev staging prod` as each comes up); per GitHub environment `<env>` and `web-<env>`, `AWS_ACCOUNT_ID`; per `web-<env>`, `WEB_CONFIG`, its `config.json` | Repository and environment variables (`gh variable set`) | `.github/workflows/cluster-bootstrap.yml`, `web.yml`, `web-deploy.yml` |
+| The GitHub environments `web-dev`, `web-staging` and `web-prod` (the web release roles', #283), deployments from `main` only, created with the others before any job names them | Repository settings ([organization-and-bootstrap.md](organization-and-bootstrap.md) step 0) | `web-deploy.yml` |
+| The addresses the SCP change alert emails, each confirming its SNS subscription (#277) | `TF_VAR_alert_emails` for `organization` | [scp-change.md](scp-change.md) |
 | The plan roles' ARNs, for the promotion gate to read the probe's result in the previous environment | Repository variables `TF_PLAN_ROLE_ARN_DEV` and `TF_PLAN_ROLE_ARN_STAGING` (outputs of `bootstrap/<env>/ap-northeast-1`) | `.github/workflows/promote.yml` |
 | The GitHub environments `staging` and `prod`, deployments from `main` only, before their deploy roles exist (T-71) | Repository settings | `infra/README.md`, step 0 |
+| The GitHub environments `prod-retained` (the retained stack's deploy role, #263) and `loadtest-staging` (staging's load test role, #259), deployments from `main` only | Repository settings | `retained`; Tokyo's staging `identity` |
 | Whether break-glass may be self-approved in staging or prod while the run has a single operator | A reviewed commit adding `BREAK_GLASS_SELF_APPROVAL: "true"` to the cluster's values, as dev has ([break-glass.md](break-glass.md)); off until then | `operatorApi.env` |
 | The operating period's budget (PRD open question 7) | `infra/organization/budgets.tf` | Budgets (NFR-20) |
 
@@ -35,9 +40,14 @@ environment, and the stacks refuse to plan without the ones that have no default
    both Regions, then for Tokyo and Osaka `network`, `data` (twice in Tokyo, around Osaka's), `cluster`, `edge`,
    `identity`, `cluster-bootstrap`, and last `alarms` (Tokyo's after Osaka's `edge`, for the Route 53 health checks).
    In prod, `retained` goes before `data`.
-2. **First deploy**: Argo CD syncs the values in `deploy/environments/<env>/<region>/`; start the key rotation job
-   once, then the invitation backlog ([deploy/README.md](../../deploy/README.md), "The first deploy of an
-   environment").
+   `cluster-bootstrap` is applied by CI (`.github/workflows/cluster-bootstrap.yml`, #279) once the environment is in
+   `LIVE_ENVIRONMENTS`: through the Systems Manager tunnel, after the Prometheus Operator's CRDs; run it by hand from
+   main for the environment, or let a merge that changes the layer run it.
+2. **First deploy**: Argo CD syncs the values in `deploy/environments/<env>/<region>/`, with
+   `dbBootstrap.runOnSync: true` in Tokyo's for that one sync, so the database bootstrap creates the login roles before
+   the migration (#278); start the key rotation job once, then the invitation backlog
+   ([deploy/README.md](../../deploy/README.md), "The first deploy of an environment"). The web app: run `web.yml` or
+   merge a web change, then promote its pointer like a digest (`web.yml`'s `promote`, ADR-0008, #283).
 3. **Promotion**: staging's digest comes from dev by the promotion pull request (`promote.yml`, `open`); prod's from
    staging. The gate passes once the previous environment is healthy in Argo CD on the digest and its synthetic probe
    has passed its last three runs since the digest landed (ADR-0005).

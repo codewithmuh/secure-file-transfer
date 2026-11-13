@@ -39,6 +39,18 @@ whether that stays, and cross-Region backup copies, are open in
 
 Not set: `rds.global_db_rpo`, which would stop commits in Tokyo whenever Osaka falls behind (ADR-0011).
 
+## Roles and the failback after a detach (#261)
+
+`cluster_role` is how the cluster joined: `primary` makes the global database, `secondary` joins it. Who writes is
+Aurora's failover and switchover, never this input. After a failover that detached Osaka's cluster, the failback makes
+a new global database from Osaka's cluster by CLI (`sft-<env>-aurora-2`, the data roots'
+`TF_VAR_aurora_global_generation=2`), and applies Tokyo's data root with `TF_VAR_aurora_role=secondary`: a change of
+`cluster_role` replaces the cluster and its instances (`replace_triggered_by` on a `terraform_data` holding the role;
+a planned create of that resource, on the first apply after this change, triggers nothing), so the old cluster goes
+with its final snapshot and a new one joins as Osaka's secondary. The master secret stays wherever the caller passes
+it, Tokyo's data stack, whatever the role, so its Osaka replica stays too. `global_cluster_identifier` is ignored after
+creation, because membership changes by Aurora's own actions (docs/runbooks/regional-failback.md).
+
 ## Follow-ups outside this module
 
 - The database bootstrap job sets `pgaudit.log = 'all'` on the master user, so every break-glass statement is

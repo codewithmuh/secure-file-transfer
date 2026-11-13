@@ -27,8 +27,9 @@ regions (`sft.service.audit_archive`). `archived_event` and `latest_critical_eve
 in the tenant's scope, as the archive record carries it (`ArchivedEvent`): IDs, enums, times and
 `details`, never the source IP or the user agent.
 
-Partition upkeep for the lifecycle job (data model 6) is here too: `create_partitions` and
-`partition_status`, as `sft_jobs` in system scope.
+Partition upkeep for the lifecycle job (data model 6) is here too: `create_partitions`,
+`partition_status`, and the retention's `drop_expired_partitions` and `expired_partitions` (#255),
+as `sft_jobs` in system scope.
 """
 
 from __future__ import annotations
@@ -75,6 +76,8 @@ __all__ = [
     "Target",
     "archived_event",
     "create_partitions",
+    "drop_expired_partitions",
+    "expired_partitions",
     "latest_critical_event",
     "partition_status",
     "record",
@@ -170,6 +173,14 @@ class PartitionStatus:
     failed: tuple[str, ...] = field(default=())
     """Partitions `create_partitions` couldn't create for another reason, such as a lock timeout;
     the database's log has the error. The next run tries again."""
+    expired: int = 0
+    """Monthly partitions past the 365-day retention still there (NFR-9, #255). Should be 0."""
+    dropped: tuple[str, ...] = field(default=())
+    """Partitions `drop_expired_partitions` dropped in this run."""
+    unarchived: tuple[str, ...] = field(default=())
+    """Expired partitions kept because a row isn't archived in both regions yet."""
+    drop_failed: tuple[str, ...] = field(default=())
+    """Expired partitions that couldn't be locked or dropped; the next run tries again."""
 
 
 async def record(
@@ -339,6 +350,28 @@ async def create_partitions(
         {"months": months_ahead, "from_month": from_month},
     )
     return {name: status for name, status in rows.tuples()}
+
+
+async def drop_expired_partitions(
+    session: AsyncSession, as_of: datetime | None = None
+) -> dict[str, str]:
+    """Drop the monthly partitions past the 365-day retention (NFR-9, #255, revision 0040): each
+    expired month's name with `dropped`, `unarchived` (kept: a row isn't in both regions' archive
+    yet) or `failed` (kept: a lock or the drop failed). A month expires when its end is 365 days
+    before `as_of`, the jobs' clock; a time later than the database's own counts as the
+    database's, so the clock can never drop a month early. An empty result means another run
+    holds the partition lock, or nothing has expired."""
+    rows = await session.execute(
+        text("SELECT partition_name, status FROM audit_drop_expired_partitions(:as_of)"),
+        {"as_of": as_of},
+    )
+    return {name: status for name, status in rows.tuples()}
+
+
+async def expired_partitions(session: AsyncSession, as_of: datetime | None = None) -> int:
+    """How many monthly partitions past the retention are still there, by the same rule."""
+    count = await session.scalar(text("SELECT audit_expired_partitions(:as_of)"), {"as_of": as_of})
+    return int(count or 0)
 
 
 async def partition_status(session: AsyncSession) -> PartitionStatus:

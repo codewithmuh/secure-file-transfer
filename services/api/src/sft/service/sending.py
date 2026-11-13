@@ -71,6 +71,7 @@ from sft.service.transfers import (
     effective_state,
     recipient_pointer,
     require_reach,
+    state_conflict,
     tenant_scope,
     transfer_view,
     undeliverable,
@@ -108,16 +109,6 @@ async def _locked(
     return transfer
 
 
-def _not_sendable(state: TransferState) -> Conflict:
-    if state is TransferState.REVOKED:
-        return Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        return Conflict("transfer_expired", current_state=state.value)
-    return Conflict(
-        "invalid_state", "A cancelled transfer can't be sent.", current_state=state.value
-    )
-
-
 async def _sendable(
     session: AsyncSession, transfer: Transfer, emails: EmailKeyring, now: datetime
 ) -> tuple[TransferState, list[str], int] | None:
@@ -130,7 +121,7 @@ async def _sendable(
     if state in UNCHANGED_ON_SEND:
         return None
     if state is not TransferState.DRAFT:
-        raise _not_sendable(state)
+        raise state_conflict(state, "A cancelled transfer can't be sent.")
     counted = await files.counted_states(session, transfer.id)
     if any(f.state in (FileState.UPLOADING, FileState.COMPLETING) for f in counted):
         raise Conflict(

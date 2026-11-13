@@ -175,7 +175,8 @@ The DLP inspector (`python -m sft.dlp.inspector`) reads `InspectorSettings`, whi
 | `INTERNAL_PORT` | `8001` | `/healthz` and `/readyz` only, plain HTTP from a thread, so a probe never reaches the framed protocol (#184) |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
-`BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
+`BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. In AWS the bootstrap job also
+reads `BOOTSTRAP_MASTER_SECRET` and `AWS_REGION` (below). Each also reads `LOG_LEVEL`.
 
 ## Runtime contract
 
@@ -288,7 +289,9 @@ Every login role gets `rds_iam` and no password: each pod's IAM role (`sft-{env}
 each new connection, over TLS with `sslmode=verify-full` (encryption and keys 2.2, 6.3; `DATABASE_IAM_AUTH`,
 `sft.data.iam_auth`, #184), so `DATABASE_URL` holds a user name and a host, never a password. The master password
 lives only in Secrets Manager (`sft/{env}/db/master`), set by Terraform's write-only arguments; the bootstrap job
-reads it once and after that only break-glass does. **Locally and in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
+reads it once and after that only break-glass does. `BOOTSTRAP_MASTER_SECRET=secretsmanager:sft/{env}/db/master`
+names it and `BOOTSTRAP_DATABASE_URL` names the master user and no password: the job reads the secret as its own role,
+checks the user, and puts the password into the connection in memory only (#278). **Locally and in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
 obviously fake password yourself (`ALTER ROLE sft_api PASSWORD '…'`), as the tests do.
 
 ### Migrations
@@ -526,18 +529,31 @@ header with `source`, `licence` and `retrieved`, then one 7-digit code per line 
 once. The file's retrieval
 date is part of `DETECTORS_VERSION`, so every file records which list inspected it.
 
-**Nothing is bundled yet (#146)**: no source whose licence allows redistribution has been confirmed, so the file holds
-only its header and the detector stays at medium. To bundle or refresh a list, before each release and at least every
-three months:
+**The list is fetched when the image is built, never committed (#146)**: no licence for its data could be confirmed
+(the design, 4.4, has the sources and the reasoning). Git holds only the header, so code run from a checkout stays at
+medium, and the tests and the accuracy corpus use their own synthetic list (`tests/bank_codes_fixture.txt`). The
+Dockerfile's build stage runs `tools/bank_codes.py zengin-code` on zengin-code/source-data at the commit in
+`BANK_CODES_REF`, and the build fails unless the codes' digest is `BANK_CODES_SHA256`. `--build-arg BANK_CODES=none`
+builds without the list (offline, or for an image published outside our registry).
 
-1. Obtain the list from a source whose terms allow redistributing it inside the inspector image, and record the terms.
-   A list compiled from a site whose terms are silent on reuse doesn't qualify.
-2. Save it as UTF-8 CSV with `bank_code` (4 digits) and `branch_code` (3 digits) columns, leading zeros kept.
-3. `uv run python -m tools.bank_codes codes.csv --source "<publisher, URL>" --licence "<terms>" --retrieved YYYY-MM-DD`
-   rewrites the file, sorted and checked.
-4. Run `uv run pytest tests/test_dlp_bank_codes.py tests/test_dlp_detect.py tests/test_dlp_corpus.py` and record the
-   source and licence in the pull request. The corpus uses its own synthetic list (`tests/bank_codes_fixture.txt`),
-   so its results don't depend on the bundled one.
+To refresh it, before each release and at least every three months (banks merge and branches close):
+
+1. Find the newest tag of zengin-code/source-data that is at least 7 days old, and its commit:
+   `gh api repos/zengin-code/source-data/tags --jq '.[] | .name + " " + .commit.sha'` (tags are dates).
+2. `uv run python -m tools.bank_codes zengin-code --ref <commit> --retrieved <tag>` downloads it and prints the number
+   of codes and their digest, writing nothing. Compare the count with the current one (31,229 at `2026-08-24`): a
+   change of more than a few hundred needs an explanation, such as a merger in the news, before it is pinned.
+3. Change `BANK_CODES_REF`, `BANK_CODES_DATE` (the tag) and `BANK_CODES_SHA256` in the Dockerfile, build the image
+   (`docker build services/api`), and check that
+   `docker run --rm <image> python -c "import sft.dlp.detect as d; print(d.DETECTORS_VERSION)"` prints
+   `2.banks-<the tag without dashes>`.
+4. Run `uv run pytest tests/test_dlp_bank_codes.py tests/test_dlp_detect.py tests/test_dlp_corpus.py`, and record the
+   tag and the count in the pull request. The detectors' version changes with the date, so files inspected from then
+   on record the new list.
+
+If a list with a licence that allows bundling becomes available, `uv run python -m tools.bank_codes csv codes.csv
+--source "<publisher, URL>" --licence "<terms>" --retrieved YYYY-MM-DD` writes it from a UTF-8 CSV with `bank_code`
+(4 digits) and `branch_code` (3 digits) columns, leading zeros kept; it can then be committed and the fetch removed.
 
 ## Email
 

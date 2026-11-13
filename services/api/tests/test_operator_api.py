@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 from prometheus_client import CollectorRegistry
 from pydantic import SecretStr
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from starlette.testclient import TestClient
 
@@ -26,9 +27,11 @@ from sft.api.server import ApiServer
 from sft.core.settings import EXIT_BAD_SETTINGS, OperatorSettings
 from sft.data import audit
 from sft.data.access import scope_of
+from sft.data.database import sync_engine
 from sft.data.roles import API, OPERATOR
 from sft.data.scope import ScopeKind
 from sft.service import operator_tenants
+from sft.service.idempotency import IdempotentRequest, OperatorKey, fingerprint
 from sft.service.operator_auth import GET_CALLER_IDENTITY
 from tools.contract_check import (
     CONTRACT,
@@ -116,6 +119,29 @@ def test_a_refused_exchange_is_a_401_problem_that_says_nothing_more(client: Test
     assert response.headers["content-type"] == PROBLEM
     assert response.json()["code"] == "credentials_invalid"
     assert "audience" not in response.text
+
+
+def test_operator_authentication_failures_are_counted(migrated_db: ScratchDatabase) -> None:
+    # auth_failures_total{scheme="operator"} (#260): a refused exchange and a token that isn't
+    # live count; a request without a token doesn't.
+    registry = CollectorRegistry()
+    app = create_operator_app(settings_for(migrated_db), sts=FakeSts(), registry=registry)
+
+    def counted() -> float | None:
+        return registry.get_sample_value("auth_failures_total", {"scheme": "operator"})
+
+    with TestClient(app) as client:
+        assert counted() == 0
+        refused = {
+            "sts_request": {
+                "headers": signed_headers(audience="operator-api-prod"),
+                "body": GET_CALLER_IDENTITY,
+            }
+        }
+        assert client.post("/v1/operator/token", json=refused).status_code == 401
+        assert client.get("/v1/operator/tenants", headers=bearer("x" * 43)).status_code == 401
+        assert client.get("/v1/operator/tenants").status_code == 401
+    assert counted() == 2
 
 
 def test_a_body_other_than_get_caller_identity_is_a_422(client: TestClient) -> None:
@@ -285,6 +311,77 @@ def test_an_unknown_tenant_is_a_404(tenant_id: str, client: TestClient, token: s
         assert (response.status_code, response.json()["code"]) == (404, "not_found")
 
 
+# ---- getTenantRecoveryContact (#274) ----
+
+
+def test_an_operator_reads_the_recovery_contact_recorded_in_both_logs(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    tenant_id = UUID(create(client, token)["tenant"]["id"])
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant_id": str(tenant_id), "recovery_contact": "+81-3-0000-0000"}
+    assert response.headers["Cache-Control"] == "no-store"
+    # In the tenant's log, where its admins see it, and as a platform event; never the contact.
+    events = migrated_db.sql(
+        "SELECT tenant_id, actor_type, details->>'operator_name', details::text FROM audit_events "
+        "WHERE action = 'tenant.recovery_contact_read' AND target_id = :id "
+        "ORDER BY tenant_id NULLS LAST",
+        id=tenant_id,
+    )
+    assert [row[:3] for row in events] == [
+        (tenant_id, "operator", OPERATOR_NAME),
+        (None, "operator", OPERATOR_NAME),
+    ]
+    assert all("0000-0000" not in row[3] for row in events)
+
+
+def test_a_tenant_made_before_contacts_were_recorded_has_none(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    tenant_id = create(client, token)["tenant"]["id"]
+    migrated_db.sql("UPDATE tenants SET recovery_contact = NULL WHERE id = :id", id=UUID(tenant_id))
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert (response.status_code, response.json()["recovery_contact"]) == (200, None)
+
+
+@pytest.mark.parametrize("tenant_id", ["0190f0f0-0000-7000-8000-000000000000", "not-a-uuid"])
+def test_an_unknown_tenants_recovery_contact_is_a_404(
+    tenant_id: str, client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    reads = "SELECT count(*) FROM audit_events WHERE action = 'tenant.recovery_contact_read'"
+    before = migrated_db.sql(reads)
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert (response.status_code, response.json()["code"]) == (404, "not_found")
+    assert migrated_db.sql(reads) == before
+
+
+def test_the_contact_is_not_returned_until_the_platform_record_is_written(
+    client: TestClient, token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant_id = create(client, token)["tenant"]["id"]
+    original = audit.record
+
+    async def platform_down(session: Any, **kwargs: Any) -> Any:
+        if scope_of(session).kind is ScopeKind.PLATFORM:
+            raise OperationalError("INSERT", {}, Exception("connection lost"))
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(operator_tenants.audit, "record", platform_down)
+    url = f"/v1/operator/tenants/{tenant_id}/recovery-contact"
+    response = client.get(url, headers=bearer(token))
+    assert (response.status_code, response.json()["code"]) == (503, "service_unavailable")
+    assert "0000-0000" not in response.text
+    monkeypatch.setattr(operator_tenants.audit, "record", original)
+    assert client.get(url, headers=bearer(token)).status_code == 200
+
+
 # ---- suspendTenant ----
 
 
@@ -353,8 +450,9 @@ def test_a_platform_record_that_fails_after_the_change_is_a_503(
 def test_a_tenant_whose_platform_record_fails_is_still_created_and_counted(
     migrated_db: ScratchDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # createTenant keeps no idempotency key, so a 503 would invite a retry that makes a second
-    # tenant and a second invitation: it answers 201, and the miss is a metric that alerts.
+    # The tenant stands, with its record in its own log: a 503 would invite a retry without a key
+    # that makes a second tenant and a second invitation. It answers 201, and the miss is a
+    # metric that alerts.
     registry = CollectorRegistry()
     app = create_operator_app(settings_for(migrated_db), sts=FakeSts(), registry=registry)
     original = audit.record
@@ -378,6 +476,90 @@ def test_a_tenant_whose_platform_record_fails_is_still_created_and_counted(
         "sft_operator_platform_audit_failures_total", {"action": "tenant.created"}
     )
     assert failures == 1
+
+
+# ---- createTenant's Idempotency-Key (#160) ----
+
+
+def keyed(client: TestClient, token: str, key: str, **fields: str) -> Any:
+    return client.post(
+        "/v1/operator/tenants",
+        json=new_tenant(**fields),
+        headers={**bearer(token), "Idempotency-Key": key},
+    )
+
+
+def test_a_retry_with_the_same_key_returns_the_first_tenant_and_makes_nothing(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    key = f"create-{UUID(int=0).hex[:4]}-retry"
+    first = keyed(client, token, key, name="Retry KK")
+    assert first.status_code == 201, first.text
+    # A retry with a new operator token: the key is the operator's, not the token's.
+    fresh = client.post("/v1/operator/token", json=token_request()).json()["token"]
+    again = keyed(client, fresh, key, name="Retry KK")
+    assert again.status_code == 201, again.text
+    assert again.json() == first.json()
+    assert again.headers["Location"] == first.headers["Location"]
+    tenant_id = UUID(first.json()["tenant"]["id"])
+    assert migrated_db.sql("SELECT count(*) FROM tenants WHERE name = 'Retry KK'") == [(1,)]
+    assert migrated_db.sql("SELECT count(*) FROM users WHERE tenant_id = :t", t=tenant_id) == [(1,)]
+    assert migrated_db.sql("SELECT count(*) FROM outbox WHERE tenant_id = :t", t=tenant_id) == [
+        (1,)
+    ]  # one invitation email
+    assert migrated_db.sql(
+        "SELECT count(*) FROM audit_events WHERE action = 'tenant.created' AND target_id = :t",
+        t=tenant_id,
+    ) == [(2,)]  # the tenant's and the platform's, once each
+    # The key is kept in the new tenant's scope, for the operator, never the body.
+    assert migrated_db.sql(
+        "SELECT tenant_id, caller_type, resource_type, resource_id, response_status "
+        "FROM idempotency_keys WHERE key = :k",
+        k=key,
+    ) == [(tenant_id, "operator", "tenant", tenant_id, 201)]
+
+
+def test_a_key_used_for_another_request_is_a_conflict(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    key = "create-conflict"
+    assert keyed(client, token, key, name="First KK").status_code == 201
+    other = keyed(client, token, key, name="Second KK")
+    assert (other.status_code, other.json()["code"]) == (409, "idempotency_conflict")
+    assert migrated_db.sql("SELECT count(*) FROM tenants WHERE name = 'Second KK'") == [(0,)]
+    # A key past its 24 hours that the daily job hasn't deleted yet is never written again.
+    migrated_db.sql(
+        "UPDATE idempotency_keys SET created_at = now() - interval '2 days', "
+        "expires_at = now() - interval '1 day' WHERE key = :k",
+        k=key,
+    )
+    late = keyed(client, token, key, name="First KK")
+    assert (late.status_code, late.json()["code"]) == (409, "idempotency_conflict")
+
+
+def test_a_key_still_in_use_is_in_progress(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    key = "create-in-progress"
+    owner = OperatorKey.of(OPERATOR_NAME, IdempotentRequest(key, fingerprint("POST", "/", b"")))
+    assert owner is not None
+    name = owner.caller_id
+    engine = sync_engine(migrated_db.admin)
+    try:
+        with engine.connect() as held:
+            # Another request with the key holds its lock (a session lock stands in for its
+            # transaction's).
+            held.execute(
+                text("SELECT pg_advisory_lock(hashtextextended(:n, 0))"),
+                {"n": f"idempotency/operator/{name}/{key}"},
+            )
+            busy = keyed(client, token, key, name="Busy KK")
+            held.execute(text("SELECT pg_advisory_unlock_all()"))
+    finally:
+        engine.dispose()
+    assert (busy.status_code, busy.json()["code"]) == (409, "idempotency_in_progress")
+    assert migrated_db.sql("SELECT count(*) FROM tenants WHERE name = 'Busy KK'") == [(0,)]
+    assert keyed(client, token, key, name="Busy KK").status_code == 201
 
 
 # ---- the authorization matrix (authn-authz 6.3: the Operator column) ----
@@ -425,6 +607,12 @@ def test_the_matrix_covers_every_operation_the_operator_app_serves() -> None:
         "listBreakGlassRequests",
         "approveBreakGlass",
         "endBreakGlass",
+        # #239: tests/test_break_glass_records.py runs it end to end.
+        "recordBreakGlassGrant",
+        # #239: tests/test_admin_recovery.py runs it end to end.
+        "recoverTenantAdmin",
+        # #274: run above.
+        "getTenantRecoveryContact",
     }
 
 

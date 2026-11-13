@@ -17,7 +17,7 @@
 locals {
   observability_enabled = local.cluster_enabled && var.github_environment != null
 
-  observability_region_shorts = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+  observability_region_shorts = var.conventions.region_shorts
 
   observability_bucket_arns = flatten([
     for r in var.network_regions : [

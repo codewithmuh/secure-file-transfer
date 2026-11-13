@@ -15,6 +15,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+# parallel and per-process coverage data (pytest-cov with subprocesses); a run deletes them, so never track them
+.coverage.*
 coverage.xml
 htmlcov/
 dist/

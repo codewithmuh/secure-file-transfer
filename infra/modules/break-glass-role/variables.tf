@@ -77,3 +77,10 @@ variable "deploy_role_arn" {
   description = "ARN of the Terraform deploy role, the only principal that may change or delete the alert topic."
   type        = string
 }
+
+variable "conventions" {
+  description = "The caller's conventions module (pass module.conventions): names the topic, the rule and the policy in this Region, from their one definition (#172)."
+  type = object({
+    region_shorts = map(string)
+  })
+}

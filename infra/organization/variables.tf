@@ -68,3 +68,18 @@ variable "activate_cost_allocation_tags" {
   type        = bool
   default     = true
 }
+
+variable "alert_emails" {
+  description = "Addresses the alert on SCP changes emails (#277, scp-alerts.tf); each confirms its SNS subscription once. Supplied at plan time, never committed."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.alert_emails) >= 1
+    error_message = "Name at least one address: an alert nobody receives is no alert."
+  }
+
+  validation {
+    condition     = alltrue([for email in var.alert_emails : can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", email))])
+    error_message = "Every alert address must be an email address."
+  }
+}

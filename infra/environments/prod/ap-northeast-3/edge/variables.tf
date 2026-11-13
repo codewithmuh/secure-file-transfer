@@ -39,3 +39,9 @@ variable "web_distribution_arn" {
   type        = string
   default     = null
 }
+
+variable "teardown" {
+  description = "True only for the apply that comes before destroying this stack (ops/teardown.sh, docs/runbooks/teardown.md): it turns the load balancer's deletion protection off, so the destroy can run (NFR-19, #263)."
+  type        = bool
+  default     = false
+}

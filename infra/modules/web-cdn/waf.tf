@@ -2,6 +2,19 @@
 # Challenge on bursts of link page loads. The link pages read the token from the fragment, which a challenge keeps,
 # and load no WAF script (T-02).
 
+locals {
+  # The rollout mode (abuse 3.2), decided here once, as in modules/edge (#186): during the rollout the managed rule
+  # groups count; after it their own actions apply (override_action none). Exactly one of the pair is present.
+  rollout_count   = var.managed_rules_in_count ? [1] : []
+  rollout_enforce = var.managed_rules_in_count ? [] : [1]
+
+  # The managed rule groups, by rule name: the API web ACL's rules 1 and 4 (modules/edge), at priorities 1 and 2 here.
+  managed_rule_groups = {
+    "ip-reputation" = { priority = 1, group = "AWSManagedRulesAmazonIpReputationList" }
+    "core-rule-set" = { priority = 2, group = "AWSManagedRulesCommonRuleSet" }
+  }
+}
+
 resource "aws_wafv2_ip_set" "block_list" {
   provider = aws.us_east_1
 
@@ -49,61 +62,37 @@ resource "aws_wafv2_web_acl" "web" {
     }
   }
 
-  rule {
-    name     = "ip-reputation"
-    priority = 1
+  # The managed rule groups, in the rollout mode.
+  dynamic "rule" {
+    for_each = local.managed_rule_groups
 
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
+    content {
+      name     = rule.key
+      priority = rule.value.priority
+
+      override_action {
+        dynamic "count" {
+          for_each = local.rollout_count
+          content {}
+        }
+        dynamic "none" {
+          for_each = local.rollout_enforce
+          content {}
+        }
       }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
+
+      statement {
+        managed_rule_group_statement {
+          vendor_name = "AWS"
+          name        = rule.value.group
+        }
       }
-    }
 
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesAmazonIpReputationList"
+      visibility_config {
+        cloudwatch_metrics_enabled = true
+        metric_name                = rule.key
+        sampled_requests_enabled   = true
       }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "ip-reputation"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  rule {
-    name     = "core-rule-set"
-    priority = 2
-
-    override_action {
-      dynamic "count" {
-        for_each = var.managed_rules_in_count ? [1] : []
-        content {}
-      }
-      dynamic "none" {
-        for_each = var.managed_rules_in_count ? [] : [1]
-        content {}
-      }
-    }
-
-    statement {
-      managed_rule_group_statement {
-        vendor_name = "AWS"
-        name        = "AWSManagedRulesCommonRuleSet"
-      }
-    }
-
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "core-rule-set"
-      sampled_requests_enabled   = true
     }
   }
 

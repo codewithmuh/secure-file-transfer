@@ -4,7 +4,8 @@
 #
 # The series come from the scan worker (sft.workers.scan) and the scan sweep (sft.workers.scan_sweep):
 # scan_results_total{state,reason}, dlp_inspection_results_total{state,reason} and dlp_inspector_failures_total{kind},
-# each label set made at zero when the worker starts, so a first failure shows as an increase. The dead-letter queues'
+# each label set made at zero when the worker starts, so a first failure shows as an increase; and
+# clamav_signature_age_seconds, the age of the signatures each node's clamd scans with (#260). The dead-letter queues'
 # depth is CloudWatch's ApproximateNumberOfMessagesVisible as the CloudWatch exporter names it (ADR-0009, M7).
 groups:
   - name: scanning
@@ -53,3 +54,15 @@ groups:
         annotations:
           summary: A file's DLP inspection failed on every attempt; the file is blocked (FR-47).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-inspector.md
+
+      # Threat model T-27: a clamd scans with signatures more than a day old. Files are still scanned, but new malware
+      # the signature mirror would have brought goes unseen (ADR-0019). The age grows from the last build time clamd
+      # gave, so a clamd that stopped answering shows here too, besides ScanFailed.
+      - alert: ClamavSignaturesStale
+        expr: max(clamav_signature_age_seconds) > 86400
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: A clamd scans with ClamAV signatures more than 24 hours old (T-27).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/clamav-signatures.md

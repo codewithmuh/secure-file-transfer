@@ -45,6 +45,7 @@ variables {
   kms_alias_prefix = "alias/sft-dev"
   domain           = "example.com"
   primary_region   = true
+  web_writer_arns  = ["arn:aws:iam::${format("%012d", 1)}:role/sft-dev-web-release"]
 }
 
 run "api_web_acl" {

@@ -246,20 +246,35 @@ def require_visible(caller: Caller, reach: Reach, transfer: Transfer) -> None:
         raise NotFound
 
 
+def terminal_conflict(state: TransferState) -> Conflict | None:
+    """The 409 for a revoked or expired transfer, which no operation may change: `transfer_revoked`
+    or `transfer_expired`, naming the state. None for any other state. This is the one place that
+    maps the two terminal states to their codes (#188, #281)."""
+    if state is TransferState.REVOKED:
+        return Conflict("transfer_revoked", current_state=state.value)
+    if state is TransferState.EXPIRED:
+        return Conflict("transfer_expired", current_state=state.value)
+    return None
+
+
+def state_conflict(state: TransferState, detail: str) -> Conflict:
+    """The 409 for an operation the transfer's state doesn't allow (#188): `transfer_revoked` and
+    `transfer_expired` name the terminal state, anything else is `invalid_state` with `detail`.
+    Every operation that refuses on the state answers through here, so the same state gets the
+    same code whatever was asked. An operation with checks of its own between the terminal states
+    and `invalid_state` calls `terminal_conflict` first."""
+    ended = terminal_conflict(state)
+    if ended is not None:
+        return ended
+    return Conflict("invalid_state", detail, current_state=state.value)
+
+
 def draft_conflict(transfer: Transfer) -> ProblemError | None:
     """None for a draft; otherwise the 409 a change to its files answers."""
     state = TransferState(transfer.state)
     if state is TransferState.DRAFT:
         return None
-    if state is TransferState.REVOKED:
-        return Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        return Conflict("transfer_expired", current_state=state.value)
-    return Conflict(
-        "invalid_state",
-        "Files change only while the transfer is a draft.",
-        current_state=state.value,
-    )
+    return state_conflict(state, "Files change only while the transfer is a draft.")
 
 
 def audit_details(caller: Caller, **details: audit.Detail) -> dict[str, audit.Detail]:

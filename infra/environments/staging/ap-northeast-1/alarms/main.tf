@@ -90,7 +90,7 @@ data "terraform_remote_state" "edge_osaka" {
   backend = "s3"
 
   config = {
-    bucket = "sft-staging-apne3-tfstate-${var.account_id}"
+    bucket = "${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-tfstate-${var.account_id}"
     key    = "environments/staging/ap-northeast-3/edge/terraform.tfstate"
     region = "ap-northeast-3"
   }
@@ -110,6 +110,8 @@ module "alarms" {
     aws.us_east_1 = aws.us_east_1
   }
 
+  conventions = module.conventions
+
   environment      = "staging"
   account_id       = var.account_id
   region           = module.conventions.region
@@ -124,7 +126,7 @@ module "alarms" {
 
   database = {
     cluster_identifier          = local.data.aurora_cluster_identifier
-    role                        = "primary"
+    role                        = var.database_role
     freeable_memory_alarm_bytes = 1610612736 # 1536 MiB, about a tenth of db.r8g.large, 16 GiB
   }
 
@@ -136,7 +138,7 @@ module "alarms" {
   replicated_buckets = {
     for kind, name in local.data.files_bucket_names : kind => {
       source      = name
-      destination = replace(name, "-apne1-", "-apne3-")
+      destination = replace(name, "-${module.conventions.region_shorts["ap-northeast-1"]}-", "-${module.conventions.region_shorts["ap-northeast-3"]}-")
     }
   }
 

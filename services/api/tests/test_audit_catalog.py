@@ -465,6 +465,22 @@ SSO_AND_BREAK_GLASS_ACTIONS = {
     "break_glass.ended": (),
     "break_glass.expired": (),
     "break_glass.lapsed": (),
+    # #239: Identity Center grants recorded by the tool or the reconciliation, and the daily SSO
+    # drift check's findings and runs, all platform events (break-glass records also in the
+    # tenants' logs).
+    "break_glass.recorded": (),
+    "sso_provider.drift_found": (),
+    "sso_provider.drift_checked": (),
+    # #239: an operator's recovery of a tenant admin writes the reset's own event (with its
+    # recovery, which `admin_recoveries` changes cover), then a platform event; the daily job
+    # ends the temporary sign-in with an event of its own.
+    "user.sign_in_reset": ("users", "user_identities", "admin_recoveries"),
+    "tenant.admin_recovered": (),
+    "user.temporary_sign_in_ended": ("user_identities", "admin_recoveries"),
+    # #273: the notification worker's link for an SSO tenant's invited member (revision 0042).
+    # #274: an operator's read of a tenant's recovery contact, in its log and the platform's.
+    "user.invitation_link_issued": ("users",),
+    "tenant.recovery_contact_read": (),
 }
 
 

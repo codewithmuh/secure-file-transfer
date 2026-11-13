@@ -323,6 +323,41 @@ data "aws_iam_policy_document" "files" {
     }
   }
 
+  # The failback's reverse rule (#262, #42 gap 4): Osaka's buckets replicate the files written there during a failover
+  # back to Tokyo, through the same role, so in Tokyo S3 also re-encrypts those replicas under this key.
+  dynamic "statement" {
+    for_each = local.primary ? [1] : []
+
+    content {
+      sid       = "FailbackReplicationWritesThroughS3"
+      actions   = ["kms:Encrypt", "kms:GenerateDataKey"]
+      resources = ["*"]
+
+      principals {
+        type        = "AWS"
+        identifiers = [local.account_root]
+      }
+
+      condition {
+        test     = "ArnEquals"
+        variable = "aws:PrincipalArn"
+        values   = [local.replication_role_arn]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = [local.via["s3"]]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:EncryptionContext:aws:s3:arn"
+        values   = [local.bucket_arns["files"], local.bucket_arns["large_files"]]
+      }
+    }
+  }
+
   # Decision 15: GuardDuty's role reads the large-file bucket only.
   statement {
     sid       = "MalwareProtectionPlanReadsThroughS3"
@@ -581,37 +616,43 @@ data "aws_iam_policy_document" "audit" {
 
   # Writers only generate data keys. The archive job writes its batches to both Regions before it moves its cursor
   # (#183); the API and the operator API write security-critical records to both Regions (architecture 5.2), and the
-  # lifecycle jobs rewrite a download grant's committed record there (#181).
-  statement {
-    sid       = "WritersPutArchiveObjectsThroughS3"
-    actions   = ["kms:GenerateDataKey"]
-    resources = ["*"]
+  # lifecycle jobs rewrite a download grant's committed record there (#181). Once the environment is torn down
+  # (environment_retired, prod's retained stack, encryption 8.4), they leave the policy: nothing writes any more, and
+  # a role re-created later under the same name matches nothing (#263).
+  dynamic "statement" {
+    for_each = var.environment_retired ? [] : [1]
 
-    principals {
-      type        = "AWS"
-      identifiers = [local.account_root]
-    }
+    content {
+      sid       = "WritersPutArchiveObjectsThroughS3"
+      actions   = ["kms:GenerateDataKey"]
+      resources = ["*"]
 
-    condition {
-      test     = "ArnEquals"
-      variable = "aws:PrincipalArn"
-      values   = [local.role_arns["archive"], local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]]
-    }
+      principals {
+        type        = "AWS"
+        identifiers = [local.account_root]
+      }
 
-    condition {
-      test     = "StringEquals"
-      variable = "kms:ViaService"
-      values   = [local.via["s3"]]
-    }
+      condition {
+        test     = "ArnEquals"
+        variable = "aws:PrincipalArn"
+        values   = [local.role_arns["archive"], local.role_arns["api"], local.role_arns["operator"], local.role_arns["jobs"]]
+      }
 
-    condition {
-      test     = "StringEquals"
-      variable = "kms:EncryptionContext:aws:s3:arn"
-      values   = [local.bucket_arns["audit_archive"]]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = [local.via["s3"]]
+      }
+
+      condition {
+        test     = "StringEquals"
+        variable = "kms:EncryptionContext:aws:s3:arn"
+        values   = [local.bucket_arns["audit_archive"]]
+      }
     }
   }
 
-  # Readers only decrypt: the recovery job, the audit reader and BreakGlass.
+  # Readers only decrypt: the recovery job (until the environment is torn down), the audit reader and BreakGlass.
   statement {
     sid       = "ReadersReadArchiveThroughS3"
     actions   = ["kms:Decrypt"]
@@ -626,7 +667,8 @@ data "aws_iam_policy_document" "audit" {
       test     = "ArnLike"
       variable = "aws:PrincipalArn"
       values = concat(
-        [local.role_arns["recovery"]], local.audit_reader_arn_patterns, var.break_glass_principal_arn_patterns,
+        var.environment_retired ? [] : [local.role_arns["recovery"]],
+        local.audit_reader_arn_patterns, var.break_glass_principal_arn_patterns,
       )
     }
 
@@ -672,7 +714,8 @@ data "aws_iam_policy_document" "audit" {
     }
   }
 
-  # Rule 2's exception: the retained stack's deploy role uses its own state, through S3, that bucket only (8.4).
+  # Rule 2's exception: the retained stack's deploy role uses its own state, through S3, that bucket only (8.4). The
+  # trail's bucket is under the same key, but CloudTrail encrypts its log files itself (the statements below).
   dynamic "statement" {
     for_each = var.retained_stack && local.primary ? [1] : []
 
@@ -686,10 +729,12 @@ data "aws_iam_policy_document" "audit" {
         identifiers = [local.account_root]
       }
 
+      # And Admin (extra_administrator_arn_patterns): the stack's first apply moves its local state into the bucket as
+      # Admin, and ops/teardown.sh applies it as Admin (encryption 8.4, #263).
       condition {
-        test     = "ArnEquals"
+        test     = "ArnLike"
         variable = "aws:PrincipalArn"
-        values   = [var.deploy_role_arn]
+        values   = concat([var.deploy_role_arn], var.extra_administrator_arn_patterns)
       }
 
       condition {
@@ -1012,6 +1057,11 @@ data "aws_iam_policy_document" "secrets" {
       BreakGlassReadsTheMasterPassword = {
         roles   = var.break_glass_principal_arn_patterns
         secrets = [local.secret_arns.db_master]
+      }
+      # Staging's load test reads its tenants' keys (#259, docs/operations/performance.md); prod has no such secret.
+      LoadTestReadsItsKeys = {
+        roles   = [local.role_arns["loadtest"]]
+        secrets = [local.secret_arns.load_test]
       }
     }
 
@@ -1565,6 +1615,59 @@ data "aws_iam_policy_document" "platform" {
       test     = "StringEquals"
       variable = "kms:ViaService"
       values   = [local.via["elasticache"]]
+    }
+  }
+  # The probe mailbox (#259, modules/probe-mailbox): SES's receipt rules write each message under this key, and only
+  # the synthetic probe and the load test read it, each through S3, for the mailbox bucket only.
+  statement {
+    sid       = "SesReceivingWritesTheProbeMailbox"
+    actions   = ["kms:GenerateDataKey"]
+    resources = ["*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ses.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [var.account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:ses:${local.region}:${var.account_id}:receipt-rule-set/${local.name_prefix}-inbound:receipt-rule/*"]
+    }
+  }
+
+  statement {
+    sid       = "ProbeAndLoadTestReadTheMailboxThroughS3"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [local.account_root]
+    }
+
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.role_arns["synthetic-probe"], local.role_arns["loadtest"]]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = [local.via["s3"]]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:EncryptionContext:aws:s3:arn"
+      values   = [local.bucket_arns["probe_mailbox"]]
     }
   }
 }

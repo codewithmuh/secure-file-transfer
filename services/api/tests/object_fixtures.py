@@ -34,18 +34,20 @@ class FakeObjects:
         self.uploads[upload_id] = {}
         return upload_id
 
-    async def part_url(
+    async def part_urls(
         self,
         storage_class: StorageClass,
         key: str,
         upload_id: str,
+        parts: Sequence[tuple[int, int]],
         *,
-        part_number: int,
-        size: int,
         expires_in: int = 900,
-    ) -> str:
+    ) -> list[str]:
         self._check()
-        return f"https://s3.test/{key}?uploadId={upload_id}&partNumber={part_number}&size={size}"
+        return [
+            f"https://s3.test/{key}?uploadId={upload_id}&partNumber={number}&size={size}"
+            for number, size in parts
+        ]
 
     def put_part(self, upload_id: str, number: int, size: int) -> None:
         self.uploads.setdefault(upload_id, {})[number] = size

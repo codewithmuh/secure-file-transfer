@@ -25,8 +25,12 @@ locals {
     "large-files" = [local.role_arns["scan"], local.role_arns["malware-protection"]]
   }
 
-  # Only the lifecycle jobs delete (ADR-0012). In dev and staging the deploy role too, so teardown can empty a bucket.
-  deleters = concat([local.role_arns["jobs"]], var.teardown_allowed ? [var.deploy_role_arn] : [])
+  # Only the lifecycle jobs delete (ADR-0012). Where teardown is allowed, also the deploy role and Admin, which runs
+  # ops/teardown.sh, so a teardown can empty a bucket (dev and staging always; prod from its teardown apply, #263).
+  deleters = concat(
+    [local.role_arns["jobs"]],
+    var.teardown_allowed ? concat([var.deploy_role_arn], var.admin_principal_arn_patterns) : [],
+  )
 
   settings_changers = concat([var.deploy_role_arn], var.admin_principal_arn_patterns)
 }
@@ -338,7 +342,7 @@ data "aws_iam_policy_document" "bucket" {
       "s3:DeleteBucket", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutBucketOwnershipControls",
       "s3:PutBucketPublicAccessBlock", "s3:PutBucketVersioning", "s3:PutBucketObjectLockConfiguration",
       "s3:PutEncryptionConfiguration", "s3:PutLifecycleConfiguration", "s3:PutReplicationConfiguration",
-      "s3:PutInventoryConfiguration", "s3:PutBucketCORS", "s3:PutBucketTagging",
+      "s3:PutBucketCORS", "s3:PutBucketTagging",
     ]
     resources = ["arn:aws:s3:::${each.value}"]
 
@@ -351,6 +355,26 @@ data "aws_iam_policy_document" "bucket" {
       test     = "ArnNotLike"
       variable = "aws:PrincipalArn"
       values   = local.settings_changers
+    }
+  }
+
+  # An inventory configuration is a way to copy every key elsewhere, so it stays with Terraform and Admin, and S3 Batch
+  # Operations' failback role, whose manifest generator needs it on Osaka's buckets (#262).
+  statement {
+    sid       = "DenyInventoryToEveryoneElse"
+    effect    = "Deny"
+    actions   = ["s3:PutInventoryConfiguration"]
+    resources = ["arn:aws:s3:::${each.value}"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "ArnNotLike"
+      variable = "aws:PrincipalArn"
+      values   = concat(local.settings_changers, [local.role_arns["s3-batch-replication"]])
     }
   }
 }

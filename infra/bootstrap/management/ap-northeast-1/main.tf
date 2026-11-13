@@ -70,10 +70,30 @@ data "aws_iam_policy_document" "plan_organization" {
     actions   = ["budgets:ListTagsForResource", "budgets:ViewBudget", "ce:ListCostAllocationTags"]
     resources = ["*"]
   }
+
+  # The alert on SCP changes in us-east-1 (#277, infra/organization/scp-alerts.tf): its rule, topic and key.
+  statement {
+    sid = "ReadTheScpAlert"
+    actions = [
+      "events:DescribeRule", "events:ListTagsForResource", "events:ListTargetsByRule",
+      "sns:GetSubscriptionAttributes", "sns:GetTopicAttributes", "sns:ListSubscriptionsByTopic", "sns:ListTagsForResource",
+      "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus", "kms:ListAliases", "kms:ListResourceTags",
+    ]
+    resources = ["*"]
+  }
+
+  # The break-glass reconciliation's read-only roles (#239, infra/organization/break-glass-trail.tf).
+  statement {
+    sid       = "ReadTheBreakGlassTrailRoles"
+    actions   = ["iam:GetRole", "iam:GetRolePolicy", "iam:ListAttachedRolePolicies", "iam:ListRolePolicies"]
+    resources = ["arn:aws:iam::${var.account_id}:role/sft-*-break-glass-trail"]
+  }
 }
 
 module "terraform_roles" {
   source = "../../../modules/terraform-oidc-roles"
+
+  conventions = module.conventions
 
   account_id         = var.account_id
   github_repository  = module.conventions.github_repository

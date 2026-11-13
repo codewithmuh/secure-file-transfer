@@ -11,7 +11,9 @@ is never sent twice (ADR-0013; consumer.py).
   each code's HMAC; `email-hmac` names addresses in the suppression list and the cross-tenant cap.
   In AWS each is read from Secrets Manager at start and every 5 minutes (`sft.runtime.secrets`).
 - **Email** through the mail adapter (`MAIL_BACKEND`): SES in AWS, Mailpit locally (ADR-0015).
-  The adapter blocks, so each send runs in this worker's own small thread pool.
+  The adapter blocks, so each send runs in this worker's own thread pool, of one thread
+  (`MAIL_THREADS`): the loop handles one message at a time and the notifier awaits each send, so
+  a second thread would never be used (#192). Throughput comes from pods, not threads.
 - **The counter store** holds the cross-tenant cap; while it is unreachable the cap counts in this
   pod (abuse 4.5).
 - **The user pool's admin side** (`USER_POOL_BACKEND`, #197, #193): it creates an invited member's
@@ -78,7 +80,14 @@ from sft.workers.queues import SqsQueues
 log = logging.getLogger(__name__)
 
 SERVICE_NAME = "sft-notify"
-MAIL_THREADS = 4
+MAIL_THREADS = 1
+"""The mail pool's size (#192). `ConsumerLoop.handle_all` handles a batch one message at a time
+and the notifier awaits each send in turn, so at most one send is ever in flight and a wider pool
+would only hold idle threads. Measured on 2026-11-09 through the SMTP adapter to a local Mailpit:
+300 sends one after another took a median of 27 ms (p95 107 ms), 25 a second on one thread, ten
+times a pod's share of the 5 emails a second at the peak (capacity and cost 3.2, 4.1). SES's own
+latency is to be measured in the AWS run. Sending concurrently would need the loop to handle
+messages concurrently and to pace them to SES's sending rate; more pods do that already."""
 
 
 class NotifyConsumer(Consumer):

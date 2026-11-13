@@ -8,6 +8,11 @@ output "region_short" {
   value       = local.region_short
 }
 
+output "region_shorts" {
+  description = "Short Region code of every Region the service runs in, by Region: the one definition modules use (#172)."
+  value       = local.region_shorts
+}
+
 output "name_prefix" {
   description = "Prefix for regional resource names: sft-<env>-<region-short>."
   value       = local.name_prefix
@@ -69,4 +74,19 @@ output "sso_role_arn_patterns" {
     admin       = "${local.sso_role_arn_prefix}*AWSReservedSSO_Admin_*"
     break_glass = "${local.sso_role_arn_prefix}*AWSReservedSSO_BreakGlass_*"
   }
+}
+
+output "workload_roles" {
+  description = "The environment's workload role short names, by the layer that makes them: cluster, data, identity, cluster_bootstrap and edge (#172)."
+  value       = local.workload_roles
+}
+
+output "workload_role_names" {
+  description = "Every workload role's name, sft-<env>-<name>, by short name (#172)."
+  value       = local.workload_role_names
+}
+
+output "workload_role_arns" {
+  description = "Every workload role's ARN at path /, by short name, built from the name so policies can name a role before it exists (#172)."
+  value       = { for name, role in local.workload_role_names : name => "arn:aws:iam::${var.account_id}:role/${role}" }
 }

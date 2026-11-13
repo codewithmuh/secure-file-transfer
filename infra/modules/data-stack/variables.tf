@@ -18,6 +18,9 @@ variable "conventions" {
     bootstrap_iam_path    = string
     sso_role_arn_patterns = object({ admin = string, break_glass = string })
     bootstrap_role_arns   = object({ terraform_deploy = string, terraform_plan = string, key_admin = string })
+    region_shorts         = map(string)
+    workload_role_names   = map(string)
+    workload_role_arns    = map(string)
   })
 
   validation {
@@ -35,7 +38,9 @@ variable "aurora" {
   description = <<-EOT
     What differs between the data roots' clusters (ADR-0011, capacity 4.1, 4.5, 5.2, 5.3): the cluster's role, its
     instance class (db.serverless with serverless_capacity for Serverless v2), how many instances (one per AZ, the
-    first the writer), the backup retention, and the master secret's recovery window outside teardown.
+    first the writer), the backup retention, the master secret's recovery window outside teardown, and the global
+    database's generation: 1 (sft-<env>-aurora) until a failback after a detach makes a new one from Osaka's cluster
+    (#261, docs/runbooks/regional-failback.md).
   EOT
   type = object({
     cluster_role                       = string
@@ -45,11 +50,17 @@ variable "aurora" {
     instance_count                     = optional(number, 1)
     backup_retention_days              = number
     master_secret_recovery_window_days = optional(number, 7)
+    global_generation                  = optional(number, 1)
   })
 
   validation {
     condition     = contains(["standalone", "primary", "secondary"], var.aurora.cluster_role)
     error_message = "aurora.cluster_role must be standalone, primary or secondary."
+  }
+
+  validation {
+    condition     = var.aurora.global_generation >= 1 && var.aurora.global_generation <= 9 && floor(var.aurora.global_generation) == var.aurora.global_generation
+    error_message = "aurora.global_generation must be a whole number from 1 to 9."
   }
 
   validation {
@@ -103,6 +114,16 @@ variable "teardown" {
   description = <<-EOT
     True only for the apply that comes before destroying the stack: it turns deletion protection off, skips the final
     snapshot and lets the master secret go without a recovery window (infra/README.md, "Apply order").
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "replicate_to_tokyo" {
+  description = <<-EOT
+    Osaka only, at a failback: replicate Osaka's files buckets back to Tokyo's (rule to-tokyo, with RTC), so the files
+    uploaded during a failover reach Tokyo (#262, #42 gap 4). Set by the failback runbook's step 2
+    (TF_VAR_replicate_to_tokyo=true) and cleared in its step 8. Ignored in Tokyo.
   EOT
   type        = bool
   default     = false

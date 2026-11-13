@@ -1,7 +1,8 @@
 """The observability stack as Argo CD will render it (ADR-0009, #243), checked against the pod rules of ADR-0004, the
 network design of ADR-0021 and the wiring #243 asks for.
 
-Renders every cluster with deploy/render.sh (helm on PATH). Run from the repository root:
+Inspects every cluster as deploy/render.sh renders it (the `rendered` fixture, deploy/conftest.py; helm on PATH). Run
+from the repository root:
 `uv run --project services/api --locked pytest deploy/observability/tests`.
 """
 
@@ -10,12 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -44,25 +43,6 @@ HOST_PATHS = {("node-agents", "/var/log/pods")}
 
 Manifest = dict[str, Any]
 Rendered = dict[tuple[str, str, str], list[Manifest]]
-
-
-@pytest.fixture(scope="session")
-def rendered(tmp_path_factory: pytest.TempPathFactory) -> Rendered:
-    out = tmp_path_factory.mktemp("rendered")
-    subprocess.run(
-        [str(ROOT / "deploy" / "render.sh"), str(out)], check=True, capture_output=True
-    )
-    result: Rendered = {}
-    for path in out.glob("*.yaml"):
-        match = re.fullmatch(
-            r"(dev|staging|prod)-(ap-northeast-[13])-(.+)\.yaml", path.name
-        )
-        assert match, path.name
-        env, region, part = match.groups()
-        result[(env, region, part)] = [
-            d for d in yaml.safe_load_all(path.read_text()) if d
-        ]
-    return result
 
 
 def stack(rendered: Rendered) -> Iterator[tuple[str, str, str, Manifest]]:
@@ -155,29 +135,11 @@ def test_tokyo_runs_the_stack_and_a_pilot_light_does_not(rendered: Rendered) -> 
 
 
 def test_every_kind_is_one_the_project_allows(rendered: Rendered) -> None:
-    project = yaml.safe_load(
-        subprocess.run(
-            [
-                "helm",
-                "template",
-                "o",
-                str(OBS / "argocd"),
-                "--show-only",
-                "templates/project.yaml",
-                "--set",
-                "environment=dev",
-                "--set",
-                "region=ap-northeast-1",
-                "--set",
-                "cluster.registry=000000000000.dkr.ecr.ap-northeast-1.amazonaws.com",
-                "--set-string",
-                "cluster.accountId=000000000000",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-    )
+    (project,) = [
+        o
+        for o in rendered[("dev", "ap-northeast-1", "observability-argocd")]
+        if o["kind"] == "AppProject"
+    ]
     allowed = {
         (k["group"], k["kind"]) for k in project["spec"]["namespaceResourceWhitelist"]
     }
@@ -342,7 +304,11 @@ def test_a_budget_for_every_workload_and_no_outside_listener(
                 labels = pod_template(obj)["metadata"]["labels"]
                 assert [
                     b for b in budgets if _selects(b["spec"]["selector"], labels)
-                ], (env, region, obj["metadata"]["name"])
+                ], (
+                    env,
+                    region,
+                    obj["metadata"]["name"],
+                )
 
 
 def test_every_rule_file_reaches_prometheus_without_wiring(rendered: Rendered) -> None:
@@ -514,6 +480,8 @@ def test_the_application_reaches_the_pushgateway_and_the_agent(
                     "invite-backlog",
                     "key-rotation",
                     "field-keys",
+                    "recovery",  # #258: run by hand; its report is its log line
+                    "standby-enrolment",  # #258: likewise
                 }:
                     continue  # no metrics of their own to push (they log)
                 assert url == "http://pushgateway.monitoring.svc.cluster.local:9091", (

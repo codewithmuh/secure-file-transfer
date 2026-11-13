@@ -120,6 +120,8 @@ module "user_pool" {
 module "signin_triggers" {
   source = "../../../../modules/signin-triggers"
 
+  conventions = module.conventions
+
   environment      = "staging"
   account_id       = var.account_id
   region           = module.conventions.region
@@ -148,4 +150,34 @@ module "app_secrets" {
   replica_region          = "ap-northeast-3"
   replica_kms_key_arn     = data.terraform_remote_state.data.outputs.kms_osaka_key_arns["secrets"]
   recovery_window_in_days = 7
+}
+
+# The synthetic probe's and the load test's mailbox in this Region (#259): SES receiving into the mailbox
+# bucket. Tokyo's stack writes the MX records, Tokyo first, then Osaka.
+module "probe_mailbox" {
+  source = "../../../../modules/probe-mailbox"
+
+  providers = {
+    aws     = aws
+    aws.dns = aws.dns
+  }
+
+  conventions = module.conventions
+
+  environment = "staging"
+  account_id  = var.account_id
+  region      = module.conventions.region
+  domain      = var.domain
+  mailboxes   = ["probe", "loadtest"]
+  mx_regions  = ["ap-northeast-1", "ap-northeast-3"]
+
+  platform_key_arn             = data.terraform_remote_state.data.outputs.kms_key_arns["platform"]
+  deploy_role_arn              = module.conventions.bootstrap_role_arns.terraform_deploy
+  admin_principal_arn_patterns = [module.conventions.sso_role_arn_patterns.admin]
+
+  # The load test's role and secret, staging's Tokyo only (docs/operations/performance.md).
+  load_test = {
+    secrets_key_arn   = data.terraform_remote_state.data.outputs.kms_key_arns["secrets"]
+    github_repository = module.conventions.github_repository
+  }
 }

@@ -23,7 +23,9 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
 - **Approval requests** (`expire_approval_requests`, #220; data model 3.6): a pending request
   past `expires_at` becomes `expired`, under its transfer's row lock, with `dlp_approval.expired`;
   unless the transfer has expired itself, the transfer goes back to `awaiting_confirmation` and
-  its sender gets `dlp_approval_expired`, and may ask again, up to 3 requests in all.
+  its sender gets `dlp_approval_expired`, and may ask again, up to 3 requests in all. Then the
+  run measures the queue (`measure_approval_backlog`, #260): the oldest pending request's age and
+  the largest share of its timeout one has used, for `DlpApprovalBacklog`.
 - **Drafts** (`cancel_stale_drafts`): a draft with no activity for 7 days is cancelled, its files
   due for deletion and an open upload rejected (data model 2.2).
 - **Deletion** (`delete_due_files`): a file past `delete_after`, not `completing` or `scanning`
@@ -57,16 +59,20 @@ needs it, so the second run finds nothing left to do. "Now" is the jobs' clock
   counted (`metadata_purge_blocked`), since deleting it would orphan the object. Audit events are
   never touched.
 - **Audit partitions** (`maintain_partitions`), daily: `sft.service.audit_partitions`, which keeps
-  three months of partitions ahead and exports what its alerts watch.
+  three months of partitions ahead, drops the months past the 365-day retention once they are
+  archived in both regions (#255, NFR-9), and exports what its alerts watch.
 - **Cleanup** (`clean_up`), daily: expired verification codes, link sessions (their grants go
   with them) and grants are deleted, each batch with one `retention.rows_deleted` event; so are
   retired DLP rule revisions no decision refers to (#219), retired detector revisions that a later
   revision replaced, or that no live rule and no finding names (#218), and known recipient domains
   365 days after `last_sent_at` (#219; the event counts rows, never names a domain). It also asks
   for the API key expiry emails due, 14 and 3 days before a key expires
-  (`sft.service.api_keys.queue_expiry_notices`, #215). A grant whose committed record isn't
-  confirmed, and its session, are never deleted: reconciliation retries the record, and
-  `lifecycle_unarchived_grants` shows how many wait.
+  (`sft.service.api_keys.queue_expiry_notices`, #215), and deletes idempotency keys past their 24
+  hours (`sft.service.idempotency.delete_expired_keys`, #162), with no event, and the identities
+  of operators' temporary local sign-ins past their 72 hours, each with its event
+  (`sft.service.admin_recovery.end_temporary_sign_ins`, #239). A grant whose
+  committed record isn't confirmed, and its session, are never deleted: reconciliation retries
+  the record, and `lifecycle_unarchived_grants` shows how many wait.
 
 Metrics, for NFR-8 and the jobs (`JobMetrics`): items done per job and result, the age of the
 oldest file whose deletion is due and not done (`lifecycle_deletion_lag_seconds`), the files past
@@ -116,7 +122,7 @@ from sft.data.models import (
 )
 from sft.data.outbox import DLP_APPROVAL_EXPIRED, enqueue
 from sft.data.scope import Scope
-from sft.service import api_keys, scan_timing
+from sft.service import admin_recovery, api_keys, idempotency, scan_timing
 from sft.service.audit_archive import AuditArchive
 from sft.service.audit_partitions import AuditPartitionMetrics, maintain_audit_partitions
 from sft.service.dlp_decision import KNOWN_FOR
@@ -303,6 +309,30 @@ class PurgeMetrics:
         return cls(rows, blocked, lag)
 
 
+@dataclass(frozen=True)
+class ApprovalBacklogMetrics:
+    """The DLP approval queue, measured by each expiry run (#260; abuse and rate limits 8.2)."""
+
+    oldest: Gauge
+    timeout_used: Gauge
+
+    @classmethod
+    def create(cls, registry: CollectorRegistry) -> ApprovalBacklogMetrics:
+        return cls(
+            Gauge(
+                "dlp_approval_oldest_pending_age_seconds",
+                "Age of the oldest pending DLP approval request, across tenants (FR-43).",
+                registry=registry,
+            ),
+            Gauge(
+                "dlp_approval_pending_timeout_used_ratio",
+                "The largest share of its tenant's approval timeout a pending request has used; "
+                "DlpApprovalBacklog fires above 0.5 (abuse and rate limits 8.2).",
+                registry=registry,
+            ),
+        )
+
+
 @dataclass
 class Jobs:
     """What the jobs act on: the database as `sft_jobs`, the files buckets of every region, the
@@ -322,6 +352,8 @@ class Jobs:
     """The purge's own metrics (#224), made only for its runs."""
     partition_metrics: AuditPartitionMetrics | None = None
     """The audit partition step's metrics, made only for its runs."""
+    approval_metrics: ApprovalBacklogMetrics | None = None
+    """The approval queue's age (#260), measured by the expiry job's runs."""
     report: dict[str, int] = field(default_factory=dict)
 
     def done(self, key: str, n: int = 1) -> None:
@@ -997,6 +1029,18 @@ async def clean_up(jobs: Jobs) -> dict[str, int]:
     notices = await api_keys.queue_expiry_notices(database, now=now)
     jobs.metrics.count(Job.CLEANUP, "api_key_notices_queued", notices)
     jobs.done("api_key_notices_queued", notices)
+    # Idempotency keys past their 24 hours (#144, #162): remembering a request isn't an action,
+    # so their deletion writes no event, as their writing writes none of its own.
+    keys = await idempotency.delete_expired_keys(database)
+    jobs.metrics.count(Job.CLEANUP, "idempotency_keys_deleted", keys)
+    jobs.done("idempotency_keys_deleted", keys)
+    # Operators' temporary local sign-ins past their 72 hours (#239): their identities stopped
+    # working at their end; the job deletes them, each with its event.
+    ended = await admin_recovery.end_temporary_sign_ins(
+        database, now=now, job=_details(SystemActor.CLEANUP_JOB)
+    )
+    jobs.metrics.count(Job.CLEANUP, "temporary_sign_ins_ended", ended)
+    jobs.done("temporary_sign_ins_ended", ended)
     # Grants waiting for their committed record, and their sessions, stay; the report says how
     # many, so a growing number shows (NFR-15).
     await measure_unarchived(jobs)
@@ -1108,11 +1152,15 @@ async def measure_purge_backlog(jobs: Jobs, cutoff: datetime) -> purges.Backlog:
 async def maintain_partitions(jobs: Jobs) -> dict[str, int]:
     """The audit partition step (`sft.service.audit_partitions`), as a lifecycle job."""
     metrics = jobs.partition_metrics or AuditPartitionMetrics.create()
-    status = await maintain_audit_partitions(jobs.database, metrics)
+    status = await maintain_audit_partitions(jobs.database, metrics, now=jobs.now)
     jobs.report["default_rows"] = status.default_rows
     jobs.report["months_covered"] = status.months_covered
+    jobs.report["partitions_dropped"] = len(status.dropped)
+    jobs.report["expired_partitions"] = status.expired
     if status.failed:
         raise RuntimeError(f"audit partitions not created: {', '.join(status.failed)}")
+    if status.drop_failed:
+        raise RuntimeError(f"audit partitions not dropped: {', '.join(status.drop_failed)}")
     return jobs.report
 
 
@@ -1123,8 +1171,20 @@ async def _expiry(jobs: Jobs) -> object:
     await expire_transfers(jobs)
     await expire_upload_requests(jobs)
     await expire_approval_requests(jobs)
+    await measure_approval_backlog(jobs)
     await cancel_stale_drafts(jobs)
     return jobs.report
+
+
+async def measure_approval_backlog(jobs: Jobs) -> dlp_approvals.Backlog:
+    """The approval queue after the expiry (#260): the oldest pending request's age and the
+    largest share of its timeout one has used, which `DlpApprovalBacklog` reads."""
+    async with jobs.database.transaction(Scope.system()) as session:
+        backlog = await dlp_approvals.pending_backlog(session, now=jobs.now())
+    if jobs.approval_metrics is not None:
+        jobs.approval_metrics.oldest.set(backlog.oldest_seconds)
+        jobs.approval_metrics.timeout_used.set(backlog.timeout_used)
+    return backlog
 
 
 RUNS.update(

@@ -36,12 +36,19 @@ from sft.core.logs import configure_logging
 from sft.core.settings import EXIT_BAD_SETTINGS, JobSettings, load_settings
 from sft.data.database import Database
 from sft.data.models import StorageClass
-from sft.runtime.archive import S3AuditArchive
+from sft.runtime.archive import open_audit_archive
 from sft.runtime.s3 import S3Cleaner, S3Objects
 from sft.service import sli
-from sft.service.audit_archive import ArchiveMetrics, AuditArchive, Region
+from sft.service.audit_archive import ArchiveMetrics, AuditArchive
 from sft.service.audit_partitions import AuditPartitionMetrics
-from sft.service.lifecycle import RUNS, Job, JobMetrics, Jobs, PurgeMetrics
+from sft.service.lifecycle import (
+    RUNS,
+    ApprovalBacklogMetrics,
+    Job,
+    JobMetrics,
+    Jobs,
+    PurgeMetrics,
+)
 from sft.workers.scan import ScanMetrics
 from sft.workers.scan_sweep import sweep
 
@@ -52,12 +59,14 @@ NEEDS_BUCKETS: Final = frozenset({Job.DELETION, Job.RECONCILIATION, Job.STORAGE_
 
 
 def _archive(settings: JobSettings, registry: CollectorRegistry) -> AuditArchive:
-    buckets = {Region.TOKYO: settings.audit_archive_tokyo_bucket}
-    endpoints = {Region.TOKYO: settings.audit_archive_tokyo_endpoint_url}
-    if settings.audit_archive_osaka_bucket is not None:
-        buckets[Region.OSAKA] = settings.audit_archive_osaka_bucket
-        endpoints[Region.OSAKA] = settings.audit_archive_osaka_endpoint_url
-    return AuditArchive(S3AuditArchive.create(buckets, endpoints), ArchiveMetrics.create(registry))
+    store = open_audit_archive(
+        tokyo_bucket=settings.audit_archive_tokyo_bucket,
+        osaka_bucket=settings.audit_archive_osaka_bucket,
+        tokyo_endpoint=settings.audit_archive_tokyo_endpoint_url,
+        osaka_endpoint=settings.audit_archive_osaka_endpoint_url,
+        surviving_region=settings.audit_archive_surviving_region,
+    )
+    return AuditArchive(store, ArchiveMetrics.create(registry))
 
 
 def _cleaner(settings: JobSettings) -> S3Cleaner:
@@ -108,6 +117,8 @@ async def run_job(job: Job, settings: JobSettings, registry: CollectorRegistry) 
         jobs.purge_metrics = PurgeMetrics.create(registry)
     if job is Job.AUDIT_PARTITIONS:
         jobs.partition_metrics = AuditPartitionMetrics.create(registry)
+    if job is Job.EXPIRY:
+        jobs.approval_metrics = ApprovalBacklogMetrics.create(registry)
     if job is Job.RECONCILIATION:
         jobs.archive = _archive(settings, registry)
         scan_metrics = ScanMetrics.create(registry)

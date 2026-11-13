@@ -80,23 +80,30 @@ misconfigurations:
     paths:
       - "**/modules/edge/logs.tf"
       - "**/modules/edge/web-bucket.tf"
+      - "**/modules/web-bundles/main.tf"
     statement: >-
-      Two buckets use SSE-S3 on purpose (encryption 3.1). The load balancer's access logs support only SSE-S3, the
-      exception to NFR-13 recorded in encryption 3.1; they hold no tokens, which travel in the URL fragment. The web
+      Two kinds of bucket use SSE-S3 on purpose (encryption 3.1). The load balancer's access logs support only SSE-S3,
+      the exception to NFR-13 recorded in encryption 3.1; they hold no tokens, which travel in the URL fragment. The web
       bundle buckets hold public content that every browser downloads; CloudFront reads them through origin access
-      control and only the release pipeline writes them (ADR-0008, T-02). The WAF log bucket in logs.tf uses the
+      control and only the release pipeline writes them (ADR-0008, T-02). So does the shared account's bundle store
+      they are copied from (#283), which every environment's release role reads across accounts; a customer managed
+      key would have to be shared with each of them for content that is public anyway, and the manifest's digests in
+      Git, not the key, are what keep a bundle from being changed. The WAF log bucket in logs.tf uses the
       environment's logs key.
   - id: AVD-AWS-0089 # S3 bucket logging
     paths:
       - "**/modules/edge/logs.tf"
       - "**/modules/edge/web-bucket.tf"
+      - "**/modules/web-bundles/main.tf"
       - "**/modules/log-archive/main.tf"
     statement: >-
       Log buckets don't log to more log buckets, which would only move the question one bucket on: the edge's WAF and
       load balancer log buckets and the organization's log archive are written by AWS's log delivery services and
       read by people only through their own sessions, which the organization trail records as management events and
       KMS calls (T-75). The web bundle buckets hold public content; CloudFront's own standard logs record every read,
-      and only the release pipeline writes them (ADR-0008, T-02). Changes to any of them are management events in the
+      and only the release pipeline writes them (ADR-0008, T-02); the bundle store is read only by the environments'
+      release roles and written only by the publish role, each assumed from a main-only GitHub environment whose
+      runs are the record (#283). Changes to any of them are management events in the
       organization trail.
   - id: AVD-AWS-0162 # CloudTrail to CloudWatch Logs
     paths:
@@ -155,3 +162,35 @@ misconfigurations:
       Identity (iam:PassedToService = pods.eks.amazonaws.com), which can't associate a role without it. Each carries
       the observability boundary, which allows no IAM change and no sts:AssumeRole, so passing one gains nothing
       beyond telemetry storage, alert publishing and metric reads (T-71).
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/environments/prod/retained/state.tf"
+      - "**/environments/prod/retained/trail.tf"
+    statement: >-
+      The retained stack's state and trail buckets (encryption 8.4, #263), like every state bucket, record access
+      through CloudTrail rather than S3 server access logs, which support only SSE-S3 (encryption 3.1): while prod runs
+      the organization trail's data events on sft-*-tfstate-* buckets, and the retained trail's management events
+      from teardown on. The trail bucket is itself a log bucket, and logging it would only move the question one
+      bucket on. Changes to either bucket's guards page through the retained stack's rules (retained-stack-change.md;
+      T-73, T-75).
+  - id: AVD-AWS-0162 # CloudTrail to CloudWatch Logs
+    paths:
+      - "**/environments/prod/retained/trail.tf"
+    statement: >-
+      The retained trail (encryption 8.4, #263) exists so EventBridge sees the archive's calls after teardown; its
+      rules (retained-stack-change.md) need no log group, and a CloudWatch Logs copy would add a monthly cost against
+      NFR-19's $7 and a second, mutable store of the same records (T-75).
+  - id: AVD-AWS-0163 # CloudTrail bucket access logging
+    paths:
+      - "**/environments/prod/retained/trail.tf"
+    statement: >-
+      The retained trail's bucket denies deleting a log file or changing the bucket to everyone but the retained
+      stack's deploy role and Admin, and keeps every version; reads by people are management events the trail itself
+      records. Server access logs would need another bucket, outside NFR-19's budget (encryption 8.4, T-75).
+  - id: AVD-AWS-0089 # S3 bucket logging
+    paths:
+      - "**/modules/probe-mailbox/main.tf"
+    statement: >-
+      The probe mailbox (#259) holds only the synthetic probe's and the load test's own emails, for a day. Server
+      access logs support only SSE-S3 (encryption 3.1) and would hold every message's key; writes are SES's alone and
+      reads are the probe's and the load test's roles, whose calls CloudTrail records. Threat model T-51, T-75.

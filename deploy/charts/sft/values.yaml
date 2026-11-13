@@ -29,6 +29,12 @@ cluster:
   appClientId: ""
   standbyUserPoolId: ""
   standbyAppClientId: ""
+  # The operator API's break-glass reconciliation (#239, #275; authn-authz 8.3), from the organization stack's outputs:
+  # the management account's read-only role for this environment, the BreakGlass permission set and Identity Center's
+  # identity store. Empty until the organization stack has made the role; the reconciliation is off while any is.
+  breakGlassTrailRoleArn: ""
+  breakGlassPermissionSetArn: ""
+  identityStoreId: ""
 
 # The keyrings are read from Secrets Manager by the API and the notification worker themselves, at start and every 5
 # minutes, as their own roles (encryption 6.4, #184): their settings only name the secret. The user pool client's ID
@@ -54,6 +60,15 @@ pilotLight: false
 # security-critical changes.
 failover:
   holdWorkers: false
+
+# The audit archive during a regional loss (#257, docs/runbooks/regional-failover.md): every security-critical record
+# and every archive batch goes to both regions' archive (architecture 5.2), so with one region lost, grants would fail.
+# The failover runbook names the region that is left (ap-northeast-3 when Tokyo is lost): the API, the operator API,
+# the lifecycle jobs and the archive job then write its archive alone (AUDIT_ARCHIVE_SURVIVING_REGION), and the archive job records what
+# the other region lacks. Failback sets it back to empty, and the archive job back-fills the other region with the same
+# objects. Never set in dev, which has Tokyo alone.
+auditArchive:
+  survivingRegionOnly: ""
 
 # The application image: one image for the API and every worker (architecture 2). The digest is the only line the
 # promotion workflow edits, in each cluster's values file (ADR-0005, #107).
@@ -104,7 +119,7 @@ network:
     namespace: egress-proxy
     host: egress-proxy.egress-proxy.svc.cluster.local
     podLabels: { app.kubernetes.io/name: egress-proxy }
-    ports: { api: 3128, notifier: 3129, signatureMirror: 3130, keyRotation: 3133 }
+    ports: { api: 3128, notifier: 3129, signatureMirror: 3130, keyRotation: 3133, operator: 3135 }
 
 # Node pools (ADR-0004, #103): main for most workloads, scan for the scan trios, which are tainted. No pod here may
 # run on, or tolerate, the system pool.
@@ -336,6 +351,44 @@ fieldKeys:
 # invite-backlog invite-backlog-1 (deploy/README.md). It runs as the notification worker, with its settings.
 inviteBacklog:
   module: sft.workers.invite_backlog
+  activeDeadlineSeconds: 3600
+
+# The recovery job (#258; sft.workers.recovery, docs/operations/disaster-recovery.md 4): a CronJob that is always
+# suspended, run by hand by the restore, failover and failback runbooks, which render a Job from it with their steps
+# and times (ops/lib/common.sh). It runs as sft_recovery with its own service account (Pod Identity: sft-<env>-recovery,
+# which lists and reads the audit archive in every region) and reads this region's (AUDIT_ARCHIVE_BUCKET), or Osaka's
+# for the failback's replay (AUDIT_ARCHIVE_REGION, #276).
+recovery:
+  module: sft.workers.recovery
+  serviceAccount: recovery # Pod Identity: sft-<env>-recovery
+  databaseRole: sft_recovery
+  activeDeadlineSeconds: 3600
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 2Gi } # the replay holds the window's records in memory
+
+# The database bootstrap job (#278; sft.data.bootstrap, encryption 6.3, data model 7; templates/db-bootstrap.yaml):
+# creates the login roles as the Aurora master user, as a PreSync hook before the migration. Off: a reviewed commit
+# sets runOnSync to true in a Tokyo values file for the sync that needs it (an environment's first deploy, or a new
+# login role), and the next commit sets it back, so the master password is read only then. It reads the password from
+# Secrets Manager itself, as its own role (sft-<env>-db-bootstrap), the only workload that may; the password is never
+# in the pod spec or a Kubernetes Secret.
+dbBootstrap:
+  runOnSync: false
+  module: sft.data.bootstrap
+  serviceAccount: db-bootstrap # Pod Identity: sft-<env>-db-bootstrap
+  masterUser: sft_master # infra/modules/aurora's master_username
+  activeDeadlineSeconds: 600
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+# The standby enrolment (#258; authn-authz 2.6): after a regional failover, every active local member gets a user in
+# this region's pool and a re-enrolment invitation. Always suspended, run by hand once by the failover runbook after the
+# recovery job's replay: kubectl create job --from=cronjob/standby-enrolment. It runs as the notification worker, with
+# its settings, its service account and its proxy listener, like invite-backlog.
+standbyEnrolment:
+  module: sft.workers.standby_enrolment
   activeDeadlineSeconds: 3600
 
 # ADR-0019's split between the scan pools, in bytes: the API routes a completed file by it, and so does

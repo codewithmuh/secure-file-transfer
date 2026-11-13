@@ -49,6 +49,7 @@ locals {
     platform         = 3132
     key-rotation     = 3133
     synthetic-probe  = 3134 # #248: the probe's own way in from outside
+    operator         = 3135 # #275: the operator API's break-glass reconciliation and SSO drift check
   }
   proxy_url = { for name, port in local.proxy_ports : name => "http://${local.proxy_host}:${port}" }
 

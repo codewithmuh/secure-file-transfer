@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Check that every required status check in .github/rulesets/protect-main.json is a job that reports on every pull
 # request (#59). A required check that never reports blocks every PR, which is what happened when the template's Go
-# and image checks stayed in the ruleset after #46 removed those jobs.
+# and image checks stayed in the ruleset after #46 removed those jobs. Also check that nobody may bypass the ruleset
+# (#6): Release PRs get their checks from the release App's token (release.yml), so no exception is needed.
 #
 # A context passes when it is the literal `name:` of a job in a workflow that triggers on `pull_request` with no
 # `paths`/`paths-ignore`/`branches` filter, and the job has no matrix (a matrix job reports under the expanded name,
@@ -52,5 +53,13 @@ done < <(jq -r '.rules[] | select(.type == "required_status_checks") | .paramete
 if [[ $count -eq 0 ]]; then
   echo "FAIL $ruleset has no required status checks"
   exit 1
+fi
+
+bypass=$(jq '.bypass_actors | length' "$ruleset")
+if [[ $bypass -eq 0 ]]; then
+  echo "ok   nobody may bypass the ruleset"
+else
+  echo "FAIL the ruleset has $bypass bypass actor(s); every merge must pass the required checks (#6)"
+  failed=1
 fi
 exit "$failed"

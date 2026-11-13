@@ -59,8 +59,10 @@ module "data" {
     instance_class        = "db.serverless"
     serverless_capacity   = { min = 1, max = 16 }
     backup_retention_days = 14
+    global_generation     = var.aurora_global_generation
   }
   primary_key_arns                 = var.primary_key_arns
   osaka_malware_protection_enabled = var.malware_protection_enabled
+  replicate_to_tokyo               = var.replicate_to_tokyo
   teardown                         = var.teardown
 }

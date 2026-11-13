@@ -12,6 +12,11 @@ decides what a retry gets; this module only reads and writes rows:
   row of the same key, so a key works again after 24 hours, before the daily job deletes it.
 - `tenants_with_expired` and `delete_expired` are the daily job's (`sft_jobs`): find across in
   system scope, then delete within each tenant's scope.
+- `find_operator`, `lock_operator` and `save_operator` are the operator API's (#160, revision
+  0036): its keys belong to the operator, not a tenant, so it finds one across tenants in platform
+  scope (`operator_find`), then locks and writes it in the scope of the tenant it makes or acts
+  on. The lock's name has no tenant, and a write never overwrites: an operator's key is written
+  once.
 
 Every function filters with `in_scope` and writes the scope's tenant, like every data-access
 function; the key's caller is the service's to choose.
@@ -39,6 +44,9 @@ LIFETIME: Final = timedelta(hours=24)
 FINGERPRINT_BYTES: Final = 32
 """A SHA-256 digest."""
 
+OPERATOR: Final = "operator"
+"""The `caller_type` of an operator's keys (revision 0036)."""
+
 
 @dataclass(frozen=True, slots=True)
 class Stored:
@@ -61,7 +69,9 @@ async def lock(session: AsyncSession, caller_type: str, caller_id: UUID, key: st
 
 
 async def find(session: AsyncSession, caller_type: str, caller_id: UUID, key: str) -> Stored | None:
-    """The key's row, if it hasn't expired."""
+    """The key's row, if it hasn't expired, in the scope's tenant: never across tenants, which only
+    the operator's platform read does (`find_operator`)."""
+    require_scope(session, ScopeKind.TENANT, ScopeKind.RESOURCE)
     statement = select(
         IdempotencyKey.request_fingerprint,
         IdempotencyKey.response_status,
@@ -124,6 +134,91 @@ async def save(
             # Only an expired row of this tenant gives way.
             where=(IdempotencyKey.expires_at <= func.now())
             & (IdempotencyKey.tenant_id == tenant_of(session)),
+        )
+        .returning(IdempotencyKey.key)
+    )
+    return (await session.scalar(statement)) is not None
+
+
+# ---- the operator API's keys (#160) ----
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorStored:
+    """An operator's key wherever it was used: its tenant, its row, and whether it is still live."""
+
+    tenant_id: UUID
+    stored: Stored
+    live: bool
+
+
+async def find_operator(session: AsyncSession, caller_id: UUID, key: str) -> OperatorStored | None:
+    """The operator's key, live or expired, in whichever tenant it was used: platform scope."""
+    require_scope(session, ScopeKind.PLATFORM)
+    statement = select(
+        IdempotencyKey.tenant_id,
+        IdempotencyKey.request_fingerprint,
+        IdempotencyKey.response_status,
+        IdempotencyKey.resource_type,
+        IdempotencyKey.resource_id,
+        IdempotencyKey.expires_at > func.now(),
+    ).where(
+        IdempotencyKey.caller_type == OPERATOR,
+        IdempotencyKey.caller_id == caller_id,
+        IdempotencyKey.key == key,
+    )
+    row = (await session.execute(statement)).first()
+    if row is None:
+        return None
+    return OperatorStored(row[0], Stored(bytes(row[1]), row[2], row[3], row[4]), bool(row[5]))
+
+
+async def lock_operator(session: AsyncSession, caller_id: UUID, key: str) -> bool:
+    """Take the operator key's advisory lock for this transaction, if no other transaction holds
+    it. Named without a tenant: two retries of `createTenant` make two tenants' scopes."""
+    require_scope(session, ScopeKind.TENANT)
+    name = f"idempotency/{OPERATOR}/{caller_id}/{key}"
+    taken = await session.scalar(
+        text("SELECT pg_try_advisory_xact_lock(hashtextextended(:name, 0))"), {"name": name}
+    )
+    return bool(taken)
+
+
+async def save_operator(
+    session: AsyncSession,
+    caller_id: UUID,
+    key: str,
+    *,
+    fingerprint: bytes,
+    status: int,
+    resource_type: str,
+    resource_id: UUID,
+) -> bool:
+    """Record the operator's key in the scope's tenant, for `LIFETIME`. False, writing nothing,
+    when the key has a row already, in any tenant: it is never overwritten."""
+    require_scope(session, ScopeKind.TENANT)
+    if len(fingerprint) != FINGERPRINT_BYTES:
+        raise ValueError("a request fingerprint is a 32-byte SHA-256 digest")
+    statement = (
+        insert(IdempotencyKey)
+        .values(
+            tenant_id=tenant_of(session),
+            caller_type=OPERATOR,
+            caller_id=caller_id,
+            key=key,
+            request_fingerprint=fingerprint,
+            response_status=status,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            created_at=func.now(),
+            expires_at=func.now() + LIFETIME,
+        )
+        .on_conflict_do_nothing(
+            index_elements=[
+                IdempotencyKey.caller_type,
+                IdempotencyKey.caller_id,
+                IdempotencyKey.key,
+            ]
         )
         .returning(IdempotencyKey.key)
     )

@@ -3,20 +3,31 @@
 import asyncio
 import random
 from collections.abc import AsyncIterator
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, StatusCode
 from prometheus_client import CollectorRegistry
 
+from sft.core.telemetry import traced
+from sft.data import counters
 from sft.data.counters import (
     BREAKER_ERRORS,
     BREAKER_SECONDS,
+    CALL_TIMEOUT_SECONDS,
+    CONNECT_TIMEOUT_SECONDS,
     CounterMetrics,
     CounterStore,
     CounterStoreUnavailableError,
+    RateCall,
+    ScoresCall,
     Verdict,
     gcra_split,
 )
-from sft.service.rate_limits.limits import ALL, Rate
+from sft.service.rate_limits import RateLimiter
+from sft.service.rate_limits.limits import ALL, TENANT_OPERATION, KeyType, Rate
 from sft.service.rate_limits.local import LocalCounters, fallback_limit
 
 pytestmark = pytest.mark.anyio
@@ -285,14 +296,16 @@ def errors(metrics: CounterMetrics) -> float:
     return metrics.errors._value.get()  # type: ignore[attr-defined, no-any-return]
 
 
-async def test_a_call_gives_up_after_50_ms(silent_server: int) -> None:
+async def test_a_server_that_never_answers_costs_a_call_its_connect_budget(
+    silent_server: int,
+) -> None:
     metrics = CounterMetrics.create(CollectorRegistry())
     store = CounterStore.connect(f"redis://u:p@127.0.0.1:{silent_server}/0", metrics)
     loop = asyncio.get_running_loop()
     start = loop.time()
     with pytest.raises(CounterStoreUnavailableError):
         await rate(store, T0)
-    assert loop.time() - start < 0.5
+    assert loop.time() - start < CONNECT_TIMEOUT_SECONDS + 0.25
     assert errors(metrics) == 1
     await store.close()
 
@@ -306,16 +319,17 @@ async def test_the_store_rests_after_repeated_failures(valkey_url: str) -> None:
         with pytest.raises(CounterStoreUnavailableError):
             await rate(store, T0)
     assert metrics.fallback_active._value.get() == 1  # type: ignore[attr-defined]
-    # Resting: no call is made, so nothing waits for a timeout.
+    # Resting: no call is made, so nothing waits for a timeout. A call starts by opening its
+    # connection (#282), which is where this one, to a port nothing listens on, fails.
     calls = 0
-    real = store._rate
+    real = store._open_connection
 
-    async def counting(**kwargs: object) -> object:
+    async def counting() -> None:
         nonlocal calls
         calls += 1
-        return await real(**kwargs)  # type: ignore[arg-type]
+        await real()
 
-    store._rate = counting  # type: ignore[assignment]
+    store._open_connection = counting  # type: ignore[method-assign]
     with pytest.raises(CounterStoreUnavailableError, match="resting"):
         await rate(store, T0)
     assert calls == 0
@@ -372,3 +386,338 @@ async def test_leases_are_capped_renewed_and_expire(counter_store: CounterStore)
     assert await counter_store.acquire_lease(key, "s4", now_ms=30, ttl_ms=1000, cap=4)
     # A worker that died leaves its lease to expire.
     assert await counter_store.acquire_lease(key, "s5", now_ms=1500, ttl_ms=1000, cap=4)
+
+
+# ---- traces (#136) ----
+
+KEY = "rl:T.code:email:e1.pseudonym-of-someone"
+MEMBER = "attempt-7f3a"
+
+
+def counter_spans(spans: InMemorySpanExporter) -> list[ReadableSpan]:
+    return [s for s in spans.get_finished_spans() if s.name.startswith("counter.")]
+
+
+def shows(span: ReadableSpan, text: str) -> bool:
+    return text in span.name or any(text in str(v) for v in (span.attributes or {}).values())
+
+
+async def test_each_call_is_a_client_span_under_the_current_one_naming_no_key(
+    counter_store: CounterStore, spans: InMemorySpanExporter
+) -> None:
+    with traced("request", kind=SpanKind.SERVER) as request:
+        await counter_store.rate(KEY, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+        await counter_store.log(
+            KEY + ":log", now_ms=T0, limit=3, window_ms=1000, mode="hit", member=MEMBER
+        )
+        await counter_store.scores(KEY + ":log", now_ms=T0, window_ms=1000)
+        await counter_store.acquire_lease(KEY + ":lease", MEMBER, now_ms=T0, ttl_ms=1000, cap=1)
+        await counter_store.release_lease(KEY + ":lease", MEMBER)
+        await counter_store.holds(KEY + ":log", MEMBER)
+        await counter_store.forget_newest(KEY + ":log")
+        await counter_store.run(
+            [RateCall(KEY, 3, 3000, 1, peek=True), ScoresCall(KEY + ":log", 1000)], now_ms=T0
+        )
+    found = counter_spans(spans)
+    assert [s.name for s in found] == [
+        "counter.rate",
+        "counter.log",
+        "counter.scores",
+        "counter.lease_acquire",
+        "counter.lease_release",
+        "counter.holds",
+        "counter.forget_newest",
+        "counter.batch",
+    ]
+    parent = request.get_span_context().span_id
+    for span in found:
+        assert span.kind is SpanKind.CLIENT
+        assert span.parent is not None
+        assert span.parent.span_id == parent
+        assert span.status.status_code is StatusCode.UNSET
+        attributes = dict(span.attributes or {})
+        assert attributes.pop("db.system.name") == "valkey"
+        assert attributes.pop("db.operation.name") == span.name
+        assert attributes.pop("server.address") == "127.0.0.1"
+        assert isinstance(attributes.pop("server.port"), int)
+        assert attributes == {}
+        # Neither a key (a pseudonymised identifier) nor a member, a score or a time.
+        for secret in (KEY, "pseudonym", MEMBER, str(T0)):
+            assert not shows(span, secret), (span.name, secret)
+
+
+async def test_a_failed_call_is_an_error_span_with_the_error_type_alone(
+    silent_server: int, spans: InMemorySpanExporter
+) -> None:
+    store = CounterStore.connect(
+        f"redis://u:p@127.0.0.1:{silent_server}/0", CounterMetrics.create(CollectorRegistry())
+    )
+    with pytest.raises(CounterStoreUnavailableError):
+        await store.rate(KEY, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+    await store.close()
+    [span] = counter_spans(spans)
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
+    assert span.attributes is not None
+    assert span.attributes["error.type"] == "TimeoutError"
+    assert span.events == ()
+    assert not shows(span, KEY)
+
+
+async def test_a_resting_store_and_the_per_pod_fallback_make_no_span(
+    spans: InMemorySpanExporter,
+) -> None:
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = CounterStore.connect("redis://u:p@127.0.0.1:1/0", metrics)
+    store._clock = Clock()
+    for _ in range(BREAKER_ERRORS):
+        with pytest.raises(CounterStoreUnavailableError):
+            await rate(store, T0)
+    failed = counter_spans(spans)
+    assert len(failed) == BREAKER_ERRORS
+    assert {s.attributes["error.type"] for s in failed if s.attributes} == {"ConnectionError"}
+    spans.clear()
+    with pytest.raises(CounterStoreUnavailableError, match="resting"):
+        await rate(store, T0)
+    # The limiter then counts in this pod: no Valkey, so no span.
+    keys = {KeyType.ACCOUNT: "a", KeyType.TENANT: "t"}
+    await RateLimiter(store, metrics).check(TENANT_OPERATION, keys)
+    await store.close()
+    assert counter_spans(spans) == []
+
+
+# ---- scripts after a restart (found in M8: sign-in starts stuck at 503) ----
+
+
+async def flush_scripts(store: CounterStore) -> None:
+    """What a restart or a failover does to the script cache."""
+    await store._client.script_flush()
+
+
+async def test_a_restart_s_lost_scripts_load_outside_the_call_s_50_ms(
+    counter_store: CounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter_store._timeout = CALL_TIMEOUT_SECONDS  # this test is about the 50 ms itself
+    await flush_scripts(counter_store)
+    real = counter_store._load_scripts
+
+    async def slow(seen: int) -> None:
+        # A load slower than a whole call's budget: it used to run inside it, and time out.
+        await asyncio.sleep(CALL_TIMEOUT_SECONDS * 2)
+        await real(seen)
+
+    monkeypatch.setattr(counter_store, "_load_scripts", slow)
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._loads == 1
+    assert errors(counter_store._metrics) == 0
+    # Loaded: the next calls run at once.
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._loads == 1
+
+
+async def test_concurrent_calls_after_a_restart_share_one_load(
+    counter_store: CounterStore,
+) -> None:
+    await flush_scripts(counter_store)
+    keys = [f"rl:T.rate:ip:192.0.2.{n}" for n in range(20)]
+    verdicts = await asyncio.gather(
+        *(
+            counter_store.rate(key, now_ms=T0, limit=3, period_ms=3000, cost=1, peek=False)
+            for key in keys
+        )
+    )
+    assert all(v.allowed for v in verdicts)
+    assert counter_store._loads == 1
+    # A batch, which runs its scripts in a pipeline, recovers the same way, and counts once.
+    await flush_scripts(counter_store)
+    [first, second] = await counter_store.run(
+        [RateCall(keys[0], 3, 3000, 1, peek=False), RateCall(keys[0], 3, 3000, 1, peek=False)],
+        now_ms=T0,
+    )
+    assert first == Verdict(True, 0)
+    assert second == Verdict(False, 1500)  # the third at T0 of 3 in 3 s: the burst is 2
+    assert counter_store._loads == 2
+
+
+async def test_a_load_that_runs_out_of_time_is_a_failure_and_the_breaker_still_closes(
+    counter_store: CounterStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(counters, "SCRIPT_LOAD_TIMEOUT_SECONDS", 0.01)
+    await flush_scripts(counter_store)
+    real = counter_store._load_scripts
+
+    async def stuck(seen: int) -> None:
+        async with asyncio.timeout(counters.SCRIPT_LOAD_TIMEOUT_SECONDS):
+            await asyncio.sleep(1)
+        await real(seen)  # pragma: no cover - never reached
+
+    monkeypatch.setattr(counter_store, "_load_scripts", stuck)
+    with pytest.raises(CounterStoreUnavailableError, match="TimeoutError"):
+        await rate(counter_store, T0)
+    assert errors(counter_store._metrics) == 1
+    # Resting after five failures, the scripts still gone: once the rest is over, the next
+    # call loads them and closes the circuit, so the limits don't stay failed for good.
+    monkeypatch.setattr(counter_store, "_load_scripts", real)
+    clock = Clock()
+    counter_store._clock = clock
+    counter_store._failures = BREAKER_ERRORS
+    counter_store._resting_until = clock.now + BREAKER_SECONDS
+    with pytest.raises(CounterStoreUnavailableError, match="resting"):
+        await rate(counter_store, T0)
+    clock.now += BREAKER_SECONDS
+    assert (await rate(counter_store, T0)).allowed
+    assert counter_store._failures == 0
+    assert counter_store._metrics.fallback_active._value.get() == 0  # type: ignore[attr-defined]
+
+
+# ---- a slow but healthy Valkey (#282) ----
+
+
+class SlowLink:
+    """A TCP proxy to the test Valkey that adds `delay` each way, as a slow host's network does,
+    and can hold the next answer back past a call's budget."""
+
+    def __init__(self, upstream: tuple[str, int], delay: float) -> None:
+        self.upstream = upstream
+        self.delay = delay
+        self.connections = 0
+        self._held = 0.0
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._writers: list[asyncio.StreamWriter] = []
+        self._server: asyncio.Server | None = None
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        return int(self._server.sockets[0].getsockname()[1])
+
+    def hold_next_answer(self, seconds: float) -> None:
+        self._held = seconds
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        for writer in self._writers:
+            writer.close()
+
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        up_reader, up_writer = await asyncio.open_connection(*self.upstream)
+        self._writers += [writer, up_writer]
+        for task in (
+            asyncio.create_task(self._pipe(reader, up_writer, answers=False)),
+            asyncio.create_task(self._pipe(up_reader, writer, answers=True)),
+        ):
+            self._tasks.add(task)
+
+    async def _pipe(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, answers: bool
+    ) -> None:
+        """Forward each chunk `delay` after it arrived, in order; end at the end of input."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue()
+
+        async def forward() -> None:
+            try:
+                while data := (item := await queue.get())[1]:
+                    await asyncio.sleep(max(0.0, item[0] - loop.time()))
+                    writer.write(data)
+                    await writer.drain()
+            except OSError:
+                pass  # the other side has gone: the held answer of a call that gave up
+            writer.close()
+
+        sender = asyncio.create_task(forward())
+        self._tasks.add(sender)
+        try:
+            while data := await reader.read(65536):
+                extra = 0.0
+                if answers and self._held:
+                    extra, self._held = self._held, 0.0
+                queue.put_nowait((loop.time() + self.delay + extra, data))
+        except OSError:
+            pass
+        queue.put_nowait((loop.time(), b""))
+
+
+DELAY = 0.025
+"""Each way: a 50 ms round trip, so opening a connection (TCP, then AUTH and CLIENT SETINFO) takes
+100 ms or more."""
+BUDGET = 4 * DELAY
+"""The calls' budget here, for the same proportions as 50 ms on a slower host: one call (one round
+trip) fits with room to spare on a busy machine; a connection and a call (three) don't."""
+
+
+@pytest.fixture
+async def slow_link(valkey_url: str) -> AsyncIterator[tuple[SlowLink, str]]:
+    """The proxy, and a URL for the test Valkey through it."""
+    parts = urlsplit(valkey_url)
+    link = SlowLink((parts.hostname or "127.0.0.1", parts.port or 6379), DELAY)
+    port = await link.start()
+    credentials, at, _ = parts.netloc.rpartition("@")
+    yield link, urlunsplit(parts._replace(netloc=f"{credentials}{at}127.0.0.1:{port}"))
+    await link.close()
+
+
+def slow_store(url: str, metrics: CounterMetrics) -> CounterStore:
+    store = CounterStore.connect(url, metrics)
+    store._timeout = BUDGET
+    return store
+
+
+async def peek(store: CounterStore) -> Verdict:
+    """A call that changes nothing, so a test can repeat it."""
+    return await store.rate(
+        "rl:T.slow_link:ip:192.0.2.82", now_ms=T0, limit=3, period_ms=3000, cost=1, peek=True
+    )
+
+
+async def test_a_slow_host_recovers_from_a_timed_out_call_without_the_breaker_resting(
+    slow_link: tuple[SlowLink, str],
+) -> None:
+    link, url = slow_link
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = slow_store(url, metrics)
+    loop = asyncio.get_running_loop()
+    try:
+        # The first call opens its connection before its budget starts: the two together take
+        # longer than the budget, and the call succeeds.
+        start = loop.time()
+        assert (await peek(store)).allowed
+        assert loop.time() - start > BUDGET
+        assert link.connections == 1
+        # One answer slower than the budget: the call gives up at its budget, and the client
+        # closes the connection with the answer unread.
+        link.hold_next_answer(3 * BUDGET)
+        start = loop.time()
+        with pytest.raises(CounterStoreUnavailableError, match="TimeoutError"):
+            await peek(store)
+        assert loop.time() - start < 3 * BUDGET
+        # The next call opens a new connection outside its budget, and every call after it uses
+        # that one: a single failure, and no rest (found in M8: every call timed out after one).
+        for _ in range(BREAKER_ERRORS):
+            assert (await peek(store)).allowed
+        assert link.connections == 2
+        assert errors(metrics) == 1
+        assert store._failures == 0
+        assert metrics.fallback_active._value.get() == 0  # type: ignore[attr-defined]
+    finally:
+        await store.close()
+
+
+async def test_concurrent_calls_on_a_slow_host_each_connect_outside_their_budget(
+    slow_link: tuple[SlowLink, str],
+) -> None:
+    link, url = slow_link
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = slow_store(url, metrics)
+    try:
+        verdicts = await asyncio.gather(*(peek(store) for _ in range(2 * BREAKER_ERRORS)))
+        assert all(v.allowed for v in verdicts)
+        # Each call opened its own connection, and none of them inside its budget.
+        assert link.connections == 2 * BREAKER_ERRORS
+        assert errors(metrics) == 0
+    finally:
+        await store.close()

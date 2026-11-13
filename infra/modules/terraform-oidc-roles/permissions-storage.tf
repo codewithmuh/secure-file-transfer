@@ -10,7 +10,7 @@
 # 6,144, so the deploy role's are split in two.
 #
 # Scoped by name: buckets sft-<env>-apne?-{files,large-files,audit-archive}-<account>, keys and aliases in our Regions
-# (each key policy then decides what the role may do to that key), the three roles these modules make, GuardDuty
+# (each key policy then decides what the role may do to that key), the four roles these modules make, GuardDuty
 # plans and EventBridge rules sft-<env>-*, and the account's EBS default encryption. The prod deploy role gets nothing
 # on the audit archive, which is the retained stack's (SCP 5 denies it anyway), and no object deletes, which only the
 # lifecycle jobs do there (ADR-0012).
@@ -22,7 +22,7 @@ locals {
   storage_teardown = local.storage_env != "prod"
 
   storage_region_shorts = [
-    for r in var.network_regions : { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }[r]
+    for r in var.network_regions : var.conventions.region_shorts[r]
   ]
 
   storage_bucket_arns = flatten([
@@ -35,9 +35,10 @@ locals {
   storage_key_arns   = [for r in var.network_regions : "arn:aws:kms:${r}:${var.account_id}:key/*"]
   storage_alias_arns = [for r in var.network_regions : "arn:aws:kms:${r}:${var.account_id}:alias/sft/${local.storage_env}/*"]
 
+  # The data layer's roles, from their one list (modules/conventions, workload_roles.data, #172).
   storage_role_arns = {
-    for name in ["s3-replication", "malware-protection", "events-delivery"] :
-    name => "arn:aws:iam::${var.account_id}:role/sft-${local.storage_env}-${name}"
+    for name in var.conventions.workload_roles.data :
+    name => "arn:aws:iam::${var.account_id}:role/${var.conventions.workload_role_names[name]}"
   }
 
   # The service-linked roles the data stack creates for EBS volumes under the platform and files keys (4.4).
@@ -47,7 +48,11 @@ locals {
   }
 
   storage_plan_arns = [for r in var.network_regions : "arn:aws:guardduty:${r}:${var.account_id}:malware-protection-plan/*"]
-  storage_rule_arns = [for r in var.network_regions : "arn:aws:events:${r}:${var.account_id}:rule/sft-${local.storage_env}-*"]
+  # Our rules in our Regions, and in us-east-1 the alarms layer's rules that forward global sign-in and STS events to
+  # a Region's bus (modules/alarms, security-events.tf, #256).
+  storage_rule_arns = [
+    for r in concat(var.network_regions, ["us-east-1"]) : "arn:aws:events:${r}:${var.account_id}:rule/sft-${local.storage_env}-*"
+  ]
 }
 
 data "aws_iam_policy_document" "storage_read" {
@@ -220,9 +225,12 @@ data "aws_iam_policy_document" "storage_write" {
   }
 
   statement {
-    sid       = "CreateServiceRoles"
-    actions   = ["iam:CreateRole", "iam:PutRolePolicy"]
-    resources = [local.storage_role_arns["s3-replication"], local.storage_role_arns["malware-protection"]]
+    sid     = "CreateServiceRoles"
+    actions = ["iam:CreateRole", "iam:PutRolePolicy"]
+    resources = [
+      local.storage_role_arns["s3-replication"], local.storage_role_arns["s3-batch-replication"],
+      local.storage_role_arns["malware-protection"],
+    ]
   }
 
   # The EventBridge delivery role can be passed by the cluster layer too, so it carries the workload boundary

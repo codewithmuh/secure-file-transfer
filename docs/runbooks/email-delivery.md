@@ -1,17 +1,19 @@
-# Runbook: EmailDeliveryFailing
+# Runbook: EmailDeliveryFailing, EmailSendSlow
 
-The email alert of architecture 6 ("Email provider failing or throttling"; NFR-7, ADR-0015), defined in
-[`deploy/alerts/pipeline.rules.yaml`](../../deploy/alerts/pipeline.rules.yaml). Severity: page.
+The email alerts of architecture 6 ("Email provider failing or throttling"; NFR-7, ADR-0015), defined in
+[`deploy/alerts/pipeline.rules.yaml`](../../deploy/alerts/pipeline.rules.yaml). Severity: page, both.
 
 ## Symptoms
 
-More than 5 % of the notification worker's messages fail for 10 minutes
-(`worker_messages_total{consumer="notify", outcome="failed"}`). Recipients don't get their verification codes or link
-emails; members don't get notices.
-
-NFR-7's own measure, emails handed to SES within 10 s at p95, has no latency metric yet (docs/operations/slos.md lists
-it as pending). Until it has, this failure rate and the `notify` queue's age alarm
-([queue-backlog.md](queue-backlog.md)) stand in for it.
+- **`EmailDeliveryFailing`:** more than 5 % of the notification worker's messages fail for 10 minutes
+  (`worker_messages_total{consumer="notify", outcome="failed"}`). Recipients don't get their verification codes or
+  link emails; members don't get notices.
+- **`EmailSendSlow`** (NFR-7, #260): more than 5 % of verification codes and link emails took over 10 s from the
+  message that asked for them to SES accepting them, for 10 minutes: NFR-7's p95 is missed. The emails go out, late.
+  `send_latency_seconds{type}` starts at the outbox message's ID (a UUIDv7, made in the request's transaction), so
+  the time includes the relay, the `notify` queue and the worker. Other email types are measured too, for the
+  dashboards; some wait on purpose (a link held by the cross-tenant cap, a digest, a notice window), so the alert
+  reads only `verification_code`, `transfer_link` and `upload_request`.
 
 ## Impact
 
@@ -42,18 +44,32 @@ aws sesv2 get-account --region <region>      # SendingEnabled, EnforcementStatus
 aws sesv2 get-configuration-set --configuration-set-name sft-<env> --region <region>
 ```
 
+For `EmailSendSlow`, find where the time goes, from the message to SES:
+
+```promql
+max(outbox_oldest_unpublished_age_seconds)                                   # the relay: OutboxBacklog's measure
+max(aws_sqs_approximate_age_of_oldest_message_maximum{dimension_QueueName=~"sft-.+-notify"})  # the queue
+histogram_quantile(0.95, sum by (le, type) (rate(send_latency_seconds_bucket[10m])))         # by email type
+```
+
+A full `notify` queue with an idle relay is the worker: too few replicas, or SES slow to answer (throttled). A late
+relay is [outbox-backlog.md](outbox-backlog.md).
+
 ## Mitigate
 
-1. **Misconfigured** after a deploy or a Terraform change: revert it. After a failover to Osaka, check that Osaka's
+1. **Slow, not failing** (`EmailSendSlow` alone): scale the notifier up for the burst (`kubectl -n sft scale deploy
+   notifier --replicas=<n>`, then the same number in the cluster's values file), and check SES's sending rate in the
+   account (`aws sesv2 get-account`): a quota reached is throttling (step 3).
+2. **Misconfigured** after a deploy or a Terraform change: revert it. After a failover to Osaka, check that Osaka's
    identity, MAIL FROM domain and configuration set `sft-<env>` exist (the `identity` layer, `infra/modules/ses`).
-2. **Throttled:** a burst (a load test, a large invitation backlog) passes; the retries catch up. If the quota is too
+3. **Throttled:** a burst (a load test, a large invitation backlog) passes; the retries catch up. If the quota is too
    small for the design load, request a higher one in the SES console (capacity 3).
-3. **Paused:** follow [ses-reputation.md](ses-reputation.md). Nothing sends until AWS lifts the pause.
-4. **Rejected, many:** look for the template or the address shape a recent change broke; fix forward or roll back.
-5. **The worker can't reach SES:** the SES API goes through its VPC endpoint (architecture 3.1); check the endpoint and
+4. **Paused:** follow [ses-reputation.md](ses-reputation.md). Nothing sends until AWS lifts the pause.
+5. **Rejected, many:** look for the template or the address shape a recent change broke; fix forward or roll back.
+6. **The worker can't reach SES:** the SES API goes through its VPC endpoint (architecture 3.1); check the endpoint and
    the notifier's network policy. Cognito invitations go through its proxy listener
    ([egress-proxy.md](egress-proxy.md)).
-6. Once fixed, redrive the dead-letter queue ([dead-letter-queue.md](dead-letter-queue.md)).
+7. Once fixed, redrive the dead-letter queue ([dead-letter-queue.md](dead-letter-queue.md)).
 
 ## Escalate
 

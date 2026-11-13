@@ -53,3 +53,13 @@ variable "domain" {
   description = "The maintainer's domain; the shared zone is sft.<domain> (PRD open question 5). TF_VAR_domain, never committed."
   type        = string
 }
+
+variable "break_glass_reconciliation" {
+  description = "The operator API's break-glass reconciliation (#275): this environment's trail role, the BreakGlass permission set and the identity store, from the organization stack's outputs (TF_VAR_break_glass_reconciliation, never committed). Null keeps it off."
+  type = object({
+    trail_role_arn     = string
+    permission_set_arn = string
+    identity_store_id  = string
+  })
+  default = null
+}

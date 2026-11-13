@@ -307,6 +307,10 @@ REGISTRY: Final[tuple[Permission, ...]] = (
     Permission("user.reset_sign_in", ("resetUserSignIn",), admin=TENANT),
     Permission("operator.tenant.sso.update", ("configureTenantSso",), operator=True),
     Permission("operator.tenant.admin_recovery", ("recoverTenantAdmin",), operator=True),
+    # #274: the second contact an admin recovery is confirmed through, audited in both logs.
+    Permission(
+        "operator.tenant.recovery_contact.read", ("getTenantRecoveryContact",), operator=True
+    ),
     Permission("operator.break_glass.record", ("recordBreakGlassGrant",), operator=True),
     # Tenant SSO (#231): the tenant admin's settings and domains, web sessions only.
     Permission("sso.read", ("getTenantSso",), admin=TENANT),

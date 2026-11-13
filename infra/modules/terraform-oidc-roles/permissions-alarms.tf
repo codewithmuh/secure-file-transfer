@@ -29,7 +29,7 @@ locals {
         "arn:aws:sns:${r}:${var.account_id}:${local.cluster_env_prefix}-${local.identity_region_shorts[r]}-${t}"
       ]
     ]),
-    ["arn:aws:sns:us-east-1:${var.account_id}:${local.cluster_env_prefix}-apne1-region-health-*"],
+    ["arn:aws:sns:us-east-1:${var.account_id}:${local.cluster_env_prefix}-${var.conventions.region_shorts["ap-northeast-1"]}-region-health-*"],
   )
 
   # Subscriptions are made on the alarm topics and the break-glass topics; a subscription's ARN is its topic's plus an ID.

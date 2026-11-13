@@ -127,6 +127,12 @@ variable "dns_firewall_allowed_domains" {
     # Egress proxy, API and notification worker listeners: Cognito's API and managed login (ADR-0021, abuse 3.2).
     "cognito-idp.{region}.amazonaws.com",
     "*.auth.{region}.amazoncognito.com",
+    # Egress proxy, operator listener (#275): the break-glass reconciliation reads the management account's CloudTrail
+    # and identity store in Identity Center's home Region, Tokyo, with a role it assumes through Tokyo's STS (in Tokyo
+    # that name is the STS endpoint's already). Its drift check reads Cognito's API, the name above.
+    "cloudtrail.ap-northeast-1.amazonaws.com",
+    "identitystore.ap-northeast-1.amazonaws.com",
+    "sts.ap-northeast-1.amazonaws.com",
     # Egress proxy, Argo CD listener: Git and its notifications.
     "github.com",
     "api.github.com",
@@ -176,5 +182,16 @@ variable "flow_log_destination_arn" {
       regex("^arn:aws:s3:::[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/.*)?$", var.flow_log_destination_arn)
     )
     error_message = "flow_log_destination_arn must be an S3 bucket ARN, optionally followed by /prefix/."
+  }
+}
+
+variable "service_domain" {
+  description = "The environment's service domain: sft.<domain> in prod, <env>.sft.<domain> elsewhere. DNS Firewall answers api. and app. under it, which the synthetic probe calls through the egress proxy (#248, #259). Null leaves them out."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.service_domain == null || can(regex("^[a-z0-9.-]+$", var.service_domain))
+    error_message = "service_domain must be a lowercase domain name."
   }
 }

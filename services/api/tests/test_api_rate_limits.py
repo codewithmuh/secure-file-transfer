@@ -10,12 +10,17 @@ import pytest
 import valkey
 from fastapi import Depends, FastAPI, HTTPException, Request
 from httpx2 import Response
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 from pydantic import SecretStr
 from starlette.testclient import TestClient
 
 from api_settings import API_SETTINGS
+from sft.api import auth_failures
 from sft.api.app import create_app
 from sft.api.client_ip import rate_limit_ip
+from sft.api.observability import HttpMetrics, RequestContextMiddleware
 from sft.api.rate_limits import get_rate_limiter, rate_limit
 from sft.core.errors import Unauthenticated
 from sft.core.settings import Settings
@@ -172,6 +177,35 @@ def test_over_the_limit_is_a_429_problem(client: TestClient) -> None:
     assert body["status"] == 429
     assert body["type"].endswith("/problems/rate_limited")
     assert "detail" not in body  # never names the key
+
+
+def test_a_refused_requests_trace_shows_its_counter_calls_under_it(
+    valkey_url: str, spans: InMemorySpanExporter
+) -> None:
+    # #136: each counter call is a CLIENT span, the request span's child, naming no key.
+    flush(valkey_url)
+    app = RequestContextMiddleware(app_with_routes(valkey_url), HttpMetrics.create())
+    with TestClient(app) as http:
+        response = until_refused(lambda: http.post("/v1/test/sign-in"), 60)
+    assert response.status_code == 429
+    finished = spans.get_finished_spans()
+    [request] = [s for s in finished if status_of(s) == 429]
+    assert request.kind is SpanKind.SERVER
+    assert request.context is not None
+    request_id = request.context.span_id
+    calls = [s for s in finished if s.parent is not None and s.parent.span_id == request_id]
+    assert calls
+    for call in calls:
+        assert call.kind is SpanKind.CLIENT
+        assert call.name.startswith("counter.")
+        assert (call.attributes or {})["db.system.name"] == "valkey"
+        # A key, `rl:<limit>:ip:<address>`, is in no attribute, nor is the client's address.
+        values = [call.name, *(str(v) for v in (call.attributes or {}).values())]
+        assert not any("rl:" in v or "testclient" in v for v in values)
+
+
+def status_of(span: ReadableSpan) -> object:
+    return (span.attributes or {}).get("http.response.status_code")
 
 
 def test_the_caller_keys_come_from_the_authentication_dependency(client: TestClient) -> None:
@@ -366,3 +400,53 @@ def test_problem_errors_carry_their_detail_and_retry_after() -> None:
     assert response.status_code == 503
     assert response.headers["retry-after"] == "1"  # at least 1
     assert response.json()["detail"] == "Try again shortly."
+
+
+# ---- auth_failures_total{scheme} (#260) ----
+
+
+def failures(client: TestClient) -> dict[str, float]:
+    found = client.app.state.auth_failures  # type: ignore[attr-defined]
+    return {
+        scheme.value: found.counter.labels(scheme=scheme.value)._value.get()
+        for scheme in auth_failures.Scheme
+    }
+
+
+def test_each_failed_authentication_counts_once_by_its_scheme(down: TestClient) -> None:
+    # Every scheme has its series from the start, at zero.
+    assert failures(down) == {"session": 0, "api_key": 0, "operator": 0, "link": 0}
+    # No credential, an ended session and a step-up are no failures.
+    down.get("/v1/test/me")
+    down.get("/v1/test/me", headers={"Authorization": "Bearer ended"})
+    down.get("/v1/step-up")
+    assert set(failures(down).values()) == {0}
+    # A bearer token nobody has: an API key; with a session cookie: the session; with a link
+    # session named: the link.
+    down.get("/v1/test/me", headers={"Authorization": "Bearer wrong"})
+    down.cookies.set("__Host-sft_session", "never-issued")
+    down.get("/v1/test/me", headers={"Authorization": "Bearer wrong"})
+    down.cookies.clear()
+    down.get("/v1/test/me", headers={"Authorization": "Bearer wrong", "X-Link-Session": "x"})
+    assert failures(down) == {"session": 1, "api_key": 1, "operator": 0, "link": 1}
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "headers", "scheme"),
+    [
+        (404, "link_not_found", {}, "link"),
+        (422, "code_invalid", {}, "link"),
+        (401, "credentials_invalid", {"authorization": "Bearer x"}, "api_key"),
+        (401, "credentials_invalid", {"cookie": "__Host-sft_session=x"}, "session"),
+        (401, "credentials_invalid", {}, "session"),
+        (401, "session_expired", {"authorization": "Bearer x"}, None),
+        (404, "not_found", {}, None),
+    ],
+)
+def test_the_scheme_of_an_answer(
+    status: int, code: str, headers: dict[str, str], scheme: str | None
+) -> None:
+    raw = [(k.encode(), v.encode()) for k, v in headers.items()]
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": raw})
+    found = auth_failures.scheme_of(request, status, code)
+    assert (None if found is None else found.value) == scheme

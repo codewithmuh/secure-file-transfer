@@ -208,10 +208,18 @@ utc() {
   date -u -r "$1" +%H:%M:%S 2>/dev/null || date -u -d "@$1" +%H:%M:%S
 }
 
-# Names (infra/README.md, Names): the Aurora global database and clusters, the EKS clusters and kube contexts.
-global_cluster() { echo "sft-$ENV_NAME-aurora"; }
+# Names (infra/README.md, Names): the Aurora global database and clusters, the EKS clusters and kube contexts. The
+# global database is sft-<env>-aurora until a failback after a detach makes sft-<env>-aurora-<n> (#261):
+# SFT_AURORA_GENERATION names it.
+global_cluster() {
+  local generation="${SFT_AURORA_GENERATION:-1}"
+  if [[ "$generation" == 1 ]]; then echo "sft-$ENV_NAME-aurora"; else echo "sft-$ENV_NAME-aurora-$generation"; fi
+}
 db_cluster() { echo "sft-$ENV_NAME-$(short "$1")-aurora"; }
-eks_cluster() { echo "sft-$ENV_NAME-$(short "$1")"; }
+# sft-<env>-<region-short>: the prefix of the region's names, Karpenter's discovery tag among them (modules/network).
+region_prefix() { echo "sft-$ENV_NAME-$(short "$1")"; }
+# The EKS cluster, <prefix>-eks (modules/eks-cluster), whose name Kubernetes puts in its volumes' tags.
+eks_cluster() { echo "$(region_prefix "$1")-eks"; }
 short() {
   case "$1" in
     "$TOKYO") echo apne1 ;;
@@ -230,8 +238,11 @@ kube_context() {
 
 # The recovery job (sft.service.recovery_replay, run as sft_recovery): the suspended `recovery` CronJob, rendered with
 # its steps and times, as docs/runbooks/field-keys.md renders field-keys. Needs kubectl and yq.
+#   recovery_job <region> <steps> [since] [rewind_to] [archive region]
+# An archive region other than the job's reads that region's audit archive, with the database still the job's: the
+# failback's replay in Tokyo reads Osaka's (#276).
 recovery_job() {
-  local region="$1" steps="$2" since="${3:-}" rewind_to="${4:-}"
+  local region="$1" steps="$2" since="${3:-}" rewind_to="${4:-}" archive="${5:-}"
   local name
   name="recovery-$(date -u +%H%M%S)"
   local filter
@@ -241,6 +252,10 @@ recovery_job() {
   fi
   if [[ -n "$rewind_to" ]]; then
     filter+=" | (.spec.template.spec.containers[0].env[] | select(.name == \"RECOVERY_REWIND_TO\")).value = \"$rewind_to\""
+  fi
+  if [[ -n "$archive" && "$archive" != "$region" ]]; then
+    filter+=" | (.spec.template.spec.containers[0].env[] | select(.name == \"AUDIT_ARCHIVE_BUCKET\")).value = \"$(region_prefix "$archive")-audit-archive-$ACCOUNT_ID\""
+    filter+=" | (.spec.template.spec.containers[0].env[] | select(.name == \"AUDIT_ARCHIVE_REGION\")).value = \"$archive\""
   fi
   printf '   $ kubectl --context %s -n sft create job --from=cronjob/recovery %s --dry-run=client -o yaml | yq %q | kubectl apply -f -\n' \
     "$(kube_context "$region")" "$name" "$filter"

@@ -19,7 +19,6 @@ A session token is 256 random bits (`new_token`). The browser holds it in the Ht
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -31,6 +30,7 @@ from sqlalchemy import func, select, text, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.ids import uuid7
+from sft.core.tokens import token_hash
 from sft.data.access import in_scope, require_scope, tenant_of
 from sft.data.audit import USER_AGENT_MAX
 from sft.data.models import MemberSession, SessionRevokedReason, Tenant, User
@@ -52,9 +52,9 @@ __all__ = [
     "LiveSession",
     "RevokedReason",
     "create_session",
-    "expires_at",
     "get_live_session",
     "lookup_session",
+    "lookup_session_hash",
     "new_token",
     "revoke_session",
     "revoke_tenant_sessions",
@@ -68,13 +68,12 @@ def new_token() -> str:
     return secrets.token_urlsafe(TOKEN_BYTES)
 
 
-def token_hash(token: str) -> bytes:
-    return hashlib.sha256(token.encode()).digest()
-
-
 @dataclass(frozen=True, slots=True)
 class LiveSession:
-    """A session that passed every check of authn and authz 3.2, with its user's current role."""
+    """A session that passed every check of authn and authz 3.2, with its user's current role.
+
+    `user` and `tenant` are the rows the check joined, as they were then: `GET /me` answers from
+    them, with no transaction of its own (#161)."""
 
     session_id: UUID
     tenant_id: UUID
@@ -84,6 +83,8 @@ class LiveSession:
     auth_method: str
     auth_time: datetime
     expires_at: datetime
+    user: User
+    tenant: Tenant
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,11 +99,17 @@ class FoundSession:
 async def lookup_session(session: AsyncSession, token: str) -> FoundSession | None:
     """The session a token belongs to, its tenant and whether it is live: the credential
     lookup. None if no session has the token."""
+    return await lookup_session_hash(session, token_hash(token))
+
+
+async def lookup_session_hash(session: AsyncSession, session_hash: bytes) -> FoundSession | None:
+    """`lookup_session` by the token's SHA-256, for a sign-in that kept only the hash of the
+    session the browser held when it started (#159)."""
     require_scope(session, ScopeKind.LOOKUP)
     row = (
         await session.execute(
             text("SELECT session_id, owner_tenant_id, live FROM lookup_member_session(:hash)"),
-            {"hash": token_hash(token)},
+            {"hash": session_hash},
         )
     ).first()
     return None if row is None else FoundSession(row[0], row[1], bool(row[2]))
@@ -113,7 +120,7 @@ async def get_live_session(session: AsyncSession, session_id: UUID) -> LiveSessi
     and its user and tenant active. Moves `last_seen_at` when it is a minute old."""
     now = func.now()
     statement = (
-        select(MemberSession, User.role)
+        select(MemberSession, User, Tenant)
         .join(
             User, (User.tenant_id == MemberSession.tenant_id) & (User.id == MemberSession.user_id)
         )
@@ -134,6 +141,8 @@ async def get_live_session(session: AsyncSession, session_id: UUID) -> LiveSessi
     if row is None:
         return None
     found: MemberSession = row[0]
+    user: User = row[1]
+    tenant: Tenant = row[2]
     await session.execute(
         update(MemberSession)
         .where(
@@ -148,20 +157,13 @@ async def get_live_session(session: AsyncSession, session_id: UUID) -> LiveSessi
         tenant_id=found.tenant_id,
         user_id=found.user_id,
         identity_id=found.identity_id,
-        role=str(row[1]),
+        role=str(user.role),
         auth_method=found.auth_method,
         auth_time=found.auth_time,
         expires_at=found.expires_at,
+        user=user,
+        tenant=tenant,
     )
-
-
-async def expires_at(session: AsyncSession, session_id: UUID) -> datetime | None:
-    """When the session ends at the latest, if the scope reaches it."""
-    statement = select(MemberSession.expires_at).where(
-        MemberSession.id == session_id, in_scope(MemberSession, session)
-    )
-    value: datetime | None = await session.scalar(statement)
-    return value
 
 
 async def create_session(

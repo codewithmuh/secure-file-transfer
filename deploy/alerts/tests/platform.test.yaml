@@ -102,3 +102,40 @@ tests:
             exp_annotations:
               summary: Pods have failed to re-read the email keyring from Secrets Manager for 15 minutes (encryption 6.4).
               runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-refresh.md
+
+  # Encryption 6.5 (#260): code-hmac's active key 100 days old, past 90 + 7, opens a ticket after an hour; email-hmac's
+  # at 100 days is within its year.
+  - interval: 1m
+    input_series:
+      - series: 'keyring_active_key_age_seconds{keyring="code", job="api"}'
+        values: '8640000x120'
+      - series: 'keyring_active_key_age_seconds{keyring="email", job="api"}'
+        values: '8640000x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KeyringKeyTooOld
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: KeyringKeyTooOld
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              keyring: code
+            exp_annotations:
+              summary: The code keyring's active key is past its rotation period plus 7 days (encryption 6.5).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-rotation.md
+  # email-hmac's at 380 days, past 365 + 7.
+  - interval: 1m
+    input_series:
+      - series: 'keyring_active_key_age_seconds{keyring="email", job="notifier"}'
+        values: '32832000x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: KeyringKeyTooOld
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              keyring: email
+            exp_annotations:
+              summary: The email keyring's active key is past its rotation period plus 7 days (encryption 6.5).
+              runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/keyring-rotation.md

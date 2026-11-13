@@ -15,23 +15,28 @@ locals {
   region  = data.aws_region.current.region
   primary = local.region == "ap-northeast-1"
 
-  region_short = {
-    "ap-northeast-1" = "apne1"
-    "ap-northeast-3" = "apne3"
-  }[local.region]
+  # sft-<env>-<region-short>-<thing>-<account-id>, here and in Osaka (infra/README.md, Names).
+  prefixes = {
+    for r, short in var.conventions.region_shorts : r => "${var.conventions.global_name_prefix}-${short}"
+  }
 
   buckets = {
-    files         = "sft-${var.environment}-${local.region_short}-files-${var.account_id}"
-    "large-files" = "sft-${var.environment}-${local.region_short}-large-files-${var.account_id}"
+    files         = "${local.prefixes[local.region]}-files-${var.account_id}"
+    "large-files" = "${local.prefixes[local.region]}-large-files-${var.account_id}"
   }
 
-  # Osaka's buckets, the replication destinations, by name.
-  osaka_buckets = { for k, name in local.buckets : k => replace(name, "-apne1-", "-apne3-") }
-
-  role_arns = {
-    for name in ["api", "scan", "jobs", "s3-replication", "malware-protection", "events-delivery"] :
-    name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
+  # Each Region's buckets by name: Osaka's are the replication destinations, Tokyo's the reverse rule's (#262).
+  osaka_buckets = {
+    files         = "${local.prefixes["ap-northeast-3"]}-files-${var.account_id}"
+    "large-files" = "${local.prefixes["ap-northeast-3"]}-large-files-${var.account_id}"
   }
+  tokyo_buckets = {
+    files         = "${local.prefixes["ap-northeast-1"]}-files-${var.account_id}"
+    "large-files" = "${local.prefixes["ap-northeast-1"]}-large-files-${var.account_id}"
+  }
+
+  # The workload roles, from their one list (modules/conventions, #172).
+  role_arns = var.conventions.workload_role_arns
 }
 
 resource "aws_s3_bucket" "this" {

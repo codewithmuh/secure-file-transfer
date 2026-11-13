@@ -3,16 +3,45 @@
 # It creates nothing and calls no AWS API.
 
 locals {
-  region_short = {
+  # Short Region codes in names, for every Region the service runs in (NFR-21). This is the one definition: modules
+  # read it from their caller's conventions (region_shorts), never from a copy of their own (#172).
+  region_shorts = {
     "ap-northeast-1" = "apne1"
     "ap-northeast-3" = "apne3"
-  }[var.region]
+  }
+  region_short = local.region_shorts[var.region]
 
   # Regional resources: sft-<env>-<region-short>-<thing>. Global resources (IAM): sft-<env>-<thing>.
   name_prefix        = "sft-${var.environment}-${local.region_short}"
   global_name_prefix = "sft-${var.environment}"
 
   github_repository = "codewithmuh/secure-file-transfer"
+
+  # An environment's workload roles: sft-<env>-<name> at path "/", by the layer that makes each (encryption 4.3,
+  # authn-authz). The key, bucket and queue policies name them before they exist, matched by aws:PrincipalArn, so a
+  # role renamed or added in one copy and missed in another would silently drop a grant. This is the one list: the
+  # cluster layer makes its roles from it, the deploy role may create exactly those, and the policies name them from
+  # it (#172).
+  workload_roles = {
+    # modules/eks-cluster, Tokyo's cluster stack.
+    cluster = [
+      "eks-cluster", "system-node", "karpenter-node", "karpenter", "vpc-cni", "ebs-csi", "lb-controller",
+      "external-secrets", "kyverno", "api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator",
+      "external-secrets-platform", "external-secrets-app", "key-rotation", "synthetic-probe", "recovery",
+      "db-bootstrap",
+    ]
+    # modules/files-buckets and modules/events-delivery-role, Tokyo's data stack.
+    data = ["s3-replication", "s3-batch-replication", "malware-protection", "events-delivery"]
+    # Tokyo's identity stack: modules/signin-triggers, and in staging modules/probe-mailbox's load test role (#259).
+    identity = ["signin-trigger", "loadtest"]
+    # modules/observability, Tokyo's cluster-bootstrap stack.
+    cluster_bootstrap = ["loki", "tempo", "alertmanager", "cloudwatch-exporter"]
+    # modules/web-release, Tokyo's edge stack: the web app's release role (#283).
+    edge = ["web-release"]
+  }
+  workload_role_names = {
+    for name in flatten(values(local.workload_roles)) : name => "${local.global_name_prefix}-${name}"
+  }
 
   # Roles the bootstrap stacks create. Only the Admin permission set may change roles under this path (ADR-0006, T-71).
   bootstrap_iam_path = "/sft-bootstrap/"

@@ -51,7 +51,17 @@ customer managed key (`Encrypt`, `Decrypt`, `ReEncrypt*`, `GenerateDataKey*`, `D
 resources only). A service-linked role has no IAM policy that could allow KMS, so the account principal can't reach
 it. `volume_service_linked_role_arns` takes them from the data stack, which creates them in Tokyo first.
 
-Names the policies rely on, all from other issues: workload roles `sft-<env>-<name>` at path `/` (#103), queues
+**Teardown of prod's retained stack** (`environment_retired`, #263, encryption 8.4): the audit key's writers and the
+recovery job leave its policy, so a role re-created later under one of those names matches nothing, and rotation stops
+(`enable_key_rotation = false`), since nothing new is written under the key. The audit reader, BreakGlass and the
+replication role stay. Admin may use the key for the retained stack's own state, as its deploy role may: the stack's
+first apply moves its state into the bucket as Admin, and `ops/teardown.sh` applies it as Admin.
+
+**Since #256 to #263** the platform key also lets SES's receipt rules write the probe mailbox and the synthetic probe and
+the load test read it through S3 (#259); the secrets key lets staging's load test read its keys (#259); and Tokyo's
+files key lets the replication role re-encrypt the failback's replicas (#262).
+
+Names the policies rely on, all from other issues: workload roles `sft-<env>-<name>` at path `/`, from the conventions module's one list (#103, #172), queues
 `sft-<env>-<region-short>-<queue>` (#101), secrets `sft/<env>/...` (6.1), buckets as in infra/README.md, and for the
 retained stack the trail `sft-prod-retained` and the role `sft-prod-retained-events-delivery`, which its later issue
 must use.

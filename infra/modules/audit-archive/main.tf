@@ -12,25 +12,22 @@ locals {
   region  = data.aws_region.current.region
   primary = local.region == "ap-northeast-1"
 
-  region_short = {
-    "ap-northeast-1" = "apne1"
-    "ap-northeast-3" = "apne3"
-  }[local.region]
+  prefixes = {
+    for r, short in var.conventions.region_shorts : r => "${var.conventions.global_name_prefix}-${short}"
+  }
 
-  bucket_name       = "sft-${var.environment}-${local.region_short}-audit-archive-${var.account_id}"
+  bucket_name       = "${local.prefixes[local.region]}-audit-archive-${var.account_id}"
   bucket_arn        = "arn:aws:s3:::${local.bucket_name}"
-  osaka_bucket_name = replace(local.bucket_name, "-apne1-", "-apne3-")
+  osaka_bucket_name = "${local.prefixes["ap-northeast-3"]}-audit-archive-${var.account_id}"
 
   # Whichever of the two bucket resources below exists. The settings refer to it directly, with the same choice, so
   # Trivy can tie them to the bucket.
   bucket_id = one(concat(aws_s3_bucket.guarded[*].id, aws_s3_bucket.unguarded[*].id))
 
-  role_arns = {
-    for name in ["api", "operator", "archive", "recovery", "jobs"] :
-    name => "arn:aws:iam::${var.account_id}:role/sft-${var.environment}-${name}"
-  }
+  # The workload roles, from their one list (modules/conventions, #172).
+  role_arns = var.conventions.workload_role_arns
 
-  replication_role_name = coalesce(var.replication_role_name, "sft-${var.environment}-s3-replication")
+  replication_role_name = coalesce(var.replication_role_name, var.conventions.workload_role_names["s3-replication"])
   replication_role_arn  = "arn:aws:iam::${var.account_id}:role/${local.replication_role_name}"
 
   # Identity Center's role for the AuditReader permission set (infra/organization/identity-center.tf).

@@ -66,6 +66,12 @@ Locally: `make audit-archive`, then `docker compose logs`; the S3 stand-in holds
    missed the job writes under the old generation's prefix again, which the conditional write refuses for keys
    already there: set the generation, then the next run continues under the new one.
 
+6. **A region is lost for good, not refusing for a while** (a regional failover): the failover runbook sets
+   `auditArchive.survivingRegionOnly` to the region left, and the job writes it alone and keeps up; the API's
+   security-critical records go there alone too ([audit-archive-single-region.md](audit-archive-single-region.md),
+   #257). Never set it for an outage of Osaka's S3 alone while Tokyo serves: there the grants' `503` is the decision
+   of #42 gap 5, and the archive catches up when Osaka answers.
+
 Don't move the cursor by hand to make the alert stop: events behind it would never be archived.
 
 ## Escalate

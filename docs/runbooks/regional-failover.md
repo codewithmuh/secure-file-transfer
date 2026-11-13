@@ -7,8 +7,8 @@ in [disaster-recovery.md](../operations/disaster-recovery.md).
 
 > [!IMPORTANT]
 > **Pending the AWS run.** Nothing in AWS has been applied yet. This page is written from the Terraform, the chart
-> and the design; the first staging drill measures each step and corrects it. Steps that wait for code still to land
-> say so (disaster-recovery.md section 8).
+> and the design; the first staging drill measures each step and corrects it. Every Terraform change in it is an
+> input of an apply, never an edit of the code (#261).
 
 ## Before you start
 
@@ -68,13 +68,20 @@ One commit, made by the script and committed by the maintainer:
 
 ```bash
 ops/failover-values.sh fence --env prod --write
+ops/failover-values.sh surviving-osaka --env prod --write
 git commit -m "ops: fence Tokyo and take prod Osaka out of pilot light" deploy/environments/prod
 ```
 
 Tokyo's file gets `pilotLight: true`: whenever Tokyo's cluster answers again, Argo CD scales it to zero, so it never
 writes to a database that is no longer the primary. Osaka's gets `pilotLight: false` with `failover.holdWorkers:
-true`: the API and the migration job may run, every worker stays at zero and every CronJob suspended. Nothing here
-needs Tokyo to answer.
+true`: the API and the migration job may run, every worker stays at zero and every CronJob suspended. Nothing here needs
+Tokyo to answer.
+
+The same commit sets `auditArchive.survivingRegionOnly: "ap-northeast-3"` in Osaka's file (the chart's
+`AUDIT_ARCHIVE_SURVIVING_REGION`, #257): Osaka's API, reconciliation and archive job write Osaka's archive alone, so
+new download grants work and the archive keeps up while Tokyo is lost; each range the archive job writes is recorded
+for the back-fill at failback ([audit-archive-single-region.md](audit-archive-single-region.md)). A drill sets it too,
+so every drill proves the back-fill.
 
 ### 3. Promote Osaka's database (5 min)
 
@@ -95,20 +102,24 @@ Check `BackupRetentionPeriod` is 14 on the promoted cluster (#42 gap 2a).
 
 ### 4. Scale Osaka (20 min)
 
-- The `system` node group from one node to two (the script runs `aws eks update-nodegroup-config`); Karpenter adds
-  the main and scan nodes as Argo CD deploys what Git now holds.
+Inputs only, each an apply of one of Osaka's roots with the apply checklist's inputs (#247, #261):
+
+- The `system` node group from one node to two: apply `infra/environments/prod/ap-northeast-3/cluster` with
+  `TF_VAR_system_node_count=2`. Karpenter adds the main and scan nodes as Argo CD deploys what Git now holds.
 - GuardDuty Malware Protection for Osaka's large-files bucket: apply `infra/environments/prod/ap-northeast-3/data`
   with `TF_VAR_malware_protection_enabled=true` (ADR-0019). GuardDuty validates its access to the bucket then.
 - The Osaka alarms, quiet in the pilot light: apply `infra/environments/<env>/ap-northeast-3/alarms` with
-  `TF_VAR_heartbeat_enabled=true TF_VAR_pilot_light=false` (and `TF_VAR_probe_enabled=true` where the probe runs), so
-  the heartbeat, the API's targets and the probe page from Osaka. The root's `database.role` (`secondary`) becomes
-  `primary` in the same change, so the writer's CPU and memory alarms watch Osaka ([alarms](../../infra/modules/alarms/README.md)).
+  `TF_VAR_heartbeat_enabled=true TF_VAR_pilot_light=false TF_VAR_database_role=primary` (and
+  `TF_VAR_probe_enabled=true` where the probe runs), so the heartbeat, the API's targets and the probe page from
+  Osaka, and the writer's CPU and memory alarms watch Osaka ([alarms](../../infra/modules/alarms/README.md)). The
+  same apply makes Osaka's us-east-1 rule that forwards root, emergency user and Identity Center sign-ins to Osaka's
+  security alerts ([privileged-sign-in.md](privileged-sign-in.md)). In a drill, also apply Tokyo's alarms with
+  `TF_VAR_database_role=secondary`.
 - **Osaka's observability stack starts with the fencing commit** (its Applications follow `pilotLight`) **with empty
   history**: Prometheus, Loki and Tempo hold nothing from before the failover, so the SLO dashboard's 28-day figures and
   the burn-rate alerts' long windows start from zero, and the failure's own evidence stays in Tokyo's volumes and
   buckets. Read the drill's or the incident's numbers from CloudWatch and the drill log, not Osaka's Grafana.
-- Put the node count into Git as well, so the next apply doesn't undo it (pending the Terraform input,
-  disaster-recovery.md section 8).
+- Keep these inputs in the apply checklist until the failback, so the next apply of those roots doesn't undo them.
 
 Wait for the API's and the operator API's rollouts. The migration job runs first as Argo CD's PreSync hook; Osaka's
 image is the same digest as Tokyo's, so it only checks the schema.
@@ -133,16 +144,20 @@ kubectl -n sft create job --from=cronjob/recovery recovery-1 --dry-run=client -o
 Copy the job's counts into the log. Tell tenant admins, by ticket, of every lockout it re-applied and every unlock it
 left out: their members unlock again, which sends the recipient a new link.
 
-Pending: the `recovery` CronJob and its entry point (disaster-recovery.md section 8).
+The job is `python -m sft.workers.recovery` as `sft_recovery` (#258). It lists Osaka's archive under both layouts (the
+API's `security-critical/v1/` records and the archive job's `g<n>/` batches, every generation, from `RECOVERY_SINCE`'s
+day), takes the highest generation, and runs the steps in the order generation, partitions, replay, outbox whatever
+order they are named in. Its last log line is the report: `generation`, `highest_in_archive`, `records`, `newest` (the
+newest archived record: the RPO evidence when the replica's lag can't be read), `replayed` by action and outcome, and
+`reapplied` (IDs). Copy it into the drill log. Running it again is safe.
 
-**The audit archive while Tokyo is lost.** The archive job, Osaka's now, writes each batch to both regions and moves
-its cursor only once both hold it (#183, data model 2.5). With Tokyo's S3 gone, every run fails on Tokyo, the cursor
-stays, and `AuditArchiveLagging` and `AuditArchiveJobNotRunning` page: expected, and nothing is lost, since the events
-wait in the database and are archived once Tokyo's bucket answers. The API's security-critical records go to both
-regions the same way (architecture 5.2), so while Tokyo's archive can't be written, new download grants answer `503`
-and the other security-critical changes answer "done, not confirmed". An Osaka-only archive mode for a regional loss,
-which writes the surviving region alone and back-fills Tokyo later, is a follow-up issue; until it exists, a failover
-for a lasting Tokyo loss serves uploads, sending and existing streams, but not new downloads. Record it in the report.
+**The audit archive while Tokyo is lost.** Normally the archive job writes each batch to both regions and moves its
+cursor only once both hold it, and the API writes security-critical records to both (#183, architecture 5.2). With
+`auditArchive.survivingRegionOnly: ap-northeast-3` (step 2), Osaka's archive job writes Osaka alone and its lag stays
+low; `AuditArchiveSingleRegion` opens a ticket after 30 minutes, expected until failback. Security-critical records,
+download grants included, go to Osaka alone and answer `2xx`. Grant intents written now stay in Osaka only (they are
+never in the database); everything else is back-filled to Tokyo at failback, whose step 10 checks it
+([regional-failback.md](regional-failback.md)).
 
 ### 6. Sign-in: the standby pool (alongside 7 and 8)
 
@@ -153,11 +168,15 @@ standby enrolment job, after step 5 so it never enrols a member the replay deact
 kubectl -n sft create job --from=cronjob/standby-enrolment standby-enrolment-1
 ```
 
-It creates each active member without SSO in the standby pool and records the identity; the invitations are outbox
-messages that the notifier sends once the workers start (#42 gap 6). Tenant admins are told. Sign in once through the
-standby pool with the synthetic tenant's SSO test member.
-
-Pending: the `standby-enrolment` job (disaster-recovery.md section 8).
+It runs `python -m sft.workers.standby_enrolment`, as the notification worker (#258): for each active member who
+signed in with a password (an identity on Tokyo's pool), it creates the user in Osaka's pool with Cognito's email
+suppressed, sends the `member_reenrolment` email with a temporary password itself, and records the identity with its
+`email.sent` event in the member's tenant. SSO members are skipped. Its log line counts `enrolled`,
+`already_enrolled`, `not_local`, `inactive` and `address_in_use`; running it again sends nothing to members already
+enrolled. Members still `invited` (they never signed in) hold an invitation for Tokyo's pool: after step 7 run
+`kubectl -n sft create job --from=cronjob/invite-backlog invite-backlog-osaka-1`, which invites them again through
+Osaka's pool. Tenant admins are told. Sign in once through the standby pool with the synthetic tenant's SSO test
+member.
 
 ### 7. Re-publish the outbox; scale the workers up (5 min)
 
@@ -194,17 +213,17 @@ Wait for the relay, notifier and scan workers. The lifecycle CronJobs resume too
 
 Run the synthetic probe in Osaka (`kubectl -n sft create job --from=cronjob/synthetic-probe probe-failover-1`): send, verify
 with a real email from Osaka's SES, download. `ProbeSuccess` for the environment is 1. Sign in once through the
-standby pool. The RTO is the time from step 1 to here.
+standby pool. `max(audit_archive_lag_seconds)` is under 2 minutes in Osaka. The RTO is the time from step 1 to here.
 
 ## Afterwards
 
 - Keep watching the failed scans of large files: those completed just before the failure end `scan_failed` at their
   deadline (#42 gaps 3 and 8); members upload them again.
 - Files uploaded in the last minutes before the failure that never reached Osaka show as unavailable (NFR-10).
-- **The probe's mail.** The probe domain's MX and SES receipt rule point at Tokyo's SES inbound, which Osaka may not
-  have (SES receiving runs in a few regions only; to check in the AWS run). If it is gone, the probe fails at
-  `link_email` in Osaka until the MX points at a region that receives: `SyntheticProbeFailing` and the `probe-failing`
-  alarm fire for that reason alone, and step 9 checks the email by hand. Note it in the report.
+- **The probe's mail.** Tokyo and Osaka both receive email (AWS General Reference, SES email receiving endpoints). The
+  probe domain's MX names Tokyo first and Osaka second, and each Region has its own receipt rule and mailbox bucket
+  (modules/probe-mailbox, #259), so with Tokyo gone senders deliver to Osaka and the probe reads Osaka's mailbox. If a
+  sender keeps retrying Tokyo first, `link_email` may be slow for a while: step 9 checks the email by hand.
 - In a drill, the script deletes the marker in Osaka; Tokyo's went with its stack. If Tokyo's Pushgateway comes back
   with it, delete it there too ([drill-in-progress.md](drill-in-progress.md)).
 - Write the drill or incident report from the template. Then plan the failback ([regional-failback.md](regional-failback.md)).

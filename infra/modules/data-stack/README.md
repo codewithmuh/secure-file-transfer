@@ -30,4 +30,11 @@ Inputs for the two-pass fresh build (infra/README.md, "Apply order"):
   replica of the secrets key, which keeps the Tokyo key's ID (encryption 4.2).
 - `osaka_malware_protection_enabled`: Osaka only, off in the pilot light (ADR-0019).
 
+Inputs of the failback and the teardown (docs/operations/disaster-recovery.md section 8):
+- `replicate_to_tokyo`: Osaka only, at a failback: the files buckets' `to-tokyo` rule (#262).
+- `aurora.global_generation` and Tokyo's `aurora.cluster_role = "secondary"`: a failback after a detach (#261; the
+  aurora module's README). Tokyo keeps the master secret whatever its cluster's role.
+- `teardown`: also gives prod's files buckets the teardown rights dev and staging always have, from that apply on
+  (#263, #42 gap 11).
+
 The keys come from `kms-keys` (`module.kms.key_arns`), so no root passes key ARNs any more.

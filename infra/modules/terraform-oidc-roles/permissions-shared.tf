@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------------------------------------------------
 # Shared stack (#105): what infra/shared needs in the shared account, when var.shared_stack is set: the registry
-# (modules/registry), the zone and its environment roles (modules/dns-zone), and the log archive with the
-# organization trail (modules/log-archive). Tokyo for everything, Osaka for the registry's replicas, us-east-1 for the
+# (modules/registry), the zone and its environment roles (modules/dns-zone), the log archive with the organization
+# trail (modules/log-archive), and the web app's bundle store with its publish role (modules/web-bundles, #283). Tokyo for everything, Osaka for the registry's replicas, us-east-1 for the
 # DNSSEC key (the region guard's exception, ADR-0006). The plan role reads; the deploy role also writes.
 #
 # Managed policies under /sft-bootstrap/, as for the edge layer. The keys' policies, not these, give the deploy role
@@ -14,6 +14,7 @@ locals {
 
   shared_iam_role_arns = ["arn:aws:iam::${var.account_id}:role/sft-shared/*"]
   shared_bucket_arn    = "arn:aws:s3:::sft-shared-apne1-log-archive-${var.account_id}"
+  shared_bundles_arn   = "arn:aws:s3:::sft-shared-apne1-web-bundles-${var.account_id}"
   shared_trail_arns    = ["arn:aws:cloudtrail:ap-northeast-1:*:trail/sft-organization"]
   shared_ecr_arns = [
     for region in ["ap-northeast-1", "ap-northeast-3"] : "arn:aws:ecr:${region}:${var.account_id}:*"
@@ -82,7 +83,7 @@ data "aws_iam_policy_document" "shared_read" {
   }
 
   statement {
-    sid = "LogArchiveRead"
+    sid = "SharedBucketsRead"
     actions = [
       "s3:GetAccelerateConfiguration",
       "s3:GetBucket*",
@@ -91,7 +92,7 @@ data "aws_iam_policy_document" "shared_read" {
       "s3:GetReplicationConfiguration",
       "s3:ListBucket", # HeadBucket, which every refresh of the bucket calls, needs it
     ]
-    resources = [local.shared_bucket_arn]
+    resources = [local.shared_bucket_arn, local.shared_bundles_arn]
   }
 }
 
@@ -184,14 +185,23 @@ data "aws_iam_policy_document" "shared_write" {
   }
 
   statement {
-    sid = "LogArchiveWrite"
+    sid = "SharedBucketsWrite"
     actions = [
       "s3:CreateBucket",
       "s3:PutBucket*",
       "s3:PutEncryptionConfiguration",
       "s3:PutLifecycleConfiguration",
     ]
-    resources = [local.shared_bucket_arn]
+    resources = [local.shared_bucket_arn, local.shared_bundles_arn]
+  }
+
+  # The bundle store, unlike the log archive, has no Object Lock: the shared stack's teardown empties and deletes it.
+  statement {
+    sid = "WebBundlesTeardown"
+    actions = [
+      "s3:DeleteBucket", "s3:DeleteBucketPolicy", "s3:DeleteObject", "s3:DeleteObjectVersion", "s3:ListBucketVersions",
+    ]
+    resources = [local.shared_bundles_arn, "${local.shared_bundles_arn}/*"]
   }
 
   # The organization trail, as CloudTrail's delegated administrator. The first one creates CloudTrail's

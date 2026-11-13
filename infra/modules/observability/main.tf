@@ -7,9 +7,9 @@
 # cluster to associate with. Torn down with it: logs and traces are derived data, kept 90 and 14 days at most.
 
 locals {
-  region_short = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
-
-  global_prefix = "sft-${var.environment}"
+  # Names from the conventions module (#172).
+  region_short  = var.conventions.region_shorts
+  global_prefix = var.conventions.global_name_prefix
   name_prefix   = "${local.global_prefix}-${local.region_short[var.region]}"
 
   # Every Region's prefix, for policies that must work in Osaka after a failover.
@@ -26,5 +26,5 @@ locals {
     cloudwatch-exporter = { service_account = "cloudwatch-exporter", description = "CloudWatch exporter: read metrics" }
   }
 
-  role_arns = { for k, _ in local.roles : k => "arn:aws:iam::${var.account_id}:role/${local.global_prefix}-${k}" }
+  role_arns = { for k, _ in local.roles : k => var.conventions.workload_role_arns[k] }
 }

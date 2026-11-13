@@ -11,6 +11,11 @@ const env = (globalThis as unknown as { process: { env: Record<string, string | 
 export const USERS = {
   member: { email: env.E2E_MEMBER_EMAIL ?? 'dev.member@example.com', password: env.E2E_MEMBER_PASSWORD ?? 'local-only-member-password' },
   admin: { email: env.E2E_ADMIN_EMAIL ?? 'dev.admin@example.com', password: env.E2E_ADMIN_PASSWORD ?? 'local-only-admin-password' },
+  // A member who is a DLP approver (#223), so a member's request has an approver who isn't the sender.
+  approver: {
+    email: env.E2E_APPROVER_EMAIL ?? 'dev.approver@example.com',
+    password: env.E2E_APPROVER_PASSWORD ?? 'local-only-approver-password',
+  },
 } as const;
 
 export const MAILPIT = 'http://localhost:8025';

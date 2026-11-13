@@ -4,7 +4,8 @@ Three ways in, by scope:
 
 - **A tenant's own row, in its scope.** The API reads its caller's tenant, and a link session the
   tenant of its link. The operator API creates a tenant in the new tenant's scope, so the new row's
-  ID is the scope's tenant, and suspends one in that tenant's scope (FR-34).
+  ID is the scope's tenant, suspends one in that tenant's scope (FR-34), and reads a tenant's
+  recovery contact there too, never through the directory (#274).
 - **The tenant directory, in platform scope, for `sft_operator` only.** Listing tenants and
   reading one by ID are the operator API's only reads across tenants (authn and authz 7.2): its
   `operator_directory` policy lets `sft_operator` read `tenants` rows, and no other table, in
@@ -41,6 +42,29 @@ async def get_tenant(session: AsyncSession, tenant_id: UUID) -> Tenant | None:
     statement = select(Tenant).where(Tenant.id == tenant_id, in_scope(Tenant, session))
     tenant: Tenant | None = await session.scalar(statement)
     return tenant
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryContact:
+    """A tenant's second contact, for `getTenantRecoveryContact` (#274): None for a tenant made
+    before revision 0005, which recorded none."""
+
+    tenant_id: UUID
+    recovery_contact: str | None
+
+
+async def recovery_contact(session: AsyncSession, tenant_id: UUID) -> RecoveryContact | None:
+    """The tenant's recovery contact, in its own scope only (the operator API, #274); None if the
+    scope doesn't reach the tenant. `getTenant` and `listTenants` leave it out of their answers."""
+    require_scope(session, ScopeKind.TENANT)
+    row = (
+        await session.execute(
+            select(Tenant.id, Tenant.recovery_contact).where(
+                Tenant.id == tenant_id, in_scope(Tenant, session)
+            )
+        )
+    ).first()
+    return None if row is None else RecoveryContact(row[0], row[1])
 
 
 async def insert_tenant(

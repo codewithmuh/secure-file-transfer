@@ -26,6 +26,29 @@ Every call has 50 ms. After 5 failures in a row the store stops calling Valkey f
 fails at once (ADR-0014), so a sick cache doesn't add latency to every request; the caller then
 applies each limit's failure mode. Any failure surfaces as `CounterStoreUnavailableError`.
 
+A call's connection is opened before its 50 ms, with a budget of its own
+(`CONNECT_TIMEOUT_SECONDS`, #282). A call that runs out of time leaves its answer unread, so the
+client closes that connection, and the next call needs a new one: TCP, TLS, then AUTH and
+CLIENT SETINFO, two round trips or more. Opened inside the 50 ms, that never fit on a host where a
+connection costs more than a call has left: one slow answer, and every call after it timed out
+too, until the breaker rested (measured in M9 through a proxy adding 10 ms each way: a call took
+23 ms and a connection 47 ms, and every call failed). It also covers the connections ElastiCache
+closes after 12 hours or in a failover. Running out of the connect budget is a failure, like any
+other; it is the most a cache that never answers adds to a call that must connect.
+
+The scripts run by their SHA-1 (`EVALSHA`). Valkey forgets them when it restarts or fails over,
+and answers `NOSCRIPT`: the store then loads all four in one round trip with a budget of its own
+(`SCRIPT_LOAD_TIMEOUT_SECONDS`) and runs the call again with a fresh 50 ms. Loading inside the
+call's 50 ms never fit on a slow host: every call timed out, the breaker kept resting, and the
+fail-closed limits answered 503 until someone loaded the scripts by hand (found in M8). A
+`NOSCRIPT` is no failure; a load that fails or runs out of time is one, like any other.
+
+Each call that reaches Valkey is a CLIENT span under the current one (#136; ADR-0009): its name and
+`db.operation.name` are the store's operation (`counter.rate`, `counter.batch`, ...), with
+`db.system.name` `valkey` and the server's address. Never a key or a value: keys hold pseudonymised
+identifiers. A failure adds its `error.type`. A call refused while the store rests reaches no
+Valkey and makes no span, and neither does the per-pod fallback the caller then applies.
+
 Locally the URL holds the ACL user and its fake password. In AWS it is `rediss://` with the
 workload's user: with `iam` (VALKEY_IAM_CACHE), a credential provider signs a 15-minute IAM token
 for each new connection (`sft.data.iam_auth`, #184). The cluster client for ElastiCache Serverless
@@ -35,20 +58,35 @@ is still to come; neither changes this interface.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import valkey.asyncio as valkey
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+from opentelemetry.util.types import AttributeValue
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
-from valkey.exceptions import ValkeyError
+from valkey.exceptions import NoScriptError, ValkeyError
 
+from sft.core.telemetry import mark_error
 from sft.data.iam_auth import valkey_iam
 
 CALL_TIMEOUT_SECONDS = 0.05
+CONNECT_TIMEOUT_SECONDS = 0.25
+"""Opening a connection (TCP, TLS, AUTH, two round trips or more): before the call's 50 ms, so a
+host where a connection costs more than a call can still connect (#282). Five times a call's
+budget, and the most a cache that never answers adds to a call that must connect."""
+SCRIPT_LOAD_TIMEOUT_SECONDS = 1.0
+"""Loading the scripts after a `NOSCRIPT`: rare (a restart or a failover), so it may take longer
+than a call, once, rather than fail every call that follows."""
 BREAKER_ERRORS = 5
 BREAKER_SECONDS = 10.0
+DB_SYSTEM = "valkey"
+
+_tracer = trace.get_tracer(__name__)
 
 # KEYS[1] the key; ARGV now (ms), interval (µs per request at the sustained rate), burst (µs: the
 # burst's size times the interval), cost, peek ("1": answer without counting). Returns {allowed,
@@ -287,6 +325,38 @@ class CounterMetrics:
         )
 
 
+class _Script:
+    """A Lua script run by its SHA-1, with no load of its own: valkey-py's `Script` loads after a
+    `NOSCRIPT` inside the caller's timeout, which is what `CounterStore` must not do."""
+
+    def __init__(self, client: valkey.Valkey, source: str) -> None:
+        self.client = client
+        self.source = source
+        self.sha = hashlib.sha1(source.encode(), usedforsecurity=False).hexdigest()
+
+    async def __call__(self, *, keys: Sequence[str], args: Sequence[str | int]) -> Any:
+        # The async client's commands are awaitables; its stubs are the sync client's.
+        command = self.client.evalsha(self.sha, len(keys), *keys, *_strings(args))
+        return await cast("Awaitable[Any]", command)
+
+
+def _strings(args: Sequence[str | int]) -> list[str]:
+    """Script arguments as Valkey takes them: it would send an int as its decimal text too."""
+    return [str(arg) for arg in args]
+
+
+def _server_attributes(client: valkey.Valkey) -> dict[str, AttributeValue]:
+    """What every counter span says about where it went: Valkey, and the server's address."""
+    attributes: dict[str, AttributeValue] = {"db.system.name": DB_SYSTEM}
+    connection = client.connection_pool.connection_kwargs
+    host, port = connection.get("host"), connection.get("port")
+    if isinstance(host, str):
+        attributes["server.address"] = host
+    if isinstance(port, int):
+        attributes["server.port"] = port
+    return attributes
+
+
 def _verdict(result: Any) -> Verdict:
     if not (isinstance(result, list) and len(result) == 2):
         raise CounterStoreUnavailableError("unexpected answer from the counter store")
@@ -328,12 +398,16 @@ class CounterStore:
         self._metrics = metrics
         self._timeout = timeout
         self._clock = clock
-        self._rate = client.register_script(_RATE)
-        self._log = client.register_script(_LOG)
-        self._lease = client.register_script(_LEASE)
-        self._budget = client.register_script(_BUDGET)
+        self._rate = _Script(client, _RATE)
+        self._log = _Script(client, _LOG)
+        self._lease = _Script(client, _LEASE)
+        self._budget = _Script(client, _BUDGET)
+        self._scripts = (self._rate, self._log, self._lease, self._budget)
+        self._loading = asyncio.Lock()
+        self._loads = 0
         self._failures = 0
         self._resting_until = 0.0
+        self._span_attributes = _server_attributes(client)
 
     @classmethod
     def connect(
@@ -346,8 +420,11 @@ class CounterStore:
         client = valkey.from_url(  # type: ignore[no-untyped-call]
             address,
             **extra,
-            socket_timeout=CALL_TIMEOUT_SECONDS,
-            socket_connect_timeout=CALL_TIMEOUT_SECONDS,
+            # Outer bounds only: each call has its 50 ms and each connection its own budget
+            # (`_timed`), and the handshake's replies (AUTH, CLIENT SETINFO) mustn't each be held
+            # to a call's 50 ms.
+            socket_timeout=CONNECT_TIMEOUT_SECONDS,
+            socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
             # A refused call is answered by the failure mode, never retried into the latency budget.
             retry_on_timeout=False,
         )
@@ -358,7 +435,7 @@ class CounterStore:
     ) -> Verdict:
         interval, burst = gcra_shape(limit, period_ms)
         args: list[str | int] = [now_ms, interval, burst, cost, "1" if peek else "0"]
-        return _verdict(await self._call(lambda: self._rate(keys=[key], args=args)))
+        return _verdict(await self._call("rate", lambda: self._rate(keys=[key], args=args)))
 
     async def log(
         self,
@@ -374,14 +451,15 @@ class CounterStore:
     ) -> Verdict:
         args: list[str | int] = [now_ms, window_ms, limit, mode, member, block_ms]
         args += [repr(score) for score in others]
-        return _verdict(await self._call(lambda: self._log(keys=[key], args=args)))
+        return _verdict(await self._call("log", lambda: self._log(keys=[key], args=args)))
 
     async def scores(self, key: str, *, now_ms: int, window_ms: int) -> list[float]:
         """The entry times in a log's window, to count them under another key (`others`)."""
         result = await self._call(
+            "scores",
             lambda: self._client.zrangebyscore(
                 key, f"({now_ms - window_ms}", "+inf", withscores=True
-            )
+            ),
         )
         if not isinstance(result, list):
             raise CounterStoreUnavailableError("unexpected answer from the counter store")
@@ -392,20 +470,20 @@ class CounterStore:
     ) -> bool:
         """Take (or renew) `member`'s lease in the set `key`, if fewer than `cap` are live."""
         args: list[str | int] = [now_ms, ttl_ms, cap, member]
-        result = await self._call(lambda: self._lease(keys=[key], args=args))
+        result = await self._call("lease_acquire", lambda: self._lease(keys=[key], args=args))
         return bool(result == 1)
 
     async def release_lease(self, key: str, member: str) -> None:
-        await self._call(lambda: self._client.zrem(key, member))
+        await self._call("lease_release", lambda: self._client.zrem(key, member))
 
     async def forget_newest(self, key: str) -> None:
         """Take the newest entry out of a log: the sign-in triggers' pending attempt that
         succeeded (#238, `sft.service.signin_triggers`). One command on one key."""
-        await self._call(lambda: self._client.zpopmax(key))
+        await self._call("forget_newest", lambda: self._client.zpopmax(key))
 
     async def holds(self, key: str, member: str) -> bool:
         """Whether a log still holds `member` (#238): a sign-in attempt nobody took out."""
-        score = await self._call(lambda: self._client.zscore(key, member))
+        score = await self._call("holds", lambda: self._client.zscore(key, member))
         return score is not None
 
     async def run(self, calls: Sequence[Call], *, now_ms: int) -> list[Verdict | list[float]]:
@@ -427,21 +505,21 @@ class CounterStore:
                         call.cost,
                         "1" if call.peek else "0",
                     ]
-                    await self._rate(keys=[call.key], args=args, client=pipe)
+                    pipe.evalsha(self._rate.sha, 1, call.key, *_strings(args))
                 elif isinstance(call, LogCall):
                     args = [now_ms, call.window_ms, call.limit, call.mode, call.member]
                     args += [call.block_ms, *(repr(score) for score in call.others)]
-                    await self._log(keys=[call.key], args=args, client=pipe)
+                    pipe.evalsha(self._log.sha, 1, call.key, *_strings(args))
                 elif isinstance(call, BudgetCall):
                     args = [call.cost, call.limit, call.ttl_ms, "1" if call.peek else "0"]
-                    await self._budget(keys=[call.key], args=args, client=pipe)
+                    pipe.evalsha(self._budget.sha, 1, call.key, *_strings(args))
                 else:
                     pipe.zrangebyscore(
                         call.key, f"({now_ms - call.window_ms}", "+inf", withscores=True
                     )
             return await pipe.execute()
 
-        results = await self._call(execute)
+        results = await self._call("batch", execute)
         if not isinstance(results, list) or len(results) != len(calls):
             raise CounterStoreUnavailableError("unexpected answer from the counter store")
         out: list[Verdict | list[float]] = []
@@ -460,25 +538,73 @@ class CounterStore:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _call(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+    async def _call(self, name: str, operation: Callable[[], Awaitable[Any]]) -> Any:
         if self._failures >= BREAKER_ERRORS and self._clock() < self._resting_until:
             self._metrics.errors.inc()
             raise CounterStoreUnavailableError(
                 "the counter store is resting after repeated failures"
             )
+        span_name = f"counter.{name}"
         start = time.perf_counter()
-        try:
-            async with asyncio.timeout(self._timeout):
-                result = await operation()
-        except (ValkeyError, OSError, TimeoutError) as exc:
-            self._failed()
-            raise CounterStoreUnavailableError(type(exc).__name__) from exc
-        finally:
-            self._metrics.latency.observe(time.perf_counter() - start)
+        # The exception's message never reaches the span: only its type, as `error.type`.
+        with _tracer.start_as_current_span(
+            span_name,
+            kind=SpanKind.CLIENT,
+            attributes={**self._span_attributes, "db.operation.name": span_name},
+            record_exception=False,
+            set_status_on_exception=False,
+        ) as span:
+            try:
+                result = await self._timed(operation)
+            except (ValkeyError, OSError, TimeoutError) as exc:
+                mark_error(span, type(exc).__qualname__)
+                self._failed()
+                raise CounterStoreUnavailableError(type(exc).__name__) from exc
+            finally:
+                self._metrics.latency.observe(time.perf_counter() - start)
         if self._failures:
             self._failures = 0
             self._metrics.fallback_active.set(0)
         return result
+
+    async def _timed(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """An open connection first, on a budget of its own; then the operation in 50 ms; after a
+        `NOSCRIPT`, the scripts loaded on a budget of their own, then the operation again in a
+        fresh 50 ms (module docstring)."""
+        await self._open_connection()
+        loads = self._loads
+        try:
+            async with asyncio.timeout(self._timeout):
+                return await operation()
+        except NoScriptError:
+            await self._load_scripts(loads)
+        async with asyncio.timeout(self._timeout):
+            return await operation()
+
+    async def _open_connection(self) -> None:
+        """Make sure the connection the operation takes is open, outside its 50 ms (#282).
+
+        The pool hands out its most recently returned connection, and nothing runs between the
+        `release` here and the operation taking a connection, so the operation gets the one opened
+        or checked here. Checking an open connection reads nothing from the network. Opening one
+        has `CONNECT_TIMEOUT_SECONDS`: running out of it is a failure, like any other."""
+        pool = self._client.connection_pool
+        async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+            connection = await pool.get_connection("PING")  # type: ignore[no-untyped-call]
+        await pool.release(connection)
+
+    async def _load_scripts(self, seen: int) -> None:
+        """Load every script in one round trip, unless a call that met the same `NOSCRIPT`
+        already has: concurrent calls after a restart wait for one load, not one each."""
+        async with self._loading:
+            if self._loads != seen:
+                return
+            async with asyncio.timeout(SCRIPT_LOAD_TIMEOUT_SECONDS):
+                pipe = self._client.pipeline(transaction=False)
+                for script in self._scripts:
+                    pipe.script_load(script.source)
+                await pipe.execute()
+            self._loads += 1
 
     def _failed(self) -> None:
         self._metrics.errors.inc()

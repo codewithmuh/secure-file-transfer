@@ -35,14 +35,10 @@ from uuid import UUID
 import httpx2 as httpx
 
 from sft.service.sso import provider_name_for
+from sft.service.sso_drift import OIDC_ATTRIBUTES, SAML_ATTRIBUTES
 
 Kind = Literal["oidc", "saml"]
 
-OIDC_ATTRIBUTES: Final = {"email": "email", "username": "sub", "custom:sso_groups": "groups"}
-SAML_ATTRIBUTES: Final = {
-    "email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
-    "custom:sso_groups": "http://schemas.xmlsoap.org/claims/Group",
-}
 # What UpdateUserPoolClient takes back from DescribeUserPoolClient: anything left out is reset.
 CLIENT_FIELDS: Final = (
     "ClientName",

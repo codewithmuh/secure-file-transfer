@@ -4,8 +4,9 @@
 # Every query from the VPC reaches the resolver: CoreDNS forwards to it, and no node or pod can send DNS anywhere
 # else (security-groups.tf: only the system nodes leave the VPC, and only on 443). The allowed names are the VPC
 # endpoints' own (endpoints.tf), S3 in this Region (gateway endpoint), and var.dns_firewall_allowed_domains: the cluster
-# API, EC2 host names, and what the egress proxy and the system nodes' host processes reach through NAT. The proxy's
-# per-workload allowlists are narrower still.
+# API, EC2 host names, and what the egress proxy and the system nodes' host processes reach through NAT; and the API's
+# and the web app's own names, which the synthetic probe calls from inside (#259). The proxy's per-workload allowlists
+# are narrower still.
 
 locals {
   dns_allowed_domains = sort(distinct(concat(
@@ -16,6 +17,8 @@ locals {
       for d in concat(var.dns_firewall_allowed_domains, var.dns_firewall_additional_domains) :
       replace(d, "{region}", var.region)
     ],
+    # The synthetic probe reaches the API and the web app by their public names, through the egress proxy (#248, #259).
+    var.service_domain == null ? [] : ["api.${var.service_domain}", "app.${var.service_domain}"],
   )))
 }
 

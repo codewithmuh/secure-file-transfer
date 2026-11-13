@@ -27,3 +27,11 @@ output "alarm_names" {
     [for a in aws_cloudwatch_metric_alarm.region_health : a.alarm_name],
   )
 }
+
+output "security_rule_names" {
+  description = "The security alerts' EventBridge rules in this Region (#256), and the us-east-1 forwarding rule where this stack makes it."
+  value = concat(
+    [for r in aws_cloudwatch_event_rule.security : r.name],
+    aws_cloudwatch_event_rule.global_events[*].name,
+  )
+}

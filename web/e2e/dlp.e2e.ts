@@ -222,6 +222,10 @@ test('the member requests approval; the admin approves one and rejects another f
   };
   try {
     await expect(admin.getByText(t.admin.approverNote)).toBeVisible();
+    // Active users only: the specs before this one invite and deactivate users, and the list loads more on request,
+    // so an unfiltered list can push a seeded user's row past the first page.
+    await admin.getByLabel(t.common.status).selectOption('active');
+    await expect(userRow(USERS.member.email)).toBeVisible();
     await makeApprover(USERS.admin.email);
     await makeApprover(USERS.member.email);
     await addKeywordList(admin, list, term);

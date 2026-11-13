@@ -3,8 +3,9 @@
 #
 # The series come from the notification worker (sft.service.notifications): emails_sent_total{type} and
 # email_caps_hit_total{cap}. When a sender's transfer needs approval and the tenant has no eligible approver, every
-# active admin gets `dlp_no_eligible_approver`, capped per tenant (`tenant_no_eligible_approver`). The age of the
-# oldest pending request, DlpApprovalBacklog's other half, waits for its metric (docs/operations/slos.md).
+# active admin gets `dlp_no_eligible_approver`, capped per tenant (`tenant_no_eligible_approver`). And from the expiry
+# job (sft.service.lifecycle, #260), which pushes them every 5 minutes: dlp_approval_pending_timeout_used_ratio, the
+# largest share of its tenant's approval timeout a pending request has used, and dlp_approval_oldest_pending_age_seconds.
 groups:
   - name: dlp-approvals
     rules:
@@ -20,4 +21,16 @@ groups:
           condition: no_eligible_approver
         annotations:
           summary: A tenant's DLP rules need approval but it has no eligible approver; its transfers wait (FR-43).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md
+
+      # Abuse 8.2: a pending request older than half its tenant's approval timeout. Its approvers haven't acted; when it
+      # expires the transfer goes back to its sender (FR-43). Tenants set their own timeout, so the ratio, not the age.
+      - alert: DlpApprovalBacklog
+        expr: max(dlp_approval_pending_timeout_used_ratio) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+          condition: pending_half_timeout
+        annotations:
+          summary: A DLP approval request has waited more than half its tenant's approval timeout (FR-43).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/dlp-approvals.md

@@ -113,6 +113,17 @@ and deleted their local identities; the notification worker deletes their user i
 creates it again with a new temporary password, records the new identity and emails a new
 invitation (authn and authz 2.5, steps 2 and 3). Payload `{"user_id": …}`."""
 
+TENANT_ADMIN_RECOVERED: Final = Topic("tenant.admin_recovered", Queue.NOTIFY)
+"""An operator recovered a tenant admin's sign-in (`recoverTenantAdmin`, #239, #273): the
+notification worker emails every active admin of the tenant which admin it was, when, and whether
+it is a reset or a temporary local sign-in (authn and authz 2.5). Written with the recovery's
+`member.sign_in_reset`. Payload `{"user_id": …, "admin_recovery_id": …}`."""
+
+MEMBER_TEMPORARY_SIGN_IN_ENDED: Final = Topic("member.temporary_sign_in_ended", Queue.NOTIFY)
+"""The daily `cleanup` job ended an operator's temporary local sign-in (#239, #273): the
+notification worker deletes the admin's user in the pool, if it is still the one made for that
+recovery's reset (authn and authz 2.5). Payload `{"user_id": …, "admin_recovery_id": …}`."""
+
 FILE_SCAN: Final = Topic("file.scan", Queue.SCAN_SMALL)
 """A file of up to 100 MB reached `scanning`: a scan worker of the small pool streams it to clamd
 and its DLP inspector (architecture 4.1, ADR-0019, #175). Payload `{"file_id": …}`. A scan over
@@ -267,6 +278,8 @@ once; otherwise the change joins the coalesced policy notice as `approvers_chang
 TOPICS: Final[Mapping[str, Topic]] = topic_registry(
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
+    TENANT_ADMIN_RECOVERED,
+    MEMBER_TEMPORARY_SIGN_IN_ENDED,
     FILE_SCAN,
     FILE_SCAN_LARGE,
     TRANSFER_SENT,

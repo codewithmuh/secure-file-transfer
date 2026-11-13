@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from prometheus_client import CollectorRegistry
 
 from member_fixtures import RecordingLimiter, client, events, seed_tenant, session_caller
 from pg import ScratchDatabase
@@ -16,6 +17,7 @@ from sft.data.database import Database
 from sft.data.models import Role
 from sft.data.roles import API, JOBS
 from sft.data.scope import Scope
+from sft.service import lifecycle
 from sft.service.caller import Caller, CallerKind
 from sft.service.idempotency import (
     IdempotentRequest,
@@ -24,6 +26,7 @@ from sft.service.idempotency import (
     key_owner,
     once,
 )
+from sft.service.lifecycle import JobMetrics, Jobs
 
 pytestmark = pytest.mark.anyio
 
@@ -303,6 +306,35 @@ async def test_the_daily_job_deletes_expired_keys_only(migrated_db: ScratchDatab
     assert migrated_db.sql("SELECT count(*) FROM idempotency_keys WHERE expires_at <= now()") == [
         (0,)
     ]
+
+
+async def test_the_daily_cleanup_runs_the_key_expiry(migrated_db: ScratchDatabase) -> None:
+    """#162: the daily `cleanup` CronJob deletes expired keys, with no audit event, and counts
+    them in its report and its metrics."""
+    tenant = seed_tenant(migrated_db)
+    migrated_db.sql(
+        "INSERT INTO idempotency_keys (tenant_id, caller_type, caller_id, key, "
+        "request_fingerprint, response_status, resource_type, resource_id, created_at, "
+        "expires_at) VALUES (:tenant, 'member', :caller, 'stale', "
+        "sha256(convert_to('stale', 'UTF8')), 201, 'user', :caller, :created, :expires)",
+        tenant=tenant.id,
+        caller=tenant.admin,
+        created=datetime.now(UTC) - timedelta(days=2),
+        expires=datetime.now(UTC) - timedelta(hours=1),
+    )
+    database = Database.connect(migrated_db.url(JOBS), pool_size=1)
+    jobs = Jobs(database, JobMetrics.create(CollectorRegistry()), lambda: datetime.now(UTC))
+    try:
+        report = await lifecycle.clean_up(jobs)
+    finally:
+        await database.dispose()
+    assert stored_keys(migrated_db, tenant.id) == []
+    assert report["idempotency_keys_deleted"] >= 1
+    assert migrated_db.sql(
+        "SELECT count(*) FROM audit_events WHERE tenant_id = :t AND action = "
+        "'retention.rows_deleted'",
+        t=tenant.id,
+    ) == [(0,)]
 
 
 async def test_the_api_role_cannot_run_the_job(migrated_db: ScratchDatabase) -> None:

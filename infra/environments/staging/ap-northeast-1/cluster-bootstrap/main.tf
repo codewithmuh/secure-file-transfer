@@ -76,7 +76,7 @@ data "terraform_remote_state" "identity" {
 data "terraform_remote_state" "identity_osaka" {
   backend = "s3"
   config = {
-    bucket = "sft-staging-apne3-tfstate-${var.account_id}"
+    bucket = "${module.conventions.global_name_prefix}-${module.conventions.region_shorts["ap-northeast-3"]}-tfstate-${var.account_id}"
     key    = "environments/staging/ap-northeast-3/identity/terraform.tfstate"
     region = "ap-northeast-3"
   }
@@ -177,6 +177,9 @@ module "cluster_bootstrap" {
     user_pool_id = data.terraform_remote_state.identity_osaka.outputs.user_pool_id
     client_id    = data.terraform_remote_state.identity_osaka.outputs.app_client_id
   }
+
+  # The operator API's break-glass reconciliation, from the organization stack's outputs (#275); null keeps it off.
+  break_glass_reconciliation = var.break_glass_reconciliation
 }
 
 # The AWS side of the observability stack (ADR-0009, #243): Loki's and Tempo's buckets in this Region under the logs
@@ -184,6 +187,8 @@ module "cluster_bootstrap" {
 # deploy/observability; the module above installs its operator, namespaces and storage class.
 module "observability" {
   source = "../../../../modules/observability"
+
+  conventions = module.conventions
 
   environment  = "staging"
   region       = module.conventions.region

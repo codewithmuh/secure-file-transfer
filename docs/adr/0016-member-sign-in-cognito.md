@@ -66,7 +66,8 @@ What we build and run:
 - **Invitations and resets.** The notification worker creates local members' Cognito users and records their
   identities; SSO identities bind through a one-time invitation link. A sign-in reset ends the member's sessions and
   removes their identities in both pools at once. Only the notification worker's IAM role may call Cognito's admin
-  operations; the API and operator API roles have no Cognito permissions.
+  operations; the API role has no Cognito permission, and the operator API role may only read the pools' identity
+  providers and app clients, for the SSO drift check (#239).
 - **SSO onboarding** is an operator runbook: DNS TXT proof of each email domain, the provider created in both pools,
   the tenant admin's audited confirmation that their provider enforces MFA, and a test sign-in through each pool. A
   daily job compares each tenant's recorded configuration with both pools.

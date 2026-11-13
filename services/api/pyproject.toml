@@ -13,7 +13,7 @@ dependencies = [
   # SQLAlchemy 2.0 as ADR-0002 names it; 2.1 is a deliberate upgrade, not a Dependabot bump.
   "sqlalchemy[asyncio]>=2.0.55,<2.1",
   # The binary wheel bundles libpq, so the slim image needs no system packages.
-  "psycopg[binary]>=3.3.6",
+  "psycopg[binary]>=3.3.7",
   "alembic>=1.20.1",
   # Traces (ADR-0009). The SDK and the exporter release in step with opentelemetry-api, which
   # FastAPI already needs, so all three move together: pinned, not bumped one at a time.
@@ -26,7 +26,7 @@ dependencies = [
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
-  "boto3>=1.43.121",
+  "boto3>=1.43.123",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
   # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
@@ -36,7 +36,7 @@ dependencies = [
   # one revocation; the security-critical part is the ID token's signature and claims, which joserfc
   # (BSD-3-Clause, the Authlib author's JOSE library) checks against the pool's published keys. The
   # cap holds 1.8.0 (2026-11-03) back until it is 7 days old (threat model T-68); lift it then.
-  "joserfc>=1.7.7,<1.8",
+  "joserfc>=1.8.0,<1.9",
   # The HTTP client for the OIDC discovery, token and revocation calls; the tests use it too.
   "httpx2>=2.16.0",
   # DLP text extraction (ADR-0022): XML with DTDs, entities and network off, and PDF text through PDFium
@@ -47,9 +47,8 @@ dependencies = [
   # certificate each pod makes at start. Already in the lock through joserfc; 50.0.2 is 2026-09-30.
   "cryptography>=50.0.2",
   # Tenant SSO (#231): proving an email domain reads its DNS TXT record (authn-authz 2.5). The
-  # resolver is async and pure Python. 2.9.1 is 2026-10-29; the cap holds 2.9.2 (2026-11-03) back
-  # until it is 7 days old (threat model T-68); lift it then.
-  "dnspython>=2.9.1,<2.9.2",
+  # resolver is async and pure Python. 2.9.2 is 2026-11-03 (7 days old by threat model T-68 since 2026-11-10).
+  "dnspython>=2.9.2,<3",
 ]
 
 [dependency-groups]
@@ -60,8 +59,8 @@ dev = [
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
   "ruff>=0.17.3",
-  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.121",  # mypy types for the AWS clients
-  "types-pyyaml>=6.0.12.20260906",
+  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.123",  # mypy types for the AWS clients
+  "types-pyyaml>=6.0.12.20261103",
 ]
 
 [build-system]

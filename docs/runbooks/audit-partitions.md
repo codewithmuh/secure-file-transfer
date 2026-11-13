@@ -10,18 +10,28 @@ which:
   (`sft_audit_partition_months_covered < 2`);
 - `stale`: the partition step hasn't succeeded for 26 hours
   (`sft_audit_partition_last_success_timestamp_seconds`);
-- `never_reported`: the step has never pushed its gauges in 26 hours, so `stale` can't fire.
+- `never_reported`: the step has never pushed its gauges in 26 hours, so `stale` can't fire;
+- `expired_present` (#255, NFR-9): a monthly partition past the 365-day retention is still there after two daily runs
+  (`sft_audit_expired_partitions > 0` for 25 hours).
 
 ## Symptoms
 
 `audit_events` is partitioned by month on `occurred_at`, in UTC months named `audit_events_yYYYYmMM`. The lifecycle
-job's step (`sft.service.audit_partitions`) calls `audit_create_partitions(3)` to keep three months ahead, and
-measures with `audit_partition_status()`. The alert means a month has no partition yet, or rows already sit in the
-default partition, or the step isn't running.
+job's step (`sft.service.audit_partitions`, the daily `audit-partitions` CronJob as `sft_jobs`) calls
+`audit_create_partitions(3)` to keep three months ahead, then `audit_drop_expired_partitions` to drop the months past
+the retention (revision 0040), and measures with `audit_partition_status()` and `audit_expired_partitions()`. The
+alert means a month has no partition yet, or rows already sit in the default partition, or the step isn't running, or
+an expired month wasn't dropped.
+
+The drop takes a month whose end is 365 days ago and whose every row is archived in both regions: below the archive
+job's cursor, and in no range still waiting for its back-fill after a regional loss. It reports each expired month
+as `dropped`, `unarchived` (kept until the archive has it) or `failed` (its lock or drop failed; the run fails too).
 
 ## Impact
 
-The default partition catches any row whose month is missing, so audit writes, and every fail-closed action behind
+`expired_present`: audit events are kept past NFR-9's 365 days, a retention breach but no loss; they are in both
+regions' archive under its own Object Lock retention anyway once dropped. The others: the default partition catches
+any row whose month is missing, so audit writes, and every fail-closed action behind
 them, never fail (data model 6). Nothing is lost. The harm is that a month whose rows sit in the default partition is
 **blocked**: the function won't create its partition until an operator moves the rows, and its alert stays on until
 then.
@@ -35,8 +45,13 @@ kubectl -n sft get cronjobs                        # is the job that runs the st
 kubectl -n sft logs job/<its last run>
 ```
 
-The step is part of the lifecycle jobs; the `sft.workers.audit_partitions` CronJob in the chart has no module yet, so
-until it exists (the APP track) these gauges aren't reported and `never_reported` is the alert that shows it.
+Its log names each month it created and dropped, and each expired month it kept (`unarchived`) or couldn't drop
+(`failed`). For `expired_present`, the archive is the usual reason a month waits:
+
+```promql
+max(audit_archive_lag_seconds)                 # the archive job is behind: audit-archive-lag.md
+max(audit_archive_single_region_ranges)        # ranges in one region after a regional loss: audit-archive-single-region.md
+```
 
 ## Mitigate
 
@@ -65,7 +80,17 @@ until it exists (the APP track) these gauges aren't reported and `never_reported
    The rows keep their `id`, `tx_id` and `occurred_at`, so the archive's cursor and every archived copy stay valid.
    Check the counts match before the `COMMIT`. Inserts into that month wait on the lock for the moment it takes. Then
    run the job once more; the month reports `exists` and the gauge returns to 0.
-3. **After a restore or failover**, re-imported events with old `occurred_at` belong in past months: the runbook runs
+3. **`expired_present`:**
+   - `unarchived`: the month waits for the archive. Fix the archive job ([audit-archive-lag.md](audit-archive-lag.md))
+     or finish the failback's back-fill ([audit-archive-single-region.md](audit-archive-single-region.md)); the next
+     daily run drops the month. Never move the archive cursor or delete back-fill rows to make it go: the drop would
+     take events that aren't in both regions.
+   - `failed`: usually the one-second lock timeout on `audit_events`, which a long transaction holds (a migration, an
+     open `psql`); the next run tries again. Run it at once with
+     `kubectl -n sft create job --from=cronjob/audit-partitions audit-partitions-now`.
+   - A month the drop doesn't know: only months named `audit_events_yYYYYmMM` are dropped. Rows of an expired month in
+     the default partition stay there until moved (step 2), then go with their month.
+4. **After a restore or failover**, re-imported events with old `occurred_at` belong in past months: the runbook runs
    `audit_create_partitions(3, <first day of the oldest month>)` as `sft_recovery` before re-importing (data model 6).
 
 ## Escalate

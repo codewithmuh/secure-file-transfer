@@ -411,4 +411,8 @@ def test_the_report_is_one_json_line() -> None:
         "events": 9,
         "objects_written": {"ap-northeast-1": 2},
         "lag_seconds": 1.235,
+        # The surviving-region mode's back-fill (#257).
+        "backfilled": 0,
+        "records_written": {},
+        "single_region": 0,
     }

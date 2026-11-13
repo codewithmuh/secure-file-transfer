@@ -23,7 +23,10 @@
         "sesConfigurationSet": { "type": "string", "pattern": "^(sft-(dev|staging|prod))?$" },
         "appClientId": { "type": "string", "pattern": "^[0-9a-z]*$" },
         "standbyUserPoolId": { "type": "string", "pattern": "^(ap-northeast-3_[0-9A-Za-z]+)?$" },
-        "standbyAppClientId": { "type": "string", "pattern": "^[0-9a-z]*$" }
+        "standbyAppClientId": { "type": "string", "pattern": "^[0-9a-z]*$" },
+        "breakGlassTrailRoleArn": { "type": "string", "pattern": "^(arn:aws:iam::[0-9]{12}:role/sft-(dev|staging|prod)-break-glass-trail)?$" },
+        "breakGlassPermissionSetArn": { "type": "string", "pattern": "^(arn:aws:sso:::permissionSet/ssoins-[0-9a-f]{16}/ps-[0-9a-f]{16})?$" },
+        "identityStoreId": { "type": "string", "pattern": "^(d-[0-9a-f]{10})?$" }
       }
     },
     "repoURL": { "const": "https://github.com/codewithmuh/secure-file-transfer.git" },

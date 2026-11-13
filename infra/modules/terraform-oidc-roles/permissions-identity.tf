@@ -24,7 +24,7 @@
 locals {
   identity_enabled = local.cluster_enabled
 
-  identity_region_shorts = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+  identity_region_shorts = var.conventions.region_shorts
   identity_prefixes      = [for r in var.network_regions : "${local.cluster_env_prefix}-${local.identity_region_shorts[r]}"]
 
   identity_topics  = [for i, r in var.network_regions : "arn:aws:sns:${r}:${var.account_id}:${local.identity_prefixes[i]}-ses-events"]

@@ -27,7 +27,22 @@ domains linked to the connection and the user isn't deactivated and has no ident
 (`user.identity_bound`); otherwise, with the tenant's `sso_jit` on, the member is created, active,
 with the role the token's groups map to or `member` (`user.provisioned`). The address never
 reaches another tenant or a domain the tenant hasn't proven. **SSO required**: a local sign-in
-to a tenant that requires SSO is refused, except for its fallback admins.
+to a tenant that requires SSO is refused, except for its fallback admins and an operator's
+temporary local sign-in (`recoverTenantAdmin`, #239), whose identity expires after 72 hours. Both
+are security-critical records.
+
+**Invitation** (`start_invitation`, #239). An SSO invitation's token finds the invited user
+(`lookup_invitation`, in lookup scope); the pre-auth record names them, the token's hash and their
+tenant's active connection. At the callback the provider's subject is bound to that user, unless
+it already is, and the invitation is consumed, which activates them, in the sign-in's transaction
+(`user.identity_bound`, `user.activated`). A subject bound to another user, an invitation used or
+replaced meanwhile, or a sign-in that didn't come through the tenant's provider is refused.
+
+**The previous session** (#159). The start keeps the SHA-256 of the session cookie the browser
+sent in the pre-auth record: the start is a same-site navigation, so the Strict cookie arrives
+there. The callback is a cross-site redirect from the user pool and carries none, so it ends that
+session by its hash, and a cookie that did arrive too (a same-site pool, as locally). A session
+planted in the browser before sign-in never outlives it (authn and authz 3.3).
 
 **Resolve** (`resolve`). The per-request check of 3.2, through the member session lookup, then in
 the session's tenant: live, not idle, user and tenant active, role from `users`.
@@ -54,7 +69,9 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import Unauthenticated
+from sft.core.tokens import token_hash
 from sft.data import audit, member_sessions, sso
+from sft.data.access import NotFoundError
 from sft.data.audit import Actor, Origin, Target
 from sft.data.database import Database
 from sft.data.identities import (
@@ -69,7 +86,7 @@ from sft.data.models import ActorType, Outcome, Role, SsoGroupRole, Tenant, User
 from sft.data.scope import Scope
 from sft.data.signin_state import PendingSignIn, StateStore
 from sft.data.tenants import get_tenant
-from sft.data.users import accept_invitation, get_user, get_user_by_email
+from sft.data.users import accept_invitation, find_invitation, get_user, get_user_by_email
 from sft.service.caller import AuthMethod, Caller, CallerKind
 from sft.service.csrf import CsrfKeyring
 from sft.service.domain_rules import DomainError, domain_of, normalize_domain
@@ -115,7 +132,10 @@ class SignInRefusal(StrEnum):
     PROVISIONING_OFF = "provisioning_off"
     """Just in time: nobody has the address, and the tenant creates no member at sign-in."""
     IDENTITY_CONFLICT = "identity_conflict"
-    """Just in time: the user already has another identity at this connection."""
+    """Just in time: the user already has another identity at this connection. An invitation:
+    the subject is bound to another user."""
+    INVITATION_INVALID = "invitation_invalid"
+    """An invitation that was used, replaced or expired between its start and the callback."""
 
 
 class SessionEnd(StrEnum):
@@ -134,6 +154,11 @@ DATABASE_UNAVAILABLE: Final = (OperationalError, InterfaceError, PoolTimeoutErro
 class SignInMethod(StrEnum):
     SSO = "sso"
     LOCAL = "local"
+
+
+class InvitationNotFoundError(Exception):
+    """No live invitation has the token, or its tenant can't sign anyone in by SSO now:
+    `404 not_found`, which says nothing about which (contract, `startInvitationSignIn`)."""
 
 
 class SignInUnavailableError(Exception):
@@ -256,8 +281,15 @@ class SignIn:
     # ---- start ----
 
     async def start(
-        self, *, method: SignInMethod, return_to: str | None, sso_domain: str | None = None
+        self,
+        *,
+        method: SignInMethod,
+        return_to: str | None,
+        sso_domain: str | None = None,
+        previous_session: str | None = None,
     ) -> Started:
+        """`previous_session` is the session cookie the browser sent, if any: its hash goes into
+        the pre-auth record, so the callback can end that session without the cookie (#159)."""
         try:
             route = None
             if method is SignInMethod.SSO and sso_domain:
@@ -274,13 +306,67 @@ class SignIn:
             # The tenant's provider: the pool sends the browser on to it (authn and authz 2.4).
             connection = Connection(route.connection_id, route.tenant_id, "sso", route.status)
             provider = route.provider_name
+        return await self._redirect(
+            connection.id, provider, safe_return_path(return_to), previous_session
+        )
+
+    async def start_invitation(self, *, token: str, previous_session: str | None) -> Started:
+        """`startInvitationSignIn` (authn and authz 2.5): the invited user and their tenant's
+        active SSO connection go into the pre-auth record, and the browser to that provider.
+        `InvitationNotFoundError` for a token no live invitation has, or a tenant that can't use
+        it now: suspended, or without an active connection. Nothing is consumed until the
+        callback."""
+        digest = token_hash(token)
+        try:
+            async with self.database.transaction(Scope.lookup()) as session:
+                match = await find_invitation(session, digest)
+            if match is None:
+                raise InvitationNotFoundError
+            async with self.database.transaction(Scope.tenant(match.tenant_id)) as session:
+                tenant = await get_tenant(session, match.tenant_id)
+                connection = await sso.get_connection(session)
+        except DATABASE_UNAVAILABLE as exc:
+            log.warning("sign-in can't reach the database", extra={"error": type(exc).__name__})
+            raise SignInUnavailableError from exc
+        if (
+            tenant is None
+            or tenant.status != "active"
+            or connection is None
+            or connection.status != "active"
+        ):
+            raise InvitationNotFoundError
+        return await self._redirect(
+            connection.id,
+            connection.provider_name,
+            DEFAULT_RETURN,
+            previous_session,
+            invited_user_id=match.user_id,
+            invitation=digest.hex(),
+        )
+
+    async def _redirect(
+        self,
+        connection_id: UUID,
+        provider: str,
+        return_to: str,
+        previous_session: str | None,
+        *,
+        invited_user_id: UUID | None = None,
+        invitation: str | None = None,
+    ) -> Started:
+        """Store the pre-auth record and return its cookie and the pool's authorization URL."""
         pkce = Pkce.new()
         pending = PendingSignIn(
             state=secrets.token_urlsafe(32),
             verifier=pkce.verifier,
             nonce=secrets.token_urlsafe(32),
-            connection_id=connection.id,
-            return_to=safe_return_path(return_to),
+            connection_id=connection_id,
+            return_to=return_to,
+            previous_session=None
+            if not previous_session
+            else member_sessions.token_hash(previous_session).hex(),
+            invited_user_id=invited_user_id,
+            invitation=invitation,
         )
         try:
             location = await self.oidc.authorization_url(
@@ -354,12 +440,20 @@ class SignIn:
                 raise _RefusedError(SignInRefusal.STATE_MISMATCH)
             token = await self._token(code, pending)
             resolved = await self._identity(token, pending)
-            session_token = await self._create_session(resolved, token, origin)
+            session_token = await self._create_session(resolved, token, origin, pending)
         except _RefusedError as refused:
             await self._audit_refusal(refused, origin)
             return Completed(location=self._web("/sign-in?error=sign_in_failed"))
+        # The session the browser held when sign-in started, from the record: the callback is a
+        # cross-site redirect and carries no Strict cookie (#159). A cookie that did arrive (a
+        # same-site pool, as locally) is ended too.
+        previous: set[bytes] = set()
+        if pending.previous_session is not None:
+            previous.add(bytes.fromhex(pending.previous_session))
         if previous_session:
-            await self._end_previous(previous_session, origin)
+            previous.add(member_sessions.token_hash(previous_session))
+        for session_hash in previous:
+            await self._end_previous(session_hash, origin)
         # Encoded whole: a return path's own query (`?tab=log&page=2`) stays inside the parameter.
         query = urlencode({"return_path": pending.return_to})
         return Completed(location=self._web(f"/auth/callback?{query}"), session_token=session_token)
@@ -398,6 +492,13 @@ class SignIn:
                 raise _RefusedError(SignInRefusal.CONNECTION_INACTIVE)
             identity = await find_identity(session, connection.id, subject)
         method = auth_method_of(token, federated=federated)
+        if pending.invited_user_id is not None:
+            # An invitation (authn and authz 2.5): only through the tenant's provider, and only a
+            # subject that is new or already the invited user's.
+            if not federated or connection.tenant_id is None:
+                raise _RefusedError(SignInRefusal.CONNECTION_MISMATCH)
+            if identity is not None and identity.user_id != pending.invited_user_id:
+                raise _RefusedError(SignInRefusal.IDENTITY_CONFLICT, identity)
         if identity is None:
             if federated and connection.tenant_id is not None:
                 # A first SSO sign-in: bound or created just in time, in the tenant's scope.
@@ -454,7 +555,62 @@ class SignIn:
         )
         return Identity(identity_id, tenant_id, user.id, None)
 
-    async def _create_session(self, resolved: _Resolved, token: IdToken, origin: Origin) -> str:
+    async def _accept(
+        self,
+        session: AsyncSession,
+        resolved: _Resolved,
+        pending: PendingSignIn,
+        tenant_id: UUID,
+        origin: Origin,
+    ) -> Identity:
+        """An invitation's sign-in: bind the subject to the invited user, unless it is bound to
+        them already, and consume the token, which activates them. In the tenant's scope, in the
+        sign-in's transaction; a used, replaced or expired invitation is refused."""
+        user_id, invitation = pending.invited_user_id, pending.invitation
+        if user_id is None or invitation is None:  # pragma: no cover - the caller checks
+            raise _RefusedError(SignInRefusal.INVITATION_INVALID, tenant_id=tenant_id)
+        user = await get_user(session, user_id, for_update=True)
+        if user is None or user.status != UserStatus.INVITED:
+            raise _RefusedError(SignInRefusal.INVITATION_INVALID, tenant_id=tenant_id)
+        identity = resolved.identity
+        if identity is None:
+            identity_id = await sso.bind_identity(
+                session,
+                user_id=user.id,
+                connection_id=resolved.connection.id,
+                subject=resolved.subject,
+            )
+            if identity_id is None:
+                raise _RefusedError(SignInRefusal.IDENTITY_CONFLICT, tenant_id=tenant_id)
+            identity = Identity(identity_id, tenant_id, user.id, None)
+            await audit.record(
+                session,
+                action="user.identity_bound",
+                actor=Actor(ActorType.SYSTEM),
+                target=Target("user", user.id),
+                origin=origin,
+                details={
+                    "idp_connection_id": resolved.connection.id,
+                    "identity_id": identity_id,
+                    "role": Role(user.role),
+                    "invitation": True,
+                },
+            )
+        try:
+            await accept_invitation(
+                session,
+                user.id,
+                actor=Actor(ActorType.MEMBER, user.id),
+                origin=origin,
+                token_hash=bytes.fromhex(invitation),
+            )
+        except NotFoundError as exc:
+            raise _RefusedError(SignInRefusal.INVITATION_INVALID, tenant_id=tenant_id) from exc
+        return identity
+
+    async def _create_session(
+        self, resolved: _Resolved, token: IdToken, origin: Origin, pending: PendingSignIn
+    ) -> str:
         identity, method = resolved.identity, resolved.method
         tenant_id = identity.tenant_id if identity is not None else resolved.connection.tenant_id
         if tenant_id is None:
@@ -468,14 +624,19 @@ class SignIn:
             tenant = await get_tenant(session, tenant_id)
             if tenant is None or tenant.status != "active":
                 raise _RefusedError(SignInRefusal.TENANT_SUSPENDED, identity, tenant_id=tenant_id)
-            if identity is None:
+            if pending.invited_user_id is not None:
+                identity = await self._accept(session, resolved, pending, tenant_id, origin)
+            elif identity is None:
                 identity = await self._provision(session, resolved, token, tenant)
             user = await get_user(session, identity.user_id, for_update=True)
             if user is None:
                 raise _RefusedError(SignInRefusal.UNKNOWN_IDENTITY, identity)
             if user.status == UserStatus.DEACTIVATED:
                 raise _RefusedError(SignInRefusal.USER_DEACTIVATED, identity)
-            if method is not AuthMethod.SSO and tenant.sso_required and not user.sso_fallback:
+            # An operator's temporary local sign-in (#239) is the one local identity that expires.
+            temporary = identity.expires_at is not None
+            local_by_exception = method is not AuthMethod.SSO and tenant.sso_required
+            if local_by_exception and not (user.sso_fallback or temporary):
                 # Only the identity provider signs this tenant's members in (authn and authz 2.5).
                 raise _RefusedError(SignInRefusal.SSO_REQUIRED, identity)
             # The caller as the new session will see it, before the session exists: its actor.
@@ -511,10 +672,12 @@ class SignIn:
                     "identity_id": identity.id,
                     "idp_connection_id": resolved.connection.id,
                     "sessions_ended": ended,
-                    # A fallback admin's local sign-in to a tenant that requires SSO (2.5).
-                    "sso_fallback_sign_in": method is not AuthMethod.SSO and tenant.sso_required,
+                    # A fallback admin's local sign-in to a tenant that requires SSO (2.5), or an
+                    # operator's temporary one (#239).
+                    "sso_fallback_sign_in": local_by_exception and not temporary,
+                    "temporary_sign_in": temporary,
                 },
-                security_critical=method is not AuthMethod.SSO and tenant.sso_required,
+                security_critical=local_by_exception or temporary,
             )
         return session_token
 
@@ -557,11 +720,11 @@ class SignIn:
                 details={**details, "identity_id": identity.id},
             )
 
-    async def _end_previous(self, token: str, origin: Origin) -> None:
-        """Revoke the session cookie the browser sent before signing in, so a planted cookie
-        can't be carried into the new sign-in (authn and authz 3.3)."""
+    async def _end_previous(self, session_hash: bytes, origin: Origin) -> None:
+        """Revoke the session the browser held before signing in, by its token's hash, so a
+        planted cookie can't be carried into the new sign-in (authn and authz 3.3)."""
         async with self.database.transaction(Scope.lookup()) as session:
-            found = await member_sessions.lookup_session(session, token)
+            found = await member_sessions.lookup_session_hash(session, session_hash)
         if found is None or not found.live:
             return
         session_id, tenant_id = found.session_id, found.tenant_id
@@ -605,19 +768,15 @@ class SignIn:
         )
         return caller, live
 
-    async def current_member(self, caller: Caller) -> CurrentMember:
-        """The member's user and tenant rows and the session's end, for `GET /me`."""
+    def current_member(self, caller: Caller, live: LiveSession) -> CurrentMember:
+        """`GET /me`: the member's user and tenant rows and the session's end, as the request's
+        session check read them (`resolve`), so it needs no transaction of its own (#161)."""
         authorize(caller, "getCurrentMember", now=datetime.now(UTC))
-        tenant_id, user_id, session_id = _member_session(caller)
-        async with self.database.transaction(Scope.tenant(tenant_id)) as session:
-            user = await get_user(session, user_id)
-            tenant = await get_tenant(session, tenant_id)
-            expires_at = await member_sessions.expires_at(session, session_id)
-        if user is None or tenant is None or expires_at is None or caller.auth_time is None:
-            # Ended between the request's session check and this read.
+        _, _, session_id = _member_session(caller)
+        if live.session_id != session_id or caller.auth_time is None:  # pragma: no cover
             raise Unauthenticated("session_expired")
         method = caller.auth_method or AuthMethod.LOCAL
-        return CurrentMember(user, tenant, method, caller.auth_time, expires_at)
+        return CurrentMember(live.user, live.tenant, method, caller.auth_time, live.expires_at)
 
     def csrf_token(self, session_token: str) -> str:
         return self.csrf.token_for(session_token)
@@ -679,6 +838,7 @@ def _same(a: str, b: str) -> bool:
 __all__ = [
     "Completed",
     "CurrentMember",
+    "InvitationNotFoundError",
     "SessionEnd",
     "SignIn",
     "SignInConfig",

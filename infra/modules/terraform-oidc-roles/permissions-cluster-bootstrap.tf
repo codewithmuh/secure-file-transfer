@@ -17,7 +17,7 @@
 locals {
   cluster_bootstrap_enabled = local.cluster_enabled && var.github_environment != null
 
-  cluster_bootstrap_region_shorts = { "ap-northeast-1" = "apne1", "ap-northeast-3" = "apne3" }
+  cluster_bootstrap_region_shorts = var.conventions.region_shorts
 
   cluster_bootstrap_node_groups = [
     for r in var.network_regions : "${local.cluster_env_prefix}-${local.cluster_bootstrap_region_shorts[r]}-system"

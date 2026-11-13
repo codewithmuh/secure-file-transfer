@@ -13,12 +13,20 @@ keyring that is loaded: a warning names the keyring, never a value, and
 steps (6.5), so one failed refresh delays nothing; `sft_keyring_refreshed_timestamp_seconds` says
 when each keyring was last read.
 
+`keyring_active_key_age_seconds{keyring}` is how long the loaded active key has been active: from
+its `activated_at`, or else its `created_at` (`sft.core.keyrings.active_since`), as the key
+rotation job counts a period, worked out at each scrape. It is set for every keyring the process
+loads, named or held in the setting, at load and at each reload that changes the version, so it
+always describes the keys in use. A keyring whose active key carries neither time reports none.
+The alert on a key older than its period plus 7 days reads it (6.5, #162, #260).
+
 The values stay in this process's memory: never on disk, in the environment or in a log.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -31,7 +39,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from prometheus_client import CollectorRegistry, Counter, Gauge
 from pydantic import SecretStr
 
-from sft.core.keyrings import KeyringError, secret_reference
+from sft.core.keyrings import KeyringError, active_since, secret_reference
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +65,7 @@ class KeyringUnavailableError(RuntimeError):
 class KeyringMetrics:
     failures: Counter
     refreshed: Gauge
+    active_age: Gauge
 
     @classmethod
     def create(cls, registry: CollectorRegistry) -> KeyringMetrics:
@@ -71,6 +80,14 @@ class KeyringMetrics:
             Gauge(
                 "sft_keyring_refreshed_timestamp_seconds",
                 "When each keyring's secret was last read and loaded.",
+                ["keyring"],
+                registry=registry,
+            ),
+            # The shared name of #260, without the `sft_` prefix, as the alert reads it.
+            Gauge(
+                "keyring_active_key_age_seconds",
+                "How long each loaded keyring's active key has been active (encryption and keys "
+                "6.5).",
                 ["keyring"],
                 registry=registry,
             ),
@@ -132,7 +149,9 @@ class Keyrings:
         raw = setting.get_secret_value()
         secret_id = secret_reference(raw, name=name)
         if secret_id is None:
-            return parse(raw)
+            local = parse(raw)
+            self._age(name, raw)
+            return local
         try:
             value, version = await asyncio.to_thread(self._read, secret_id)
             keyring = parse(value)
@@ -143,6 +162,7 @@ class Keyrings:
             ) from exc
         self._named.append(_Named(name, secret_id, keyring, version))
         self._metrics.refreshed.labels(name).set(self._clock())
+        self._age(name, value)
         return keyring
 
     async def refresh(self) -> None:
@@ -154,6 +174,7 @@ class Keyrings:
                     self._metrics.refreshed.labels(named.name).set(self._clock())
                     continue
                 named.keyring.reload(value)
+                self._age(named.name, value)
             except (BotoCoreError, ClientError, KeyringError, ValueError) as exc:
                 self._metrics.failures.labels(named.name).inc()
                 log.warning(
@@ -173,6 +194,17 @@ class Keyrings:
         while True:
             await asyncio.sleep(self._interval)
             await self.refresh()
+
+    def _age(self, name: str, raw: str) -> None:
+        """Report the age of the active key of the version just loaded, from the scrape's time."""
+        since = active_since(raw)
+        gauge = self._metrics.active_age
+        if since is None:
+            with contextlib.suppress(KeyError):
+                gauge.remove(name)
+            return
+        started, clock = since.timestamp(), self._clock
+        gauge.labels(name).set_function(lambda: clock() - started)
 
     def _read(self, secret_id: str) -> tuple[str, str | None]:
         if self._client is None:

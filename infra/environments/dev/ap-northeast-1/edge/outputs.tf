@@ -49,3 +49,8 @@ output "web_distribution_id" {
   description = "The distribution's ID."
   value       = module.web_cdn.distribution_id
 }
+
+output "web_release_role_arn" {
+  description = "The web app's release role, which the web-deploy workflow assumes from the GitHub environment web-<env> (#283)."
+  value       = module.web_release.role_arn
+}

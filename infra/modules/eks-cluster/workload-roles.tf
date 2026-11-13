@@ -5,8 +5,7 @@
 # #102), so each permission needs both sides.
 #
 # clamd, the DLP inspector and the signature mirror get no role and no service account token (architecture 3.1).
-# The database bootstrap and recovery jobs (encryption 4.3) get theirs with the issues that build them; the key
-# rotation job's is below (#185).
+# The key rotation job's (#185), the recovery job's (#258) and the database bootstrap job's (#278) are below.
 
 locals {
   # Namespaces and service accounts agreed with the Helm chart (#106) and cluster-bootstrap (#104).
@@ -17,6 +16,8 @@ locals {
     notify           = { namespace = "sft", service_accounts = ["notifier"], description = "Notification worker" }
     jobs             = { namespace = "sft", service_accounts = ["jobs"], description = "Lifecycle jobs" }
     archive          = { namespace = "sft", service_accounts = ["audit-archive"], description = "Audit archive job" }
+    recovery         = { namespace = "sft", service_accounts = ["recovery"], description = "Recovery job" }
+    db_bootstrap     = { namespace = "sft", service_accounts = ["db-bootstrap"], description = "Database bootstrap job" }
     migrate          = { namespace = "sft", service_accounts = ["migrate"], description = "Migrations job" }
     key_rotation     = { namespace = "sft", service_accounts = ["key-rotation"], description = "Key rotation job" }
     synthetic_probe  = { namespace = "sft", service_accounts = ["synthetic-probe"], description = "Synthetic probe" }
@@ -108,6 +109,10 @@ locals {
   platform_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/platform/*"
   ]
+  # The Aurora master password (encryption 6.3): Tokyo's secret and its read-only Osaka replica, the same name in both.
+  db_master_secrets = [
+    for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/db/master-??????"
+  ]
   # The synthetic tenant's API key, which the probe reads as an environment variable (#248, encryption 6.4).
   probe_secrets = [
     for r in var.cluster_regions : "arn:aws:secretsmanager:${r}:${var.account_id}:secret:sft/${var.environment}/app/probe-api-key-??????"
@@ -128,7 +133,7 @@ locals {
   # Statements every database user needs: IAM authentication as its own PostgreSQL login role (encryption 6.3). The
   # account has no other Aurora clusters, so any cluster resource ID in the Regions with a cluster (#101).
   database = {
-    for w in ["api", "relay", "scan", "notify", "jobs", "archive", "migrate", "operator"] : w => {
+    for w in ["api", "relay", "scan", "notify", "jobs", "archive", "recovery", "migrate", "operator"] : w => {
       Sid      = "ConnectAsOwnDatabaseRole"
       Effect   = "Allow"
       Action   = ["rds-db:connect"]
@@ -309,7 +314,7 @@ locals {
 
     # Sends email through SES's API, releases cleared suppressions from a tenant's SES list (#217), and runs the
     # Cognito admin calls for members (authn-authz 2.5): create, delete, disable and sign out users; the only role
-    # with any Cognito permission.
+    # that changes a Cognito user.
     notify = [
       {
         Sid      = "ConsumeNotificationQueues"
@@ -432,7 +437,53 @@ locals {
       },
     ]
 
+    # The recovery job (#258, disaster-recovery.md 4): lists and reads the audit archive in every Region, as
+    # sft_recovery; it never writes it. Run by hand from its suspended CronJob, after a failover or a restore.
+    recovery = [
+      {
+        Sid      = "ListAuditArchive"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = local.buckets["audit-archive"]
+      },
+      {
+        Sid      = "ReadAuditArchive"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = local.objects["audit-archive"]
+      },
+      local.database["recovery"],
+      {
+        Sid       = "AuditKeyThroughS3"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["audit"], StringEquals = { "kms:ViaService" = local.via["s3"], "kms:EncryptionContext:aws:s3:arn" = local.buckets["audit-archive"] } }
+      },
+    ]
+
     migrate = [local.database["migrate"]]
+
+    # The database bootstrap job (#278, encryption 4.3 and 6.3): reads the master password, the only workload that may,
+    # and signs in with it as the master user to create the login roles, once per environment and whenever the role
+    # list changes. Not rds-db:connect: the master user signs in with its password, never an IAM token. The secret's
+    # own policy denies every other reader but BreakGlass and the deploy role (modules/aurora), and the secrets key
+    # names this role for this one secret (modules/kms-keys).
+    db_bootstrap = [
+      {
+        Sid      = "ReadTheMasterPassword"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = local.db_master_secrets
+      },
+      {
+        Sid       = "SecretsKeyForTheMasterPassword"
+        Effect    = "Allow"
+        Action    = ["kms:Decrypt"]
+        Resource  = local.key_arns
+        Condition = { "ForAnyValue:StringEquals" = local.key_alias["secrets"], StringEquals = { "kms:ViaService" = local.via["secretsmanager"] }, StringLike = { "kms:EncryptionContext:SecretARN" = local.db_master_secrets } }
+      },
+    ]
 
     # The synthetic probe (#248): no database, no counter store, no queue. Its result to CloudWatch, in its own
     # namespace only, and its emails from the probe mailbox, read once and deleted (docs/runbooks/synthetic-probe.md).
@@ -491,13 +542,29 @@ locals {
       },
     ]
 
-    # Writes its security-critical audit records to the archive (encryption 4.3, decision 12); no Cognito, no files.
+    # Writes its security-critical audit records to the archive (encryption 4.3, decision 12), recoverTenantAdmin's
+    # among them (#239); no files. Cognito read only, for the SSO drift check of both pools; and the management
+    # account's read-only role for the break-glass reconciliation (#239, infra/organization/break-glass-trail.tf),
+    # by its name in our organization.
     operator = [
       {
         Sid      = "WriteSecurityCriticalAuditRecords"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
         Resource = local.objects["audit-archive"]
+      },
+      {
+        Sid      = "ReadPoolProvidersForDriftCheck"
+        Effect   = "Allow"
+        Action   = ["cognito-idp:DescribeIdentityProvider", "cognito-idp:DescribeUserPoolClient", "cognito-idp:ListIdentityProviders"]
+        Resource = [for r in var.cluster_regions : "arn:aws:cognito-idp:${r}:${var.account_id}:userpool/*"]
+      },
+      {
+        Sid       = "AssumeBreakGlassTrailReader"
+        Effect    = "Allow"
+        Action    = ["sts:AssumeRole"]
+        Resource  = ["arn:aws:iam::*:role/${var.global_name_prefix}-break-glass-trail"]
+        Condition = { StringEquals = { "aws:ResourceOrgID" = var.organization_id } }
       },
       local.database["operator"],
       local.valkey["operator"],

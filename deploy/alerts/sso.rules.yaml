@@ -1,0 +1,44 @@
+# Alerts of the daily SSO provider drift check (FR-26, authn-authz 2.5 and 2.6; #239), in Prometheus rule format. Each
+# links to its runbook (NFR-17), tested by deploy/alerts/tests/sso.test.yaml (`promtool test rules`, CI's deploy
+# job). Prometheus loads every deploy/alerts/*.rules.yaml file (ADR-0009, #243).
+#
+# The series come from the operator API's /metrics (sft.api.operator.jobs). Where the environment configures
+# SSO_DRIFT_POOLS, it compares each tenant's recorded SSO provider with both user pools once a day and then sets:
+# - sft_sso_provider_drift{pool, problem}: the providers that differ at the last check, by pool (its Region) and
+#   problem: `missing` (an active connection's provider isn't in the pool), `changed` (its type, issuer, attribute
+#   mapping or identifiers differ, or the app client doesn't offer it) or `unrecorded` (a provider no tenant records);
+#   every pair is made at zero when the check starts;
+# - sft_sso_drift_check_last_success_timestamp_seconds: the Unix time of the last check that ran to the end.
+groups:
+  - name: sso
+    rules:
+      # FR-26: a tenant's provider is missing or changed in a pool. In the active pool its members' SSO sign-in may
+      # fail now, or map the wrong attributes; in the standby pool it fails at a failover (authn-authz 2.6). A change
+      # nobody made through the CLI is a security question too, so it is never inhibited.
+      - alert: SsoProviderDrift
+        expr: max by (pool, problem) (sft_sso_provider_drift{problem=~"missing|changed"}) > 0
+        labels:
+          severity: page
+          security: "true"
+        annotations:
+          summary: A tenant's SSO provider is {{ $labels.problem }} in the {{ $labels.pool }} user pool (FR-26).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+
+      # A pool has a provider that no tenant records: left behind by a change of connection, or made by hand.
+      - alert: SsoProviderUnrecorded
+        expr: max by (pool) (sft_sso_provider_drift{problem="unrecorded"}) > 0
+        labels:
+          severity: ticket
+          security: "true"
+        annotations:
+          summary: The {{ $labels.pool }} user pool has an SSO provider no tenant has recorded (FR-26).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md
+
+      # The daily check hasn't run to the end for 26 hours, so drift goes unseen. Only while the series exists.
+      - alert: SsoDriftCheckStalled
+        expr: time() - max(sft_sso_drift_check_last_success_timestamp_seconds) > 26 * 3600
+        labels:
+          severity: ticket
+        annotations:
+          summary: The SSO provider drift check hasn't completed for 26 hours (FR-26).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/sso-provider-drift.md

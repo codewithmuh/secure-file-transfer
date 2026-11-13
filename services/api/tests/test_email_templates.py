@@ -12,6 +12,7 @@ import pytest
 from jinja2 import meta, nodes
 
 from email_samples import (
+    ADMIN,
     CODE,
     EXPIRES,
     LINK_TOKEN,
@@ -288,6 +289,7 @@ def test_reprs_hold_no_secret_and_no_address() -> None:
         shown = repr(email)
         assert not any(secret in shown for secret in SECRETS), email.TYPE
         assert SENDER not in shown, email.TYPE
+        assert ADMIN not in shown, email.TYPE
     for email, _, rendered in RENDERED:
         assert (
             repr(rendered)

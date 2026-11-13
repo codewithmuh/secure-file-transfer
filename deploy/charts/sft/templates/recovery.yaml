@@ -1,0 +1,42 @@
+{{- if eq .Values.part "application" }}
+{{- /*
+The recovery job (#258; sft.workers.recovery, sft.core.settings.RecoverySettings; docs/operations/disaster-recovery.md
+4): always suspended, so the schedule never fires. The restore, failover and failback runbooks render a Job from it
+with their steps and times (ops/lib/common.sh's recovery_job, `yq` on the three RECOVERY_* variables, which are here
+empty so the filter finds them). It runs as sft_recovery, with its own service account and IAM role, and lists and
+reads this region's audit archive: the surviving region's after a failover, Tokyo's after a restore. The failback's
+replay sets AUDIT_ARCHIVE_BUCKET and AUDIT_ARCHIVE_REGION (empty here: this region) to Osaka's archive (#276), which
+the role may read too. Neither pilotLight nor failover.holdWorkers changes it: the runbooks run it while the workers
+are held.
+*/}}
+{{- $r := .Values.recovery }}
+{{- $ctx := dict "root" $ "component" "recovery" "serviceAccount" $r.serviceAccount }}
+{{- $env := printf "- name: DATABASE_URL\n  value: %s" (include "sft.databaseUrl" (dict "root" $ "role" $r.databaseRole) | quote) }}
+{{- $env = printf "%s\n- name: AUDIT_ARCHIVE_BUCKET\n  value: %s" $env (printf "%s-audit-archive-%s" (include "sft.namePrefix" .) (toString .Values.cluster.accountId) | quote) }}
+{{- range $name := list "AUDIT_ARCHIVE_REGION" "RECOVERY_STEPS" "RECOVERY_SINCE" "RECOVERY_REWIND_TO" }}
+{{- $env = printf "%s\n- name: %s\n  value: \"\"" $env $name }}
+{{- end }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: recovery
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "sft.labels" $ctx | nindent 4 }}
+spec:
+  schedule: "0 0 1 1 *"
+  timeZone: Etc/UTC
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "sft.labels" $ctx | nindent 8 }}
+    spec:
+      backoffLimit: 0 # the runbook reads the log and runs it again: every step is idempotent
+      activeDeadlineSeconds: {{ $r.activeDeadlineSeconds }}
+      template:
+        {{- include "sft.jobPod" (dict "root" $ "component" "recovery" "module" $r.module "serviceAccount" $r.serviceAccount "env" $env "resources" $r.resources) | nindent 8 }}
+{{- end }}

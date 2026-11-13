@@ -33,9 +33,11 @@ from sft.data.outbox import (
     FILE_SCAN_LARGE,
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
+    MEMBER_TEMPORARY_SIGN_IN_ENDED,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
+    TENANT_ADMIN_RECOVERED,
     TOPICS,
     TRANSFER_AWAITING_CONFIRMATION,
     TRANSFER_FIRST_DOWNLOAD,
@@ -84,6 +86,9 @@ def test_the_service_names_each_topic_it_sends() -> None:
     assert {
         "member.invited": MEMBER_INVITED,
         "member.sign_in_reset": MEMBER_SIGN_IN_RESET,
+        # An operator's admin recovery: the admins' notice, and the pool user's end (#273).
+        "tenant.admin_recovered": TENANT_ADMIN_RECOVERED,
+        "member.temporary_sign_in_ended": MEMBER_TEMPORARY_SIGN_IN_ENDED,
         "file.scan": FILE_SCAN,
         "file.scan_large": FILE_SCAN_LARGE,
         "transfer.sent": TRANSFER_SENT,
@@ -128,6 +133,8 @@ def test_the_service_names_each_topic_it_sends() -> None:
         assert topic.queue is Queue.NOTIFY
     assert MEMBER_INVITED.queue is Queue.NOTIFY
     assert MEMBER_SIGN_IN_RESET.queue is Queue.NOTIFY  # a sign-in reset's new invitation (#197)
+    assert TENANT_ADMIN_RECOVERED.queue is Queue.NOTIFY
+    assert MEMBER_TEMPORARY_SIGN_IN_ENDED.queue is Queue.NOTIFY
     assert FILE_SCAN.queue is Queue.SCAN_SMALL
     assert FILE_SCAN_LARGE.queue is Queue.SCAN_LARGE
     notices = (TRANSFER_SENT, TRANSFER_HELD, TRANSFER_RETURNED_TO_DRAFT)

@@ -1,0 +1,144 @@
+name: cluster-bootstrap-apply
+
+# One cluster's cluster-bootstrap apply (ADR-0005, ADR-0021, #279), called by cluster-bootstrap.yml for each cluster in
+# the apply order. It runs on a GitHub-hosted runner as the environment's Terraform deploy role, from the GitHub
+# environment <env> (main only, T-71), and reaches the private cluster API only through the Systems Manager tunnel
+# (.github/scripts/cluster-tunnel.sh). Before Terraform, it server-side applies the Prometheus Operator's CRDs that the
+# pinned kube-prometheus-stack chart needs, after checking the vendored bundle is that chart's byte for byte
+# (deploy/observability/crds/check.sh; docs/operations/observability.md, section 11): Helm installs a chart's CRDs on
+# its first install only, so this is how a chart bump's CRDs reach a cluster, every time and before the operator moves.
+# Terraform's own precondition on the operator's release refuses an apply whose CRDs aren't the pinned operator's, so
+# a bump without this step can't reach a cluster another way (infra/modules/cluster-bootstrap/observability.tf).
+#
+# The repository is public, and so are this job's logs: the account ID and the domain are masked, and Terraform's plan
+# and apply print only their summaries here.
+#
+# Variables (never literals in this file):
+#   SHARED_ACCOUNT_ID                 repository: the shared account, whose registry serves every image
+#   SFT_DOMAIN                        repository: the maintainer's domain; the zone is sft.<domain>
+#   AWS_ACCOUNT_ID                    environment <env>: the environment's account
+#   TF_VAR_IDENTITY_CENTER_SAML       environment <env>, optional: Argo CD's SAML application (JSON)
+#   TF_VAR_GITHUB_APP                 environment <env>, optional: Argo CD's GitHub App for deployment statuses (JSON)
+#   TF_VAR_BREAK_GLASS_RECONCILIATION environment <env>, optional: the operator API's trail role, permission set and
+#                                     identity store, from the organization stack's outputs (JSON, #275)
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev, staging or prod
+        type: string
+        required: true
+      region:
+        description: ap-northeast-1 or ap-northeast-3
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  apply:
+    name: cluster-bootstrap ${{ inputs.environment }} ${{ inputs.region }}
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }} # the deploy role's OIDC subject; main only, prod waits for approval (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the environment's deploy role
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      REGION: ${{ inputs.region }}
+      # Terraform as infra/scripts/check.sh runs it; Helm as CI's deploy job; kubectl at the clusters' minor version
+      # (infra/environments/*/*/cluster, kubernetes_version). Each checked against its release's own checksum.
+      TERRAFORM_VERSION: 1.17.1
+      TERRAFORM_SHA256: 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+      HELM_VERSION: v3.22.0
+      HELM_SHA256: 1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+      KUBECTL_VERSION: v1.37.2
+      KUBECTL_SHA256: c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+      TUNNEL_PORT: "8443"
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Keep the account IDs and the domain out of the public log
+        env:
+          ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+          SHARED: ${{ vars.SHARED_ACCOUNT_ID }}
+          DOMAIN: ${{ vars.SFT_DOMAIN }}
+        run: |
+          for value in "$ACCOUNT" "$SHARED" "$DOMAIN"; do
+            if [[ -z $value ]]; then
+              echo "::error::AWS_ACCOUNT_ID ($ENVIRONMENT), SHARED_ACCOUNT_ID and SFT_DOMAIN must all be set."
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+      - name: Install Terraform, Helm and kubectl, checked against their checksums
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --output terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "${TERRAFORM_SHA256}  terraform.zip" | sha256sum --check --strict
+          unzip -q -o terraform.zip terraform -d bin
+          curl --fail --silent --show-error --location --output helm.tar.gz \
+            "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file helm.tar.gz --strip-components 1 --directory bin linux-amd64/helm
+          curl --fail --silent --show-error --location --output bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  bin/kubectl" | sha256sum --check --strict
+          chmod +x bin/kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sft-bootstrap/sft-${{ inputs.environment }}-terraform-deploy
+          role-session-name: cluster-bootstrap-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ inputs.region }}
+          mask-aws-account-id: true
+      - name: Open the tunnel to the cluster API
+        run: |
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          .github/scripts/cluster-tunnel.sh open "$ENVIRONMENT" "$REGION" "$TUNNEL_PORT" "$RUNNER_TEMP/kubeconfig"
+      - name: Check the vendored CRDs are the pinned chart's (deploy/observability/crds/check.sh)
+        run: deploy/observability/crds/check.sh
+      - name: Apply the Prometheus Operator's CRDs, server-side, and wait until they are served
+        run: |
+          bundle=$(ls deploy/observability/crds/kube-prometheus-stack-*.crds.bz2)
+          bzcat "$bundle" | kubectl apply --server-side --force-conflicts --field-manager=sft-crds -f -
+          bzcat "$bundle" | kubectl wait --for condition=Established --timeout=120s -f -
+          version=$(kubectl get crd prometheuses.monitoring.coreos.com \
+            -o jsonpath='{.metadata.annotations.operator\.prometheus\.io/version}')
+          echo "Applied ${bundle##*/}: the CRDs of Prometheus Operator $version." >> "$GITHUB_STEP_SUMMARY"
+      - name: Terraform init, plan and apply
+        env:
+          TF_VAR_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+          TF_VAR_shared_account_id: ${{ vars.SHARED_ACCOUNT_ID }}
+          TF_VAR_domain: ${{ vars.SFT_DOMAIN }}
+          IDENTITY_CENTER_SAML: ${{ vars.TF_VAR_IDENTITY_CENTER_SAML }}
+          GITHUB_APP: ${{ vars.TF_VAR_GITHUB_APP }}
+          BREAK_GLASS_RECONCILIATION: ${{ vars.TF_VAR_BREAK_GLASS_RECONCILIATION }}
+        run: |
+          export TF_VAR_cluster_api_tunnel_url="https://127.0.0.1:$TUNNEL_PORT"
+          # The optional inputs are objects: set only when given, since an empty value isn't null.
+          if [[ -n $IDENTITY_CENTER_SAML ]]; then export TF_VAR_identity_center_saml=$IDENTITY_CENTER_SAML; fi
+          if [[ -n $GITHUB_APP ]]; then export TF_VAR_github_app=$GITHUB_APP; fi
+          if [[ -n $BREAK_GLASS_RECONCILIATION ]]; then export TF_VAR_break_glass_reconciliation=$BREAK_GLASS_RECONCILIATION; fi
+          case $REGION in ap-northeast-1) short=apne1 ;; ap-northeast-3) short=apne3 ;; esac
+          root="infra/environments/$ENVIRONMENT/$REGION/cluster-bootstrap"
+          logs="$RUNNER_TEMP/terraform"
+          mkdir -p "$logs"
+          # Full output to files, summaries to the log: the plan names endpoints and IDs this public log mustn't show.
+          show() { grep -E '^(Plan:|No changes|Apply complete|Error|│)' "$1" || true; }
+          terraform -chdir="$root" init -no-color -lockfile=readonly \
+            -backend-config="bucket=sft-$ENVIRONMENT-$short-tfstate-$TF_VAR_account_id" > "$logs/init.log" 2>&1 ||
+            { show "$logs/init.log"; exit 1; }
+          terraform -chdir="$root" plan -no-color -out=tfplan > "$logs/plan.log" 2>&1 || { show "$logs/plan.log"; exit 1; }
+          show "$logs/plan.log"
+          terraform -chdir="$root" apply -no-color tfplan > "$logs/apply.log" 2>&1 || { show "$logs/apply.log"; exit 1; }
+          show "$logs/apply.log" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Close the tunnel
+        if: always()
+        run: .github/scripts/cluster-tunnel.sh close

@@ -112,7 +112,7 @@ module "user_pool" {
   ses_configuration_set = module.ses.configuration_set
   sign_in_web_acl_arn   = data.terraform_remote_state.edge.outputs.sign_in_web_acl_arn
   trigger_function_arn  = module.signin_triggers.function_arn
-  deletion_protection   = true
+  deletion_protection   = !var.teardown
 
   depends_on = [module.ses]
 }
@@ -121,6 +121,8 @@ module "user_pool" {
 # function in this Region's private subnets. Its role is Tokyo's.
 module "signin_triggers" {
   source = "../../../../modules/signin-triggers"
+
+  conventions = module.conventions
 
   environment      = "prod"
   account_id       = var.account_id
@@ -148,4 +150,28 @@ module "app_secrets" {
   primary_region          = false
   kms_alias_prefix        = module.conventions.kms_alias_prefix
   recovery_window_in_days = 30
+}
+
+# The synthetic probe's mailbox in this Region (#259): SES receiving into the mailbox
+# bucket. Tokyo's stack writes the MX records; Osaka is their second choice.
+module "probe_mailbox" {
+  source = "../../../../modules/probe-mailbox"
+
+  providers = {
+    aws     = aws
+    aws.dns = aws.dns
+  }
+
+  conventions = module.conventions
+
+  environment = "prod"
+  account_id  = var.account_id
+  region      = module.conventions.region
+  domain      = var.domain
+  mailboxes   = ["probe"]
+  mx_regions  = []
+
+  platform_key_arn             = data.terraform_remote_state.data.outputs.kms_key_arns["platform"]
+  deploy_role_arn              = module.conventions.bootstrap_role_arns.terraform_deploy
+  admin_principal_arn_patterns = [module.conventions.sso_role_arn_patterns.admin]
 }

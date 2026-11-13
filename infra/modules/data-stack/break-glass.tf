@@ -7,6 +7,7 @@ module "break_glass_role" {
 
   environment = local.environment
   account_id  = var.account_id
+  conventions = var.conventions
   region      = local.region
   regions     = local.with_osaka ? ["ap-northeast-1", "ap-northeast-3"] : ["ap-northeast-1"]
   create_role = local.tokyo

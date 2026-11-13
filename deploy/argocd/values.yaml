@@ -15,6 +15,9 @@ cluster:
   appClientId: "" # this region's app client, whose secret the key rotation job rotates (Tokyo)
   standbyUserPoolId: "" # Osaka's user pool, for the key rotation job in Tokyo (staging, prod)
   standbyAppClientId: "" # its app client
+  breakGlassTrailRoleArn: "" # the operator API's break-glass reconciliation (#275): the management account's trail role
+  breakGlassPermissionSetArn: "" # the BreakGlass permission set
+  identityStoreId: "" # Identity Center's identity store
 
 repoURL: https://github.com/codewithmuh/secure-file-transfer.git
 # Argo CD syncs only reviewed main (ADR-0005, T-72).

@@ -342,7 +342,36 @@ def seed_tenant(db: Sql, label: str) -> Seeded:
     seed_data_keys(db, tenant_id, marker)
     seed_sso(db, tenant_id, marker, rows)
     seed_purgeable(db, tenant_id, marker, rows)
+    seed_operator_work(db, tenant_id, marker, rows)
     return Seeded(tenant_id, marker, rows)
+
+
+def seed_operator_work(
+    db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]
+) -> None:
+    """#160 and #239: an operator's idempotency key, named with the marker, and an admin recovery
+    whose temporary sign-in has ended but which the job hasn't ended yet, confirmed through the
+    marker."""
+    rows["operator_key_owner"], rows["admin_recovery"] = uuid.uuid4(), uuid.uuid4()
+    db.sql(
+        "INSERT INTO idempotency_keys (tenant_id, caller_type, caller_id, key, "
+        "request_fingerprint, response_status, resource_type, resource_id, expires_at) "
+        "VALUES (:tenant, 'operator', :owner, :marker, sha256(convert_to(:marker, 'UTF8')), 201, "
+        "'tenant', :tenant, now() + interval '1 day')",
+        tenant=tenant_id,
+        owner=rows["operator_key_owner"],
+        marker=marker,
+    )
+    db.sql(
+        "INSERT INTO admin_recoveries (id, tenant_id, user_id, kind, confirmed_via, "
+        "operator_name, sign_in_reset_id, temporary_sign_in_expires_at) VALUES (:id, :tenant, "
+        ":user, 'temporary_local_sign_in', :marker, :marker, :reset, now() - interval '1 hour')",
+        id=rows["admin_recovery"],
+        tenant=tenant_id,
+        user=rows["user"],
+        marker=marker,
+        reset=uuid.uuid4(),
+    )
 
 
 def seed_sso(db: Sql, tenant_id: uuid.UUID, marker: str, rows: dict[str, uuid.UUID]) -> None:

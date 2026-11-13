@@ -34,6 +34,7 @@ from typing import Annotated, Any, Protocol
 from fastapi import Depends, FastAPI, Request
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sft.api import auth_failures
 from sft.api.client_ip import rate_limit_ip
 from sft.api.errors import problem_for
 from sft.core.errors import ProblemError
@@ -115,17 +116,19 @@ class CountFailedAuthentications:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope) if scope["type"] == "http" else None
         limiter = getattr(request.app.state, "rate_limiter", None) if request else None
-        if request is None or not isinstance(limiter, RateLimiter):
+        failures = auth_failures.of(request) if request else None
+        if request is None or (not isinstance(limiter, RateLimiter) and failures is None):
             await self.app(scope, receive, send)
             return
-        ip = client_ip(request)
         # Shared with the request the error handler sees, which notes the problem's code here.
         state: dict[str, Any] = scope.setdefault("state", {})
-        try:
-            await limiter.check(EVERY_REQUEST, {KeyType.IP: ip})
-        except ProblemError as refused:
-            await problem_for(refused)(scope, receive, send)
-            return
+        ip = client_ip(request)
+        if isinstance(limiter, RateLimiter):
+            try:
+                await limiter.check(EVERY_REQUEST, {KeyType.IP: ip})
+            except ProblemError as refused:
+                await problem_for(refused)(scope, receive, send)
+                return
         status = 0
 
         async def watch(message: Message) -> None:
@@ -135,7 +138,11 @@ class CountFailedAuthentications:
             await send(message)
 
         await self.app(scope, receive, watch)
-        if status == 401 and state.get("problem_code") in FAILED_AUTHENTICATIONS:
+        code = state.get("problem_code")
+        if failures is not None:
+            # auth_failures_total{scheme} (#260): the same answers, by credential.
+            failures.observe(request, status, code)
+        if isinstance(limiter, RateLimiter) and status == 401 and code in FAILED_AUTHENTICATIONS:
             await limiter.record(H_FAILED_AUTH, ip)
 
 

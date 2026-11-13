@@ -32,6 +32,7 @@ ADR-0004 are written once: deploy/tests/ checks every rendered container against
 {{- if eq $v.part "operator" -}}
 {{- $_ := required "cluster.operatorRoleName is required (from the root Application)" $v.cluster.operatorRoleName -}}
 {{- end -}}
+{{- if and (eq $v.environment "dev") $v.auditArchive.survivingRegionOnly }}{{ fail "auditArchive.survivingRegionOnly must stay empty in dev, which has Tokyo's archive alone" }}{{ end -}}
 {{- range $key := list "vpcCidr" "publicSubnetsCidr" "endpointSubnetsCidr" "isolatedSubnetsCidr" -}}
 {{- $_ := required (printf "network.%s is required (the cluster's values file)" $key) (index $v.network $key) -}}
 {{- end -}}
@@ -410,4 +411,12 @@ spec:
         - { name: tmp, mountPath: /tmp }
   volumes:
     {{- include "sft.tmpVolume" . | nindent 4 }}
+{{- end -}}
+
+{{/*
+The audit archive's surviving region during a regional loss (#257): AUDIT_ARCHIVE_SURVIVING_REGION for the API, the
+operator API and the jobs that write the archive, as a dict to merge into their environment; empty when auditArchive.survivingRegionOnly is.
+*/}}
+{{- define "sft.survivingRegionEnv" -}}
+{{- with .Values.auditArchive.survivingRegionOnly }}{{ dict "AUDIT_ARCHIVE_SURVIVING_REGION" . | toJson }}{{ else }}{}{{ end -}}
 {{- end -}}

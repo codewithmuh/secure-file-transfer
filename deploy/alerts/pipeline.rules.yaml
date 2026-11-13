@@ -3,7 +3,8 @@
 #
 # The series come from the outbox relay (sft.workers.relay): outbox_oldest_unpublished_age_seconds, the age of the
 # oldest row not yet sent to SQS, 0 when there is none; and from every queue consumer (sft.workers.consumer):
-# worker_messages_total{consumer,outcome}. How long messages wait in SQS itself, and the dead-letter queues, are
+# worker_messages_total{consumer,outcome}; and from the notification worker (sft.service.notifications, #260):
+# send_latency_seconds{type}, from the message that asked for an email to SES accepting it. How long messages wait in SQS itself, and the dead-letter queues, are
 # CloudWatch alarms (infra/modules/alarms/queues.tf), which keep working when the cluster doesn't.
 groups:
   - name: pipeline
@@ -45,4 +46,24 @@ groups:
           severity: page
         annotations:
           summary: More than 5 % of email messages fail; verification codes and link emails are late or lost (NFR-7).
+          runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-delivery.md
+
+      # NFR-7 (#260): more than 5 % of verification codes and link emails, the emails a person waits for, took over 10 s
+      # from their message to SES accepting them, for 10 minutes: NFR-7's p95, exactly, since 10 s is a bucket edge.
+      # The other types are measured for the dashboards; some wait on purpose (a capped link, a digest, a notice window).
+      - alert: EmailSendSlow
+        expr: |
+          (
+            sum(rate(send_latency_seconds_count{type=~"verification_code|transfer_link|upload_request"}[10m]))
+            -
+            sum(rate(send_latency_seconds_bucket{type=~"verification_code|transfer_link|upload_request", le=~"10(\\.0)?"}[10m]))
+          )
+            /
+          clamp_min(sum(rate(send_latency_seconds_count{type=~"verification_code|transfer_link|upload_request"}[10m])), 1e-9)
+          > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: More than 5 % of verification codes and link emails take over 10 s to reach SES (NFR-7).
           runbook_url: https://github.com/codewithmuh/secure-file-transfer/blob/main/docs/runbooks/email-delivery.md

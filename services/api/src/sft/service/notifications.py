@@ -54,15 +54,25 @@ the named system actor `notification_worker` (authn and authz 6.1):
 - `dlp_approval.approver_deactivated` (#230): a deactivation cleared an approver designation.
   With fewer than two active approvers left, `dlp_approver_deactivated` to every active admin at
   once; otherwise the kind `approvers_changed` joins the coalesced policy notice.
-- `member.invited`: with a user pool (`sft.service.user_pool`; Keycloak locally, #197), the
-  member's pool user with a temporary password, its identity, then `member_invitation` with that
-  password; an address that already signs in locally for another tenant gets
-  `invitation_address_in_use` instead and no pool user. Cognito's admin API in AWS (#193),
-  Keycloak's locally. Without a pool: recorded, and nothing sent; `invite_backlog` invites those
-  members once the pool exists.
-- `member.sign_in_reset`: the same, after deleting the member's pool user: a new user, a new
-  identity, a new invitation (authn and authz 2.5). The API already ended the sessions and deleted
-  the old identities.
+- `member.invited`: in a tenant with an active SSO connection (#273), when the tenant requires SSO
+  or the address is on one of its proven domains linked to that connection, no pool user: a new
+  one-time link (256 bits, its SHA-256 and a 7-day expiry on the user,
+  `user.invitation_link_issued`), then `member_invitation_sso` with it; the member binds their
+  identity provider's subject when they follow it (`startInvitationSignIn`). Otherwise, with a user
+  pool (`sft.service.user_pool`; Keycloak locally, #197), the member's pool user with a temporary
+  password, its identity, then `member_invitation` with that password; an address that already signs
+  in locally for another tenant gets `invitation_address_in_use` instead and no pool user. Cognito's
+  admin API in AWS (#193), Keycloak's locally. Without a pool: recorded, and nothing sent;
+  `invite_backlog` invites those members once the pool exists.
+- `member.sign_in_reset`: the pool user, after deleting the member's earlier one: a new user, a
+  new identity, a new invitation (authn and authz 2.5). The API already ended the sessions and
+  deleted the old identities.
+- `tenant.admin_recovered` (#273): `tenant_admin_recovered` to every active admin of the tenant,
+  the recovered one included: which admin an operator recovered, when, and whether it is a reset
+  or a temporary local sign-in (`recoverTenantAdmin`, authn and authz 2.5).
+- `member.temporary_sign_in_ended` (#273): the daily job ended an operator's temporary local
+  sign-in. The admin's pool user is deleted if the recovery's reset is still the admin's latest
+  and the pool user was made for it; one made since, for a newer reset, stays. No email.
 - `api_key.expiring` (#215): `api_key_expiring` to the key's owner and every active tenant admin,
   unless the key was revoked or has expired meanwhile. Names the key by its prefix only.
 - `api_key.first_export` (#216): `api_key_first_export` to every active tenant admin.
@@ -100,6 +110,9 @@ is recorded with a new, delayed `recipient.link_due` message in the same transac
 recipient stays `queued`, the neutral state of every delay. During a counter store outage the cap
 counts in this pod (group G fails open).
 
+**A new link on every retry** of an SSO invitation, as a new temporary password is for a local
+one: only the link's hash is stored, so a redelivery mints another, which replaces the first.
+
 **A pool user before its email.** The pool user and its identity are made after the first
 transaction and before the send (`_Plan.before_send`), so the email names a password the pool
 holds. A redelivery makes a new password: it finds the user an earlier delivery created (by its
@@ -110,7 +123,8 @@ only into the pool and the email, never into the outbox, a log or an audit row.
 their own yet. A suspended tenant's messages are recorded and send nothing.
 
 Every email sent is audited (`email.sent`, with its type), and counted in
-`emails_sent_total{type}`; every email held by a cap in `email_caps_hit_total{cap}`.
+`emails_sent_total{type}`; every email held by a cap in `email_caps_hit_total{cap}`. How long each
+took from its message to the provider is `send_latency_seconds{type}` (NFR-7, #260).
 """
 
 from __future__ import annotations
@@ -124,20 +138,23 @@ from enum import StrEnum
 from typing import Final, Protocol
 from uuid import UUID
 
-from prometheus_client import CollectorRegistry, Counter
+from prometheus_client import CollectorRegistry, Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sft.core.errors import RateLimited
 from sft.core.hmac_keyrings import CodeKeyring, LinkKeyring
 from sft.core.ids import uuid7
 from sft.core.pseudonyms import EmailKeyring
+from sft.core.tokens import token_hash
 from sft.data import (
+    admin_recoveries,
     api_keys,
     audit,
     codes,
     dlp_approvals,
     identities,
     recipients,
+    sso,
     suppressions,
     tenants,
     transfers,
@@ -154,6 +171,7 @@ from sft.data.models import (
     Role,
     TransferState,
     UploadRequestState,
+    User,
     UserStatus,
 )
 from sft.data.models import Outcome as AuditOutcome
@@ -171,9 +189,11 @@ from sft.data.outbox import (
     MAX_DELAY,
     MEMBER_INVITED,
     MEMBER_SIGN_IN_RESET,
+    MEMBER_TEMPORARY_SIGN_IN_ENDED,
     RECIPIENT_CODE_REQUESTED,
     RECIPIENT_LINK_DUE,
     RECIPIENT_LOCKED,
+    TENANT_ADMIN_RECOVERED,
     TRANSFER_AWAITING_CONFIRMATION,
     TRANSFER_FIRST_DOWNLOAD,
     TRANSFER_HELD,
@@ -209,8 +229,10 @@ from sft.service.email.catalog import (
     InvitationAddressInUse,
     Locale,
     MemberInvitation,
+    MemberInvitationSso,
     PolicyChange,
     RecipientLocked,
+    TenantAdminRecovered,
     TransferHeld,
     TransferLink,
     TransferReturnedToDraft,
@@ -219,6 +241,8 @@ from sft.service.email.catalog import (
 )
 from sft.service.rate_limits import Charge
 from sft.service.rate_limits.limits import CROSS_TENANT_LINK_EMAILS, KeyType
+from sft.service.transfers import effective_state
+from sft.service.upload_requests import effective_state as request_effective_state
 from sft.service.user_pool import (
     INVITATION_ENROLMENT,
     TEMPORARY_PASSWORD_DAYS,
@@ -233,6 +257,10 @@ CONSUMER: Final = "notify"
 """The consumer's name in `processed_messages`. Never change it."""
 CODE_DIGITS: Final = 6
 """NFR-14: at least 6 digits, from the operating system's generator."""
+INVITATION_TOKEN_BYTES: Final = 32
+"""An SSO invitation link's token: 256 random bits (authn and authz 2.5)."""
+ADMIN_RECOVERY_TARGET: Final = "admin_recovery"
+"""The audit target of the admin recovery notice's emails: the recovery (#273)."""
 
 SYSTEM: Final = Actor(ActorType.SYSTEM)
 
@@ -276,6 +304,15 @@ Release = Callable[[UUID, str], Awaitable[None]]
 class NotifyMetrics:
     emails: Counter
     caps: Counter
+    send_latency: Histogram
+
+    def observe_send(self, message_id: UUID, email_type: EmailType, now: datetime) -> None:
+        """NFR-7 (#260): from the outbox message that asked for the email, made when its UUIDv7
+        ID was (data model 1), to the provider accepting it."""
+        if message_id.version != 7:
+            return
+        made = datetime.fromtimestamp((message_id.int >> 80) / 1000, UTC)
+        self.send_latency.labels(email_type.value).observe(max(0.0, (now - made).total_seconds()))
 
     @classmethod
     def create(cls, registry: CollectorRegistry) -> NotifyMetrics:
@@ -298,7 +335,17 @@ class NotifyMetrics:
         # "no eligible approver" notices.
         caps.labels("approver_request_emails")
         caps.labels("tenant_no_eligible_approver")
-        return cls(emails, caps)
+        send_latency = Histogram(
+            "send_latency_seconds",
+            "NFR-7: from the message that asked for an email to the provider accepting it, by "
+            "type; the edge at 10 s is NFR-7's target.",
+            ["type"],
+            buckets=(1, 2.5, 5, 10, 20, 30, 60, 300, 900),
+            registry=registry,
+        )
+        for email_type in EmailType:
+            send_latency.labels(email_type.value)
+        return cls(emails, caps, send_latency)
 
 
 @dataclass
@@ -376,8 +423,10 @@ class Notifier:
         ):
             return await self._enrol(message, self.pool, reset=message.topic != MEMBER_INVITED.name)
         if message.topic == MEMBER_SIGN_IN_RESET.name:
-            # Without a pool there is no user to create again: recorded, as an invitation is.
-            return await self._with_emails(message, self._invited)
+            # Without a pool there is no user to create again: recorded, and nothing sent.
+            return await self._with_emails(message, self._left_for_pool)
+        if message.topic == MEMBER_TEMPORARY_SIGN_IN_ENDED.name:
+            return await self._temporary_sign_in_ended(message)
         prepare = {
             RECIPIENT_LINK_DUE.name: self._link,
             RECIPIENT_CODE_REQUESTED.name: self._code,
@@ -393,6 +442,7 @@ class Notifier:
             UPLOAD_REQUEST_FILES_SETTLED.name: self._files_settled,
             API_KEY_EXPIRING.name: self._key_expiring,
             API_KEY_FIRST_EXPORT.name: self._key_first_export,
+            TENANT_ADMIN_RECOVERED.name: self._admin_recovered,
             **{topic.name: self._policy_changed for topic in DLP_POLICY_CHANGED.values()},
             DLP_APPROVAL_REQUESTED.name: self._approval_requested,
             DLP_APPROVAL_DECIDED.name: self._approval_decided,
@@ -453,6 +503,7 @@ class Notifier:
                 continue
             delivered = True
             sent.append(email)
+            self.metrics.observe_send(message.id, email.TYPE, self.clock())
             if plan.charge is not None:
                 await plan.charge()
             if part is not None:
@@ -523,13 +574,11 @@ class Notifier:
         """The recipient, locked, if their transfer is sent and hasn't expired, they aren't
         locked out and their tenant is active."""
         target = await recipients.link_target(session, recipient_id, lock=True)
-        if target is None or target.transfer_state != TransferState.SENT.value:
+        if target is None or target.locked_at is not None:
             return None
-        if target.expires_at is not None and target.expires_at <= self.clock():
-            return None
-        if target.locked_at is not None:
-            return None
-        return target
+        stored = TransferState(target.transfer_state)
+        state = effective_state(stored, target.expires_at, self.clock())
+        return target if state is TransferState.SENT else None
 
     async def _suppressed(self, session: AsyncSession, address: str) -> bool:
         found = await suppressions.suppressed(session, self.emails.every_version(address))
@@ -660,7 +709,7 @@ class Notifier:
             target.id,
             key_id=key_id,
             issued_at=issued_at,
-            hashed=recipients.token_hash(token),
+            hashed=token_hash(token),
             replace=replace,
         )
         if not issued:
@@ -744,11 +793,10 @@ class Notifier:
         """The request, locked, if it is open and hasn't expired and its uploader isn't locked
         out."""
         target = await upload_requests.link_target(session, request_id, lock=True)
-        if target is None or target.state is not UploadRequestState.OPEN:
+        if target is None or target.locked_at is not None:
             return None
-        if target.expires_at <= self.clock() or target.locked_at is not None:
-            return None
-        return target
+        state = request_effective_state(target.state, target.expires_at, self.clock())
+        return target if state is UploadRequestState.OPEN else None
 
     async def _uploader_link(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         """`upload_request` to the uploader, as `_link` sends a recipient theirs."""
@@ -844,7 +892,7 @@ class Notifier:
             target.id,
             key_id=key_id,
             issued_at=issued_at,
-            hashed=recipients.token_hash(token),
+            hashed=token_hash(token),
             replace=replace,
         )
         if not issued:
@@ -1288,10 +1336,50 @@ class Notifier:
         )
 
     async def _invited(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
-        # No pool here: the user stays `invited`, and nothing is sent (#178). `invite_backlog`
-        # invites them once the pool exists (#193).
+        """An invitation without a pool: an SSO tenant's link needs none (#273). Otherwise the
+        user stays `invited`, and nothing is sent (#178); `invite_backlog` invites them once the
+        pool exists (#193)."""
+        user = await users.get_user(session, _id(message, "user_id"))
+        sender = await tenants.sender(session)
+        if user is None or sender is None or not sender.active:
+            return _Plan()
+        if user.status != UserStatus.INVITED.value:
+            return _Plan()  # they joined meanwhile: nothing to send
+        plan = await self._sso_invitation(session, message, user, sender)
+        return plan if plan is not None else await self._left_for_pool(session, message)
+
+    async def _left_for_pool(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
         log.info("invitation left for the user pool", extra={"outbox_id": str(message.id)})
         return _Plan()
+
+    async def _sso_invitation(
+        self, session: AsyncSession, message: OutboxMessage, user: User, sender: tenants.Sender
+    ) -> _Plan | None:
+        """An invited user of a tenant with an active SSO connection, if the tenant requires SSO or
+        their address is on one of its proven domains linked to that connection (authn and authz
+        2.5, #273): a new one-time link, its hash and expiry on the user, committed before the
+        send, then `member_invitation_sso`; no pool user. None otherwise: the invitation takes the
+        pool's path, as any local member's. The token goes only into the email; the row, the
+        audit event and the logs never hold it."""
+        connection_id = await sso.active_connection_id(session)
+        if connection_id is None or not await sso.invites_through_sso(
+            session, connection_id, user.email_normalized
+        ):
+            return None
+        token = secrets.token_urlsafe(INVITATION_TOKEN_BYTES)
+        expires_at = await users.issue_invitation_link(session, user.id, token_hash(token))
+        if expires_at is None:  # pragma: no cover - read as invited in this transaction
+            return _Plan()
+        target = Target(users.TARGET, user.id)
+        await audit.record(
+            session,
+            action="user.invitation_link_issued",
+            actor=SYSTEM,
+            target=target,
+            details=_details(replaced=user.invitation_token_hash is not None),
+        )
+        email = MemberInvitationSso(tenant_name=sender.name, token=token, expires_at=expires_at)
+        return _Plan([self._to_member(email, sender, user.email, message.tenant_id)], target)
 
     async def _enrol(self, message: OutboxMessage, pool: UserPool, *, reset: bool) -> Done:
         """An invitation or a sign-in reset, with the pool: the pool user before the email names its
@@ -1325,6 +1413,9 @@ class Notifier:
                 enrolment = INVITATION_ENROLMENT
                 if user.status != UserStatus.INVITED.value:
                     return _Plan()  # they joined meanwhile: nothing to send
+                link = await self._sso_invitation(session, message, user, sender)
+                if link is not None:
+                    return link  # an SSO tenant's member: a link, and no pool user (#273)
             target = Target(users.TARGET, user.id)
             if address_in_use:
                 in_use: Email = InvitationAddressInUse(tenant_name=sender.name)
@@ -1421,6 +1512,65 @@ class Notifier:
                 target=Target(users.TARGET, user_id),
                 details=_details(tenant_id=tenant_id, sign_in_reset=reset),
             )
+
+    # ---- an operator's admin recovery (#273) ----
+
+    async def _admin_recovered(self, session: AsyncSession, message: OutboxMessage) -> _Plan:
+        """`tenant_admin_recovered` to every active admin of the tenant, the recovered one
+        included (authn and authz 2.5): which admin, when, and the kind. Each email is recorded
+        on its own, so a redelivery after a failure midway sends only the ones not sent yet."""
+        recovery_id = _id(message, "admin_recovery_id")
+        recovery = await admin_recoveries.get_recovery(session, recovery_id)
+        sender = await tenants.sender(session)
+        if recovery is None or sender is None or not sender.active:
+            return _Plan()
+        admin = await users.get_user(session, recovery.user_id)
+        if admin is None:  # pragma: no cover - a recovery names a user of its tenant
+            return _Plan()
+        email = TenantAdminRecovered(
+            tenant_name=sender.name,
+            admin_email=admin.email,
+            recovered_at=recovery.created_at,
+            temporary_until=recovery.temporary_sign_in_expires_at,
+        )
+        admins = await users.list_users(
+            session, role=Role.ADMIN, status=UserStatus.ACTIVE, limit=users.MAX_PAGE
+        )
+        return _Plan(
+            [self._to_member(email, sender, a.email, message.tenant_id) for a in admins],
+            Target(ADMIN_RECOVERY_TARGET, recovery_id),
+            per_email=True,
+        )
+
+    async def _temporary_sign_in_ended(self, message: OutboxMessage) -> Done:
+        """The daily job ended a temporary local sign-in (authn and authz 2.5): delete the
+        admin's pool user, outside any transaction, then record the message. Only while the
+        recovery's reset is still the admin's latest and the pool user was made for it (its
+        enrolment): after a newer reset, the pool user is that reset's, the admin's sign-in now,
+        and the newer reset's own message replaces the old one anyway. Without a pool: recorded."""
+        scope = Scope.tenant(message.tenant_id)
+        message_id = str(message.id)
+        recovery_id = _id(message, "admin_recovery_id")
+        async with self.database.transaction(scope) as session:
+            if await recorded_before(session, consumer=CONSUMER, message_id=message_id):
+                return Done.DUPLICATE
+            recovery = await admin_recoveries.get_recovery(session, recovery_id)
+            admin = None if recovery is None else await users.get_user(session, recovery.user_id)
+        if (
+            self.pool is not None
+            and recovery is not None
+            and admin is not None
+            and admin.sign_in_reset_id == recovery.sign_in_reset_id
+        ):
+            username = str(recovery.user_id)
+            existing = await self.pool.find_user(username=username)
+            if existing is not None and existing.enrolment == str(recovery.sign_in_reset_id):
+                await self.pool.delete_user(username=username)
+                log.info("temporary sign-in's pool user deleted", extra={"outbox_id": message_id})
+        async with self.database.transaction(scope) as session:
+            if not await record_processed(session, consumer=CONSUMER, message_id=message_id):
+                return Done.DUPLICATE
+        return Done.PROCESSED
 
     async def _owner_and_admins(self, session: AsyncSession, owner_id: UUID) -> list[str]:
         addresses: dict[str, str] = {}
