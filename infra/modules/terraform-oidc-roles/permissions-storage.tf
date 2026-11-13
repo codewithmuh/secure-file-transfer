@@ -1,19 +1,21 @@
 # ---------------------------------------------------------------------------------------------------------------------
 # Storage and keys in the data layer (#102): the KMS keys (modules/kms-keys), the files buckets and GuardDuty Malware
-# Protection (modules/files-buckets), the audit archive in dev and staging (modules/audit-archive) and EventBridge's
-# delivery role (modules/events-delivery-role), in the Regions of var.network_regions: the data layer lives wherever
-# the network does. The plan role reads; the deploy role also creates, changes and deletes. Like everything in this
-# module, it changes only through an Admin apply of the account's bootstrap stack (SCP 4).
+# Protection (modules/files-buckets), the audit archive in dev and staging (modules/audit-archive), the VPC flow log's
+# bucket (modules/data-stack, flow-logs.tf) and EventBridge's delivery role (modules/events-delivery-role), in the
+# Regions of var.network_regions: the data layer lives wherever the network does. The plan role reads; the deploy role
+# also creates, changes and deletes. Like everything in this module, it changes only through an Admin apply of the
+# account's bootstrap stack (SCP 4).
 #
 # Managed policies under /sft-bootstrap/, which SCP 4 already keeps with Admin, because the inline policies' 10,240
 # characters per role can't hold every layer (infra/README.md, "Layer permissions"). Each managed policy holds at most
-# 6,144, so the deploy role's are split in two.
+# 6,144, so the deploy role's are split in two; counted from the statements, staging's write policy, the largest, comes
+# to about 5,800 with the flow log's buckets.
 #
-# Scoped by name: buckets sft-<env>-apne?-{files,large-files,audit-archive}-<account>, keys and aliases in our Regions
-# (each key policy then decides what the role may do to that key), the four roles these modules make, GuardDuty
-# plans and EventBridge rules sft-<env>-*, and the account's EBS default encryption. The prod deploy role gets nothing
-# on the audit archive, which is the retained stack's (SCP 5 denies it anyway), and no object deletes, which only the
-# lifecycle jobs do there (ADR-0012).
+# Scoped by name: buckets sft-<env>-apne?-{files,large-files,flow-logs,audit-archive}-<account>, keys and aliases in
+# our Regions (each key policy then decides what the role may do to that key), the four roles these modules make,
+# GuardDuty plans and EventBridge rules sft-<env>-*, and the account's EBS default encryption. The prod deploy role gets
+# nothing on the audit archive, which is the retained stack's (SCP 5 denies it anyway), and no object deletes, which
+# only the lifecycle jobs do there (ADR-0012).
 # ---------------------------------------------------------------------------------------------------------------------
 
 locals {
@@ -27,7 +29,7 @@ locals {
 
   storage_bucket_arns = flatten([
     for rs in local.storage_region_shorts : [
-      for kind in concat(["files", "large-files"], local.storage_teardown ? ["audit-archive"] : []) :
+      for kind in concat(["files", "large-files", "flow-logs"], local.storage_teardown ? ["audit-archive"] : []) :
       "arn:aws:s3:::sft-${local.storage_env}-${rs}-${kind}-${var.account_id}"
     ]
   ])

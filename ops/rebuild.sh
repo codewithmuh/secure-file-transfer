@@ -76,7 +76,23 @@ apply() {
 
 # --- stacks ----------------------------------------------------------------------------------------------------------
 
-network() { apply "$(env_root "$1" network)"; }
+# The VPC flow log goes to the same Region's flow-log bucket, the data stack's flow_log_bucket_arn output, which a first
+# build doesn't have yet: network goes once without it, then again after data (infra/README.md). Once the data stack
+# exists every apply passes it, so no apply turns the flow log off.
+network() {
+  local region="$1" data arn
+  data="$(env_root "$region" data)"
+  tf_init "$data"
+  arn="$(tf_output "$data" flow_log_bucket_arn)"
+  arn="${arn//\"/}"
+  if [[ -n "$arn" && "$arn" != null ]]; then
+    echo "   TF_VAR_flow_log_destination_arn: the data stack's flow_log_bucket_arn output"
+    TF_VAR_flow_log_destination_arn="$arn" apply "$(env_root "$region" network)"
+  else
+    echo "   No flow-log bucket yet (a first build): the flow log comes with network's apply after data."
+    apply "$(env_root "$region" network)"
+  fi
+}
 
 # Tokyo's data stack. In staging and prod the Regions need each other's keys and buckets, so a first build applies it
 # with osaka_ready=false, then Osaka's, then Tokyo's again (infra/README.md). A first build is one where Osaka's data
@@ -188,6 +204,7 @@ if [[ "$STAGE" != after ]]; then
       env_root "$OSAKA" data
       echo "$(env_root "$TOKYO" data) (again, on a first build)"
     fi
+    for region in "${REGIONS[@]}"; do printf '%s (again: the flow log, once data exists)\n' "$(env_root "$region" network)"; done
     for layer in cluster edge identity; do
       for region in "${REGIONS[@]}"; do env_root "$region" "$layer"; done
     done
@@ -211,6 +228,9 @@ if [[ "$STAGE" != after ]]; then
     step 1800 "Apply $(env_root "$OSAKA" data)" data_osaka
     step 900 "Apply $(env_root "$TOKYO" data) again (first build only)" data_tokyo_again
   fi
+  for region in "${REGIONS[@]}"; do
+    step 600 "Apply $(env_root "$region" network) again: the flow log" network "$region"
+  done
   for region in "${REGIONS[@]}"; do
     step 1800 "Apply $(env_root "$region" cluster)" cluster "$region"
   done

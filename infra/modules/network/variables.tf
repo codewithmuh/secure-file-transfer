@@ -170,9 +170,10 @@ variable "dns_firewall_additional_domains" {
 
 variable "flow_log_destination_arn" {
   description = <<-EOT
-    S3 bucket ARN, optionally with a prefix, for the VPC flow log: the environment's log bucket under the logs key
-    (capacity A19, encryption 2.2). Null until that bucket exists: the data layer creates it after the network, so the
-    first build applies the network once without a flow log (infra/README.md, "Apply order").
+    S3 bucket ARN, optionally with a prefix, for the VPC flow log: the data root's flow_log_bucket_arn output, the
+    Region's sft-<env>-<region-short>-flow-logs-<account-id> under the logs key (capacity A19, encryption 3.1). Null
+    until that bucket exists: the data layer creates it after the network, so the first build applies the network once
+    without a flow log (infra/README.md, "Apply order").
   EOT
   type        = string
   default     = null

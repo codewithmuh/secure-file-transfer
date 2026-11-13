@@ -113,7 +113,8 @@ variable "master_password_version" {
 variable "teardown" {
   description = <<-EOT
     True only for the apply that comes before destroying the stack: it turns deletion protection off, skips the final
-    snapshot and lets the master secret go without a recovery window (infra/README.md, "Apply order").
+    snapshot, lets the master secret go without a recovery window, and in prod lets the destroy empty the files and
+    flow log buckets (infra/README.md, "Apply order").
   EOT
   type        = bool
   default     = false

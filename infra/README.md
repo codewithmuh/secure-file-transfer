@@ -43,7 +43,7 @@ Osaka are built from the same code and the pilot light can't fall behind (T-79).
 | Layer | Holds | Notes |
 |---|---|---|
 | `network` | VPC, subnets, NAT gateways, VPC endpoints and their policies, the egress security groups, DNS Firewall, the flow log (ADR-0021) | [`modules/network`](modules/network/README.md); dev has two AZs, one NAT gateway and its endpoints in one AZ |
-| `data` | Aurora, the files buckets, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
+| `data` | Aurora, the files buckets, the VPC flow log's bucket, queues, the rate-limit store, the environment's KMS keys; the audit archive in dev and staging | In Osaka, the pilot light's replicas |
 | `cluster` | EKS, the `system` node group, Karpenter's IAM, workload roles (ADR-0004) | [`modules/eks-cluster`](modules/eks-cluster/README.md); the account's IAM roles are made by the Tokyo stack, so Osaka's goes after it |
 | `cluster-bootstrap` | Argo CD and its root Applications, Kyverno and its policies, Karpenter, External Secrets, the Load Balancer Controller, the egress proxy (ADR-0004, ADR-0005, ADR-0021); the observability stack's operator, namespaces and storage class, and its buckets and roles ([`modules/observability`](modules/observability/README.md), ADR-0009, #243) | [`modules/cluster-bootstrap`](modules/cluster-bootstrap/README.md); planned and applied only on `main`, by `.github/workflows/cluster-bootstrap.yml` through the Systems Manager tunnel (ADR-0021, #279), which applies the Prometheus Operator's CRDs first; pull request plans never reach a cluster API |
 | `edge` | Load balancer, WAF, the environment's DNS records, the web bucket; in Tokyo, CloudFront and its us-east-1 certificate and web ACL, and the web app's release role (#283) | [`modules/edge`](modules/edge/README.md), [`modules/web-cdn`](modules/web-cdn/README.md) and [`modules/web-release`](modules/web-release/README.md); the API's target group, which the Load Balancer Controller fills by name from the chart's TargetGroupBinding (#106) |
@@ -114,8 +114,10 @@ ADR-0007), each accepting deployments from `main` only, so that no deploy role e
    deploy role trusts. Every `network` root needs `TF_VAR_domain`: DNS Firewall answers the API's and the web app's
    names, which the synthetic probe calls (#259). Staging's load test needs the GitHub environment `loadtest-staging`
    (main only) that its role trusts. On a fresh build `network`
-   runs twice: first without a flow log, then, once `data` has made the log bucket, with
-   `TF_VAR_flow_log_destination_arn` set to it, because the flow log can't exist before its bucket (capacity A19).
+   runs twice: first without a flow log, then, once `data` has made the flow-log bucket, with
+   `TF_VAR_flow_log_destination_arn` set to the same Region's data output `flow_log_bucket_arn`, because the flow log
+   can't exist before its bucket (capacity A19). `ops/rebuild.sh` does both, and passes the output on every later
+   apply, so no apply turns the flow log off.
    In staging and prod `data` also runs twice in Tokyo, because the two Regions need each other's keys and buckets:
    Osaka's `data` replicates Tokyo's key primaries (`TF_VAR_primary_key_arns`, from Tokyo's `kms_key_arns` output),
    while Tokyo's bucket replication and the master secret's Osaka replica need Osaka's buckets and key replicas. So
@@ -400,7 +402,7 @@ comment.
   The plan role reads keys, the files and archive buckets' settings, the storage roles, GuardDuty plans and `sft-<env>-*`
   rules. The deploy role also creates multi-Region keys and administers them (each key policy then limits it),
   replicates only to Osaka, creates grants only for AWS resources through RDS, ElastiCache and EKS, encrypts the
-  secrets it writes, manages the buckets `sft-<env>-apne?-{files,large-files,audit-archive}-<account-id>` (not the
+  secrets it writes, manages the buckets `sft-<env>-apne?-{files,large-files,flow-logs,audit-archive}-<account-id>` (not the
   archive in prod, which is the retained stack's), the roles `sft-<env>-{s3-replication,s3-batch-replication,malware-protection,events-delivery}`
   (the conventions module's data layer list) and the services they are passed to (`events-delivery` only with the workload boundary), the Auto Scaling and EC2
   Fleet service-linked roles that the platform and files keys name, the account's EBS encryption by default,

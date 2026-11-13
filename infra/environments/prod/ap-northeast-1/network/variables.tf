@@ -9,7 +9,7 @@ variable "account_id" {
 }
 
 variable "flow_log_destination_arn" {
-  description = "The environment's log bucket ARN, optionally with /prefix/, for the VPC flow log. Null until data creates it."
+  description = "The VPC flow log's bucket ARN: the data root's flow_log_bucket_arn output (TF_VAR_flow_log_destination_arn). Null until data creates it."
   type        = string
   default     = null
 }
