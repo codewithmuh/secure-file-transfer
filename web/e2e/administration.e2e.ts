@@ -64,7 +64,7 @@ test('the audit log: search, page, open an event, export CSV and JSON (#216)', a
   await page.getByRole('checkbox', { name: 'member.signed_in' }).check();
   await page.getByLabel('Email address').fill(USERS.admin.email);
   const searched = page.waitForResponse((r) => r.url().endsWith('/v1/audit/events/search') && r.request().method() === 'POST');
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   expect((await searched).request().postDataJSON()).toMatchObject({ filter: { email: USERS.admin.email, actions: ['member.signed_in'] } });
   expect(page.url()).not.toContain(USERS.admin.email); // T-47
   const first = page.getByRole('row').filter({ hasText: 'member.signed_in' }).first();
@@ -72,7 +72,7 @@ test('the audit log: search, page, open an event, export CSV and JSON (#216)', a
 
   // Paging, when the tenant has more than one page of sign-ins.
   const older = page.getByRole('button', { name: 'Older' });
-  await expect(page.getByRole('button', { name: 'Search' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Search', exact: true })).toBeEnabled();
   if (await older.isVisible()) {
     await expect(older).toBeEnabled();
     await older.click();
