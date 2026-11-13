@@ -2,8 +2,9 @@ name: environment
 
 # One command to bring an AWS environment up or down (#295; NFR-19, NFR-20; docs/runbooks/environment-up-down.md):
 #
-#   make aws-up ENV=dev       up: ops/rebuild.sh's stacks, cluster-bootstrap for each cluster
-#                             (cluster-bootstrap-apply.yml), then the alarms and the first deploy. Up to 2 hours.
+#   make aws-up ENV=dev       up: ops/rebuild.sh's foundation (network, data) and platform (cluster, edge, identity),
+#                             each a job with its own 2-hour deploy session; cluster-bootstrap for each cluster
+#                             (cluster-bootstrap-apply.yml); then the alarms and the first deploy. About 2 hours.
 #   make aws-down ENV=dev     down: ops/teardown.sh: everything the environment bills for. dev and staging keep their
 #                             bootstrap stacks, so `up` can build them again; prod's teardown is its final one, its
 #                             retained stack's teardown apply first, and its bootstrap stacks stay for Admin.
@@ -15,6 +16,9 @@ name: environment
 # (ADR-0004). The role trusts only this repository's GitHub environment of the same name, which accepts main alone;
 # prod waits for its reviewer (T-71). An environment takes part once it is in LIVE_ENVIRONMENTS, as in
 # cluster-bootstrap.yml. One run per environment at a time, never cancelled: a half-applied stack stays half applied.
+# What and where, in the run list: ops/environment.sh finds its run by this name (#299).
+run-name: ${{ inputs.action }} ${{ inputs.environment }} by ${{ github.actor }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -70,23 +74,34 @@ jobs:
 
   # --- up --------------------------------------------------------------------------------------------------------------
 
-  stacks:
+  foundation:
     needs: check
     if: inputs.action == 'up'
     uses: ./.github/workflows/environment-run.yml
     with:
       environment: ${{ inputs.environment }}
-      task: rebuild-stacks
+      task: rebuild-foundation
+    permissions:
+      contents: read
+      id-token: write
+
+  platform:
+    needs: foundation
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      task: rebuild-platform
     permissions:
       contents: read
       id-token: write
 
   cluster-bootstrap-tokyo:
-    needs: stacks
+    needs: platform
     uses: ./.github/workflows/cluster-bootstrap-apply.yml
     with:
       environment: ${{ inputs.environment }}
       region: ap-northeast-1
+      require-cluster: true
     permissions:
       contents: read
       id-token: write
@@ -98,6 +113,7 @@ jobs:
     with:
       environment: ${{ inputs.environment }}
       region: ap-northeast-3
+      require-cluster: true
     permissions:
       contents: read
       id-token: write

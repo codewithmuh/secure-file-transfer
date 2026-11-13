@@ -1,8 +1,8 @@
 # The data layer of one environment and Region (#101): Aurora, the counter store and the queues, wired to the network
 # stack's subnets and security groups. Every data root calls this module once and passes only what differs between
 # them: the cluster's role and size, its backups, the master secret's recovery window, and the inputs of the two-pass
-# fresh build. #102 adds the keys and buckets (storage.tf). So a change to the layer is made here once, not in five
-# roots. Providers, the backend and the conventions module stay
+# fresh build. #102 adds the keys and buckets (storage.tf); flow-logs.tf the VPC flow log's bucket. So a change to the
+# layer is made here once, not in five roots. Providers, the backend and the conventions module stay
 # in the roots (infra/README.md, "Add a stack or a module").
 
 locals {

@@ -122,8 +122,27 @@ listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
 [[ "$listed" == *"retained: teardown apply"* && "$listed" != *"environments/prod/ap-northeast"* && "$listed" != *bootstrap* ]] ||
   fail "prod's retained part does more than the retained apply: $listed"
 
+# The teardown's fixes (#299): Osaka's data stack gets Tokyo's key primaries, a stack already gone is checked for
+# before anything is applied to it, and the drain removes the AppProjects while Argo CD still runs.
+out="$("$ops/teardown.sh" --env staging --profile p --part layers </dev/null 2>&1)"
+[[ "$out" == *"TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"*"ap-northeast-3/data apply -var teardown=true"* ]] ||
+  fail "Osaka's data teardown doesn't get primary_key_arns: $out"
+[[ "$out" == *"delete applications.argoproj.io"*"delete appprojects.argoproj.io"*"cluster-bootstrap destroy"* ]] ||
+  fail "the drain doesn't remove the AppProjects before the destroy"
+[[ "$out" == *"cluster-tunnel.sh open staging ap-northeast-3 8444"*"cluster-tunnel.sh open staging ap-northeast-1 8443"* ]] ||
+  fail "the tunnels don't use a port per Region"
+
+# plan_destroys reads Terraform's summary, colored or not, and the "to forget" form.
+plans="$(mktemp -d)"
+printf 'Plan: 1 to add, 0 to change, 2 to destroy.\n' >"$plans/plain"
+printf '\033[0m\033[1mPlan:\033[0m 0 to add, 0 to change, 3 to destroy, 1 to forget.\n' >"$plans/colored"
+printf 'No changes. Your infrastructure matches the configuration.\n' >"$plans/none"
+got="$(bash -c 'source "$1"; for f in plain colored none; do plan_destroys "$2/$f"; done' _ "$ops/lib/common.sh" "$plans" | tr '\n' ' ')"
+[[ "$got" == "2 3 0 " ]] || fail "plan_destroys read $got, not 2 3 0"
+rm -rf "$plans"
+
 # The rebuild (#295): its refusals, and the order of a staging rebuild and a dev one, which has no Osaka.
-expect_refusal "--execute takes --stage stacks or after" "$ops/rebuild.sh" --env staging --profile p \
+expect_refusal "--execute takes --stage foundation, platform, stacks or after" "$ops/rebuild.sh" --env staging --profile p \
   --account-id 000000000000 --execute --log "$fake_bin/refused.md"
 expect_refusal "--unattended is for --execute" "$ops/rebuild.sh" --env staging --profile p --unattended
 expect_refusal "--stage must be" "$ops/rebuild.sh" --env staging --profile p --stage everything
@@ -131,14 +150,25 @@ out="$("$ops/rebuild.sh" --env staging --profile p </dev/null 2>&1)"
 listed="$(sed -n 's/^ *[0-9]*\. //p' <<<"$out" | tr '\n' ' ')"
 want="environments/staging/ap-northeast-1/network environments/staging/ap-northeast-3/network"
 want+=" environments/staging/ap-northeast-1/data environments/staging/ap-northeast-3/data"
-want+=" environments/staging/ap-northeast-1/data (again, on a first build)"
+want+=" environments/staging/ap-northeast-1/data (again, until Tokyo replicates)"
+want+=" environments/staging/ap-northeast-1/network (again: the flow log, once data exists)"
+want+=" environments/staging/ap-northeast-3/network (again: the flow log, once data exists)"
 want+=" environments/staging/ap-northeast-1/cluster environments/staging/ap-northeast-3/cluster"
 want+=" environments/staging/ap-northeast-1/edge environments/staging/ap-northeast-3/edge"
 want+=" environments/staging/ap-northeast-1/identity environments/staging/ap-northeast-3/identity "
 [[ "$listed" == "$want" ]] || fail "rebuild order: $listed"
 [[ "$out" == *"-var osaka_ready=false"* ]] || fail "a first staging build doesn't pass osaka_ready=false"
+[[ "$out" == *"TF_VAR_flow_log_destination_arn: the data stack's flow_log_bucket_arn output"* ]] ||
+  fail "the rebuild doesn't pass the flow-log bucket to network"
 [[ "$out" == *"alarms"*"cluster-tunnel.sh open staging ap-northeast-1"*"create job"*"key-rotation"* ]] ||
   fail "the rebuild's after stage has no first deploy through the tunnel"
+# The stages the workflow runs as separate jobs (#299): foundation has no cluster, platform no network or data.
+out="$("$ops/rebuild.sh" --env staging --profile p --stage foundation </dev/null 2>&1)"
+[[ "$out" == *"ap-northeast-3/data"* && "$out" != *"/cluster"* && "$out" != *"key-rotation"* ]] ||
+  fail "the foundation stage isn't network and data only"
+out="$("$ops/rebuild.sh" --env staging --profile p --stage platform </dev/null 2>&1)"
+[[ "$out" == *"ap-northeast-3/identity"* && "$out" != *"/network"* && "$out" != *"/data "* ]] ||
+  fail "the platform stage isn't cluster, edge and identity only"
 out="$("$ops/rebuild.sh" --env dev --profile p </dev/null 2>&1)"
 [[ "$out" != *"ap-northeast-3"* ]] || fail "dev's rebuild touches Osaka"
 [[ "$out" != *"osaka_ready"* ]] || fail "dev's rebuild passes osaka_ready"

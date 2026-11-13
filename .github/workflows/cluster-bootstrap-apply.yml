@@ -32,6 +32,12 @@ on:
         description: ap-northeast-1 or ap-northeast-3
         type: string
         required: true
+      require-cluster:
+        description: >-
+          Fail if the cluster doesn't exist. Off for a push to main, where a torn-down environment (make aws-down) has
+          nothing to apply and must not block the others; on in environment.yml's `up`, which has just built it.
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -41,6 +47,10 @@ jobs:
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
     timeout-minutes: 60
     environment: ${{ inputs.environment }} # the deploy role's OIDC subject; main only, prod waits for approval (T-71)
+    # One apply per cluster at a time, whichever workflow calls it (cluster-bootstrap.yml or environment.yml, #299).
+    concurrency:
+      group: cluster-bootstrap-${{ inputs.environment }}-${{ inputs.region }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write # OIDC into the environment's deploy role
@@ -98,13 +108,33 @@ jobs:
           role-session-name: cluster-bootstrap-${{ inputs.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
           aws-region: ${{ inputs.region }}
           mask-aws-account-id: true
+      - name: Is the cluster there?
+        id: cluster
+        env:
+          REQUIRE: ${{ inputs.require-cluster }}
+        run: |
+          case $REGION in ap-northeast-1) short=apne1 ;; ap-northeast-3) short=apne3 ;; esac
+          if out=$(aws eks describe-cluster --region "$REGION" --name "sft-$ENVIRONMENT-$short-eks" \
+            --query cluster.status --output text 2>&1); then
+            echo "up=true" >> "$GITHUB_OUTPUT"
+          elif [[ $out == *ResourceNotFoundException* && $REQUIRE != true ]]; then
+            echo "up=false" >> "$GITHUB_OUTPUT"
+            echo "$ENVIRONMENT has no cluster in $REGION: it is down (make aws-down), so there is nothing to apply." \
+              "make aws-up applies this layer when it comes back." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::Can't read $ENVIRONMENT's cluster in $REGION: $out"
+            exit 1
+          fi
       - name: Open the tunnel to the cluster API
+        if: steps.cluster.outputs.up == 'true'
         run: |
           echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           .github/scripts/cluster-tunnel.sh open "$ENVIRONMENT" "$REGION" "$TUNNEL_PORT" "$RUNNER_TEMP/kubeconfig"
       - name: Check the vendored CRDs are the pinned chart's (deploy/observability/crds/check.sh)
+        if: steps.cluster.outputs.up == 'true'
         run: deploy/observability/crds/check.sh
       - name: Apply the Prometheus Operator's CRDs, server-side, and wait until they are served
+        if: steps.cluster.outputs.up == 'true'
         run: |
           bundle=$(ls deploy/observability/crds/kube-prometheus-stack-*.crds.bz2)
           bzcat "$bundle" | kubectl apply --server-side --force-conflicts --field-manager=sft-crds -f -
@@ -113,6 +143,7 @@ jobs:
             -o jsonpath='{.metadata.annotations.operator\.prometheus\.io/version}')
           echo "Applied ${bundle##*/}: the CRDs of Prometheus Operator $version." >> "$GITHUB_STEP_SUMMARY"
       - name: Terraform init, plan and apply
+        if: steps.cluster.outputs.up == 'true'
         env:
           TF_VAR_account_id: ${{ vars.AWS_ACCOUNT_ID }}
           TF_VAR_shared_account_id: ${{ vars.SHARED_ACCOUNT_ID }}

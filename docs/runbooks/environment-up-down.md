@@ -29,9 +29,9 @@ alone (SCP `OnlyAdminChangesBootstrapIam`).
 
 | Command | Jobs, in order | Takes |
 |---|---|---|
-| `aws-up` | `stacks` ([`ops/rebuild.sh`](../../ops/rebuild.sh) `--stage stacks`: network, data, cluster, edge and identity, Tokyo then Osaka), then `cluster-bootstrap` for each cluster ([cluster-bootstrap-apply.yml](../../.github/workflows/cluster-bootstrap-apply.yml)), then `after` (the alarms, the key rotation's first run, and Argo CD's Applications synced and healthy) | ≤ 2 h |
+| `aws-up` | `foundation` ([`ops/rebuild.sh`](../../ops/rebuild.sh) `--stage foundation`: network, data, then network again for its flow log, Tokyo then Osaka), then `platform` (`--stage platform`: cluster, edge and identity). Each is its own job, with its own 2-hour deploy session. Then `cluster-bootstrap` for each cluster ([cluster-bootstrap-apply.yml](../../.github/workflows/cluster-bootstrap-apply.yml)), then `after` (the alarms, the key rotation's first run, and Argo CD's Applications synced and healthy) | ≤ 2 h |
 | `aws-down` | dev and staging: [`ops/teardown.sh`](../../ops/teardown.sh) `--scope idle --part layers`, which drains each cluster and destroys `cluster-bootstrap` through the tunnel, gives `data` its teardown apply, destroys every stack, then searches by tag for anything left. prod: first `--part retained` as the retained stack's own role (GitHub environment `prod-retained`), then `--scope final --part layers` | ≤ 1 h |
-| `aws-status` | `ops/teardown.sh --inventory` | minutes |
+| `aws-status` | `ops/teardown.sh --inventory`. The log is public: it shows each stack's resource addresses and every tagged resource's ARN, with the account ID masked. The IDs in them aren't secrets (they appear in DNS and in the web app's config), but keep them out of other places | minutes |
 
 A rebuild is safe to run again on a live environment, so a failed `up` is fixed and then run again. It refuses a plan
 that destroys or replaces anything: on a live environment that means drift, or a change that needs its own review.
@@ -82,7 +82,7 @@ What `down` leaves, and what still bills afterwards:
 
 ## If something fails
 
-- **`up` fails in `stacks`:** the log names the stack and prints Terraform's error lines. Fix it in a pull request,
+- **`up` fails in `foundation` or `platform`:** the log names the stack and prints Terraform's error lines. Fix it in a pull request,
   merge, and run `make aws-up` again: the stacks already built show no changes.
 - **`up` fails in `cluster-bootstrap`:** the same, and a rerun applies only that layer onward. It can also be run on
   its own: `gh workflow run cluster-bootstrap.yml -f environment=dev`.
@@ -91,3 +91,5 @@ What `down` leaves, and what still bills afterwards:
   manual step for it.
 - **Billing after a `down`:** `make aws-status` lists every resource still tagged with the environment. Cost Explorer
   by the `environment` tag shows the rest the next day.
+- **"Error acquiring the state lock":** a job stopped mid-apply (its timeout, or a cancel) and left the stack's lock file. First make sure no other run is applying that stack (the Actions tab). Then, with BreakGlass, run `terraform -chdir=infra/<root> force-unlock <lock ID from the error>`, and run the command again.
+- **A push to `main` while an environment is down:** `cluster-bootstrap.yml` finds no cluster and skips it, saying so in the run's summary. The other environments still get the change, and `make aws-up` applies it when the environment comes back.

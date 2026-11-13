@@ -275,10 +275,12 @@ resource "aws_route_table_association" "isolated" {
 # VPC flow log: all traffic to the environment's log bucket (capacity A19, T-53)
 # ---------------------------------------------------------------------------------------------------------------------
 
-# The bucket and its logs key belong to the data layer, which is applied after this one, so the flow log starts with
-# the second network apply of a fresh build (infra/README.md, "Apply order"). The bucket policy must let
-# delivery.logs.amazonaws.com write under <prefix>/AWSLogs/aws-account-id=<account>/ for this account, and the logs key
-# must let it encrypt (encryption 3.1).
+# The bucket, sft-<env>-<region-short>-flow-logs-<account-id>, and its logs key belong to the data layer, which is
+# applied after this one, so the flow log starts with the second network apply of a fresh build, given the data root's
+# flow_log_bucket_arn output (infra/README.md, "Apply order"). The bucket's policy lets delivery.logs.amazonaws.com
+# write under AWSLogs/aws-account-id=<account>/ for this account and Region, and the logs key lets it encrypt, both
+# limited by aws:SourceAccount and aws:SourceArn (modules/data-stack, flow-logs.tf; encryption 3.1). A prefix in
+# flow_log_destination_arn would need that bucket policy changed to match.
 resource "aws_flow_log" "this" {
   count = var.flow_log_destination_arn == null ? 0 : 1
 

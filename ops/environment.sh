@@ -28,12 +28,18 @@ if [[ "$action" == down ]]; then
   [[ "$confirm" == "$env" ]] || die "not confirmed"
 fi
 
-since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The run is the one named "<action> <env> by <you>" (environment.yml's run-name) that wasn't there before: no clock
+# comparison, and another run on the list, another environment's or someone else's, is never the one followed (#299).
+me="$(gh api user --jq .login)"
+title="$action $env by $me"
+before="$(gh run list --workflow environment.yml --limit 50 --json databaseId --jq '.[].databaseId' | tr '\n' ' ')"
 gh workflow run environment.yml --ref main -f environment="$env" -f action="$action" -f confirm="$confirm"
 run=""
 for _ in $(seq 1 30); do
-  run="$(gh run list --workflow environment.yml --branch main --event workflow_dispatch --limit 10 \
-    --json databaseId,createdAt --jq "[.[] | select(.createdAt >= \"$since\")] | last | .databaseId // empty")"
+  for id in $(gh run list --workflow environment.yml --limit 20 --json databaseId,displayTitle \
+    --jq ".[] | select(.displayTitle == \"$title\") | .databaseId"); do
+    [[ " $before " == *" $id "* ]] || { run="$id"; break; }
+  done
   [[ -z "$run" ]] || break
   sleep 2
 done

@@ -22,7 +22,7 @@ on:
         type: string
         required: true
       task:
-        description: rebuild-stacks, rebuild-after, teardown-retained, teardown-layers or inventory
+        description: rebuild-foundation, rebuild-platform, rebuild-after, teardown-retained, teardown-layers or inventory
         type: string
         required: true
 
@@ -32,7 +32,9 @@ jobs:
   run:
     name: ${{ inputs.task }} ${{ inputs.environment }}
     runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
-    timeout-minutes: 150
+    # Inside the deploy session's 2 hours: past them the credentials expire mid-apply and leave the state locked
+    # (docs/runbooks/environment-up-down.md, "If something fails"). The rebuild runs as two jobs to stay within it.
+    timeout-minutes: 115
     environment: ${{ inputs.task == 'teardown-retained' && 'prod-retained' || inputs.environment }}
     permissions:
       contents: read
@@ -60,7 +62,7 @@ jobs:
           DOMAIN: ${{ vars.SFT_DOMAIN }}
         run: |
           case $TASK in
-            rebuild-stacks | rebuild-after | teardown-retained | teardown-layers | inventory) ;;
+            rebuild-foundation | rebuild-platform | rebuild-after | teardown-retained | teardown-layers | inventory) ;;
             *) echo "::error::unknown task '$TASK'"; exit 1 ;;
           esac
           for value in "$ACCOUNT" "$SHARED" "$DOMAIN"; do
@@ -115,14 +117,16 @@ jobs:
           scope=idle
           if [[ $ENVIRONMENT == prod ]]; then scope=final; fi
           case $TASK in
-            rebuild-stacks) ops/rebuild.sh "${common[@]}" --stage stacks --execute --unattended ;;
+            rebuild-foundation) ops/rebuild.sh "${common[@]}" --stage foundation --execute --unattended ;;
+            rebuild-platform) ops/rebuild.sh "${common[@]}" --stage platform --execute --unattended ;;
             rebuild-after) ops/rebuild.sh "${common[@]}" --stage after --execute --unattended ;;
             teardown-retained) ops/teardown.sh "${common[@]}" --scope final --part retained --execute --unattended ;;
             teardown-layers) ops/teardown.sh "${common[@]}" --scope "$scope" --part layers --execute --unattended ;;
             inventory) ops/teardown.sh "${common[@]}" --inventory ;;
           esac
       - name: Keep the timed log
-        if: ${{ !cancelled() && inputs.task != 'inventory' }}
+        # always(): a job stopped at its timeout is cancelled, and its log is the one most needed (#299).
+        if: ${{ always() && inputs.task != 'inventory' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ inputs.task }}-${{ inputs.environment }}-log

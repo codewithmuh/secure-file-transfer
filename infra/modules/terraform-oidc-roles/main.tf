@@ -104,6 +104,15 @@ data "aws_iam_policy_document" "placeholder" {
     actions   = ["ec2:DescribeRegions", "ec2:DescribeAvailabilityZones"]
     resources = ["*"]
   }
+
+  # The teardown's last check and `make aws-status` (ops/teardown.sh, #299): every resource still tagged with the
+  # environment, and what Kubernetes made outside Terraform (Karpenter's instances, the claims' volumes). Read-only;
+  # none of these calls takes a resource.
+  statement {
+    sid       = "FindWhatIsLeft"
+    actions   = ["tag:GetResources", "ec2:DescribeInstances", "ec2:DescribeVolumes"]
+    resources = ["*"]
+  }
 }
 
 # A caller that knows its plan role's needs replaces the placeholder with plan_policy_json: the management account

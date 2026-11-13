@@ -110,21 +110,32 @@ roots_in_order() {
 
 tag_search() {
   # Every resource still tagged with the environment, in Tokyo, Osaka and us-east-1 (CloudFront's alarms, NFR-21).
-  # The tagging API lists a deleted resource for a while after it goes, so a hit is checked before it counts.
+  # The tagging API lists a deleted resource for a while after it goes, so a hit is checked before it counts. A search
+  # that fails doesn't stop the teardown, whose stacks are gone by then: it is listed for the operator (#299).
   local region
   for region in "$TOKYO" "$OSAKA" us-east-1; do
     # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
     run aws resourcegroupstaggingapi get-resources --region "$region" \
       --tag-filters "Key=project,Values=secure-file-transfer" "Key=environment,Values=$ENV_NAME" \
-      --query 'ResourceTagMappingList[].[ResourceARN, Tags[?Key==`retention`].Value | [0]]' --output text
+      --query 'ResourceTagMappingList[].[ResourceARN, Tags[?Key==`retention`].Value | [0]]' --output text ||
+      search_failed "the tag search in $region"
   done
   # What Kubernetes made outside Terraform: Karpenter's instances, volumes from claims, and their network interfaces.
   for region in "${REGIONS[@]}"; do
     run aws ec2 describe-instances --region "$region" --filters "Name=tag:karpenter.sh/discovery,Values=$(region_prefix "$region")" \
-      "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId'
+      "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' ||
+      search_failed "the search for Karpenter's instances in $region"
     run aws ec2 describe-volumes --region "$region" \
-      --filters "Name=tag:kubernetes.io/cluster/$(eks_cluster "$region"),Values=owned" --query 'Volumes[].VolumeId'
+      --filters "Name=tag:kubernetes.io/cluster/$(eks_cluster "$region"),Values=owned" --query 'Volumes[].VolumeId' ||
+      search_failed "the search for the claims' volumes in $region"
   done
+}
+
+search_failed() {
+  echo "   warning: $1 failed; nothing above proves that what it covers is gone" >&2
+  if $EXECUTE && [[ -n "$LOG_FILE" ]]; then
+    echo "- $1 failed: run it again by hand, or check Cost Explorer by the environment tag." >>"$LOG_FILE.todo"
+  fi
 }
 
 ROOTS=()
@@ -224,6 +235,9 @@ drain_cluster() {
   # Argo CD's Applications first, while Argo CD still runs: their finalizer prunes what each synced, so no workload
   # holds a claim below, and nothing syncs it back (#295).
   run kubectl --context "$ctx" -n argocd delete applications.argoproj.io --all --wait=true --timeout=15m
+  # Then the AppProjects, whose finalizer only Argo CD clears: left for the destroy, they would hold the argocd
+  # namespace in Terminating after Argo CD is gone (#299).
+  run kubectl --context "$ctx" -n argocd delete appprojects.argoproj.io --all --wait=true --timeout=5m
   # What Kubernetes made in AWS outside Terraform goes next, or the VPC can't be destroyed: Karpenter's nodes and
   # the volumes of persistent claims (the observability stack's).
   run kubectl --context "$ctx" delete nodepools.karpenter.sh --all --wait=true --timeout=10m
@@ -239,13 +253,32 @@ cluster_bootstrap_teardown() {
 }
 
 data_teardown_apply() {
-  local region="$1"
+  local region="$1" tokyo keys
+  # Osaka's data stack takes Tokyo's key primaries, a required input with no default; Tokyo's data stack goes after
+  # it, so its state still has them (#299).
+  if [[ "$region" == "$OSAKA" ]]; then
+    tokyo="environments/$ENV_NAME/$TOKYO/data"
+    tf_init "$tokyo"
+    keys="$(tf_output "$tokyo" kms_key_arns)"
+    [[ -n "$keys" && "$keys" != null ]] || die "Tokyo's data stack has no kms_key_arns output, which Osaka's needs"
+    echo "   TF_VAR_primary_key_arns: Tokyo's kms_key_arns output"
+    export TF_VAR_primary_key_arns="$keys"
+  fi
   # Aurora's deletion protection off, no final snapshot, the master secret without a recovery window (infra/README.md).
   tf_root "environments/$ENV_NAME/$region/data" apply -var teardown=true "${APPROVE[@]+"${APPROVE[@]}"}"
 }
 
 destroy_root() {
   local root="$1"
+  # A stack already destroyed (a teardown run again after it stopped) is skipped: a teardown apply on an empty state
+  # would build the stack again (#299).
+  if [[ "$root" == environments/* ]]; then
+    tf_init "$root"
+    if $EXECUTE && ! has_state "$root"; then
+      echo "   Already gone: its state holds nothing."
+      return 0
+    fi
+  fi
   case "$root" in
     environments/*/cluster-bootstrap)
       with_tunnel "$(basename "$(dirname "$root")")" cluster_bootstrap_teardown "$(basename "$(dirname "$root")")"
