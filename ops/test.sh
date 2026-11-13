@@ -120,6 +120,14 @@ out="$("$ops/regional-failback.sh" --env staging --profile p --after-detach </de
 [[ "$out" == *"create-global-cluster"*"sft-staging-aurora-2"* ]] || fail "the failback after a detach has no new global database"
 [[ "$out" == *"TF_VAR_aurora_role=secondary"* ]] || fail "the failback after a detach doesn't set Tokyo's role input"
 [[ ! -s "$calls" ]] || fail "the failback's dry run ran: $(cat "$calls")"
+# The failback's replay reads Osaka's archive (#276); its generation and outbox jobs keep Tokyo's own.
+out="$("$ops/regional-failback.sh" --env staging --profile p </dev/null 2>&1)"
+replay="$(grep 'cronjob/recovery.*replay' <<<"$out" || true)"
+[[ "$replay" == *apne3-audit-archive* && "$replay" == *AUDIT_ARCHIVE_REGION*ap-northeast-3* ]] ||
+  fail "the failback's replay doesn't read Osaka's archive: $replay"
+others="$(grep 'cronjob/recovery' <<<"$out" | grep -v replay || true)"
+[[ "$(grep -c . <<<"$others")" -eq 2 && "$others" != *AUDIT_ARCHIVE* ]] ||
+  fail "the failback's generation and outbox jobs don't read Tokyo's archive: $others"
 
 # failover-values.sh on a copy of the repository's values files.
 copy="$(mktemp -d)"

@@ -74,8 +74,8 @@ regional loss; failback's back-fill writes the other (#257, gap 12). The chart r
 ## 4. The recovery job
 
 `sft.service.recovery_replay`, run by `python -m sft.workers.recovery` (`sft.service.recovery`, #258) as the
-`sft_recovery` database role (IAM role `sft-{env}-recovery`, which lists and reads this Region's audit archive) in
-recovery scope, by a suspended `recovery` CronJob rendered with its steps, as the field-keys runbook renders its
+`sft_recovery` database role (IAM role `sft-{env}-recovery`, which lists and reads the audit archive in both Regions)
+in recovery scope, by a suspended `recovery` CronJob rendered with its steps, as the field-keys runbook renders its
 job. One module serves the regional failover, the failback and the restore, in four steps:
 
 1. **`generation`.** The archive cursor's generation becomes one more than the highest in the surviving region's
@@ -89,6 +89,14 @@ job. One module serves the regional failover, the failback and the restore, in f
    whose event the database already has is skipped, so running it twice changes nothing.
 4. **`outbox`.** Every outbox message published since `RECOVERY_SINCE` (24 hours back) goes back to unsent; the relay
    publishes it once the workers scale up, and consumers skip what they already did (architecture 5.3).
+
+**Which archive it reads.** This Region's (`AUDIT_ARCHIVE_BUCKET`), unless `AUDIT_ARCHIVE_REGION` names the other;
+the database is always this Region's. Only the failback uses that (#276): between its hold and its fence, Osaka's API
+writes security-critical records to Osaka's archive alone and the archive job is held, so until the back-fill only
+Osaka's archive has them. The failback runs `generation` on Tokyo's own archive, which keeps the failover's
+generation, then `partitions,replay` on Osaka's, from the hold. The switchover loses nothing, so every record must be
+present: the report's `missing` (records whose event the database didn't have) is 0, and anything else fails the
+drill. The report names the archive's region (`archive_region`) for the drill log.
 
 **What it re-applies.** The changes that take access away: transfer and upload request revocations (with their link
 sessions, and the transfer's files sent to the deletion job), recipient and uploader lockouts, API key revocations,
@@ -154,7 +162,7 @@ Gaps the runbooks found while being written, decided the same way:
 | 9 | **DNS when Tokyo's state can't be read.** The API's record belongs to Tokyo's edge stack, whose state is in Tokyo. | In a real failover, if Tokyo's state bucket doesn't answer, the operator upserts the API's alias record to Osaka's load balancer through the environment's DNS role in the shared zone, by CLI; the failback's edge apply puts it back under Terraform. Drills use the Terraform path. | Failover drill, step 8 (Terraform path); the CLI path once, in staging, with Tokyo's state bucket denied to the operator. |
 | 10 | **The old Tokyo database after an unplanned failover.** | Never a writer again (T-78). After a managed failover Aurora brings it back as Osaka's secondary and keeps a snapshot of its volume from before; after a detach it is deleted and a new secondary made, its final snapshot kept. Rows only it had are the RPO NFR-10 allows: security-critical ones are re-applied from the archive, the rest are not merged automatically in v1, and the snapshot is kept 30 days for support questions. | Failback drill, step 1. |
 | 11 | **Prod's files buckets have no teardown rights** (modules/data-stack gives `teardown_allowed` only outside prod), so prod's `data` destroy fails on non-empty buckets. | **The teardown apply gives them.** modules/data-stack passes `teardown_allowed` to prod's files buckets from its `TF_VAR_teardown=true` apply on (#263): `force_destroy`, and deletes by the deploy role and `Admin`, which runs `ops/teardown.sh`, as in dev and staging always. Never while prod runs. Prod's `cluster`, `identity` and `edge` take the same input for their deletion protection. | Teardown rehearsal in staging; prod's timed teardown. |
-| 12 | **A regional loss and the archive's two-region writes** (#257). | **Surviving-region mode, back-filled at failback.** The failover sets `auditArchive.survivingRegionOnly`; the API and the archive job write the surviving region alone, the job records each range, and at failback rewrites the same objects to the other region. Grant intents aren't back-filled (never in the database; superseded by their committed records). Never for an Osaka-only S3 outage while Tokyo serves (gap 5). | Failback drill, step 10: the two regions' `g<n>/` listings are equal and `audit_archive_single_region_ranges` is 0. |
+| 12 | **A regional loss and the archive's two-region writes** (#257). | **Surviving-region mode, back-filled at failback.** The failover sets `auditArchive.survivingRegionOnly`; the API and the archive job write the surviving region alone, the job records each range, and at failback rewrites the same objects to the other region. Grant intents aren't back-filled (never in the database; superseded by their committed records). Never for an Osaka-only S3 outage while Tokyo serves (gap 5). | Failback drill, step 10: the two regions' `g<n>/` listings are equal and `audit_archive_single_region_ranges` is 0. Step 6: the replay of Osaka's archive from the hold finds every record of the window in the database (`missing` 0, #276). |
 
 ## 6. Drills
 

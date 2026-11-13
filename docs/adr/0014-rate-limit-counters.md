@@ -45,11 +45,13 @@ rate-based rules** in front for coarse per-IP floods. PostgreSQL keeps the secur
     chart wired the operator API's settings).
 
   Nothing is replicated between regions; Osaka's cache idles at its minimum until a failover.
-- **Failure.** 50 ms per call; after 5 errors in a row the API stops calling the store for 10 seconds. Link steps
-  answer `503` with `Retry-After: 5` and the sign-in trigger denies sign-in (fail closed). Other groups fall back to a
-  per-pod limiter at a third of each limit; checks held in PostgreSQL are unchanged (abuse design 4.5). The scan worker
-  skips the per-tenant scan cap and the fair queues alone apply (abuse design 6.4). The notification worker holds the
-  per-address cap with a per-pod limiter, as group G does (abuse design 2.2).
+- **Failure.** 50 ms per call; a call that needs a new connection opens it first, with 250 ms of its own (#282), so a
+  host where a connection costs more than a call doesn't keep timing out after one slow answer. After 5 errors in a
+  row the API stops calling the store for 10 seconds. Link steps answer `503` with `Retry-After: 5` and the sign-in
+  trigger denies sign-in (fail closed). Other groups fall back to a per-pod limiter at a third of each limit; checks
+  held in PostgreSQL are unchanged (abuse design 4.5). The scan worker skips the per-tenant scan cap and the fair
+  queues alone apply (abuse design 6.4). The notification worker holds the per-address cap with a per-pod limiter, as
+  group G does (abuse design 2.2).
 - **WAF** carries the per-IP backstops on the API, sign-in and web app web ACLs (abuse design 3.2).
 
 ## Options considered

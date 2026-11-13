@@ -821,9 +821,13 @@ What is deliberately not a secret here:
   Every other read raises an alert (authentication and authorization 8.3). **As built (#278):** the role is the cluster
   layer's (modules/eks-cluster), bound by Pod Identity to the service account `db-bootstrap` in `sft`, and may read only
   `sft/{env}/db/master` (Tokyo's and its Osaka replica) and decrypt it through Secrets Manager. The job is a PreSync
-  hook of the chart that runs only in a sync whose values turn it on (`dbBootstrap.runOnSync`, deploy/README.md): it
-  reads the secret itself (`BOOTSTRAP_MASTER_SECRET`), so the password is never in a pod spec or a Kubernetes Secret,
-  and signs in with it, so the role has no `rds-db:connect`.
+  hook of the chart that runs only in a sync whose values turn it on (`dbBootstrap.runOnSync`, deploy/README.md).
+  `BOOTSTRAP_MASTER_SECRET=secretsmanager:sft/{env}/db/master` names the secret, and `BOOTSTRAP_DATABASE_URL` names
+  the master user and no password (the settings refuse one with a password). The job reads the secret once as its own
+  role, checks that its `username` is the URL's, and puts the password into the connection in memory only
+  (`sft.data.bootstrap`), so the password is never in a pod spec or a Kubernetes Secret, and the role has no
+  `rds-db:connect`. A read that fails exits 1 naming the secret ID and the error code, never a value. Locally no secret
+  is named and the URL holds the superuser's fake password.
 
 ### 6.4 How workloads read and write secrets
 

@@ -356,7 +356,8 @@ inviteBacklog:
 # The recovery job (#258; sft.workers.recovery, docs/operations/disaster-recovery.md 4): a CronJob that is always
 # suspended, run by hand by the restore, failover and failback runbooks, which render a Job from it with their steps
 # and times (ops/lib/common.sh). It runs as sft_recovery with its own service account (Pod Identity: sft-<env>-recovery,
-# which lists and reads this region's audit archive) and reads that archive (AUDIT_ARCHIVE_BUCKET).
+# which lists and reads the audit archive in every region) and reads this region's (AUDIT_ARCHIVE_BUCKET), or Osaka's
+# for the failback's replay (AUDIT_ARCHIVE_REGION, #276).
 recovery:
   module: sft.workers.recovery
   serviceAccount: recovery # Pod Identity: sft-<env>-recovery

@@ -6,8 +6,10 @@ failback runbooks run, as `sft_recovery` with the `recovery` service account.
 
 The chart's `recovery` CronJob is always suspended: the runbooks render a Job from it with their
 steps and times (`ops/lib/common.sh`'s `recovery_job`). It reads `RecoverySettings`, lists and
-reads this region's audit archive (`AUDIT_ARCHIVE_BUCKET`), and logs its report as one JSON line:
-counts, the generation and the newest record's time, which the drill log takes. It exits 0 when
+reads this region's audit archive (`AUDIT_ARCHIVE_BUCKET`), or another region's with
+`AUDIT_ARCHIVE_REGION` (the failback's replay in Tokyo reads Osaka's, #276) while the database
+stays this region's, and logs its report as one JSON line: counts, the generation, the newest
+record's time and the archive's region, which the drill log takes. It exits 0 when
 every step it was given is done, 1 when one failed (running it again is safe: every step is
 idempotent), and 2 on bad settings.
 """
@@ -38,13 +40,15 @@ async def run_once(settings: RecoverySettings) -> RecoveryReport:
         pool_size=1,
         iam_region=settings.aws_region if settings.database_iam_auth else None,
     )
+    # S3 in the archive's own Region; the database's IAM tokens stay this Region's.
+    archive_region = settings.audit_archive_region or settings.aws_region
     reader = S3ArchiveReader.create(
-        region=settings.aws_region,
+        region=archive_region,
         bucket=settings.audit_archive_bucket,
         endpoint=settings.audit_archive_endpoint_url,
     )
     try:
-        return await run_recovery(
+        report = await run_recovery(
             database,
             reader,
             steps=parse_steps(settings.recovery_steps),
@@ -52,6 +56,8 @@ async def run_once(settings: RecoverySettings) -> RecoveryReport:
             rewind_to=settings.recovery_rewind_to,
             today=datetime.now(UTC).date(),
         )
+        report.archive_region = archive_region
+        return report
     finally:
         await reader.close()
         await database.dispose()

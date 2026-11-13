@@ -1444,3 +1444,25 @@ def test_the_admin_recovery_revision_keeps_the_sql_the_helpers_wrote_for_it() ->
         policy_sql("jobs_temporary", "user_identities", roles=["sft_jobs"], using=tenant_rows),
     ]
     assert f"({', '.join(repr(k.value) for k in AdminRecoveryKind)})" == module.KINDS
+
+
+def test_the_sso_invitation_revision_keeps_the_sql_the_helpers_wrote_for_it() -> None:
+    # #273: the worker mints an SSO tenant's invitation links, and reads its tenant's connection.
+    [module] = [
+        s.module for s in SCRIPTS.walk_revisions() if hasattr(s.module, "NOTIFY_INVITATION_LINKS")
+    ]
+    assert list(module.NOTIFY_INVITATION_LINKS) == [
+        grant_sql(
+            "users",
+            "sft_notify",
+            "UPDATE",
+            columns=["invitation_token_hash", "invitation_expires_at", "updated_at"],
+        ),
+        policy_sql(
+            "notify_connection",
+            "idp_connections",
+            roles=["sft_notify"],
+            command="SELECT",
+            using="tenant_id = app_tenant_id()",
+        ),
+    ]

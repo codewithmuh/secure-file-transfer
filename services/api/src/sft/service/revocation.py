@@ -27,7 +27,7 @@ from uuid import UUID
 
 from sqlalchemy import func
 
-from sft.core.errors import Conflict, NotFound
+from sft.core.errors import NotFound
 from sft.data import audit, files, link_sessions, transfers
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
@@ -43,6 +43,7 @@ from sft.service.transfers import (
     audit_details,
     effective_state,
     require_reach,
+    state_conflict,
     tenant_scope,
     transfer_view,
 )
@@ -89,13 +90,9 @@ async def revoke_transfer(
             view = await transfer_view(session, tenant_id, transfer, now)
         else:
             state = effective_state(stored, transfer.expires_at, now)
-            if state is TransferState.EXPIRED:
-                raise Conflict("transfer_expired", current_state=state.value)
             if state not in REVOCABLE:
-                raise Conflict(
-                    "invalid_state",
-                    "Only a transfer that was submitted can be revoked; cancel a draft.",
-                    current_state=state.value,
+                raise state_conflict(
+                    state, "Only a transfer that was submitted can be revoked; cancel a draft."
                 )
             await transfers.change_state(
                 session,

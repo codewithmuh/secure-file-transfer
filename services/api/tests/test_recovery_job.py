@@ -15,6 +15,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import boto3
 import pytest
@@ -26,13 +27,16 @@ from pg import ScratchDatabase
 from sft.core.settings import RecoverySettings
 from sft.data.migrate import run
 from sft.data.roles import MIGRATE, RECOVERY
+from sft.runtime.archive import S3ArchiveReader
 from sft.service.audit_archive import PREFIX
 from sft.service.recovery import (
+    RecoveryReport,
     Step,
     highest_generation,
     parse_steps,
     read_records,
 )
+from sft.service.recovery_replay import Outcome
 from sft.workers import recovery as recovery_command
 
 pytestmark = pytest.mark.anyio
@@ -127,6 +131,26 @@ def test_the_settings_read_the_cronjobs_empty_variables_as_unset() -> None:
         RecoverySettings(**base, recovery_steps="drop")
     # As the CronJob is rendered: the settings load, and the command refuses to run (below).
     assert RecoverySettings(**base, recovery_steps="").recovery_steps == ""
+    # The archive's region (#276): empty is this region's; only the archive's two regions.
+    assert RecoverySettings(**base, audit_archive_region="").audit_archive_region is None
+    failback = RecoverySettings(**base, audit_archive_region="ap-northeast-3")
+    assert (failback.aws_region, failback.audit_archive_region) == (
+        "ap-northeast-1",
+        "ap-northeast-3",
+    )
+    with pytest.raises(ValueError, match="audit_archive_region"):
+        RecoverySettings(**base, audit_archive_region="us-east-1")
+
+
+def test_the_report_counts_missing_records_only_after_a_replay() -> None:
+    generation = RecoveryReport((Step.GENERATION,)).as_dict()
+    assert (generation["present"], generation["missing"]) == (None, None)
+    replay = RecoveryReport((Step.REPLAY,))
+    replay.outcomes.update(
+        {Outcome.PRESENT: 3, Outcome.IGNORED: 1, Outcome.REIMPORTED: 1, Outcome.REAPPLIED: 1}
+    )
+    replay.outcomes[Outcome.NOT_REAPPLIED] += 1
+    assert (replay.as_dict()["present"], replay.missing) == (3, 3)
 
 
 async def test_both_layouts_are_read_in_every_generation_from_the_day_of_since() -> None:
@@ -205,15 +229,24 @@ def s3() -> object:
     )
 
 
-def settings(db: ScratchDatabase, bucket: str, steps: str, **times: datetime) -> RecoverySettings:
+def settings(
+    db: ScratchDatabase,
+    bucket: str,
+    steps: str,
+    *,
+    region: str = "ap-northeast-3",
+    archive_region: str | None = None,
+    **times: datetime,
+) -> RecoverySettings:
     return RecoverySettings(
         database_url=db.url(RECOVERY),
-        aws_region="ap-northeast-3",
+        aws_region=region,
         audit_archive_bucket=bucket,
         audit_archive_endpoint_url=os.environ["TEST_S3_ENDPOINT_URL"],
         recovery_steps=steps,
         recovery_since=times.get("since"),
         recovery_rewind_to=times.get("rewind_to"),
+        audit_archive_region=archive_region,
     )
 
 
@@ -285,6 +318,102 @@ async def test_the_job_runs_the_failovers_steps_against_the_local_services(
     assert outbox.republished is not None
     assert outbox.republished >= 1
     assert own_db.sql("SELECT published_at FROM outbox WHERE id = :id", id=sent) == [(None,)]
+
+
+async def test_the_failbacks_replay_reads_osakas_archive_and_finds_the_window_present(
+    own_db: ScratchDatabase, archive_bucket: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Acceptance criterion of #276: Tokyo's job, with Tokyo's database, reads Osaka's archive
+    # (the bucket made in ap-northeast-3), every record of the window since the hold, and finds
+    # each in the database; a record the database lacks shows as missing.
+    seeded = seed_tenant(own_db, "failback")
+    tenant, transfer = seeded.tenant_id, seeded.rows["transfer"]
+    own_db.sql(
+        "UPDATE transfers SET state = 'sent', expires_at = now() + interval '7 days', "
+        "submitted_at = now(), sent_at = now() WHERE id = :id",
+        id=transfer,
+    )
+    held = SINCE
+    admin = {"actor_type": "admin", "actor_id": str(seeded.rows["user"]), "tenant_id": str(tenant)}
+    # What Osaka's API committed between the hold and the fence, and wrote to Osaka's archive
+    # alone: the switchover brought each event to Tokyo's database.
+    window = [
+        body("api_key.revoked", at=held + timedelta(minutes=m), critical=True, **admin)
+        for m in (2, 4)
+    ]
+    window.append(
+        body("user.signed_out_by_admin", at=held + timedelta(minutes=6), critical=True, **admin)
+    )
+    for record in window:
+        own_db.sql(
+            "INSERT INTO audit_events (id, tenant_id, occurred_at, actor_type, actor_id, action, "
+            "target_type, target_id, outcome, security_critical, details) VALUES (:id, :tenant, "
+            ":at, :actor_type, :actor_id, :action, :target_type, :target_id, 'success', true, "
+            "'{}')",
+            id=record["id"],
+            tenant=record["tenant_id"],
+            at=record["occurred_at"],
+            actor_type=record["actor_type"],
+            actor_id=record["actor_id"],
+            action=record["action"],
+            target_type=record["target_type"],
+            target_id=record["target_id"],
+        )
+    # A grant's intent is never in the database, and a record from before the hold isn't read.
+    intent = body("download.grant_intent", at=held + timedelta(minutes=3), critical=True, **admin)
+    before = body("transfer.revoked", at=held - timedelta(minutes=5), critical=True, **admin)
+    client = s3()
+    for record in [*window, intent, before]:
+        client.put_object(  # type: ignore[attr-defined]
+            Bucket=archive_bucket, Key=direct_key(record), Body=json.dumps(record).encode()
+        )
+    regions: list[str] = []
+    create = S3ArchiveReader.create
+
+    def reader_in(**kwargs: Any) -> S3ArchiveReader:
+        regions.append(kwargs["region"])
+        return create(**kwargs)
+
+    monkeypatch.setattr(recovery_command.S3ArchiveReader, "create", reader_in)
+    failback = settings(
+        own_db,
+        archive_bucket,
+        "partitions,replay",
+        region="ap-northeast-1",
+        archive_region="ap-northeast-3",
+        since=held,
+    )
+
+    report = await recovery_command.run_once(failback)
+    assert regions == ["ap-northeast-3"]  # S3 in Osaka; the database stays Tokyo's
+    logged = report.as_dict()
+    assert {k: logged[k] for k in ("records", "present", "missing", "archive_region")} == {
+        "records": 4,
+        "present": 3,
+        "missing": 0,
+        "archive_region": "ap-northeast-3",
+    }
+    assert logged["replayed"] == {
+        "api_key.revoked:present": 2,
+        "user.signed_out_by_admin:present": 1,
+        "download.grant_intent:ignored": 1,
+    }
+
+    # A record of the window the switchover lost: read, missing, and its change made again.
+    lost = body(
+        "transfer.revoked",
+        at=held + timedelta(minutes=8),
+        critical=True,
+        target_id=str(transfer),
+        **admin,
+    )
+    client.put_object(  # type: ignore[attr-defined]
+        Bucket=archive_bucket, Key=direct_key(lost), Body=json.dumps(lost).encode()
+    )
+    again = await recovery_command.run_once(failback)
+    assert (again.records, again.missing, again.outcomes[Outcome.PRESENT]) == (5, 1, 3)
+    assert again.replayed["transfer.revoked:reapplied"] == 1
+    assert own_db.sql("SELECT state FROM transfers WHERE id = :id", id=transfer) == [("revoked",)]
 
 
 def test_the_command_refuses_bad_settings_and_fails_without_its_archive(

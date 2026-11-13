@@ -432,7 +432,7 @@ Every Must requirement with a user action, and the operations that serve it. Thi
 | FR-20 | Revoke transfers and upload requests | `revokeTransfer`, `revokeUploadRequest` |
 | FR-22 | Invite, deactivate and assign roles | `inviteUser`, `listUsers`, `getUser`, `updateUser`, `deactivateUser`, `signOutUser`, `resetUserSignIn`, `getCurrentMember` |
 | FR-23 | Tenant policy | `getTenantPolicy`, `updateTenantPolicy` |
-| FR-25 | Sign in with MFA | `startSignIn`, `completeSignIn`, `signOut`, `getCurrentMember`; `resetUserSignIn` for a lost factor; `recoverTenantAdmin` for a tenant's last admin |
+| FR-25 | Sign in with MFA | `startSignIn`, `completeSignIn`, `signOut`, `getCurrentMember`; `resetUserSignIn` for a lost factor; `recoverTenantAdmin` for a tenant's last admin, confirmed through `getTenantRecoveryContact` |
 | FR-28 | Search the audit log | `searchAuditEvents` |
 | FR-33 | English and Japanese recipient and uploader pages and emails, in v1 | `locale` on recipients and upload requests; `default_locale` in the tenant policy |
 | FR-34 | Provision a tenant and its first admin | `createTenant`; the operator API's `createOperatorToken` |

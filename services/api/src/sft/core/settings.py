@@ -1021,6 +1021,28 @@ class BootstrapSettings(_Base):
         description="True on Aurora: the login roles sign in with IAM database authentication. "
         "False locally, where they get passwords some other way. No default: choose.",
     )
+    # In AWS (#278): the master password is read from Secrets Manager by the job's own role, never
+    # handed to it through a Kubernetes Secret (encryption and keys 6.3).
+    bootstrap_master_secret: str | None = Field(
+        default=None,
+        pattern=r"^secretsmanager:[A-Za-z0-9/_+=.@-]{1,512}$",
+        description="`secretsmanager:<id>` of the master user's secret (`sft/<env>/db/master`, "
+        "JSON with `username` and `password`): the job reads the password once, in `AWS_REGION`, "
+        "and `BOOTSTRAP_DATABASE_URL` names the user and no password. Unset locally.",
+    )
+    aws_region: str = Field(default="ap-northeast-1", pattern=r"^[a-z]{2}(-[a-z]+)+-\d$")
+
+    @model_validator(mode="after")
+    def _master_secret_alone(self) -> Self:
+        parts = urlsplit(self.bootstrap_database_url.get_secret_value())
+        if self.bootstrap_master_secret is not None and (
+            not parts.username or parts.password is not None
+        ):
+            raise ValueError(
+                "with BOOTSTRAP_MASTER_SECRET, BOOTSTRAP_DATABASE_URL names the master user and "
+                "no password"
+            )
+        return self
 
 
 # Email stays in Japan (NFR-21): Tokyo, and Osaka for failover (ADR-0015).
@@ -1418,8 +1440,8 @@ class RecoverySettings(_Base):
     """The recovery job's settings (#258; `sft.workers.recovery`, disaster-recovery.md 4): the
     `sft_recovery` role, this region's audit archive, which it reads, and the steps and times
     the runbook renders into the `recovery` CronJob's run. A one-shot command, run by hand. The
-    CronJob carries the three `RECOVERY_*` variables empty, so a runbook's `yq` finds them;
-    empty means unset."""
+    CronJob carries the three `RECOVERY_*` variables and `AUDIT_ARCHIVE_REGION` empty, so a
+    runbook's `yq` finds them; empty means unset."""
 
     app_version: str = Field(default="0.0.0", description="Set by the image build.")
     database_url: PostgresUrl = Field(
@@ -1429,7 +1451,8 @@ class RecoverySettings(_Base):
     audit_archive_bucket: str = Field(
         pattern=_BUCKET,
         description="This region's audit archive bucket, which the job lists and reads: the "
-        "surviving region's after a failover, Tokyo's after a restore.",
+        "surviving region's after a failover, Tokyo's after a restore; Osaka's for the failback's "
+        "replay, with `AUDIT_ARCHIVE_REGION`.",
     )
     audit_archive_endpoint_url: str | None = Field(
         default=None, pattern=r"^https?://[^\s/]+(:\d+)?/?$", description="Local only."
@@ -1483,6 +1506,20 @@ class RecoverySettings(_Base):
         if self.database_iam_auth:
             _iam_database(self.database_url, "DATABASE_URL")
         return self
+
+    # The failback's replay (#276): Tokyo's job reads Osaka's archive, which alone holds what Osaka
+    # wrote between the hold and the fence until the back-fill (regional-failback.md step 6).
+    audit_archive_region: ArchiveRegion | None = Field(
+        default=None,
+        description="The S3 Region of `AUDIT_ARCHIVE_BUCKET` when it isn't this one "
+        "(`AWS_REGION`), which stays the database's. Empty, as the CronJob is rendered: this "
+        "Region's archive.",
+    )
+
+    @field_validator("audit_archive_region", mode="before")
+    @classmethod
+    def _empty_region_is_this_one(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
 
 EXIT_BAD_SETTINGS = 2

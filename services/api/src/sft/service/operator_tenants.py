@@ -1,4 +1,5 @@
-"""Tenant provisioning by a platform operator (FR-34): create, list, get and suspend.
+"""Tenant provisioning by a platform operator (FR-34): create, list, get and suspend, and the
+read of a tenant's recovery contact for an admin recovery (#274).
 
 Every call is audited as a platform event, and a call that acts on a tenant in that tenant's audit
 log too (authn and authz 8.2), with actor type `operator`, the operator session's ID and the
@@ -19,7 +20,8 @@ stands, with its record in the tenant's log, and the error is logged:
   tenant, so an operator always sends one.
 
 Reads go through the tenant directory (`sft.data.tenants`), in platform scope: the tenant rows
-only, never a tenant's users, transfers, files or audit log.
+only, never a tenant's users, transfers, files or audit log. The recovery contact is left out of
+them; `getTenantRecoveryContact` reads it in the tenant's own scope, recorded in both logs.
 
 Each function checks the operator against the permission registry first (`authorize`, authn and
 authz 6.1), as the member operations do. The operator app resolves only operator tokens, so the
@@ -219,6 +221,33 @@ async def get_tenant(
             details=operator.details(),
         )
     return tenant
+
+
+async def get_recovery_contact(
+    database: Database, operator: Operator, tenant_id: UUID, origin: Origin
+) -> tenants.RecoveryContact:
+    """`getTenantRecoveryContact` (#274): the second contact `recoverTenantAdmin` is confirmed
+    through (authn and authz 2.5); `404` for a tenant that doesn't exist.
+
+    Read in the tenant's scope, with `tenant.recovery_contact_read` in its audit log in the same
+    transaction, so its admins see every read; then the platform event. The contact is returned
+    only once both are written: a failed platform write is a `503`, and a retry reads again.
+    """
+    authorize(operator.caller, "getTenantRecoveryContact", now=datetime.now(UTC))
+    async with database.transaction(Scope.tenant(tenant_id)) as session:
+        contact = await tenants.recovery_contact(session, tenant_id)
+        if contact is None:
+            raise NotFound()
+        await audit.record(
+            session,
+            action="tenant.recovery_contact_read",
+            actor=operator.actor,
+            target=Target(TARGET, tenant_id),
+            origin=origin,
+            details=operator.details(),
+        )
+    await platform_event(database, operator, "tenant.recovery_contact_read", origin, tenant_id)
+    return contact
 
 
 async def list_tenants(

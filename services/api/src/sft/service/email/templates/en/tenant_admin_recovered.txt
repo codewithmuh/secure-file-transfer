@@ -1,0 +1,27 @@
+{% extends "en/_layout.txt" %}
+{% block subject %}An admin's sign-in to {{ tenant_name }} was recovered{% endblock %}
+{% block body %}
+At the request of {{ tenant_name }}, a Secure File Transfer operator
+recovered the sign-in of the admin {{ admin_email }} on {{ recovered_at }}.
+The request was confirmed through the recovery contact {{ tenant_name }}
+gave when its account was set up.
+{% if temporary_until %}
+
+They have a temporary sign-in with a password, which works until
+{{ temporary_until }}, even if {{ tenant_name }} requires single sign-on.
+Ask them to name a fallback admin while they are signed in.
+{% else %}
+
+Their sessions were ended and their old sign-in removed. They will get a
+new invitation to choose a password and a second factor.
+{% endif %}
+
+Every admin of {{ tenant_name }} gets this email. If nobody at
+{{ tenant_name }} asked for it, treat it as an attempt to take over the
+account: check the audit log, and tell the Secure File Transfer operators
+at once, through the contact details you were given when the account was
+set up.
+
+Open the audit log:
+{{ audit_log_url }}
+{% endblock %}

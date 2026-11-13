@@ -1,11 +1,14 @@
+import json
+
 import pytest
-from sqlalchemy import text
+from botocore.exceptions import ClientError, EndpointConnectionError
+from sqlalchemy import URL, make_url, text
 from sqlalchemy.exc import DBAPIError
 
 from pg import ScratchDatabase
 from sft.core import settings as settings_module
 from sft.data import bootstrap as bootstrap_module
-from sft.data.bootstrap import bootstrap, bootstrap_sql
+from sft.data.bootstrap import MasterSecretError, bootstrap, bootstrap_sql, with_master_password
 from sft.data.database import sync_engine
 from sft.data.roles import LOGIN_ROLES, LOOKUP, MIGRATE, OWNER
 
@@ -129,3 +132,112 @@ def test_main_exits_2_without_a_choice_of_authentication(monkeypatch: pytest.Mon
     monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", "postgresql://postgres@127.0.0.1:1/sft")
     monkeypatch.delenv("BOOTSTRAP_IAM_AUTH", raising=False)
     assert bootstrap_module.main() == 2
+
+
+# ---- the master password from Secrets Manager (#278) ----
+
+MASTER_SECRET = "secretsmanager:sft/dev/db/master"  # noqa: S105 - a secret's ID, not a secret
+SECRET_ID = MASTER_SECRET.removeprefix("secretsmanager:")
+VALUE = "test-only"  # what a wrong secret holds: never in a message or a log
+
+
+class FakeSecrets:
+    """Secrets Manager's one call, answering `secret` (or raising `error`) and keeping each ID."""
+
+    def __init__(self, secret: object = None, error: Exception | None = None) -> None:
+        self.secret, self.error = secret, error
+        self.read: list[str] = []
+
+    def get_secret_value(self, *, SecretId: str) -> dict[str, object]:  # noqa: N803
+        self.read.append(SecretId)
+        if self.error is not None:
+            raise self.error
+        return {
+            "SecretString": self.secret if isinstance(self.secret, str) else json.dumps(self.secret)
+        }
+
+
+def without_password(db: ScratchDatabase) -> tuple[str, str, str]:
+    """The test server's URL with no password, its user, and the password it needs."""
+    url = make_url(db.admin_url())
+    assert url.username is not None
+    assert url.password is not None
+    bare = URL.create(url.drivername, url.username, None, url.host, url.port, url.database)
+    return (
+        bare.render_as_string(hide_password=False),
+        url.username,
+        str(url.password),
+    )
+
+
+@pytest.mark.usefixtures("quiet_logging")
+def test_in_aws_the_job_reads_the_master_password_from_its_secret(
+    empty_db: ScratchDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    url, user, password = without_password(empty_db)
+    monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", url)
+    monkeypatch.setenv("BOOTSTRAP_IAM_AUTH", "false")
+    monkeypatch.setenv("BOOTSTRAP_MASTER_SECRET", MASTER_SECRET)
+    monkeypatch.setenv("AWS_REGION", "ap-northeast-3")
+    secrets = FakeSecrets({"username": user, "password": password})
+    regions: list[str] = []
+
+    def client(region: str) -> FakeSecrets:
+        regions.append(region)
+        return secrets
+
+    assert bootstrap_module.main(secrets_client=client) == 0
+    assert (secrets.read, regions) == ([SECRET_ID], ["ap-northeast-3"])
+    assert empty_db.sql("SELECT count(*) FROM pg_roles WHERE rolname = :r", r=OWNER) == [(1,)]
+
+
+@pytest.mark.usefixtures("quiet_logging")
+def test_with_a_secret_the_url_carries_no_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BOOTSTRAP_IAM_AUTH", "true")
+    monkeypatch.setenv("BOOTSTRAP_MASTER_SECRET", MASTER_SECRET)
+    for url in (
+        "postgresql://sft_master:x@db.example.test/sft",
+        "postgresql://db.example.test/sft",
+    ):
+        monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", url)
+        assert bootstrap_module.main(secrets_client=lambda region: FakeSecrets()) == 2
+    monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", "postgresql://sft_master@db.example.test/sft")
+    monkeypatch.setenv("BOOTSTRAP_MASTER_SECRET", "sft/dev/db/master")  # not a reference
+    assert bootstrap_module.main(secrets_client=lambda region: FakeSecrets()) == 2
+
+
+@pytest.mark.parametrize(
+    ("secrets", "reason"),
+    [
+        (
+            FakeSecrets(
+                error=ClientError(
+                    {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "GetSecretValue"
+                )
+            ),
+            r"refused the read \(AccessDeniedException\)",
+        ),
+        (FakeSecrets(error=EndpointConnectionError(endpoint_url="x")), "can't be reached"),
+        (FakeSecrets(f"{VALUE}-not-json"), "isn't a JSON object"),
+        (FakeSecrets({"username": "sft_master"}), "needs a username and a password"),
+        (FakeSecrets({"username": "someone", "password": VALUE}), "isn't BOOTSTRAP"),
+    ],
+)
+def test_a_secret_that_cant_be_used_names_no_value(secrets: FakeSecrets, reason: str) -> None:
+    with pytest.raises(MasterSecretError, match=reason) as refused:
+        with_master_password("postgresql://sft_master@db.example.test/sft", SECRET_ID, secrets)
+    assert VALUE not in str(refused.value)
+
+
+@pytest.mark.usefixtures("quiet_logging")
+def test_main_exits_1_on_a_secret_it_cant_use_and_logs_its_id_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", "postgresql://sft_master@127.0.0.1:1/sft")
+    monkeypatch.setenv("BOOTSTRAP_IAM_AUTH", "true")
+    monkeypatch.setenv("BOOTSTRAP_MASTER_SECRET", MASTER_SECRET)
+    wrong_user = FakeSecrets({"username": "someone", "password": VALUE})
+    assert bootstrap_module.main(secrets_client=lambda region: wrong_user) == 1
+    [record] = [r for r in caplog.records if r.name == "sft.data.bootstrap"]
+    assert record.secret_id == SECRET_ID  # type: ignore[attr-defined]
+    assert VALUE not in caplog.text

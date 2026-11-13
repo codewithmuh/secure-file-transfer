@@ -366,6 +366,24 @@ def operator_router() -> APIRouter:
         tenant = await operator_tenants.get_tenant(database, operator, tenant_id, origin)
         return Tenant.of(tenant)
 
+    @router.get(
+        "/operator/tenants/{tenant_id}/recovery-contact",
+        operation_id="getTenantRecoveryContact",
+        responses=problem_responses(401, 404, 429, 503),
+    )
+    async def get_tenant_recovery_contact(
+        tenant_id: UUID,
+        response: Response,
+        database: DatabaseDep,
+        operator: OperatorDep,
+        origin: OriginDep,
+    ) -> schemas.TenantRecoveryContact:
+        contact = await operator_tenants.get_recovery_contact(database, operator, tenant_id, origin)
+        response.headers["Cache-Control"] = "no-store"  # a person's contact details
+        return schemas.TenantRecoveryContact(
+            tenant_id=contact.tenant_id, recovery_contact=contact.recovery_contact
+        )
+
     @router.post(
         "/operator/tenants/{tenant_id}/admin-recovery",
         operation_id="recoverTenantAdmin",

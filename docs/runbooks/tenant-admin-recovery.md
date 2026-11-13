@@ -24,9 +24,17 @@ Not for a member: their admin resets them. Not for an admin who still has a coll
 The request arrives by email or phone. Never act on that channel alone: it may be an attacker who controls the admin's
 mailbox.
 
-1. Find the tenant's recovery contact: the second contact besides the first admin, given at `createTenant` and kept
-   in `tenants.recovery_contact`. No operator operation returns it yet, so use the onboarding record kept with the
-   tenant's agreement, which holds the same value.
+1. Read the tenant's recovery contact, the second contact besides the first admin given at `createTenant`, with a
+   fresh operator token (#274):
+
+   ```
+   GET /v1/operator/tenants/{tenant_id}/recovery-contact
+   ```
+
+   The read is recorded as `tenant.recovery_contact_read` in the tenant's audit log, where its admins see it, and in
+   the platform log, so read it only for a request you are acting on. `503`: the platform record wasn't written and
+   nothing was returned; retry. `recovery_contact: null` means a tenant made before contacts were recorded: use the
+   onboarding record kept with the tenant's agreement instead.
 2. Call or write to that contact, from our own records, never from a number or address in the request. Confirm that
    the tenant asks for the recovery, and which admin it is for.
 3. Write down how you confirmed it, in one or two sentences: who you reached, how, and when. That text becomes
@@ -60,14 +68,17 @@ Idempotency-Key: <a new key for this recovery>
   kind; the platform log has `tenant.admin_recovered`.
 - The notification worker sent the invitation (`email.sent`, `member_invitation`). If it didn't within a few minutes,
   see [dead-letter-queue.md](dead-letter-queue.md).
-- Tell the tenant's other admins, if any, yourself: the service doesn't email them yet (#239's follow-up).
+- Every active admin of the tenant, the recovered one included, was emailed `tenant_admin_recovered` (#273): in the
+  tenant's log, `email.sent` events on the recovery with that type, one per admin. If not within a few minutes, see
+  [dead-letter-queue.md](dead-letter-queue.md).
 
 ## 4. After 72 hours (temporary sign-in only)
 
 Nothing to do. Sign-in refuses the temporary identity from its `expires_at`, and the daily `cleanup` job deletes it
-and records `user.temporary_sign_in_ended`. Until the notification worker deletes pool users as well (#239's
-follow-up), the admin's Cognito user stays in the pool with nothing in our database that maps to it; it can't sign in
-to the service. Delete it by hand with the operator's AWS credentials if the tenant asks.
+and records `user.temporary_sign_in_ended`. Its message then has the notification worker delete the admin's Cognito
+user in the active pool (#273), unless a newer reset has made the admin a new one since. A user left in the other pool
+after a failover maps to nothing in our database and can't sign in to the service; delete it by hand with the
+operator's AWS credentials if the tenant asks.
 
 ## Escalate
 

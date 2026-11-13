@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import Final
 from uuid import UUID
 
-from sft.core.errors import Conflict, Forbidden, NotFound
+from sft.core.errors import Forbidden, NotFound
 from sft.data import audit, recipients, transfers
 from sft.data.access import NotFoundError
 from sft.data.audit import Origin, Target
@@ -40,6 +40,7 @@ from sft.service.transfers import (
     require_visible,
     sees_tenant,
     tenant_scope,
+    terminal_conflict,
 )
 
 RECIPIENT: Final = "recipient"
@@ -88,11 +89,10 @@ async def unlock_recipient(
         except NotFoundError:
             raise NotFound from None
         # 404, then 403, then 409 (authn and authz 6.4).
+        # Only the terminal states refuse: unlocking a recipient of any other transfer is allowed.
         state = effective_state(TransferState(transfer.state), transfer.expires_at, now)
-        if state is TransferState.REVOKED:
-            raise Conflict("transfer_revoked", current_state=state.value)
-        if state is TransferState.EXPIRED:
-            raise Conflict("transfer_expired", current_state=state.value)
+        if (ended := terminal_conflict(state)) is not None:
+            raise ended
         if locked_at is not None and caller.user_id is not None:
             await recipients.unlock(session, recipient_id, by=caller.user_id)
             await audit.record(

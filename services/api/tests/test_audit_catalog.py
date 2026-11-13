@@ -477,6 +477,10 @@ SSO_AND_BREAK_GLASS_ACTIONS = {
     "user.sign_in_reset": ("users", "user_identities", "admin_recoveries"),
     "tenant.admin_recovered": (),
     "user.temporary_sign_in_ended": ("user_identities", "admin_recoveries"),
+    # #273: the notification worker's link for an SSO tenant's invited member (revision 0042).
+    # #274: an operator's read of a tenant's recovery contact, in its log and the platform's.
+    "user.invitation_link_issued": ("users",),
+    "tenant.recovery_contact_read": (),
 }
 
 

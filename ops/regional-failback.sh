@@ -117,10 +117,16 @@ values_back() {
 }
 
 generation_and_outbox() {
-  # Tokyo's archive gets the failover's generation only with the back-fill (runbook step 10), so the generation step
-  # keeps the cursor's, which a switchover needs no more than; the re-import finds every record Tokyo's archive holds
-  # present (nothing was lost). Then the outbox since the hold, for what sat in Osaka's queues.
-  recovery_job "$TOKYO" "generation,partitions,replay" "$HELD_AT" "$HELD_AT"
+  # Tokyo's archive gets the failover's generation only with the back-fill (runbook step 10), so the generation step,
+  # on Tokyo's own archive, keeps the cursor's, which a switchover needs no more than. The replay reads Osaka's archive
+  # (#276): it alone holds the records Osaka wrote between the hold and the fence, and every one since the fence went
+  # to both. Each must be in the database (the switchover lost nothing): its report's missing is 0. Then the outbox
+  # since the hold, for what sat in Osaka's queues.
+  recovery_job "$TOKYO" "generation" "" "$HELD_AT"
+  recovery_job "$TOKYO" "partitions,replay" "$HELD_AT" "" "$OSAKA"
+  manual "The replay's report reads archive_region $OSAKA and missing 0: every record since the hold is present but" \
+    "the grant intents (download.grant_intent:ignored), which are never in the database. A missing record fails the" \
+    "drill: the switchover lost it, and the job re-imported it. Write records, present and missing in the drill log."
   recovery_job "$TOKYO" "outbox" "$HELD_AT"
   run "$OPS_ROOT/failover-values.sh" release-tokyo --env "$ENV_NAME" --write
   manual "Commit and push 'ops: start $ENV_NAME Tokyo's workers after the failback'."
@@ -162,7 +168,7 @@ step 300 "Hold Osaka's workers" hold_osaka
 step 300 "Switch the database over to Tokyo (no data loss)" switchover
 step 600 "Fence Osaka, take Tokyo out of pilot light with its workers held" values_back
 drill_marker start "$TOKYO"
-step 600 "New archive generation, the outbox since the hold, then Tokyo's workers" generation_and_outbox
+step 600 "Archive generation, the replay of Osaka's archive, the outbox since the hold, then Tokyo's workers" generation_and_outbox
 step 300 "Switch DNS back to Tokyo" dns_back
 step 600 "Osaka back to its pilot light" osaka_pilot_light
 step 300 "Verify with the synthetic probe and an original sign-in" verify

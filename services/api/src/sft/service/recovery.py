@@ -3,8 +3,9 @@ data model 2.5, 4.2, 6; docs/operations/disaster-recovery.md 4).
 
 `python -m sft.workers.recovery` runs it once, as `sft_recovery` in recovery scope, from the
 always-suspended `recovery` CronJob, rendered by hand with its steps and times
-(`RECOVERY_STEPS`, `RECOVERY_SINCE`, `RECOVERY_REWIND_TO`). It reads this region's audit archive
-and calls `sft.service.recovery_replay` for each step it is given, always in this order:
+(`RECOVERY_STEPS`, `RECOVERY_SINCE`, `RECOVERY_REWIND_TO`). It reads one region's audit archive,
+this region's unless `AUDIT_ARCHIVE_REGION` names the other (below), and calls
+`sft.service.recovery_replay` for each step it is given, always in this order:
 
 1. **`generation`.** The highest generation in the archive is the largest `g<n>/` prefix the
    archive job wrote (0 if none); the cursor's generation becomes one more, rewound to the oldest
@@ -24,8 +25,17 @@ the partitions step needs the oldest: a failover's hour, or a restore's few hour
 hundreds of thousands of records. An object that isn't a record fails the run, since skipping it
 could skip a revocation; the error names its key, which holds IDs and dates only.
 
-What it logs is counts, the generation and the newest record's time (the drill's RPO evidence),
-never a record's content.
+**The failback's proof** (#276). Between the failback's hold and its fence, Osaka's API writes
+security-critical records to Osaka's archive alone, and the archive job is held, so Tokyo's archive
+gets them only with the back-fill. The failback runs `partitions,replay` in Tokyo against Osaka's
+archive (`AUDIT_ARCHIVE_REGION=ap-northeast-3`), so the replay reads every record since the hold.
+The switchover lost nothing, so each must be `present`: the report's `missing` counts the records
+whose event the database didn't have, and anything but 0 fails the drill. The `generation` step
+runs on its own against Tokyo's archive, which the cursor writes, so it keeps the failover's
+generation (docs/runbooks/regional-failback.md step 6).
+
+What it logs is counts, the generation, the newest record's time (the drill's RPO evidence) and
+the archive's region, never a record's content.
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ from sft.service.recovery_replay import Outcome, Record, day_prefixes, parse_rec
 log = logging.getLogger(__name__)
 
 _GENERATION: Final = re.compile(r"^g([1-9][0-9]{0,8})/$")
+_MISSING: Final = (Outcome.REIMPORTED, Outcome.REAPPLIED, Outcome.NOT_REAPPLIED)
 
 
 class Step(StrEnum):
@@ -158,6 +169,19 @@ class RecoveryReport:
     reapplied: list[tuple[str, str | None, str | None]] = field(default_factory=list)
     """(action, tenant, target) of each change made again: IDs, for the drill log."""
     republished: int | None = None
+    outcomes: Counter[Outcome] = field(default_factory=Counter)
+    """The replay's records by outcome, whatever their action."""
+    archive_region: str | None = None
+    """The region whose archive was read (set by the entry point)."""
+
+    @property
+    def missing(self) -> int | None:
+        """The replayed records whose event the database didn't have: re-imported, re-applied
+        or left out on purpose. None without a replay. The failback's replay must find 0 (module
+        docstring); a grant intent is never in the database and doesn't count."""
+        if Step.REPLAY not in self.steps:
+            return None
+        return sum(self.outcomes[o] for o in _MISSING)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -172,6 +196,9 @@ class RecoveryReport:
             "replayed": dict(self.replayed),
             "reapplied": [list(item) for item in self.reapplied],
             "republished": self.republished,
+            "present": self.outcomes[Outcome.PRESENT] if Step.REPLAY in self.steps else None,
+            "missing": self.missing,
+            "archive_region": self.archive_region,
         }
 
 
@@ -225,6 +252,7 @@ async def run_recovery(
             replayed = await recovery_replay.replay(database, records, since=since)
             for (action, outcome), count in replayed.counts.items():
                 report.replayed[f"{action}:{Outcome(outcome).value}"] += count
+                report.outcomes[Outcome(outcome)] += count
             report.reapplied = [
                 (action, None if tenant is None else str(tenant), None if t is None else str(t))
                 for action, tenant, t in replayed.reapplied

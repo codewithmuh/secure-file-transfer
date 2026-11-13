@@ -48,6 +48,7 @@ from sft.service.transfers import (
     audit_details,
     effective_state,
     require_reach,
+    state_conflict,
     tenant_scope,
     transfer_view,
 )
@@ -74,15 +75,9 @@ def _out_of_range(detail: str) -> Unprocessable:
 
 def _check_state(transfer: Transfer, now: datetime) -> None:
     state = effective_state(TransferState(transfer.state), transfer.expires_at, now)
-    if state is TransferState.REVOKED:
-        raise Conflict("transfer_revoked", current_state=state.value)
-    if state is TransferState.EXPIRED:
-        raise Conflict("transfer_expired", current_state=state.value)
     if state not in EXTENDABLE:
-        raise Conflict(
-            "invalid_state",
-            "Only a transfer that was submitted and hasn't ended can be extended.",
-            current_state=state.value,
+        raise state_conflict(
+            state, "Only a transfer that was submitted and hasn't ended can be extended."
         )
 
 

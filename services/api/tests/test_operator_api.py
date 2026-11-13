@@ -311,6 +311,77 @@ def test_an_unknown_tenant_is_a_404(tenant_id: str, client: TestClient, token: s
         assert (response.status_code, response.json()["code"]) == (404, "not_found")
 
 
+# ---- getTenantRecoveryContact (#274) ----
+
+
+def test_an_operator_reads_the_recovery_contact_recorded_in_both_logs(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    tenant_id = UUID(create(client, token)["tenant"]["id"])
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tenant_id": str(tenant_id), "recovery_contact": "+81-3-0000-0000"}
+    assert response.headers["Cache-Control"] == "no-store"
+    # In the tenant's log, where its admins see it, and as a platform event; never the contact.
+    events = migrated_db.sql(
+        "SELECT tenant_id, actor_type, details->>'operator_name', details::text FROM audit_events "
+        "WHERE action = 'tenant.recovery_contact_read' AND target_id = :id "
+        "ORDER BY tenant_id NULLS LAST",
+        id=tenant_id,
+    )
+    assert [row[:3] for row in events] == [
+        (tenant_id, "operator", OPERATOR_NAME),
+        (None, "operator", OPERATOR_NAME),
+    ]
+    assert all("0000-0000" not in row[3] for row in events)
+
+
+def test_a_tenant_made_before_contacts_were_recorded_has_none(
+    client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    tenant_id = create(client, token)["tenant"]["id"]
+    migrated_db.sql("UPDATE tenants SET recovery_contact = NULL WHERE id = :id", id=UUID(tenant_id))
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert (response.status_code, response.json()["recovery_contact"]) == (200, None)
+
+
+@pytest.mark.parametrize("tenant_id", ["0190f0f0-0000-7000-8000-000000000000", "not-a-uuid"])
+def test_an_unknown_tenants_recovery_contact_is_a_404(
+    tenant_id: str, client: TestClient, token: str, migrated_db: ScratchDatabase
+) -> None:
+    reads = "SELECT count(*) FROM audit_events WHERE action = 'tenant.recovery_contact_read'"
+    before = migrated_db.sql(reads)
+    response = client.get(
+        f"/v1/operator/tenants/{tenant_id}/recovery-contact", headers=bearer(token)
+    )
+    assert (response.status_code, response.json()["code"]) == (404, "not_found")
+    assert migrated_db.sql(reads) == before
+
+
+def test_the_contact_is_not_returned_until_the_platform_record_is_written(
+    client: TestClient, token: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant_id = create(client, token)["tenant"]["id"]
+    original = audit.record
+
+    async def platform_down(session: Any, **kwargs: Any) -> Any:
+        if scope_of(session).kind is ScopeKind.PLATFORM:
+            raise OperationalError("INSERT", {}, Exception("connection lost"))
+        return await original(session, **kwargs)
+
+    monkeypatch.setattr(operator_tenants.audit, "record", platform_down)
+    url = f"/v1/operator/tenants/{tenant_id}/recovery-contact"
+    response = client.get(url, headers=bearer(token))
+    assert (response.status_code, response.json()["code"]) == (503, "service_unavailable")
+    assert "0000-0000" not in response.text
+    monkeypatch.setattr(operator_tenants.audit, "record", original)
+    assert client.get(url, headers=bearer(token)).status_code == 200
+
+
 # ---- suspendTenant ----
 
 
@@ -540,6 +611,8 @@ def test_the_matrix_covers_every_operation_the_operator_app_serves() -> None:
         "recordBreakGlassGrant",
         # #239: tests/test_admin_recovery.py runs it end to end.
         "recoverTenantAdmin",
+        # #274: run above.
+        "getTenantRecoveryContact",
     }
 
 

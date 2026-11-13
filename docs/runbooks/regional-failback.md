@@ -25,7 +25,7 @@ ops/regional-failback.sh --env prod --profile sft-prod-admin --account-id <prod 
 | 3 | Hold Osaka's workers | 5 min |
 | 4 | Switch the database over to Tokyo | 5 min |
 | 5 | Fence Osaka; take Tokyo out of pilot light with its workers held | 10 min |
-| 6 | New archive generation, the outbox since the hold, Tokyo's workers | 10 min |
+| 6 | Archive generation, the replay of Osaka's archive, the outbox since the hold, Tokyo's workers | 10 min |
 | 7 | DNS back to Tokyo | 5 min |
 | 8 | Osaka back to its pilot light | 10 min |
 | 9 | Verify | 5 min |
@@ -119,17 +119,29 @@ security-critical records go to both archives again. From its next run, Tokyo's 
 every range Osaka's job wrote alone to both regions, as the same objects, with the window's security-critical records
 ([audit-archive-single-region.md](audit-archive-single-region.md), #257). Step 10 proves it.
 
-## 6. New generation, the outbox, Tokyo's workers (10 min)
+## 6. Archive generation, the replay of Osaka's archive, the outbox, Tokyo's workers (10 min)
 
-The recovery job in Tokyo (`python -m sft.workers.recovery`, which reads Tokyo's archive), with
-`RECOVERY_STEPS=generation,partitions,replay` and both times at step 3's hold. Tokyo's archive doesn't hold the
-failover's generation yet: what Osaka's alone holds reaches it with the back-fill once the archive job resumes (step
-10). So the generation step finds the cursor already past Tokyo's highest and keeps it, which is right after a
-switchover, since no transaction ID is reused; the report shows `generation` one above `highest_in_archive`. The replay
-reads what Tokyo's API wrote since step 5 and should find every record present; a re-applied record here means the
-switchover lost something, which fails the drill. The records Osaka wrote alone between the hold and the fence aren't
-read here: the switchover kept them in the database, and step 10 checks their archive copies. Then
-`RECOVERY_STEPS=outbox` from the hold, for the messages that sat in Osaka's queues, and release Tokyo's workers:
+The recovery job in Tokyo (`python -m sft.workers.recovery`), three times, each time from step 3's hold:
+
+1. **`RECOVERY_STEPS=generation`, on Tokyo's archive** (`RECOVERY_REWIND_TO` at the hold). Tokyo's archive doesn't
+   hold the failover's generation yet: what Osaka's alone holds reaches it with the back-fill once the archive job
+   resumes (step 10). So the generation step finds the cursor already past Tokyo's highest and keeps it, which is
+   right after a switchover, since no transaction ID is reused; the report shows `generation` one above
+   `highest_in_archive`. Run against Osaka's archive, it would start a generation nothing needs.
+2. **`RECOVERY_STEPS=partitions,replay`, on Osaka's archive** (`RECOVERY_SINCE` at the hold; the Job's
+   `AUDIT_ARCHIVE_BUCKET` is Osaka's archive and `AUDIT_ARCHIVE_REGION=ap-northeast-3`, while the database stays
+   Tokyo's, #276). The recovery role lists and reads the archive in both Regions (modules/eks-cluster), and the pod
+   reaches Osaka's S3 through the cross-Region endpoint, as the API's archive writes do (ADR-0021). Between the hold
+   and the fence, Osaka's API wrote its security-critical records to Osaka's archive alone, and its archive job was
+   held, so only Osaka's archive holds them until the back-fill; since the fence, Tokyo's API writes both. So the
+   replay reads every record of the window. The switchover lost nothing, so the report must show `archive_region`
+   `ap-northeast-3` and `missing` 0: `present` is every record since the hold but the grant intents
+   (`download.grant_intent:ignored`), which are never in the database (data model 2.3). A missing record fails the
+   drill: the switchover lost it, and the job re-imported it (and re-applied its change, if it takes access away).
+   Write `records`, `present` and `missing` in the drill log.
+3. **`RECOVERY_STEPS=outbox`**, for the messages that sat in Osaka's queues.
+
+Then release Tokyo's workers:
 
 ```bash
 ops/failover-values.sh release-tokyo --env prod --write
@@ -172,7 +184,7 @@ diff osaka.txt tokyo.txt
 The diff must be empty: no gap, no duplicate. For two keys, `aws s3api head-object --checksum-mode ENABLED` in each
 region gives the same `ChecksumSHA256`. Then list `security-critical/v1/<the synthetic tenant>/<the failover's days>/`
 in both: Tokyo holds every record Osaka does but the `download.grant_intent` ones (never in the database, data model
-2.3). Record the counts in the drill log. A missing object fails the drill; so does one written twice under different
-keys.
+2.3, and not copied, by decision: data model 2.5, #284). Record the counts in the drill log. A missing object fails
+the drill; so does one written twice under different keys.
 
 [AUTH]: ../security/authn-authz.md

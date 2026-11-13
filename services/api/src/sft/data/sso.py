@@ -1,7 +1,8 @@
 """Data access for tenant single sign-on (#231; FR-26; data model 2.1; authn and authz 2.4, 2.5).
 
 - **The tenant's connection** (`idp_connections`, a tenant's row): at most one per tenant. The
-  operator API writes it (`put_connection`); the API reads it, in the tenant's scope.
+  operator API writes it (`put_connection`); the API reads it, in the tenant's scope, and the
+  notification worker whether it is active (`active_connection_id`, #273).
 - **Domains** (`sso_domains`): a tenant claims an email domain with a token it publishes in a DNS
   TXT record, then proves it. A proven domain is the tenant's alone (a unique index), routes
   "Continue with SSO" once an operator links it to the connection, and is a trusted recipient domain
@@ -65,6 +66,21 @@ async def get_connection(session: AsyncSession) -> IdpConnection | None:
         )
     )
     return connection
+
+
+async def active_connection_id(session: AsyncSession) -> UUID | None:
+    """The scope's tenant's SSO connection, if it is active: its ID. The notification worker's
+    test for an SSO invitation (#273): it reads only the ID, tenant and status of the tenant's
+    own row (revision 0042), never its issuer."""
+    require_scope(session, *_TENANT)
+    found: UUID | None = await session.scalar(
+        select(IdpConnection.id).where(
+            IdpConnection.tenant_id.is_not(None),
+            IdpConnection.status == "active",
+            in_scope(IdpConnection, session),
+        )
+    )
+    return found
 
 
 async def put_connection(

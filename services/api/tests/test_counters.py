@@ -3,6 +3,7 @@
 import asyncio
 import random
 from collections.abc import AsyncIterator
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from opentelemetry.sdk.trace import ReadableSpan
@@ -16,6 +17,7 @@ from sft.data.counters import (
     BREAKER_ERRORS,
     BREAKER_SECONDS,
     CALL_TIMEOUT_SECONDS,
+    CONNECT_TIMEOUT_SECONDS,
     CounterMetrics,
     CounterStore,
     CounterStoreUnavailableError,
@@ -294,14 +296,16 @@ def errors(metrics: CounterMetrics) -> float:
     return metrics.errors._value.get()  # type: ignore[attr-defined, no-any-return]
 
 
-async def test_a_call_gives_up_after_50_ms(silent_server: int) -> None:
+async def test_a_server_that_never_answers_costs_a_call_its_connect_budget(
+    silent_server: int,
+) -> None:
     metrics = CounterMetrics.create(CollectorRegistry())
     store = CounterStore.connect(f"redis://u:p@127.0.0.1:{silent_server}/0", metrics)
     loop = asyncio.get_running_loop()
     start = loop.time()
     with pytest.raises(CounterStoreUnavailableError):
         await rate(store, T0)
-    assert loop.time() - start < 0.5
+    assert loop.time() - start < CONNECT_TIMEOUT_SECONDS + 0.25
     assert errors(metrics) == 1
     await store.close()
 
@@ -315,16 +319,17 @@ async def test_the_store_rests_after_repeated_failures(valkey_url: str) -> None:
         with pytest.raises(CounterStoreUnavailableError):
             await rate(store, T0)
     assert metrics.fallback_active._value.get() == 1  # type: ignore[attr-defined]
-    # Resting: no call is made, so nothing waits for a timeout.
+    # Resting: no call is made, so nothing waits for a timeout. A call starts by opening its
+    # connection (#282), which is where this one, to a port nothing listens on, fails.
     calls = 0
-    real = store._rate
+    real = store._open_connection
 
-    async def counting(**kwargs: object) -> object:
+    async def counting() -> None:
         nonlocal calls
         calls += 1
-        return await real(**kwargs)  # type: ignore[arg-type]
+        await real()
 
-    store._rate = counting  # type: ignore[assignment]
+    store._open_connection = counting  # type: ignore[method-assign]
     with pytest.raises(CounterStoreUnavailableError, match="resting"):
         await rate(store, T0)
     assert calls == 0
@@ -562,3 +567,156 @@ async def test_a_load_that_runs_out_of_time_is_a_failure_and_the_breaker_still_c
     assert (await rate(counter_store, T0)).allowed
     assert counter_store._failures == 0
     assert counter_store._metrics.fallback_active._value.get() == 0  # type: ignore[attr-defined]
+
+
+# ---- a slow but healthy Valkey (#282) ----
+
+
+class SlowLink:
+    """A TCP proxy to the test Valkey that adds `delay` each way, as a slow host's network does,
+    and can hold the next answer back past a call's budget."""
+
+    def __init__(self, upstream: tuple[str, int], delay: float) -> None:
+        self.upstream = upstream
+        self.delay = delay
+        self.connections = 0
+        self._held = 0.0
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._writers: list[asyncio.StreamWriter] = []
+        self._server: asyncio.Server | None = None
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        return int(self._server.sockets[0].getsockname()[1])
+
+    def hold_next_answer(self, seconds: float) -> None:
+        self._held = seconds
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        for writer in self._writers:
+            writer.close()
+
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.connections += 1
+        up_reader, up_writer = await asyncio.open_connection(*self.upstream)
+        self._writers += [writer, up_writer]
+        for task in (
+            asyncio.create_task(self._pipe(reader, up_writer, answers=False)),
+            asyncio.create_task(self._pipe(up_reader, writer, answers=True)),
+        ):
+            self._tasks.add(task)
+
+    async def _pipe(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, answers: bool
+    ) -> None:
+        """Forward each chunk `delay` after it arrived, in order; end at the end of input."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue()
+
+        async def forward() -> None:
+            try:
+                while data := (item := await queue.get())[1]:
+                    await asyncio.sleep(max(0.0, item[0] - loop.time()))
+                    writer.write(data)
+                    await writer.drain()
+            except OSError:
+                pass  # the other side has gone: the held answer of a call that gave up
+            writer.close()
+
+        sender = asyncio.create_task(forward())
+        self._tasks.add(sender)
+        try:
+            while data := await reader.read(65536):
+                extra = 0.0
+                if answers and self._held:
+                    extra, self._held = self._held, 0.0
+                queue.put_nowait((loop.time() + self.delay + extra, data))
+        except OSError:
+            pass
+        queue.put_nowait((loop.time(), b""))
+
+
+DELAY = 0.025
+"""Each way: a 50 ms round trip, so opening a connection (TCP, then AUTH and CLIENT SETINFO) takes
+100 ms or more."""
+BUDGET = 4 * DELAY
+"""The calls' budget here, for the same proportions as 50 ms on a slower host: one call (one round
+trip) fits with room to spare on a busy machine; a connection and a call (three) don't."""
+
+
+@pytest.fixture
+async def slow_link(valkey_url: str) -> AsyncIterator[tuple[SlowLink, str]]:
+    """The proxy, and a URL for the test Valkey through it."""
+    parts = urlsplit(valkey_url)
+    link = SlowLink((parts.hostname or "127.0.0.1", parts.port or 6379), DELAY)
+    port = await link.start()
+    credentials, at, _ = parts.netloc.rpartition("@")
+    yield link, urlunsplit(parts._replace(netloc=f"{credentials}{at}127.0.0.1:{port}"))
+    await link.close()
+
+
+def slow_store(url: str, metrics: CounterMetrics) -> CounterStore:
+    store = CounterStore.connect(url, metrics)
+    store._timeout = BUDGET
+    return store
+
+
+async def peek(store: CounterStore) -> Verdict:
+    """A call that changes nothing, so a test can repeat it."""
+    return await store.rate(
+        "rl:T.slow_link:ip:192.0.2.82", now_ms=T0, limit=3, period_ms=3000, cost=1, peek=True
+    )
+
+
+async def test_a_slow_host_recovers_from_a_timed_out_call_without_the_breaker_resting(
+    slow_link: tuple[SlowLink, str],
+) -> None:
+    link, url = slow_link
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = slow_store(url, metrics)
+    loop = asyncio.get_running_loop()
+    try:
+        # The first call opens its connection before its budget starts: the two together take
+        # longer than the budget, and the call succeeds.
+        start = loop.time()
+        assert (await peek(store)).allowed
+        assert loop.time() - start > BUDGET
+        assert link.connections == 1
+        # One answer slower than the budget: the call gives up at its budget, and the client
+        # closes the connection with the answer unread.
+        link.hold_next_answer(3 * BUDGET)
+        start = loop.time()
+        with pytest.raises(CounterStoreUnavailableError, match="TimeoutError"):
+            await peek(store)
+        assert loop.time() - start < 3 * BUDGET
+        # The next call opens a new connection outside its budget, and every call after it uses
+        # that one: a single failure, and no rest (found in M8: every call timed out after one).
+        for _ in range(BREAKER_ERRORS):
+            assert (await peek(store)).allowed
+        assert link.connections == 2
+        assert errors(metrics) == 1
+        assert store._failures == 0
+        assert metrics.fallback_active._value.get() == 0  # type: ignore[attr-defined]
+    finally:
+        await store.close()
+
+
+async def test_concurrent_calls_on_a_slow_host_each_connect_outside_their_budget(
+    slow_link: tuple[SlowLink, str],
+) -> None:
+    link, url = slow_link
+    metrics = CounterMetrics.create(CollectorRegistry())
+    store = slow_store(url, metrics)
+    try:
+        verdicts = await asyncio.gather(*(peek(store) for _ in range(2 * BREAKER_ERRORS)))
+        assert all(v.allowed for v in verdicts)
+        # Each call opened its own connection, and none of them inside its budget.
+        assert link.connections == 2 * BREAKER_ERRORS
+        assert errors(metrics) == 0
+    finally:
+        await store.close()

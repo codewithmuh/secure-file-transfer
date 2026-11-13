@@ -238,9 +238,16 @@ does.
     otherwise), binds a subject that has no identity yet, or is already the invited user's, and refuses one bound to
     someone else (`identity_conflict`); an invitation used or replaced since the start is `invitation_invalid`. The
     binding is `user.identity_bound` (with `invitation: true`) and the activation `user.activated`, in the sign-in's
-    transaction, so a refusal binds nothing. Minting the token and sending `member_invitation_sso` is the
-    notification worker's step for a tenant with an active connection; it is pending (#239's follow-up), and until it
-    lands members of an SSO tenant join by just-in-time binding (2.4).
+    transaction, so a refusal binds nothing.
+  - **The link (#273).** For `member.invited` in a tenant with an active connection the notification worker makes
+    no pool user: it mints the token (256 random bits), stores its SHA-256 and a 7-day expiry on the invited user
+    (`user.invitation_link_issued`, revision 0042) in a transaction that commits before the send, and emails
+    `member_invitation_sso`. The token is only in the email. A redelivery mints a new link, which replaces the
+    first, as a redelivered local invitation sets a new password; a member who joined or left meanwhile gets
+    nothing. It needs no pool, so it works where the worker has none. A tenant whose connection is inactive invites
+    through the pool as before, and a sign-in reset, an operator's temporary sign-in included, always makes a pool
+    user. To tell which, the worker reads its tenant's own `idp_connections` row (`notify_connection`: the ID,
+    tenant and status, never the issuer).
 - **Turning SSO on.** When a tenant's SSO connection becomes active, every existing member gets an invitation link to
   bind their SSO identity. Their local sign-in keeps working until the tenant requires SSO.
 
@@ -258,12 +265,14 @@ pools, so old credentials can't come back with a failover or failback:
 That is the same assurance as the first enrollment (ASVS 5.0 V6.4).
 
 **Operator-assisted recovery** covers a tenant's last admin who has lost their factor, and an SSO tenant whose identity
-provider is down with no fallback admin available. An operator calls `recoverTenantAdmin` (operator API) for
-a named admin of the tenant, only after confirming the request through the second contact recorded when the tenant
-was provisioned, and records how it was confirmed. For a local admin, it is the reset above. For an SSO tenant, it
-gives that admin a temporary local sign-in: the worker creates a Cognito user and identity for them as for a local
-invitation, and deletes both after 72 hours. It is a security-critical record in the tenant's audit log, and every
-admin of the tenant is emailed.
+provider is down with no fallback admin available. An operator calls `recoverTenantAdmin` (operator API) for a named
+admin of the tenant, only after confirming the request through the second contact recorded when the tenant was
+provisioned, and records how it was confirmed. The operator reads that contact with `getTenantRecoveryContact` (#274):
+in the tenant's scope, never through the directory, and only once `tenant.recovery_contact_read` is in the tenant's
+audit log, where its admins see it, and in the platform log (`503` otherwise, with nothing returned). For a local admin,
+it is the reset above. For an SSO tenant, it gives that admin a temporary local sign-in: the worker creates a Cognito
+user and identity for them as for a local invitation, and deletes both after 72 hours. It is a security-critical record
+in the tenant's audit log, and every admin of the tenant is emailed.
 
 **As built (#239).** `recoverTenantAdmin` (`sft.service.admin_recovery`, revision 0037) works in the tenant's scope as
 `sft_operator`, for an active admin only (`409 invalid_state` otherwise):
@@ -282,9 +291,15 @@ admin of the tenant is emailed.
   (`record_identity`), so sign-in refuses it from then on (`identity_expired`). Until then the callback lets that
   identity in even when the tenant requires SSO, as a security-critical `member.signed_in` with
   `temporary_sign_in: true`. The daily `cleanup` job deletes expired identities of ended recoveries and records
-  `user.temporary_sign_in_ended`; a session made before the end lasts at most its own 12 hours. Deleting the pool
-  user at the same time and emailing the tenant's admins need the notification worker, and are pending (#239's
-  follow-up).
+  `user.temporary_sign_in_ended`; a session made before the end lasts at most its own 12 hours. With each, in the
+  same transaction, it writes `member.temporary_sign_in_ended`, and the notification worker deletes the admin's
+  user in its pool (#273) if it is still the one made for the recovery's reset (the pool user's enrolment) and that
+  reset is still the admin's latest; one made since, for a newer reset, is the admin's sign-in now and stays. A pool user left in the other pool after a
+  failover maps to no identity and can't sign in.
+- **Every admin is told (#273).** The recovery's transaction writes `tenant.admin_recovered`, and the worker emails
+  every active admin of the tenant, the recovered one included, `tenant_admin_recovered`: which admin, when, and
+  whether it is a reset or a temporary sign-in and until when. It names no operator and not how the request was
+  confirmed. Each email is recorded on its own, so a redelivery sends only those not sent yet.
 - **A retry** with the same `Idempotency-Key` (8.2) finds the recovery, archives its record if still missing and
   answers `202`, with no second reset.
 
@@ -783,6 +798,7 @@ means the caller is refused (`401` if it has no credential the operation accepts
 | `user.reset_sign_in` | `resetUserSignIn` | — | Tenant, step-up | — | — | — | — | Local members only; acts on both pools (2.5) |
 | `operator.tenant.sso.update` | `configureTenantSso` | — | — | — | — | — | Yes | Records the connection and domains that the operator CLI set up in both pools |
 | `operator.tenant.admin_recovery` | `recoverTenantAdmin` | — | — | — | — | — | Yes | Only after an out-of-band check with the tenant's second contact; security-critical; the tenant's admins are emailed (2.5) |
+| `operator.tenant.recovery_contact.read` | `getTenantRecoveryContact` | — | — | — | — | — | Yes | The second contact a recovery is confirmed through; audited in the tenant's log and as a platform event before it is returned (2.5, #274) |
 | `operator.break_glass.record` | `recordBreakGlassGrant` | — | — | — | — | — | Yes | Best effort: the Identity Center assignment and CloudTrail are the record, and a job fills any gap (8.3) |
 | `sso.read` | `getTenantSso` | — | Tenant | — | — | — | — | The tenant's connection, domains, SSO rules and group roles (2.5, #231) |
 | `sso.update` | `updateTenantSso`, `claimSsoDomain`, `verifySsoDomain`, `deleteSsoDomain` | — | Tenant, step-up | — | — | — | — | Web session only; a domain is proven by its DNS TXT record and is one tenant's at most; requiring SSO needs an active connection and the MFA confirmation (2.5) |
@@ -910,11 +926,11 @@ The login roles use IAM database authentication, one per workload (#22).
 | Role | Used by | Scope | Row-level security |
 |---|---|---|---|
 | `sft_api` | API service | Tenant, resource or platform, plus the credential lookup functions | Tenant policy on every table; tenant and platform audit inserts; reads its tenant's audit events |
-| `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts; in platform scope, the `tenants` rows alone (`operator_directory`, the tenant directory of `listTenants` and `getTenant`); in a tenant's scope, revoking its `member_sessions` when it suspends the tenant (two columns read, the two of a revocation written). Its own `idempotency_keys` (`caller_type = 'operator'`): written in a tenant's scope (`operator_keys`), found across tenants in platform scope (`operator_find`, revision 0036, #160). For `recoverTenantAdmin` (revision 0037, #239): `admin_recoveries`, `users.sign_in_reset_id`, deleting a user's identities (`operator_recovery`), and reading back its own security-critical events in the tenant's scope (`operator_read_own_critical`), never the rest of the tenant's log. No column grant on file names or messages. |
+| `sft_operator` | Operator API and its jobs (8.2, 8.3) | Platform; tenant while acting on one tenant | Platform tables (no row-level security); tenant policy; tenant and platform audit inserts; in platform scope, the `tenants` rows alone (`operator_directory`, the tenant directory of `listTenants` and `getTenant`, which leave out the recovery contact; `getTenantRecoveryContact` reads it in the tenant's scope, #274); in a tenant's scope, revoking its `member_sessions` when it suspends the tenant (two columns read, the two of a revocation written). Its own `idempotency_keys` (`caller_type = 'operator'`): written in a tenant's scope (`operator_keys`), found across tenants in platform scope (`operator_find`, revision 0036, #160). For `recoverTenantAdmin` (revision 0037, #239): `admin_recoveries`, `users.sign_in_reset_id`, deleting a user's identities (`operator_recovery`), and reading back its own security-critical events in the tenant's scope (`operator_read_own_critical`), never the rest of the tenant's log. No column grant on file names or messages. |
 | `sft_scan` | Scan worker | Tenant, from the message | Tenant policy. For DLP it reads the tenant's DLP policy, rules, detectors and wrapped DLP data keys, recipient domains and known domains, and inserts findings and decisions; no column grant to select finding details or any field ciphertext (data model 4.2). |
-| `sft_notify` | Notification worker | Tenant, from the message; platform for one event | Tenant policy. It records the `user_identities` row of a pool user it created, replacing the user's earlier one on that pool (2.5), and reads the pool rows of `idp_connections` (no tenant, `kind = 'local'`) to name the connection (`pool_read`, revision 0016). It inserts one platform audit event: an invited address that signs in for another tenant (2.5). It alone reads and writes `notice_windows`, the windows of the coalesced and capped DLP notices (#230, revision 0028). It reads `admin_recoveries`, so the identity of an operator's temporary sign-in expires with it (#239, revision 0037) |
+| `sft_notify` | Notification worker | Tenant, from the message; platform for one event | Tenant policy. It records the `user_identities` row of a pool user it created, replacing the user's earlier one on that pool (2.5), and reads the pool rows of `idp_connections` (no tenant, `kind = 'local'`) to name the connection (`pool_read`, revision 0016). It inserts one platform audit event: an invited address that signs in for another tenant (2.5). It alone reads and writes `notice_windows`, the windows of the coalesced and capped DLP notices (#230, revision 0028). It reads `admin_recoveries`, so the identity of an operator's temporary sign-in expires with it (#239, revision 0037), and to tell the tenant's admins of a recovery (#273). For an SSO tenant's invitation it reads its tenant's own `idp_connections` row (`notify_connection`, the same columns) and writes the invited user's `invitation_token_hash` and `invitation_expires_at` (revision 0042, #273) |
 | `sft_relay` | Outbox relay | System | `outbox` only: reads and marks rows of every tenant, in system scope |
-| `sft_jobs` | Lifecycle jobs | System to find work, tenant to do it | `jobs_find` reads across tenants in system scope, with column grants limited to what the jobs need; every write under the tenant policy. The metadata purge (#224) deletes ended `transfers` and `upload_requests` past their retention, in each tenant's scope, their child rows going by cascade; no role deletes an audit event row. The daily partition job runs `audit_drop_expired_partitions` and `audit_expired_partitions` (revision 0040, #255), `SECURITY DEFINER` functions that drop only whole months past the 365-day retention once archived in both regions. The expiry job reads `dlp_approval_requests.created_at` for the approval backlog's age (revision 0041, #260). The `cleanup` job ends operators' temporary local sign-ins: it finds `admin_recoveries` past their end in system scope, then deletes the expired identities (`jobs_temporary`) and marks the recovery ended (#239, revision 0037) |
+| `sft_jobs` | Lifecycle jobs | System to find work, tenant to do it | `jobs_find` reads across tenants in system scope, with column grants limited to what the jobs need; every write under the tenant policy. The metadata purge (#224) deletes ended `transfers` and `upload_requests` past their retention, in each tenant's scope, their child rows going by cascade; no role deletes an audit event row. The daily partition job runs `audit_drop_expired_partitions` and `audit_expired_partitions` (revision 0040, #255), `SECURITY DEFINER` functions that drop only whole months past the 365-day retention once archived in both regions. The expiry job reads `dlp_approval_requests.created_at` for the approval backlog's age (revision 0041, #260). The `cleanup` job ends operators' temporary local sign-ins: it finds `admin_recoveries` past their end in system scope, then deletes the expired identities (`jobs_temporary`), marks the recovery ended and writes the outbox message that has the worker delete the pool user (#239, #273, revision 0037) |
 | `sft_archive` | Audit archive job | System | Reads `audit_events` in system scope, and reads and moves `audit_archive_cursor` (its position and claim, never the generation, #183); for a regional loss's back-fill it reads, inserts and deletes `audit_archive_single_region` and updates the cursor's `single_region_since` and `both_regions_since` (revision 0039, #257); no other table |
 | `sft_recovery` | Restore and failover jobs only (IAM role `sft-{env}-recovery`), never a running service | Recovery (`app_scope() = 'recovery'`) | `recovery_reapply` policies: read and update, across tenants, exactly the rows a security-critical record changes, and add a committed grant's missing count to its counter; insert-only on `audit_events` for re-imported rows, with `tx_id` and `occurred_at` read to rewind the archive cursor; starts a new archive generation and rewinds `audit_archive_cursor`; re-publishes the outbox (revisions 0034, 0035; [disaster recovery](../operations/disaster-recovery.md) 4); no column grant on file names or messages |
 | `sft_migrate` | Migration job | Becomes `sft_owner` with `SET ROLE` | Not applied: the table owner |

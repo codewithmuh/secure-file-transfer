@@ -14,7 +14,9 @@ recovery contact first, and records how (`confirmed_via`).
   expires 72 hours later (`sft.data.identities.record_identity`). Sign-in lets that identity in
   although the tenant requires SSO, as a security-critical record, and refuses it once it has
   expired; the daily `cleanup` job then deletes it (`end_temporary_sign_ins`). A fallback admin
-  already has a local sign-in, so theirs is reset.
+  already has a local sign-in, so theirs is reset. Each ended sign-in's message asks the
+  notification worker to delete the admin's pool user too (`member.temporary_sign_in_ended`), if
+  it is still the one made for the recovery (#273).
 
 The recovery is an `admin_recoveries` row, which keeps `confirmed_via` (free text, never in an
 audit event), and a security-critical `user.sign_in_reset` event in the tenant's log, by the
@@ -27,8 +29,9 @@ the same `Idempotency-Key` (`sft.service.idempotency`, #160) finds the recovery,
 record if it is still missing and answers `202`; it never starts a second recovery. The platform
 audit event follows, as for every operator call (`sft.service.operator_tenants`).
 
-Not yet: the email to every admin of the tenant. It needs a notification of its own, which the
-notification worker doesn't send yet (#239's follow-up); the tenant's log holds the record.
+**Every admin is told** (#273): the recovery's `tenant.admin_recovered` message, in the same
+transaction, has the notification worker email every active admin of the tenant, the recovered one
+included, which admin it was, when, and the kind (`tenant_admin_recovered`).
 """
 
 from __future__ import annotations
@@ -46,7 +49,12 @@ from sft.data import admin_recoveries, audit, identities, member_sessions, sso, 
 from sft.data.audit import Actor, ActorType, Origin, Target
 from sft.data.database import Database
 from sft.data.models import AdminRecovery, AdminRecoveryKind, Role, UserStatus
-from sft.data.outbox import MEMBER_SIGN_IN_RESET, enqueue
+from sft.data.outbox import (
+    MEMBER_SIGN_IN_RESET,
+    MEMBER_TEMPORARY_SIGN_IN_ENDED,
+    TENANT_ADMIN_RECOVERED,
+    enqueue,
+)
 from sft.data.scope import Scope
 from sft.service.audit_archive import DONE_NOT_CONFIRMED, AuditArchive, RecordNotConfirmed
 from sft.service.idempotency import OperatorKey, operator_claim, operator_replay
@@ -161,6 +169,11 @@ async def _recover(
             security_critical=True,
         )
         await enqueue(session, MEMBER_SIGN_IN_RESET, {"user_id": user.id, "reset_id": reset_id})
+        await enqueue(
+            session,
+            TENANT_ADMIN_RECOVERED,
+            {"user_id": user.id, "admin_recovery_id": recovery.id},
+        )
         event = await audit.archived_event(session, event_id)
     return recovery, event
 
@@ -183,8 +196,9 @@ async def end_temporary_sign_ins(
     database: Database, *, now: datetime, job: Mapping[str, audit.Detail]
 ) -> int:
     """The daily job's step (`sft_jobs`): delete the identities of temporary sign-ins past their
-    end, each with its event naming the job (`job`); how many sign-ins it ended. Find across, act
-    within (ADR-0020)."""
+    end, each with its event naming the job (`job`) and its message for the notification worker,
+    which deletes the pool user (#273); how many sign-ins it ended. Find across, act within
+    (ADR-0020)."""
     system = Actor(ActorType.SYSTEM)
     total = 0
     while True:
@@ -207,6 +221,11 @@ async def end_temporary_sign_ins(
                             "admin_recovery_id": item.recovery_id,
                             "identities_removed": item.identities_deleted,
                         },
+                    )
+                    await enqueue(
+                        session,
+                        MEMBER_TEMPORARY_SIGN_IN_ENDED,
+                        {"user_id": item.user_id, "admin_recovery_id": item.recovery_id},
                     )
             total += len(ended)
         if not tenant_ids or total == before_pass:

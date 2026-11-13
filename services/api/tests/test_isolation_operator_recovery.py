@@ -7,6 +7,7 @@ tests/test_isolation.py.
 - A recovery, its reset's identities and its records stay in their tenant: the operator, the
   notification worker and the daily job reach another tenant's in no tenant scope; the job's find
   step reads across tenants in system scope, by design, and changes nothing.
+- A tenant's recovery contact (#274) is read in that tenant's scope only.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from isolation import Cases, Tenants
 from sft.data import admin_recoveries, audit, idempotency, identities
+from sft.data import tenants as tenants_data
 from sft.data.audit import Actor, ActorType, Target
 from sft.data.models import AdminRecoveryKind
 from sft.data.roles import JOBS, NOTIFY, OPERATOR
@@ -86,6 +88,12 @@ async def recover_another_tenants_user(session: AsyncSession, tenants: Tenants) 
         lasts=None,
     )
     return [removed, critical, recovery]
+
+
+@cases.add(scopes={OPERATOR: [TENANT]})
+async def read_another_tenants_recovery_contact(session: AsyncSession, tenants: Tenants) -> object:
+    # #274: read in the tenant's own scope only; the harness's contact holds their marker.
+    return await tenants_data.recovery_contact(session, tenants.theirs.tenant_id)
 
 
 @cases.add(scopes={JOBS: [TENANT]})

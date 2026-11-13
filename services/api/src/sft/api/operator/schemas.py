@@ -308,3 +308,10 @@ class AdminRecovery(BaseModel):
             temporary_sign_in_expires_at=row.temporary_sign_in_expires_at,
             created_at=row.created_at,
         )
+
+
+class TenantRecoveryContact(BaseModel):
+    """`getTenantRecoveryContact` (#274): what the operator confirms a recovery through."""
+
+    tenant_id: UUID
+    recovery_contact: Annotated[str | None, Field(min_length=1, max_length=320)]

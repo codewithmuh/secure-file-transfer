@@ -175,7 +175,8 @@ The DLP inspector (`python -m sft.dlp.inspector`) reads `InspectorSettings`, whi
 | `INTERNAL_PORT` | `8001` | `/healthz` and `/readyz` only, plain HTTP from a thread, so a probe never reaches the framed protocol (#184) |
 
 The migration job reads `MIGRATION_DATABASE_URL` (the `sft_migrate` role) and the bootstrap job reads
-`BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. Each also reads `LOG_LEVEL`.
+`BOOTSTRAP_DATABASE_URL` (the master user) and `BOOTSTRAP_IAM_AUTH`, with no defaults. In AWS the bootstrap job also
+reads `BOOTSTRAP_MASTER_SECRET` and `AWS_REGION` (below). Each also reads `LOG_LEVEL`.
 
 ## Runtime contract
 
@@ -288,7 +289,9 @@ Every login role gets `rds_iam` and no password: each pod's IAM role (`sft-{env}
 each new connection, over TLS with `sslmode=verify-full` (encryption and keys 2.2, 6.3; `DATABASE_IAM_AUTH`,
 `sft.data.iam_auth`, #184), so `DATABASE_URL` holds a user name and a host, never a password. The master password
 lives only in Secrets Manager (`sft/{env}/db/master`), set by Terraform's write-only arguments; the bootstrap job
-reads it once and after that only break-glass does. **Locally and in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
+reads it once and after that only break-glass does. `BOOTSTRAP_MASTER_SECRET=secretsmanager:sft/{env}/db/master`
+names it and `BOOTSTRAP_DATABASE_URL` names the master user and no password: the job reads the secret as its own role,
+checks the user, and puts the password into the connection in memory only (#278). **Locally and in CI** there is no IAM: run the bootstrap with `BOOTSTRAP_IAM_AUTH=false` as a superuser, and give the login roles an
 obviously fake password yourself (`ALTER ROLE sft_api PASSWORD '…'`), as the tests do.
 
 ### Migrations

@@ -129,9 +129,14 @@ def test_a_local_admins_sign_in_is_reset(operator: Operator, migrated_db: Scratc
     [(reset_id,)] = migrated_db.sql(
         "SELECT sign_in_reset_id FROM users WHERE id = :u", u=tenant.admin
     )
+    # The reset's message, and the notice to every admin of the tenant (#273), both in its
+    # transaction.
     assert migrated_db.sql(
-        "SELECT topic, payload FROM outbox WHERE tenant_id = :t", t=tenant.id
-    ) == [("member.sign_in_reset", {"user_id": str(tenant.admin), "reset_id": str(reset_id)})]
+        "SELECT topic, payload FROM outbox WHERE tenant_id = :t ORDER BY topic", t=tenant.id
+    ) == [
+        ("member.sign_in_reset", {"user_id": str(tenant.admin), "reset_id": str(reset_id)}),
+        ("tenant.admin_recovered", {"user_id": str(tenant.admin), "admin_recovery_id": body["id"]}),
+    ]
     # The confirmation stays in the row, never in an event.
     assert migrated_db.sql(
         "SELECT confirmed_via, operator_name FROM admin_recoveries WHERE id = :id",
@@ -211,6 +216,13 @@ async def test_an_sso_tenants_admin_gets_a_temporary_sign_in_that_ends(
     )
     assert details["admin_recovery_id"] == body["id"]
     assert details["identities_removed"] == 1
+    # Its message, in the same transaction, asks the notification worker to delete the pool user
+    # (#273).
+    assert migrated_db.sql(
+        "SELECT payload FROM outbox WHERE tenant_id = :t "
+        "AND topic = 'member.temporary_sign_in_ended'",
+        t=tenant.id,
+    ) == [({"user_id": str(tenant.admin), "admin_recovery_id": body["id"]},)]
 
 
 def test_a_fallback_admin_of_an_sso_tenant_is_reset(
@@ -253,9 +265,9 @@ def test_a_retry_with_the_key_archives_the_record_and_starts_nothing(
     assert operator.store.actions(Region.OSAKA) == ["user.sign_in_reset"]
     assert recoveries(migrated_db, tenant.id) == [(1,)]
     assert migrated_db.sql(
-        "SELECT count(*) FROM outbox WHERE tenant_id = :t AND topic = 'member.sign_in_reset'",
+        "SELECT topic, count(*) FROM outbox WHERE tenant_id = :t GROUP BY 1 ORDER BY 1",
         t=tenant.id,
-    ) == [(1,)]
+    ) == [("member.sign_in_reset", 1), ("tenant.admin_recovered", 1)]
     again = operator.recover(tenant.id, tenant.admin, key="recover-1")
     assert again.json() == retried.json()
     # The same key for another admin is a conflict.

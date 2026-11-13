@@ -10,6 +10,7 @@ What an email may hold (abuse 7.5, architecture 4.6):
 - A link token only in the link emails (transfer, upload request, SSO invitation), a code only in
   the code email, a temporary password only in the invitation and re-enrolment emails.
 - The tenant's name as the operator recorded it, and for link emails the sender's verified address.
+- An admin's address only in the admin recovery notice, to the same tenant's admins.
 - DLP notices go only to the tenant's own people and link to the web app, never to an approve
   action: decisions are made only there, signed in.
 
@@ -62,6 +63,7 @@ class EmailType(enum.StrEnum):
     API_KEY_EXPIRING = "api_key_expiring"
     API_KEY_FIRST_EXPORT = "api_key_first_export"
     DLP_APPROVER_DEACTIVATED = "dlp_approver_deactivated"
+    TENANT_ADMIN_RECOVERED = "tenant_admin_recovered"
 
 
 class PolicyChange(enum.StrEnum):
@@ -114,6 +116,9 @@ class Links:
 
     def api_keys(self) -> str:
         return f"{self.origin}/admin/api-keys"
+
+    def audit_log(self) -> str:
+        return f"{self.origin}/admin/audit"
 
 
 # ---- formatting ----
@@ -233,6 +238,29 @@ class MemberInvitationSso(Email):
         return {
             "invitation_url": links.invitation(self.token),
             "expires_at": format_time(self.expires_at, locale),
+        }
+
+
+@dataclass(frozen=True, kw_only=True)
+class TenantAdminRecovered(Email):
+    """To every active admin of the tenant, the recovered one included (authn-authz 2.5, #273): a
+    platform operator recovered an admin's sign-in (`recoverTenantAdmin`). Which admin, when, and
+    with `temporary_until`, a temporary local sign-in that works until then; without it, a reset.
+    Names no operator and not how the request was confirmed."""
+
+    TYPE = EmailType.TENANT_ADMIN_RECOVERED
+    admin_email: str = field(repr=False)
+    recovered_at: datetime
+    temporary_until: datetime | None = None
+
+    def _context(self, links: Links, locale: Locale) -> dict[str, object]:
+        return {
+            "admin_email": self.admin_email,
+            "recovered_at": format_time(self.recovered_at, locale),
+            "temporary_until": (
+                None if self.temporary_until is None else format_time(self.temporary_until, locale)
+            ),
+            "audit_log_url": links.audit_log(),
         }
 
 
@@ -593,6 +621,7 @@ EMAILS: dict[EmailType, type[Email]] = {
         ApiKeyExpiring,
         ApiKeyFirstExport,
         DlpApproverDeactivated,
+        TenantAdminRecovered,
     )
 }
 """Every email type and its class; a test checks it covers `EmailType`."""

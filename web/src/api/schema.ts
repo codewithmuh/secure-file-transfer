@@ -2704,6 +2704,39 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/operator/tenants/{tenant_id}/recovery-contact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a tenant's recovery contact
+         * @description The tenant's `recovery_contact`, the second contact `createTenant` recorded, through which an operator confirms
+         *     a `recoverTenantAdmin` request before making it (authn-authz 2.5, docs/runbooks/tenant-admin-recovery.md).
+         *     `getTenant` and `listTenants` never return it. `null` for a tenant created before contacts were recorded.
+         *
+         *     Every read is audited as `tenant.recovery_contact_read`: in the tenant's audit log, where its admins can see
+         *     it, and as a platform event. The contact is returned only once both are written; if the platform event can't
+         *     be written the call returns `503`, and a retry reads again. Sent with `Cache-Control` set to `no-store`.
+         *
+         *     Errors: `404 not_found`, `503 service_unavailable`.
+         *
+         *     Requirements: FR-34, FR-27.
+         */
+        get: operations["getTenantRecoveryContact"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/operator/tenants/{tenant_id}/suspend": {
         parameters: {
             query?: never;
@@ -2798,7 +2831,8 @@ export interface paths {
          * @description Operator-assisted recovery for a tenant whose last admin has lost their factor, or an SSO tenant whose
          *     identity provider is down with no fallback admin available (authn-authz 2.5). The operator calls it for a
          *     named admin of the tenant only after confirming the request through the tenant's `recovery_contact`, the
-         *     second contact recorded by `createTenant`, and records how it was confirmed (`confirmed_via`).
+         *     second contact recorded by `createTenant` (`getTenantRecoveryContact`), and records how it was confirmed
+         *     (`confirmed_via`).
          *
          *     - **A local admin:** their sign-in is reset as by `resetUserSignIn`: every session ends, their identities in
          *       both pools are removed, and a new invitation is emailed.
@@ -2816,8 +2850,9 @@ export interface paths {
          *     the failover and restore runbooks re-apply it as a reset. `confirmed_via` stays in the recovery's row and
          *     never reaches an audit event. A temporary local sign-in is the kind for an admin of a tenant with an active
          *     SSO connection who isn't one of its fallback admins; sign-in accepts it even when the tenant requires SSO,
-         *     as a security-critical record, until it expires, and the daily job then deletes it. Emailing the tenant's
-         *     admins is pending the notification worker (#239's follow-up).
+         *     as a security-critical record, until it expires, and the daily job then deletes it with its pool user. Every
+         *     active admin of the tenant, the recovered one included, is emailed which admin was recovered, when, and the
+         *     kind; the email names no operator and not how the request was confirmed.
          *
          *     Errors: `404 not_found` (tenant, or a user who isn't in it), `409 invalid_state` (the user isn't an active
          *     admin), `409 idempotency_conflict`, `409 idempotency_in_progress`, `422 validation_failed`,
@@ -3757,11 +3792,20 @@ export interface components {
             first_admin_email: components["schemas"]["EmailAddress"];
             /**
              * @description A second contact at the tenant besides the first admin, such as an email address or phone number. An
-             *     operator confirms every `recoverTenantAdmin` request through it. Visible only in the operator API.
+             *     operator confirms every `recoverTenantAdmin` request through it. Read only with `getTenantRecoveryContact`,
+             *     which is audited.
              */
             recovery_contact: string;
             /** @default en */
             default_locale?: components["schemas"]["Locale"];
+        };
+        TenantRecoveryContact: {
+            tenant_id: components["schemas"]["Id"];
+            /**
+             * @description The second contact at the tenant, as `createTenant` recorded it; `null` for a tenant created before
+             *     contacts were recorded.
+             */
+            recovery_contact: string | null;
         };
         TenantCreated: {
             tenant: components["schemas"]["Tenant"];
@@ -7713,6 +7757,33 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
+        };
+    };
+    getTenantRecoveryContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description ID of the tenant. */
+                tenant_id: components["parameters"]["TenantId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The tenant's recovery contact, sent with `Cache-Control` set to `no-store`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TenantRecoveryContact"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
+            503: components["responses"]["ServiceUnavailable"];
         };
     };
     suspendTenant: {

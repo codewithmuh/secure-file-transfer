@@ -26,6 +26,16 @@ Every call has 50 ms. After 5 failures in a row the store stops calling Valkey f
 fails at once (ADR-0014), so a sick cache doesn't add latency to every request; the caller then
 applies each limit's failure mode. Any failure surfaces as `CounterStoreUnavailableError`.
 
+A call's connection is opened before its 50 ms, with a budget of its own
+(`CONNECT_TIMEOUT_SECONDS`, #282). A call that runs out of time leaves its answer unread, so the
+client closes that connection, and the next call needs a new one: TCP, TLS, then AUTH and
+CLIENT SETINFO, two round trips or more. Opened inside the 50 ms, that never fit on a host where a
+connection costs more than a call has left: one slow answer, and every call after it timed out
+too, until the breaker rested (measured in M9 through a proxy adding 10 ms each way: a call took
+23 ms and a connection 47 ms, and every call failed). It also covers the connections ElastiCache
+closes after 12 hours or in a failover. Running out of the connect budget is a failure, like any
+other; it is the most a cache that never answers adds to a call that must connect.
+
 The scripts run by their SHA-1 (`EVALSHA`). Valkey forgets them when it restarts or fails over,
 and answers `NOSCRIPT`: the store then loads all four in one round trip with a budget of its own
 (`SCRIPT_LOAD_TIMEOUT_SECONDS`) and runs the call again with a fresh 50 ms. Loading inside the
@@ -65,6 +75,10 @@ from sft.core.telemetry import mark_error
 from sft.data.iam_auth import valkey_iam
 
 CALL_TIMEOUT_SECONDS = 0.05
+CONNECT_TIMEOUT_SECONDS = 0.25
+"""Opening a connection (TCP, TLS, AUTH, two round trips or more): before the call's 50 ms, so a
+host where a connection costs more than a call can still connect (#282). Five times a call's
+budget, and the most a cache that never answers adds to a call that must connect."""
 SCRIPT_LOAD_TIMEOUT_SECONDS = 1.0
 """Loading the scripts after a `NOSCRIPT`: rare (a restart or a failover), so it may take longer
 than a call, once, rather than fail every call that follows."""
@@ -406,8 +420,11 @@ class CounterStore:
         client = valkey.from_url(  # type: ignore[no-untyped-call]
             address,
             **extra,
-            socket_timeout=CALL_TIMEOUT_SECONDS,
-            socket_connect_timeout=CALL_TIMEOUT_SECONDS,
+            # Outer bounds only: each call has its 50 ms and each connection its own budget
+            # (`_timed`), and the handshake's replies (AUTH, CLIENT SETINFO) mustn't each be held
+            # to a call's 50 ms.
+            socket_timeout=CONNECT_TIMEOUT_SECONDS,
+            socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
             # A refused call is answered by the failure mode, never retried into the latency budget.
             retry_on_timeout=False,
         )
@@ -551,8 +568,10 @@ class CounterStore:
         return result
 
     async def _timed(self, operation: Callable[[], Awaitable[Any]]) -> Any:
-        """The operation in 50 ms; after a `NOSCRIPT`, the scripts loaded on a budget of their
-        own, then the operation again in a fresh 50 ms (module docstring)."""
+        """An open connection first, on a budget of its own; then the operation in 50 ms; after a
+        `NOSCRIPT`, the scripts loaded on a budget of their own, then the operation again in a
+        fresh 50 ms (module docstring)."""
+        await self._open_connection()
         loads = self._loads
         try:
             async with asyncio.timeout(self._timeout):
@@ -561,6 +580,18 @@ class CounterStore:
             await self._load_scripts(loads)
         async with asyncio.timeout(self._timeout):
             return await operation()
+
+    async def _open_connection(self) -> None:
+        """Make sure the connection the operation takes is open, outside its 50 ms (#282).
+
+        The pool hands out its most recently returned connection, and nothing runs between the
+        `release` here and the operation taking a connection, so the operation gets the one opened
+        or checked here. Checking an open connection reads nothing from the network. Opening one
+        has `CONNECT_TIMEOUT_SECONDS`: running out of it is a failure, like any other."""
+        pool = self._client.connection_pool
+        async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+            connection = await pool.get_connection("PING")  # type: ignore[no-untyped-call]
+        await pool.release(connection)
 
     async def _load_scripts(self, seen: int) -> None:
         """Load every script in one round trip, unless a call that met the same `NOSCRIPT`
