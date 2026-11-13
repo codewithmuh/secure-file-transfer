@@ -109,4 +109,5 @@ Steps the maintainer runs on purpose, not in answer to an alert.
 | Restore the database to a point in time (NFR-11, #253) | [point-in-time-restore.md](point-in-time-restore.md) |
 | Run a drill without paging for it | [drill-in-progress.md](drill-in-progress.md) |
 | Start, run and end prod's operating period (#254) | [operating-period.md](operating-period.md) |
+| Bring an environment up or down with one command: `make aws-up`, `make aws-down`, `make aws-status` (NFR-19, NFR-20, #295) | [environment-up-down.md](environment-up-down.md) |
 | Tear an environment down, prod's retained stack aside (NFR-19, #254) | [teardown.md](teardown.md) |

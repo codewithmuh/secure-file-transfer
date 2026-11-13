@@ -1,0 +1,131 @@
+name: environment-run
+
+# One task of environment.yml (#295), on a GitHub-hosted runner, as the role that owns it: the environment's Terraform
+# deploy role from its GitHub environment, or for prod's retained stack its own deploy role from `prod-retained`. Both
+# accept main alone (T-71). The ops scripts run unattended: no typed confirmation, applies approved, and their operator
+# steps listed at the end of the timed log, which is kept as an artifact.
+#
+# The repository is public, and so are these logs: the account IDs and the domain are masked, the emails are secrets,
+# and Terraform prints only its summaries here (SFT_TF_QUIET; ops/lib/common.sh).
+#
+# Variables and secrets (never literals in this file):
+#   SHARED_ACCOUNT_ID, SFT_DOMAIN            repository variables, as cluster-bootstrap-apply.yml
+#   AWS_ACCOUNT_ID                           environment variable: the environment's account (prod-retained: prod's)
+#   ALERT_EMAILS                             environment secret: a JSON list, the alarms' and the retained stack's
+#   DMARC_REPORT_ADDRESS                     environment secret: where DMARC reports go (ADR-0015)
+#   BUDGET_EMAIL                             prod-retained secret: the retained stack's budget (NFR-19)
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: dev, staging or prod
+        type: string
+        required: true
+      task:
+        description: rebuild-stacks, rebuild-after, teardown-retained, teardown-layers or inventory
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  run:
+    name: ${{ inputs.task }} ${{ inputs.environment }}
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 150
+    environment: ${{ inputs.task == 'teardown-retained' && 'prod-retained' || inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # OIDC into the deploy role
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      TASK: ${{ inputs.task }}
+      # As cluster-bootstrap-apply.yml: Terraform as infra/scripts/check.sh runs it, kubectl at the clusters' minor
+      # version, each checked against its release's own checksum.
+      TERRAFORM_VERSION: 1.17.1
+      TERRAFORM_SHA256: 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+      KUBECTL_VERSION: v1.37.2
+      KUBECTL_SHA256: c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      SFT_TF_QUIET: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Keep the account IDs and the domain out of the public log
+        env:
+          ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+          SHARED: ${{ vars.SHARED_ACCOUNT_ID }}
+          DOMAIN: ${{ vars.SFT_DOMAIN }}
+        run: |
+          case $TASK in
+            rebuild-stacks | rebuild-after | teardown-retained | teardown-layers | inventory) ;;
+            *) echo "::error::unknown task '$TASK'"; exit 1 ;;
+          esac
+          for value in "$ACCOUNT" "$SHARED" "$DOMAIN"; do
+            if [[ -z $value ]]; then
+              echo "::error::AWS_ACCOUNT_ID (this GitHub environment), SHARED_ACCOUNT_ID and SFT_DOMAIN must all be set."
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+      - name: Install Terraform and kubectl, checked against their checksums
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --output terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "${TERRAFORM_SHA256}  terraform.zip" | sha256sum --check --strict
+          unzip -q -o terraform.zip terraform -d bin
+          curl --fail --silent --show-error --location --output bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  bin/kubectl" | sha256sum --check --strict
+          chmod +x bin/kubectl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: >-
+            arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sft-bootstrap/${{ inputs.task == 'teardown-retained'
+            && 'sft-prod-retained-terraform-deploy' || format('sft-{0}-terraform-deploy', inputs.environment) }}
+          role-session-name: environment-${{ inputs.task }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # The deploy role allows 2 hours, sized for a rebuild (NFR-19); the retained stack's, 1.
+          role-duration-seconds: ${{ inputs.task == 'teardown-retained' && 3600 || 7200 }}
+          aws-region: ap-northeast-1
+          mask-aws-account-id: true
+      - name: Hand the session to the ops scripts as a named profile
+        # The scripts take --profile and clear the environment's own credentials, so the default identity is never
+        # used (ops/lib/common.sh); on this runner the profile holds the role's session and nothing else.
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID" --profile sft-ci
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" --profile sft-ci
+          aws configure set aws_session_token "$AWS_SESSION_TOKEN" --profile sft-ci
+          aws configure set region ap-northeast-1 --profile sft-ci
+      - name: Run ${{ inputs.task }}
+        env:
+          ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          TF_VAR_shared_account_id: ${{ vars.SHARED_ACCOUNT_ID }}
+          TF_VAR_domain: ${{ vars.SFT_DOMAIN }}
+          TF_VAR_alert_emails: ${{ secrets.ALERT_EMAILS }}
+          TF_VAR_dmarc_report_address: ${{ secrets.DMARC_REPORT_ADDRESS }}
+          SFT_BUDGET_EMAIL: ${{ secrets.BUDGET_EMAIL }}
+        run: |
+          export SFT_TF_LOG_DIR="$RUNNER_TEMP/terraform"
+          common=(--env "$ENVIRONMENT" --profile sft-ci --account-id "$ACCOUNT_ID")
+          scope=idle
+          if [[ $ENVIRONMENT == prod ]]; then scope=final; fi
+          case $TASK in
+            rebuild-stacks) ops/rebuild.sh "${common[@]}" --stage stacks --execute --unattended ;;
+            rebuild-after) ops/rebuild.sh "${common[@]}" --stage after --execute --unattended ;;
+            teardown-retained) ops/teardown.sh "${common[@]}" --scope final --part retained --execute --unattended ;;
+            teardown-layers) ops/teardown.sh "${common[@]}" --scope "$scope" --part layers --execute --unattended ;;
+            inventory) ops/teardown.sh "${common[@]}" --inventory ;;
+          esac
+      - name: Keep the timed log
+        if: ${{ !cancelled() && inputs.task != 'inventory' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.task }}-${{ inputs.environment }}-log
+          path: docs/operations/drills/
+          if-no-files-found: warn
+          retention-days: 90

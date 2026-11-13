@@ -24,6 +24,9 @@ PROFILE=""
 ACCOUNT_ID=""
 EXECUTE=false
 ASSUME_YES=false
+# Set by a script that accepts --unattended (rebuild.sh, teardown.sh), for the environment workflow: nobody is at the
+# keyboard, so operator steps are logged for after the run instead of waited for (#295).
+UNATTENDED=false
 LOG_FILE=""
 EXTRA_ARGS=()
 
@@ -134,11 +137,17 @@ run() {
   fi
 }
 
-# manual <text>: an operator's action; with --execute, wait until they say it's done.
+# manual <text>: an operator's action; with --execute, wait until they say it's done. In an unattended run it is
+# listed in the log under "Left for the operator" instead, and the script goes on.
 manual() {
   echo "   [operator] $*"
   if $EXECUTE; then
-    read -r -p "   Done? Press Enter when it is (Ctrl-C stops the drill): " _
+    if $UNATTENDED; then
+      echo "   (unattended: left for the operator, listed at the end of the log)"
+      echo "- $*" >>"$LOG_FILE.todo"
+    else
+      read -r -p "   Done? Press Enter when it is (Ctrl-C stops the drill): " _
+    fi
   fi
 }
 
@@ -190,10 +199,16 @@ finish() {
       echo "|---|---|"
       cat "$LOG_FILE.measures"
     fi
+    if [[ -s "$LOG_FILE.todo" ]]; then
+      echo
+      echo "Left for the operator (an unattended run doesn't wait for these):"
+      echo
+      cat "$LOG_FILE.todo"
+    fi
     echo
     echo "Fill in the rest of the report from docs/operations/drill-log-template.md: what went wrong, what changes."
   } >>"$LOG_FILE"
-  rm -f "$LOG_FILE.measures"
+  rm -f "$LOG_FILE.measures" "$LOG_FILE.todo"
   echo
   echo "== done in $(minutes "$took"); log: $LOG_FILE"
 }
@@ -234,6 +249,137 @@ kube_context() {
     "$TOKYO") echo "${SFT_KUBE_CONTEXT_TOKYO:-sft-$ENV_NAME-apne1}" ;;
     "$OSAKA") echo "${SFT_KUBE_CONTEXT_OSAKA:-sft-$ENV_NAME-apne3}" ;;
   esac
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The environment's stacks, for rebuild.sh and teardown.sh (#295; infra/README.md, "Apply order").
+
+# What every environment root takes besides its account, from the operator's shell or the environment workflow's
+# variables and secrets; never committed. A destroy needs them as much as an apply: Terraform plans neither without a
+# required variable.
+STACK_INPUTS=(TF_VAR_domain TF_VAR_shared_account_id TF_VAR_dmarc_report_address TF_VAR_alert_emails)
+
+# stack_inputs: print which are set; with --execute, refuse to go on without all of them.
+stack_inputs() {
+  local name missing=0
+  echo "Inputs of the environment's stacks:"
+  for name in "${STACK_INPUTS[@]}"; do
+    if [[ -n "${!name:-}" ]]; then
+      echo "  set:     $name"
+    else
+      echo "  not set: $name"
+      missing=$((missing + 1))
+    fi
+  done
+  echo "  derived: TF_VAR_signin_trigger_image, per Region, from the shared registry and the digest in" \
+    "deploy/environments/$ENV_NAME/$TOKYO/values.yaml"
+  if $EXECUTE && ((missing > 0)); then
+    die "$missing input(s) not set (docs/runbooks/environment-up-down.md, \"Inputs\")"
+  fi
+  return 0
+}
+
+# image_digest: the digest the environment's values pin; the promotion workflow edits only that line (ADR-0005).
+image_digest() {
+  sed -n 's/^  digest: \(sha256:[0-9a-f]\{64\}\)$/\1/p' "$REPO_ROOT/deploy/environments/$ENV_NAME/$TOKYO/values.yaml" |
+    head -1
+}
+
+# signin_trigger_image <region>: the image the sign-in triggers run, from the shared registry in that Region (Lambda
+# pulls only from its own Region; modules/registry replicates to Osaka), by the digest the environment runs (#238).
+signin_trigger_image() {
+  echo "${TF_VAR_shared_account_id:-<shared-account-id>}.dkr.ecr.$1.amazonaws.com/sft/app@$(image_digest)"
+}
+
+# tf_init <root>: terraform init for a root under infra/, with its account's state bucket (infra/README.md, State).
+tf_init() {
+  local root="$1" region=$TOKYO bucket
+  [[ "$root" != *"/$OSAKA"* ]] || region=$OSAKA
+  bucket="sft-$ENV_NAME-$(short "$region")-tfstate-$ACCOUNT_ID"
+  # The retained stack keeps its state in its own bucket, under the audit key (encryption 8.4).
+  [[ "$root" != environments/prod/retained ]] || bucket="sft-prod-apne1-retained-tfstate-$ACCOUNT_ID"
+  tf_run "$root" init -input=false -reconfigure -backend-config="bucket=$bucket"
+}
+
+# tf_root <root> <terraform args...>: init, then the command, with the account and the inputs of the root's Region:
+# the sign-in triggers' image, and the shared account's DNS role to assume, deploy (edge and identity, #185).
+tf_root() {
+  local root="$1" region=$TOKYO
+  shift
+  [[ "$root" != *"/$OSAKA"* ]] || region=$OSAKA
+  export TF_VAR_account_id="$ACCOUNT_ID" TF_VAR_terraform_role=deploy
+  TF_VAR_signin_trigger_image="$(signin_trigger_image "$region")"
+  export TF_VAR_signin_trigger_image
+  tf_init "$root"
+  tf_run "$root" "$@"
+}
+
+# tf_run <root> <terraform args...>: print it; with --execute run it in infra/<root>, its whole output also kept in a
+# file (SFT_TF_LOG_DIR, or a temporary directory). With SFT_TF_QUIET=1, as in the environment workflow, whose logs
+# are public, only the summary and error lines are printed: plans and applies name endpoints and resource IDs.
+tf_run() {
+  local root="$1" logs log status=0
+  shift
+  printf '   $ terraform -chdir=infra/%s' "$root"
+  printf ' %q' "$@"
+  printf '\n'
+  $EXECUTE || return 0
+  logs="${SFT_TF_LOG_DIR:-${TMPDIR:-/tmp}/sft-$DRILL-$ENV_NAME-terraform}"
+  mkdir -p "$logs"
+  log="$logs/${root//\//_}.$1.log"
+  if [[ "${SFT_TF_QUIET:-}" == 1 ]]; then
+    TF_CLI_ARGS_init=-no-color TF_CLI_ARGS_plan=-no-color TF_CLI_ARGS_apply=-no-color TF_CLI_ARGS_destroy=-no-color \
+      terraform -chdir="$REPO_ROOT/infra/$root" "$@" >"$log" 2>&1 || status=$?
+    if ((status == 0)); then
+      grep -E '^(Plan:|No changes|Apply complete|Destroy complete)' "$log" | sed 's/^/   /' || true
+    else
+      grep -E '^(Error|│)' "$log" | head -60 >&2 || true
+    fi
+  else
+    terraform -chdir="$REPO_ROOT/infra/$root" "$@" 2>&1 | tee "$log" || status=$?
+  fi
+  # shellcheck disable=SC2034 # read by rebuild.sh's destroy guard, after the plan
+  TF_LAST_LOG="$log"
+  return "$status"
+}
+
+# tf_output <root> <name>: one output of an initialized root, as JSON; empty when the root has no state or no such
+# output. A dry run prints a placeholder.
+tf_output() {
+  if ! $EXECUTE; then
+    echo "<$2 output of $1>"
+    return 0
+  fi
+  terraform -chdir="$REPO_ROOT/infra/$1" output -json "$2" 2>/dev/null || true
+}
+
+# has_state <root>: whether an initialized root holds any resource; a dry run says no.
+has_state() {
+  $EXECUTE || return 1
+  [[ -n "$(terraform -chdir="$REPO_ROOT/infra/$1" state list 2>/dev/null | head -1)" ]]
+}
+
+# with_tunnel <region> <command...>: run it with that Region's private cluster API reachable through the Systems
+# Manager tunnel (.github/scripts/cluster-tunnel.sh, ADR-0021): KUBECONFIG holds a context under kube_context's default
+# name, and TF_VAR_cluster_api_tunnel_url is the tunnel's local end, for the cluster-bootstrap root's providers. The
+# tunnel closes afterwards, whatever the command did. Needs the Session Manager plugin, and an identity the cluster
+# admits: the deploy role (the environment workflow) or BreakGlass.
+with_tunnel() {
+  local region="$1" port="${SFT_TUNNEL_PORT:-8443}" kubeconfig status=0
+  shift
+  kubeconfig="${TMPDIR:-/tmp}/sft-$ENV_NAME-$(short "$region")-kubeconfig"
+  run "$REPO_ROOT/.github/scripts/cluster-tunnel.sh" open "$ENV_NAME" "$region" "$port" "$kubeconfig"
+  set +e
+  (
+    set -e
+    unset SFT_KUBE_CONTEXT_TOKYO SFT_KUBE_CONTEXT_OSAKA # the tunnel's kubeconfig names the default contexts
+    export KUBECONFIG="$kubeconfig" TF_VAR_cluster_api_tunnel_url="https://127.0.0.1:$port"
+    "$@"
+  )
+  status=$?
+  set -e
+  run "$REPO_ROOT/.github/scripts/cluster-tunnel.sh" close
+  return "$status"
 }
 
 # The recovery job (sft.service.recovery_replay, run as sft_recovery): the suspended `recovery` CronJob, rendered with

@@ -1,0 +1,157 @@
+name: environment
+
+# One command to bring an AWS environment up or down (#295; NFR-19, NFR-20; docs/runbooks/environment-up-down.md):
+#
+#   make aws-up ENV=dev       up: ops/rebuild.sh's stacks, cluster-bootstrap for each cluster
+#                             (cluster-bootstrap-apply.yml), then the alarms and the first deploy. Up to 2 hours.
+#   make aws-down ENV=dev     down: ops/teardown.sh: everything the environment bills for. dev and staging keep their
+#                             bootstrap stacks, so `up` can build them again; prod's teardown is its final one, its
+#                             retained stack's teardown apply first, and its bootstrap stacks stay for Admin.
+#   make aws-status ENV=dev   status: ops/teardown.sh --inventory: each stack's state and every resource still tagged
+#                             with the environment. Read-only.
+#
+# Why a workflow and not the operator's shell: every job runs as the environment's Terraform deploy role, the only
+# identity that may change the environment's IAM (SCP OnlyDeployRolesChangeIam) and, with BreakGlass, its clusters
+# (ADR-0004). The role trusts only this repository's GitHub environment of the same name, which accepts main alone;
+# prod waits for its reviewer (T-71). An environment takes part once it is in LIVE_ENVIRONMENTS, as in
+# cluster-bootstrap.yml. One run per environment at a time, never cancelled: a half-applied stack stays half applied.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      action:
+        description: up (build), down (destroy what bills) or status (read-only)
+        type: choice
+        options: [up, down, status]
+        required: true
+      confirm:
+        description: For down, the environment's name again
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: environment-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the run
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: From main, a live environment, and down confirmed
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ACTION: ${{ inputs.action }}
+          CONFIRM: ${{ inputs.confirm }}
+          REF: ${{ github.ref }}
+          LIVE: ${{ vars.LIVE_ENVIRONMENTS }}
+        run: |
+          if [[ $REF != refs/heads/main ]]; then
+            echo "::error::Run it from main: the deploy roles trust main alone."
+            exit 1
+          fi
+          if [[ " $LIVE " != *" $ENVIRONMENT "* ]]; then
+            echo "::error::$ENVIRONMENT isn't in LIVE_ENVIRONMENTS: its one-time setup comes first (docs/runbooks/environment-up-down.md)."
+            exit 1
+          fi
+          if [[ $ACTION == down && $CONFIRM != "$ENVIRONMENT" ]]; then
+            echo "::error::down destroys $ENVIRONMENT: type its name in the confirm input."
+            exit 1
+          fi
+          echo "$ACTION $ENVIRONMENT, run by $GITHUB_ACTOR." >> "$GITHUB_STEP_SUMMARY"
+
+  # --- up --------------------------------------------------------------------------------------------------------------
+
+  stacks:
+    needs: check
+    if: inputs.action == 'up'
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      task: rebuild-stacks
+    permissions:
+      contents: read
+      id-token: write
+
+  cluster-bootstrap-tokyo:
+    needs: stacks
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: ${{ inputs.environment }}
+      region: ap-northeast-1
+    permissions:
+      contents: read
+      id-token: write
+
+  cluster-bootstrap-osaka:
+    needs: cluster-bootstrap-tokyo
+    if: inputs.environment != 'dev'
+    uses: ./.github/workflows/cluster-bootstrap-apply.yml
+    with:
+      environment: ${{ inputs.environment }}
+      region: ap-northeast-3
+    permissions:
+      contents: read
+      id-token: write
+
+  after:
+    needs: [cluster-bootstrap-tokyo, cluster-bootstrap-osaka]
+    # Osaka's job is skipped in dev, which has no Osaka.
+    if: >-
+      !cancelled() && needs.cluster-bootstrap-tokyo.result == 'success'
+      && (needs.cluster-bootstrap-osaka.result == 'success' || inputs.environment == 'dev')
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      task: rebuild-after
+    permissions:
+      contents: read
+      id-token: write
+
+  # --- down ------------------------------------------------------------------------------------------------------------
+
+  retained:
+    needs: check
+    if: inputs.action == 'down' && inputs.environment == 'prod'
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: prod
+      task: teardown-retained
+    permissions:
+      contents: read
+      id-token: write
+
+  down:
+    needs: [check, retained]
+    # The retained job is skipped outside prod.
+    if: >-
+      !cancelled() && needs.check.result == 'success' && inputs.action == 'down'
+      && (needs.retained.result == 'success' || inputs.environment != 'prod')
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      task: teardown-layers
+    permissions:
+      contents: read
+      id-token: write
+
+  # --- status ----------------------------------------------------------------------------------------------------------
+
+  status:
+    needs: check
+    if: inputs.action == 'status'
+    uses: ./.github/workflows/environment-run.yml
+    with:
+      environment: ${{ inputs.environment }}
+      task: inventory
+    permissions:
+      contents: read
+      id-token: write
