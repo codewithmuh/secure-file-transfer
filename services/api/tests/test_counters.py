@@ -497,6 +497,7 @@ async def flush_scripts(store: CounterStore) -> None:
 async def test_a_restart_s_lost_scripts_load_outside_the_call_s_50_ms(
     counter_store: CounterStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    counter_store._timeout = CALL_TIMEOUT_SECONDS  # this test is about the 50 ms itself
     await flush_scripts(counter_store)
     real = counter_store._load_scripts
 

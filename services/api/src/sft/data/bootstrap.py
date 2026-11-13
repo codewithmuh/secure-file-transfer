@@ -190,10 +190,9 @@ def main(secrets_client: Callable[[str], SecretsClient] = _secrets_client) -> in
         try:
             url = with_master_password(str(url), secret_id, secrets_client(settings.aws_region))
         except MasterSecretError as exc:
-            log.critical(
-                "the master user's secret can't be used",
-                extra={"secret_id": secret_id, "reason": str(exc)},
-            )
+            # The reason names what is wrong, never a value; the secret's ID is the chart's
+            # BOOTSTRAP_MASTER_SECRET, so the log needn't repeat it.
+            log.critical("the master user's secret can't be used", extra={"reason": str(exc)})
             return EXIT_FAILED
     engine = sync_engine(url)
     try:

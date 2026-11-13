@@ -59,8 +59,8 @@ web-check: ## Web app: clean install, type check, lint, tests, build and generat
 # is mounted read-only and copied, without node_modules, dist and test-results, to a path inside the container, so the
 # run writes nothing to the host: no root-owned files on a Linux host, and the host's node_modules is untouched.
 # PLAYWRIGHT_VERSION must equal @playwright/test in web/package.json: the target checks that first.
-PLAYWRIGHT_VERSION := 1.64.0
-PLAYWRIGHT_IMAGE := mcr.microsoft.com/playwright:v$(PLAYWRIGHT_VERSION)-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
+PLAYWRIGHT_VERSION := 1.64.1
+PLAYWRIGHT_IMAGE := mcr.microsoft.com/playwright:v$(PLAYWRIGHT_VERSION)-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f
 .PHONY: web-a11y
 web-a11y: ## Web app: axe accessibility checks on every page, in English and Japanese (needs Docker)
 	docker run --rm --init --ipc=host --volume "$(CURDIR)/web:/src/web:ro" --workdir /web \

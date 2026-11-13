@@ -11,6 +11,10 @@ web_yml="$root/.github/workflows/web.yml"
 deploy_yml="$root/.github/workflows/web-deploy.yml"
 promote_yml="$root/.github/workflows/promote.yml"
 
+# A throwaway repository's commits, and the ones web-release.sh makes in it, need an author; CI's runner has none.
+export GIT_AUTHOR_NAME=maintainer GIT_AUTHOR_EMAIL=test@example.invalid
+export GIT_COMMITTER_NAME=maintainer GIT_COMMITTER_EMAIL=test@example.invalid
+
 work=$(mktemp -d)  # the repository
 other=$(mktemp -d) # the stand-ins, the fake S3 and the build
 trap 'rm -rf "$work" "$other"' EXIT

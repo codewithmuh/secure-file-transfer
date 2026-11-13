@@ -66,7 +66,7 @@ ISSUER = "http://localhost:8180/realms/sft"
 WEB_APP = "http://localhost:3000"
 # The M5 journey's partner (#223): a trusted domain, so a rule scoped to untrusted recipients
 # leaves its transfers alone. Every journey sends to addresses at it.
-TRUSTED_DOMAIN = "partner.example"
+PARTNER_DOMAIN = "partner.example"
 
 # Each user's ID is its Keycloak `username` (the ID token's `cognito:username`), and its identity's
 # subject is the Keycloak user's own ID (`sub`): local/keycloak/sft-realm.json.
@@ -77,7 +77,6 @@ USERS = (
         "identity_id": "88888888-8888-4888-8888-888888888888",
         "subject": "55555555-5555-4555-8555-555555555555",
         "email": "dev.admin@example.com",
-        "password": "local-only-admin-password",
         "dlp_approver": True,
     },
     {
@@ -86,7 +85,6 @@ USERS = (
         "identity_id": "77777777-7777-4777-8777-777777777777",
         "subject": "33333333-3333-4333-8333-333333333333",
         "email": "dev.member@example.com",
-        "password": "local-only-member-password",
     },
     {
         "role": "member",
@@ -94,7 +92,6 @@ USERS = (
         "identity_id": "14141414-1414-4414-8414-141414141414",
         "subject": "13131313-1313-4313-8313-131313131313",
         "email": "dev.approver@example.com",
-        "password": "local-only-approver-password",
         "dlp_approver": True,
     },
 )
@@ -197,7 +194,7 @@ def seed(connection: psycopg.Connection, suppress: list[str]) -> dict[str, int]:
         "dlp_policies",
         "UPDATE dlp_policies SET trusted_domains = ARRAY[%(domain)s]::text[] "
         "WHERE tenant_id = %(tenant)s AND cardinality(trusted_domains) = 0",
-        {"tenant": TENANT_ID, "domain": TRUSTED_DOMAIN},
+        {"tenant": TENANT_ID, "domain": PARTNER_DOMAIN},
     )
     run(
         "idp_connections",
@@ -288,7 +285,7 @@ def main() -> int:
             }
             for u in USERS
         ],
-        "trusted_domains": [TRUSTED_DOMAIN],
+        "trusted_domains": [PARTNER_DOMAIN],
         "passwords": "docs/local-development.md, section 3",
         "added": added,
     }
@@ -303,7 +300,7 @@ def main() -> int:
     for user in USERS:
         approver = ", DLP approver" if user.get("dlp_approver") else ""
         print(f"  {user['role']:6}  {user['email']}{approver}")
-    print(f"Trusted domain: {TRUSTED_DOMAIN} (the DLP policy's)")
+    print(f"Trusted domain: {PARTNER_DOMAIN} (the DLP policy's)")
     print(
         "Their local-only, fake passwords are in docs/local-development.md, section 3."
     )

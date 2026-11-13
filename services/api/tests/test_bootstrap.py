@@ -230,7 +230,7 @@ def test_a_secret_that_cant_be_used_names_no_value(secrets: FakeSecrets, reason:
 
 
 @pytest.mark.usefixtures("quiet_logging")
-def test_main_exits_1_on_a_secret_it_cant_use_and_logs_its_id_only(
+def test_main_exits_1_on_a_secret_it_cant_use_and_logs_the_reason_only(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("BOOTSTRAP_DATABASE_URL", "postgresql://sft_master@127.0.0.1:1/sft")
@@ -239,5 +239,5 @@ def test_main_exits_1_on_a_secret_it_cant_use_and_logs_its_id_only(
     wrong_user = FakeSecrets({"username": "someone", "password": VALUE})
     assert bootstrap_module.main(secrets_client=lambda region: wrong_user) == 1
     [record] = [r for r in caplog.records if r.name == "sft.data.bootstrap"]
-    assert record.secret_id == SECRET_ID  # type: ignore[attr-defined]
+    assert record.reason == "the secret's user isn't BOOTSTRAP_DATABASE_URL's"  # type: ignore[attr-defined]
     assert VALUE not in caplog.text

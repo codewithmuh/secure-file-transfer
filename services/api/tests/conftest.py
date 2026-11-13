@@ -175,8 +175,11 @@ def valkey_url() -> str:
 
 @pytest.fixture
 async def counter_store(valkey_url: str) -> AsyncIterator[CounterStore]:
-    """A store on the test server, emptied first, with metrics of its own."""
+    """A store on the test server, emptied first, with metrics of its own. Its calls have 1 s, not
+    50 ms: the tests that use it check what the store answers, and one slow answer from a busy test
+    runner mustn't fail them. The tests of the 50 ms set it themselves, or make their own store."""
     store = CounterStore.connect(valkey_url, CounterMetrics.create(CollectorRegistry()))
+    store._timeout = 1.0
     await store._client.flushdb()  # read here only to start each test empty
     yield store
     await store.close()
