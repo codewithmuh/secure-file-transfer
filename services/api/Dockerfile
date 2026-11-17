@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 
-FROM ghcr.io/astral-sh/uv:0.13.7 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.9 AS uv
 
 # ---- build: resolve the locked dependencies into a virtualenv ----
-FROM python:3.13-slim-trixie AS build
+FROM python:3.15-slim-trixie AS build
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never UV_PROJECT_ENVIRONMENT=/app/.venv
 WORKDIR /app
@@ -34,7 +34,7 @@ RUN case "${BANK_CODES}" in \
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-editable
 
 # ---- runtime: slim image, only the virtualenv, non-root ----
-FROM python:3.13-slim-trixie
+FROM python:3.15-slim-trixie
 ARG APP_VERSION=0.0.0
 ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1 APP_VERSION=${APP_VERSION} BIND_HOST=0.0.0.0
 # Debian's fixes go in at build time, not when the base image is next rebuilt upstream: the scan
