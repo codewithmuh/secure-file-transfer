@@ -6,14 +6,14 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = "PolyForm-Noncommercial-1.0.0"
 dependencies = [
-  "fastapi>=0.162.0",
+  "fastapi>=0.162.2",
   "uvicorn>=0.54",
   "prometheus-client>=0.23",
   "pydantic-settings>=2.16",
   # SQLAlchemy 2.0 as ADR-0002 names it; 2.1 is a deliberate upgrade, not a Dependabot bump.
-  "sqlalchemy[asyncio]>=2.0.55,<2.1",
+  "sqlalchemy[asyncio]>=2.0.57,<2.1",
   # The binary wheel bundles libpq, so the slim image needs no system packages.
-  "psycopg[binary]>=3.3.7",
+  "psycopg[binary]>=3.3.8",
   "alembic>=1.20.1",
   # Traces (ADR-0009). The SDK and the exporter release in step with opentelemetry-api, which
   # FastAPI already needs, so all three move together: pinned, not bumped one at a time.
@@ -26,12 +26,12 @@ dependencies = [
   # The AWS SDK: SQS for the workers (sft.workers.queues) and the SES API v2 behind the mail
   # adapter (sft.data.mail, ADR-0015). It is synchronous, so callers run it in a thread pool of
   # their own (ADR-0002); M4's IAM database tokens are signed with it too.
-  "boto3>=1.43.123",
+  "boto3>=1.43.127",
   # The rate-limit counters (ADR-0014): the Valkey project's own client, pure Python, asyncio.
   "valkey>=6.2.0",
   # DLP detectors (ADR-0022): RE2 for patterns that run in linear time, libphonenumber's metadata.
   "google-re2>=1.1.20251105",
-  "phonenumbers>=9.0.42",
+  "phonenumbers>=9.0.43",
   # Member sign-in (ADR-0016, #113). The OIDC code flow with PKCE is a redirect, one form POST and
   # one revocation; the security-critical part is the ID token's signature and claims, which joserfc
   # (BSD-3-Clause, the Authlib author's JOSE library) checks against the pool's published keys. The
@@ -42,7 +42,7 @@ dependencies = [
   # DLP text extraction (ADR-0022): XML with DTDs, entities and network off, and PDF text through PDFium
   # (the default wheels, built without V8 or XFA).
   "lxml>=6.1.3",
-  "pypdfium2>=5.14.0",
+  "pypdfium2>=5.15.2",
   # TLS on the API's public port (#184, encryption and keys 2.2): the ECDSA key and self-signed
   # certificate each pod makes at start. Already in the lock through joserfc; 50.0.2 is 2026-09-30.
   "cryptography>=50.0.2",
@@ -53,13 +53,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "import-linter>=2.15",
+  "import-linter>=2.16",
   "mypy>=2.4.1",
   "pytest>=9.2.0",
   "pytest-cov>=7.0",
   "pyyaml>=6.0.3",  # the generated-spec check reads the contract (tools/contract_check.py)
-  "ruff>=0.17.3",
-  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.123",  # mypy types for the AWS clients
+  "ruff>=0.17.4",
+  "types-boto3[cognito-idp,s3,secretsmanager,sesv2,sqs]>=1.43.127",  # mypy types for the AWS clients
   "types-pyyaml>=6.0.12.20261103",
 ]
 
