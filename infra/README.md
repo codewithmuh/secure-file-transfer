@@ -160,7 +160,9 @@ destroyed for good: its bucket, key and key-admin role have `prevent_destroy`, w
 
 ### Bootstrap an account
 
-A bootstrap stack creates the bucket its own state will live in, so it starts with local state. With Terraform 1.17
+A bootstrap stack creates the bucket its own state will live in, so it starts with local state. The apply goes only
+after `check-policy-sizes.py` passes on the plan: IAM's size limits apply to the rendered policies, which only a plan
+shows (#312). The plan's JSON goes outside the repository, as it holds the account's IDs. With Terraform 1.17
 (`required_version` enforces it), the account's named CLI profile and the `Admin` permission set, never the default
 identity:
 
@@ -169,7 +171,10 @@ cd infra/bootstrap/<account>/<region>
 export AWS_PROFILE=<named profile> TF_VAR_account_id=<account id>
 # Osaka only: export TF_VAR_tfstate_primary_key_arn=<tfstate_key_arn output of the Tokyo stack>
 printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf   # git-ignored; check.sh fails while it exists
-terraform init && terraform apply
+terraform init && terraform plan -out=bootstrap.tfplan
+terraform show -json bootstrap.tfplan > "${TMPDIR:-/tmp}/bootstrap.json"
+../../../scripts/check-policy-sizes.py "${TMPDIR:-/tmp}/bootstrap.json" && terraform apply bootstrap.tfplan
+rm -f bootstrap.tfplan "${TMPDIR:-/tmp}/bootstrap.json"
 bucket=$(terraform output -raw state_bucket_name)
 rm backend_override.tf
 terraform init -migrate-state -backend-config="bucket=$bucket"
@@ -383,8 +388,9 @@ comment.
   (`ec2:VpceServiceOwner`), deletes only resources tagged `managed-by = terraform` and `project =
   secure-file-transfer`, delivers flow logs (`logs:CreateLogDelivery`), writes DNS Firewall but no other Resolver
   resource, and, where it has two Regions, holds `vpce:AllowMultiRegion` for the cross-Region S3 endpoint.
-- **Data, stores** (#101), in the same Regions (`permissions-data.tf`), as managed policies `sft-<env>-terraform-plan-data`
-  and `sft-<env>-terraform-deploy-data` under `/sft-bootstrap/`. The plan role reads: RDS, ElastiCache and log group
+- **Data, stores** (#101), in the same Regions (`permissions-data.tf`), as managed policies `sft-<env>-terraform-plan-data`,
+  `sft-<env>-terraform-deploy-data` (the databases) and `-deploy-data-stores` (the other stores, apart so each stays
+  under IAM's 6,144 characters, #312) under `/sft-bootstrap/`. The plan role reads: RDS, ElastiCache and log group
   Describe calls, the queues' attributes, the master secret's metadata and version list, never its value, and
   `secretsmanager:GetRandomPassword`, because the master password's ephemeral resource opens during plans too. The
   deploy role also creates and changes `sft-*` clusters, instances, global clusters, subnet and parameter groups,
@@ -409,8 +415,9 @@ comment.
   GuardDuty plans and `sft-<env>-*` rules, in our Regions and us-east-1 (the alarms layer's forwarding rule, #256). In
   dev and staging it may empty the buckets at teardown.
 
-- **Cluster** (#103), in the same Regions: every environment Region with a network has a cluster. Three managed
-  policies under `/sft-bootstrap/` (`sft-<env>-terraform-cluster-read`, `-cluster-deploy`, `-cluster-deploy-iam`),
+- **Cluster** (#103), in the same Regions: every environment Region with a network has a cluster. Four managed
+  policies under `/sft-bootstrap/` (`sft-<env>-terraform-cluster-read`, `-cluster-deploy`, `-cluster-deploy-iam` and
+  `-cluster-deploy-pass`, apart so each stays under IAM's 6,144 characters, #312),
   not inline ones, and the workload permissions boundary `sft-<env>-workload-boundary`. The plan role reads EKS, the
   launch templates, the interruption queue and rules, the log groups, the tunnel document, IAM roles (Identity
   Center's included) and KMS aliases. The deploy role also builds EKS resources named `sft-<env>-*`, never with a
@@ -458,7 +465,8 @@ comment.
 cluster 3, cluster bootstrap 1, edge 2, identity 1), one over IAM's default limit of 10 per role, and its plan role 5.
 The break-glass database role (#232) adds one to each: 12 and 6. The observability stack (#243) adds one to the
 deploy role, and the boundary its roles carry, which is attached to none; the alarms layer (#246) adds one more to each:
-14 and 7; the probe mailbox (#259) one more again: 15 and 8.
+14 and 7; the probe mailbox (#259) one more again: 15 and 8. Splitting two policies that were over IAM's 6,144 characters
+(#312) makes the deploy role's 17.
 So before the bootstrap apply that adds the identity layer's policies, raise each environment account's quota in
 Service Quotas: IAM, "Managed policies per role" (`L-0DA4ABF3`), to 20, in us-east-1, where IAM's global quotas live
 (`aws service-quotas request-service-quota-increase --service-code iam --quota-code L-0DA4ABF3 --desired-value 20
@@ -466,7 +474,9 @@ Service Quotas: IAM, "Managed policies per role" (`L-0DA4ABF3`), to 20, in us-ea
 come to about 7,000 characters together, and the identity layer's deploy policy, which already folds in its reads, to
 about 5,300. Until the quota is raised, that bootstrap apply fails at the attachment. Each managed policy must stay
 under IAM's 6,144 characters; counted from their statements, the edge's two come to about 2,000 and 5,000 in staging
-and prod. No static check measures the rendered JSON, so the bootstrap apply is the test.
+and prod. Only the rendered JSON shows a policy's real size, so the bootstrap
+procedure measures it from the plan before applying: `infra/scripts/check-policy-sizes.py` fails on a policy over
+6,144 characters or a role with more managed policies than the quota (#312; dev's first apply found two over).
 
 These policies change only through an **Admin apply of each account's Tokyo bootstrap stack** (SCP 4 keeps
 `/sft-bootstrap/` with `Admin`), never through CI. So before an environment's first network plan in M4, apply

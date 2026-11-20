@@ -157,7 +157,8 @@ export TF_VAR_alert_emails='["..."]'   # the alert on SCP changes (#277)
 export TF_VAR_identity_center_enabled=false TF_VAR_activate_cost_allocation_tags=false
 terraform init -backend-config="bucket=sft-management-apne1-tfstate-${TF_VAR_account_id}"
 
-# Budgets first: the $6,500 alarm exists before anything can spend (NFR-20).
+# Budgets first: the $6,500 alarm exists before anything can spend (NFR-20). Its account filters name the member
+# accounts, so this also creates the organization, its OUs and the four accounts: 9 resources, none of which spends.
 terraform apply -target='aws_budgets_budget.monthly["total"]'
 terraform apply
 ```
@@ -267,18 +268,29 @@ M4 needs shared and dev; staging and prod follow in M7. For each account, in thi
 
 1. Assign yourself `Admin` in that account ("Assign and remove Admin" below) and `aws sso login --profile
    sft-<account>-admin`.
-2. Apply `infra/bootstrap/<account>/ap-northeast-1` as [infra/README.md](../../infra/README.md#bootstrap-an-account)
-   says, with `TF_VAR_account_id` from `terraform output account_ids` in step 5. The admin pattern comes from the
-   code; no `TF_VAR_admin_principal_arn_patterns`.
-3. Set up the emergency user the Tokyo stack created (authn-authz 8.4), in the console, still as `Admin`: IAM →
+2. dev, staging and prod: raise the account's "Managed policies per role" quota to 20 first, or the apply fails at
+   the attachments (the deploy role has 17; infra/README.md, "IAM quotas"). It's usually approved within minutes:
+
+   ```bash
+   aws service-quotas request-service-quota-increase --service-code iam --quota-code L-0DA4ABF3 \
+     --desired-value 20 --region us-east-1 --profile sft-<account>-admin
+   aws service-quotas get-service-quota --service-code iam --quota-code L-0DA4ABF3 --region us-east-1 \
+     --profile sft-<account>-admin --query Quota.Value
+   ```
+
+3. Apply `infra/bootstrap/<account>/ap-northeast-1` as [infra/README.md](../../infra/README.md#bootstrap-an-account)
+   says, with `TF_VAR_account_id` from `terraform output account_ids` in step 5, and measure the plan's IAM policies
+   with `infra/scripts/check-policy-sizes.py` before the apply (#312). The admin pattern comes from the code; no
+   `TF_VAR_admin_principal_arn_patterns`.
+4. Set up the emergency user the Tokyo stack created (authn-authz 8.4), in the console, still as `Admin`: IAM →
    Users → `sft-<account>-emergency` → **Security credentials**. **Enable console access** with a custom password of
    at least 32 random characters, written down and kept offline (not in a synced password manager), with no reset
    at first sign-in. **Assign MFA device** → security key, both of your keys. Never create access keys; SCP 4 denies
    them anyway. Sign in once at `https://<account id>.signin.aws.amazon.com/console` as that user to prove the
    password and keys work, then sign out.
-4. Staging and prod only: apply `infra/bootstrap/<account>/ap-northeast-3` with `TF_VAR_tfstate_primary_key_arn` from
+5. Staging and prod only: apply `infra/bootstrap/<account>/ap-northeast-3` with `TF_VAR_tfstate_primary_key_arn` from
    the Tokyo stack's `tfstate_key_arn` output. Its bucket and key policies name the emergency user by its ARN.
-5. Remove your `Admin` assignment.
+6. Remove your `Admin` assignment.
 
 Then check, in that account:
 
