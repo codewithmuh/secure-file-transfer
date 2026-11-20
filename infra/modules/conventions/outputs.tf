@@ -39,8 +39,8 @@ output "tags" {
 }
 
 output "github_repository" {
-  description = "The repository whose workflows may assume the Terraform roles (T-71)."
-  value       = local.github_repository
+  description = "The repository whose workflows may assume the roles, as GitHub's OIDC subject names it: owner@id/name@id (T-71, #316). Only trust policies read it."
+  value       = local.github_oidc_repository
 }
 
 output "bootstrap_iam_path" {
