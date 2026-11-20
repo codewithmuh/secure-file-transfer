@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.1.0](https://github.com/codewithmuh/secure-file-transfer/compare/v1.0.0...v1.1.0) (2026-11-20)
+
+
+### Features
+
+* **infra:** apply infra/shared from a workflow as its deploy role, and the organization fixes that missed [#313](https://github.com/codewithmuh/secure-file-transfer/issues/313) ([#314](https://github.com/codewithmuh/secure-file-transfer/issues/314)) ([#315](https://github.com/codewithmuh/secure-file-transfer/issues/315)) ([225637d](https://github.com/codewithmuh/secure-file-transfer/commit/225637ddc6c0612debdfe371f2a96e303690630a))
+* **ops:** one command to bring an AWS environment up or down ([#295](https://github.com/codewithmuh/secure-file-transfer/issues/295)) ([#296](https://github.com/codewithmuh/secure-file-transfer/issues/296)) ([e41fc3b](https://github.com/codewithmuh/secure-file-transfer/commit/e41fc3b533ab03f60a955a40d3467feff6335bd7))
+
+
+### Bug Fixes
+
+* **infra:** split two deploy policies over IAM's 6,144 characters, and measure policies before apply ([#312](https://github.com/codewithmuh/secure-file-transfer/issues/312)) ([#313](https://github.com/codewithmuh/secure-file-transfer/issues/313)) ([5032599](https://github.com/codewithmuh/secure-file-transfer/commit/5032599e5624ad4c5a51085aa3e012fa10b71c42))
+* **infra:** trust GitHub's immutable OIDC subject, owner@id/name@id ([#316](https://github.com/codewithmuh/secure-file-transfer/issues/316)) ([#317](https://github.com/codewithmuh/secure-file-transfer/issues/317)) ([b504bd1](https://github.com/codewithmuh/secure-file-transfer/commit/b504bd1a6a509995a0cd60539cad2987ae246bfe))
+* **ops:** [#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)'s review fixes, which missed its merge ([#301](https://github.com/codewithmuh/secure-file-transfer/issues/301)) ([#302](https://github.com/codewithmuh/secure-file-transfer/issues/302)) ([8dcddf0](https://github.com/codewithmuh/secure-file-transfer/commit/8dcddf0c46ea35a1529ade3c075d5b23d61fe7e3))
+* **ops:** review fixes for aws-up/aws-down, and the flow-log bucket that missed [#296](https://github.com/codewithmuh/secure-file-transfer/issues/296) ([#299](https://github.com/codewithmuh/secure-file-transfer/issues/299)) ([#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)) ([820f673](https://github.com/codewithmuh/secure-file-transfer/commit/820f673948ae9bdf698278477eae8bcc87f9ae71))
+
 ## [1.0.0](https://github.com/codewithmuh/secure-file-transfer/compare/v0.1.0...v1.0.0) (2026-11-13)
 
 
