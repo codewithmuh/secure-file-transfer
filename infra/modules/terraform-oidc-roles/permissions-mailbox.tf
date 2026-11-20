@@ -5,8 +5,8 @@
 # identities are the identity policy's (SesIdentitiesAndConfigurationSets), and their records go through the DNS roles.
 #
 # Its own managed policies, `sft-<env>-terraform-mailbox-read` for the plan role and `-mailbox` for the deploy role,
-# because the identity layer's one policy is already near IAM's 6,144 characters. That makes 15 managed policies on
-# the deploy role and 8 on the plan role, inside the quota of 20 (infra/README.md, "IAM quotas").
+# because the identity layer's one policy is already near IAM's 6,144 characters. That made 15 managed policies on
+# the deploy role and 8 on the plan role; #312's two splits make 17 and 8, inside the quota of 20 (infra/README.md, "IAM quotas").
 # ---------------------------------------------------------------------------------------------------------------------
 
 locals {

@@ -87,3 +87,7 @@ jobs:
       - name: terraform test, the modules with tests (the WAF rules and logging, mocked AWS provider)
         if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
         run: infra/scripts/check.sh test
+
+      - name: The IAM policy size check's self-test (check-policy-sizes.py, #312)
+        if: ${{ !cancelled() && steps.changes.outputs.infra == 'true' }}
+        run: infra/scripts/check.sh policy-sizes
