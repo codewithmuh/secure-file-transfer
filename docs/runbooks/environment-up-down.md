@@ -51,8 +51,23 @@ What `down` leaves, and what still bills afterwards:
 
 1. [organization-and-bootstrap.md](organization-and-bootstrap.md): the GitHub environments, the organization,
    Identity Center, and each account's bootstrap stacks. Some of it is console steps.
-2. `infra/shared`: the registry and the `sft.<domain>` zone. Then add the zone's 4 name servers as NS records for
-   `sft` at your domain's DNS host.
+2. `infra/shared`: the registry, the `sft.<domain>` zone, the web bundles bucket and the organization's log archive
+   and trail. Only the shared account's deploy role may apply it (SCP 4, and its keys' policies), so it goes through
+   [shared.yml](../../.github/workflows/shared.yml), from `main`, after setting its variables: `AWS_ACCOUNT_ID`,
+   `MANAGEMENT_ACCOUNT_ID` and `MEMBER_ACCOUNT_IDS` (JSON, the environments whose bootstrap stack is applied: the
+   DNS roles trust each one's deploy role by its exact ARN, which IAM checks) in the GitHub environment
+   `shared`, and `SFT_DOMAIN` in the repository (#314):
+
+   ```bash
+   gh workflow run shared.yml -f action=plan
+   gh workflow run shared.yml -f action=apply
+   ```
+
+   Then, as the shared account's `Admin`, read `terraform output zone_name_servers` in `infra/shared` and add the 4
+   name servers as NS records for `sft` at your domain's DNS host. Add the DS record (`zone_ds_record`) only once the
+   zone answers signed: a DS record before that makes the zone fail validation ([dns-zone](../../infra/modules/dns-zone/README.md)).
+   When an environment's bootstrap stack is applied, add it to `MEMBER_ACCOUNT_IDS` and apply again: its DNS roles
+   come with it.
 3. An image: a push to `main` builds one (`build.yml`), and merging its pull request pins dev to it. The sign-in
    triggers run that digest, so `up` refuses while the values pin none.
 4. SES production access, requested per account and Region in the console a day ahead (ADR-0015). It stays with the
