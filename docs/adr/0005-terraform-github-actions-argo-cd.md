@@ -32,8 +32,8 @@
   readable only by that account's Terraform roles (T-73). The plan role may write only the `.tflock` lock objects and
   use the tfstate key only to decrypt and generate data keys; it can't write state.
 - **GitHub Actions with OIDC.** Each account has a plan role for pull requests and an apply role for `main`, and they
-  trust different subjects (T-71): the plan role only `repo:codewithmuh/secure-file-transfer:pull_request`, the apply
-  role only its GitHub environment, for example `repo:codewithmuh/secure-file-transfer:environment:prod`. Each GitHub
+  trust different subjects (T-71): the plan role only `repo:codewithmuh@51082957/secure-file-transfer@1443829486:pull_request`, the apply
+  role only its GitHub environment, for example `repo:codewithmuh@51082957/secure-file-transfer@1443829486:environment:prod`. Each GitHub
   environment accepts deployments from `main` only, so no pull request job can obtain an apply role's subject. Applies
   run after merge, dev → staging → prod, and prod waits for the environment's approval.
 - **Argo CD in each cluster**, pulling the deploy config from `main` only: a Helm chart for the application and one

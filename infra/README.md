@@ -211,9 +211,13 @@ bootstrap's `backend_override.tf` is the one override ever used, and it is gone 
 
 | Role | Trust (T-71) | May |
 |---|---|---|
-| `sft-<env>-terraform-plan` | `repo:codewithmuh/secure-file-transfer:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network, data, storage, cluster, edge, identity and alarms layers; in shared, the shared stack (below) |
-| `sft-<env>-terraform-deploy` | `repo:codewithmuh/secure-file-transfer:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network, data, storage, cluster, edge, identity and alarms layers; in shared, the shared stack (below) |
+| `sft-<env>-terraform-plan` | `repo:codewithmuh@51082957/secure-file-transfer@1443829486:pull_request` only | Read state and write lock files; describe Regions and AZs; in dev, staging and prod, read the network, data, storage, cluster, edge, identity and alarms layers; in shared, the shared stack (below) |
+| `sft-<env>-terraform-deploy` | `repo:codewithmuh@51082957/secure-file-transfer@1443829486:environment:<env>` only (`dev`, `staging`, `prod`, `shared`) | Read and write state; describe Regions and AZs; in dev, staging and prod, build the network, data, storage, cluster, edge, identity and alarms layers; in shared, the shared stack (below) |
 | `sft-<env>-keyadmin` | The account's `BreakGlass` permission set role only | Get and put key policies, through the key policies that name it |
+
+The subjects are GitHub's immutable form, `repo:<owner>@<owner id>/<name>@<repo id>:...`, which this repository's tokens carry
+and GitHub keeps on; `modules/conventions` holds it (#316). A repository deleted and created again under the same
+name gets new IDs, so it can't assume these roles.
 
 All three sit under the `/sft-bootstrap/` IAM path, which only `Admin` may change (ADR-0006, SCP 4). So does the
 retained stack's own deploy role, which must be named `sft-prod-retained-terraform-deploy`: the SCPs treat every

@@ -16,6 +16,9 @@ locals {
   global_name_prefix = "sft-${var.environment}"
 
   github_repository = "codewithmuh/secure-file-transfer"
+  # As GitHub's OIDC tokens name it: owner and repository with their numeric IDs (GitHub's immutable subject, #316), so
+  # a repository deleted and created again under the same name can't assume these roles.
+  github_oidc_repository = "codewithmuh@51082957/secure-file-transfer@1443829486"
 
   # An environment's workload roles: sft-<env>-<name> at path "/", by the layer that makes each (encryption 4.3,
   # authn-authz). The key, bucket and queue policies name them before they exist, matched by aws:PrincipalArn, so a

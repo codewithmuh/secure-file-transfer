@@ -9,12 +9,12 @@ variable "account_id" {
 }
 
 variable "github_repository" {
-  description = "owner/name of the repository whose workflows may assume the roles. No wildcards (T-71)."
+  description = "The repository whose workflows may assume the roles, as GitHub's OIDC subject names it: owner@id/name@id (#316), or owner/name. No wildcards (T-71)."
   type        = string
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
-    error_message = "github_repository must be owner/name, without wildcards."
+    condition     = can(regex("^[A-Za-z0-9_.-]+(@[0-9]+)?/[A-Za-z0-9_.-]+(@[0-9]+)?$", var.github_repository))
+    error_message = "github_repository must be owner@id/name@id or owner/name, without wildcards."
   }
 }
 
