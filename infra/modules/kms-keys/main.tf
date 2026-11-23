@@ -59,7 +59,7 @@ locals {
   }
 
   via = {
-    for service in ["s3", "sqs", "sns", "ec2", "rds", "elasticache", "secretsmanager", "eks", "logs"] :
+    for service in ["s3", "sqs", "sns", "ec2", "rds", "elasticache", "dax", "secretsmanager", "eks", "logs"] :
     service => "${service}.${local.region}.amazonaws.com"
   }
 
