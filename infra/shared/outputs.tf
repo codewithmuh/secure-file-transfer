@@ -48,11 +48,6 @@ output "log_archive_key_arn" {
   value       = module.log_archive.logs_key_arn
 }
 
-output "organization_trail_arn" {
-  description = "ARN of the organization trail."
-  value       = module.log_archive.trail_arn
-}
-
 output "web_bundle_bucket" {
   description = "The web app's bundle store, for the WEB_BUNDLE_BUCKET repository variable (#283)."
   value       = module.web_bundles.bucket_name

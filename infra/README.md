@@ -253,7 +253,7 @@ docs/runbooks/scp-change.md).
 |---|---|
 | OUs and accounts | `prod` (prod), `nonprod` (dev, staging), `shared` (shared). Accounts are named `sft-<env>`; their emails come in as `TF_VAR_account_emails`. `prevent_destroy` and `close_on_deletion = false`: nothing here closes an account. |
 | Root access | Centralized root access: member accounts have no root credentials. A privileged root task runs from the management account through `sts:AssumeRoot`. |
-| Trusted access | Identity Center, IAM (root access) and CloudTrail. The shared account is CloudTrail's delegated administrator: the shared stack creates the organization trail next to its log archive, and that trail must log S3 data events on every `sft-*-tfstate-*` bucket (`.trivyignore.yaml`). GuardDuty and Config belong to each environment, so neither is delegated. |
+| Trusted access | Identity Center, IAM (root access) and CloudTrail. The shared account is CloudTrail's delegated administrator and holds the log archive. The organization stack creates the organization trail into that archive: AWS makes the management account an organization trail's owner whoever creates it, and the provider reads it only from there (#318). The trail must log S3 data events on every `sft-*-tfstate-*` bucket (`.trivyignore.yaml`). GuardDuty and Config belong to each environment, so neither is delegated. |
 | Budgets | $6,500 in total and per account: shared $20, dev $500, staging $800, prod $5,180 (capacity 7.3). Alarms by email at 50 % actual, 80 % and 100 % actual and forecast (NFR-20). The $7 NFR-19 budget is the retained stack's. |
 | Cost allocation tags | `environment`, `component`, `stack` |
 

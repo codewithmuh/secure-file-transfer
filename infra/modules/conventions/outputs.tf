@@ -90,3 +90,8 @@ output "workload_role_arns" {
   description = "Every workload role's ARN at path /, by short name, built from the name so policies can name a role before it exists (#172)."
   value       = { for name, role in local.workload_role_names : name => "arn:aws:iam::${var.account_id}:role/${role}" }
 }
+
+output "organization_trail_name" {
+  description = "Name of the organization trail, which the organization stack creates and the log archive's policies admit (#318)."
+  value       = local.organization_trail_name
+}

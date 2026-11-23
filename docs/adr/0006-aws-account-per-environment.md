@@ -94,11 +94,12 @@ protections. The retained stack stays in the prod account, which stays open afte
   runs from the management account through `sts:AssumeRoot`, which SCP 3 lets through. Only the management account's
   root user has a password and security keys.
 - **The shared account** lives from the bootstrap until the last environment is torn down. It is CloudTrail's
-  delegated administrator and creates the organization trail next to its log archive, so the management account holds
-  no trail. GuardDuty and Config belong to each environment and have no delegated administrator. The organization trail
-  writes to its log archive under Object Lock with 90-day retention (T-75), so after the final teardown it keeps
-  billing a few cents for up to 90 days, the small exception NFR-19 records. The retained stack keeps its own trail
-  (encryption 8.4), because the organization trail ends with the shared account.
+  delegated administrator and holds the log archive. The organization trail is the organization stack's, in the
+  management account, which AWS makes an organization trail's owner whoever creates it (#318); it writes into that
+  archive. GuardDuty and Config belong to each environment and have no delegated administrator. The archive keeps
+  everything under Object Lock with 90-day retention (T-75), so after the final teardown, which removes the trail
+  before the shared stack, it keeps billing a few cents for up to 90 days, the small exception NFR-19 records. The
+  retained stack keeps its own trail (encryption 8.4).
 - **Cross-account access**: each environment's node role pulls from ECR in shared (repository policy, and the registry
   key through ECR only); the release workflow pushes through an OIDC role in shared; each environment's apply role
   reads the web bundle artifacts and writes its own DNS records in the shared zone through a role limited to its names

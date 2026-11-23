@@ -48,7 +48,7 @@ aws eks describe-cluster --region <region> --name sft-<env>-<rs>-eks --query clu
 ## Mitigate
 
 1. **Put it back with Terraform:** apply the stack that owns the resource (the data stack for GuardDuty's plans, the
-   alarms stack for these rules, the cluster stack for the endpoint; the shared stack for the organization trail). A
+   alarms stack for these rules, the cluster stack for the endpoint; the organization stack for the organization trail). A
    public endpoint first: apply the cluster stack, which sets it private.
 2. **A refused attempt or an unknown caller:** end that principal's sessions and assignments, as in
    [privileged-sign-in.md](privileged-sign-in.md), and check the SCPs in the management account

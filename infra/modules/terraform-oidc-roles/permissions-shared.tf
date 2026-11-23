@@ -15,7 +15,6 @@ locals {
   shared_iam_role_arns = ["arn:aws:iam::${var.account_id}:role/sft-shared/*"]
   shared_bucket_arn    = "arn:aws:s3:::sft-shared-apne1-log-archive-${var.account_id}"
   shared_bundles_arn   = "arn:aws:s3:::sft-shared-apne1-web-bundles-${var.account_id}"
-  shared_trail_arns    = ["arn:aws:cloudtrail:ap-northeast-1:*:trail/sft-organization"]
   shared_ecr_arns = [
     for region in ["ap-northeast-1", "ap-northeast-3"] : "arn:aws:ecr:${region}:${var.account_id}:*"
   ]
@@ -204,23 +203,8 @@ data "aws_iam_policy_document" "shared_write" {
     resources = [local.shared_bundles_arn, "${local.shared_bundles_arn}/*"]
   }
 
-  # The organization trail, as CloudTrail's delegated administrator. The first one creates CloudTrail's
-  # service-linked role.
-  statement {
-    sid = "OrganizationTrail"
-    actions = [
-      "cloudtrail:AddTags",
-      "cloudtrail:CreateTrail",
-      "cloudtrail:DeleteTrail",
-      "cloudtrail:PutEventSelectors",
-      "cloudtrail:RemoveTags",
-      "cloudtrail:StartLogging",
-      "cloudtrail:StopLogging",
-      "cloudtrail:UpdateTrail",
-    ]
-    resources = local.shared_trail_arns
-  }
-
+  # The organization trail is the organization stack's (#318): as CloudTrail's delegated administrator, this account
+  # only reads it.
   statement {
     sid = "OrganizationTrailChecks"
     actions = [
@@ -229,18 +213,6 @@ data "aws_iam_policy_document" "shared_write" {
       "organizations:ListDelegatedAdministrators",
     ]
     resources = ["*"]
-  }
-
-  statement {
-    sid       = "CloudTrailServiceLinkedRole"
-    actions   = ["iam:CreateServiceLinkedRole", "iam:GetRole"]
-    resources = ["arn:aws:iam::${var.account_id}:role/aws-service-role/cloudtrail.amazonaws.com/*"]
-
-    condition {
-      test     = "StringEqualsIfExists"
-      variable = "iam:AWSServiceName"
-      values   = ["cloudtrail.amazonaws.com"]
-    }
   }
 }
 
