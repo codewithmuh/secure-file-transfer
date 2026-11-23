@@ -259,7 +259,7 @@ data "aws_iam_policy_document" "network_deploy" {
       flatten([
         for type in [
           "elastic-ip", "internet-gateway", "natgateway", "route-table", "security-group", "security-group-rule",
-          "subnet", "vpc", "vpc-flow-log",
+          "subnet", "vpc", "vpc-endpoint", "vpc-flow-log", # vpc-endpoint: tagged as it is created (#324)
         ] : local.network_ec2_arns[type]
       ]),
       local.network_aws_prefix_list_arns,
