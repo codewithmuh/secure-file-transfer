@@ -8,7 +8,8 @@ name: environment-run
 # The repository is public, and so are these logs: the account IDs and the domain are masked, the emails are secrets,
 # and Terraform prints only its summaries here (SFT_TF_QUIET; ops/lib/common.sh).
 #
-# Variables and secrets (never literals in this file):
+# Variables and secrets (never literals in this file). A called workflow sees only the secrets its caller passes, so
+# environment.yml passes them with `secrets: inherit`; without it these read empty (#321).
 #   SHARED_ACCOUNT_ID, SFT_DOMAIN            repository variables, as cluster-bootstrap-apply.yml
 #   AWS_ACCOUNT_ID                           environment variable: the environment's account (prod-retained: prod's)
 #   ALERT_EMAILS                             environment secret: a JSON list, the alarms' and the retained stack's
