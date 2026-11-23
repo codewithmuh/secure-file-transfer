@@ -49,7 +49,8 @@ locals {
 
   data_kms_via_services = flatten([
     for region in var.network_regions : [
-      for service in ["rds", "elasticache", "secretsmanager", "sqs"] : "${service}.${region}.amazonaws.com"
+      # ElastiCache Serverless reaches KMS as dax as well as elasticache (ElastiCache guide, at-rest encryption; #326).
+      for service in ["rds", "elasticache", "dax", "secretsmanager", "sqs"] : "${service}.${region}.amazonaws.com"
     ]
   ])
 
@@ -134,6 +135,8 @@ data "aws_iam_policy_document" "data_deploy" {
       "rds:ModifyDBInstance",
       "rds:ModifyDBSubnetGroup",
       "rds:ModifyGlobalCluster",
+      # The provider reboots a new cluster instance to apply its parameter group (#326).
+      "rds:RebootDBInstance",
       "rds:RemoveTagsFromResource",
       # The provider resets a parameter that is removed from the cluster parameter group.
       "rds:ResetDBClusterParameterGroup",

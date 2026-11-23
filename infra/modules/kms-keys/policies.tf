@@ -1616,7 +1616,7 @@ data "aws_iam_policy_document" "platform" {
     condition {
       test     = "StringEquals"
       variable = "kms:ViaService"
-      values   = [local.via["elasticache"]]
+      values   = [local.via["elasticache"], local.via["dax"]] # ElastiCache Serverless calls KMS as both (#326)
     }
   }
   # The probe mailbox (#259, modules/probe-mailbox): SES's receipt rules write each message under this key, and only
