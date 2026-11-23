@@ -3,7 +3,7 @@
 
 # The promotion workflow edits only the digest line (ADR-0005, #107). The all-zeros digest means "never built".
 image:
-  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  digest: sha256:843416ac47c52a3961b9c56f6def3b495a126da4d57e4e251f2799d357d95b01
 
 # Fencing after a failover sets this to true (ADR-0004, T-78).
 pilotLight: false
