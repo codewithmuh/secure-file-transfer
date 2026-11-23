@@ -78,6 +78,7 @@ jobs:
     needs: check
     if: inputs.action == 'up'
     uses: ./.github/workflows/environment-run.yml
+    secrets: inherit # the environment's ALERT_EMAILS, DMARC_REPORT_ADDRESS, BUDGET_EMAIL (#321)
     with:
       environment: ${{ inputs.environment }}
       task: rebuild-foundation
@@ -88,6 +89,7 @@ jobs:
   platform:
     needs: foundation
     uses: ./.github/workflows/environment-run.yml
+    secrets: inherit # the environment's ALERT_EMAILS, DMARC_REPORT_ADDRESS, BUDGET_EMAIL (#321)
     with:
       environment: ${{ inputs.environment }}
       task: rebuild-platform
@@ -125,6 +127,7 @@ jobs:
       !cancelled() && needs.cluster-bootstrap-tokyo.result == 'success'
       && (needs.cluster-bootstrap-osaka.result == 'success' || inputs.environment == 'dev')
     uses: ./.github/workflows/environment-run.yml
+    secrets: inherit # the environment's ALERT_EMAILS, DMARC_REPORT_ADDRESS, BUDGET_EMAIL (#321)
     with:
       environment: ${{ inputs.environment }}
       task: rebuild-after
@@ -138,6 +141,7 @@ jobs:
     needs: check
     if: inputs.action == 'down' && inputs.environment == 'prod'
     uses: ./.github/workflows/environment-run.yml
+    secrets: inherit # the environment's ALERT_EMAILS, DMARC_REPORT_ADDRESS, BUDGET_EMAIL (#321)
     with:
       environment: prod
       task: teardown-retained
@@ -152,6 +156,7 @@ jobs:
       !cancelled() && needs.check.result == 'success' && inputs.action == 'down'
       && (needs.retained.result == 'success' || inputs.environment != 'prod')
     uses: ./.github/workflows/environment-run.yml
+    secrets: inherit # the environment's ALERT_EMAILS, DMARC_REPORT_ADDRESS, BUDGET_EMAIL (#321)
     with:
       environment: ${{ inputs.environment }}
       task: teardown-layers
