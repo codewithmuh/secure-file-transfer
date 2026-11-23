@@ -419,9 +419,12 @@ Every key policy follows these rules:
 
 1. **Named principals only.** The policy does not give `kms:*` to the account root, so an IAM administrator can't give
    themselves Decrypt with an identity policy. The Terraform deploy role of the stack that owns the key administers it.
-2. **Separation of duties.** Administrators can't use the key, and users can't administer it. Two exceptions, each
+2. **Separation of duties.** Administrators can't use the key, and users can't administer it. Three exceptions, each
    limited to named resources: the deploy role encrypts and decrypts its Terraform state (tfstate key, and the audit
-   key for the retained stack's state bucket), and it encrypts the secrets it writes (6.4).
+   key for the retained stack's state bucket); it encrypts the secrets it writes (6.4); and the shared account's deploy
+   role may `DescribeKey`, `GetPublicKey` and `Sign` with the DNSSEC key, because Route 53 refuses to create a
+   key-signing key for a caller that can't use the key (#318). The zone is that role's own, so signing with its key
+   grants nothing it can't already do to the zone's records.
 3. **No grants to people.** `CreateGrant` is allowed only for AWS resources (`kms:GrantIsForAWSResource`), and only to
    the deploy role, the node provisioner and AWS services acting for their own resources.
 4. **Osaka only.** `ReplicateKey` is allowed only with `kms:ReplicaRegion` set to `ap-northeast-3`.

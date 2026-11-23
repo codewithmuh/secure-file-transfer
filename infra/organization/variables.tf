@@ -83,3 +83,25 @@ variable "alert_emails" {
     error_message = "Every alert address must be an email address."
   }
 }
+
+# The organization trail (organization-trail.tf, #318).
+variable "organization_trail_enabled" {
+  description = "Whether the organization trail exists. False only before the shared stack's archive does, and to remove the trail at the final teardown."
+  type        = bool
+  default     = true
+}
+
+variable "adopt_organization_trail" {
+  description = "Import the organization trail the shared account created before #318, once. False for a trail this stack creates."
+  type        = bool
+  default     = false
+}
+
+variable "log_archive" {
+  description = "The shared stack's log archive bucket name and logs key ARN (its outputs), for the organization trail. Null until the shared stack exists. TF_VAR_log_archive, never committed."
+  type = object({
+    bucket_name = string
+    key_arn     = string
+  })
+  default = null
+}

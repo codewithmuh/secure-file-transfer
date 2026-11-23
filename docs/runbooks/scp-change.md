@@ -17,7 +17,7 @@ organization stack page too**. Organizations has no other policy type in use her
 
 > [!IMPORTANT]
 > **Pending the AWS run**, like every EventBridge alert: checked statically, fired for real by the first organization
-> apply after the shared stack's organization trail exists (the rule sees nothing before that trail logs).
+> apply after the organization trail exists (organization-trail.tf) (the rule sees nothing before that trail logs).
 
 ## The message
 

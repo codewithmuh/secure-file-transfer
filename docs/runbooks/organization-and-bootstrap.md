@@ -155,6 +155,7 @@ export TF_VAR_account_emails='{shared="...",dev="...",staging="...",prod="..."}'
 export TF_VAR_budget_notification_emails='["..."]'
 export TF_VAR_alert_emails='["..."]'   # the alert on SCP changes (#277)
 export TF_VAR_identity_center_enabled=false TF_VAR_activate_cost_allocation_tags=false
+export TF_VAR_organization_trail_enabled=false   # until the shared stack's log archive exists (#318)
 terraform init -backend-config="bucket=sft-management-apne1-tfstate-${TF_VAR_account_id}"
 
 # Budgets first: the $6,500 alarm exists before anything can spend (NFR-20). Its account filters name the member
@@ -172,7 +173,7 @@ Then check:
 - The budget emails don't need confirming, but check spam for the first one.
 - Each address in `TF_VAR_alert_emails` gets an SNS confirmation for `sft-management-scp-alerts` (us-east-1): confirm
   it, or the alert on SCP changes reaches nobody ([scp-change.md](scp-change.md), #277). This apply's own SCP
-  attachments page through it once the shared stack's organization trail exists, not before: the rule sees nothing
+  attachments page through it once the organization trail exists, not before: the rule sees nothing
   until then.
 - `terraform output account_ids` lists all five accounts. Note them; every other stack takes its `TF_VAR_account_id`
   from here.

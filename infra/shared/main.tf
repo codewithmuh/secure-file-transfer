@@ -134,6 +134,7 @@ module "log_archive" {
   member_account_ids    = var.member_account_ids
   bucket_name           = "${module.conventions.name_prefix}-log-archive-${var.account_id}"
   kms_alias_prefix      = module.conventions.kms_alias_prefix
+  trail_name            = module.conventions.organization_trail_name
 
   deploy_role_arn                    = local.bootstrap_role_arns.terraform_deploy
   plan_role_arn                      = local.bootstrap_role_arns.terraform_plan
@@ -153,4 +154,14 @@ module "web_bundles" {
   github_repository        = module.conventions.github_repository
   publish_role_name        = "${module.conventions.global_name_prefix}-web-publish"
   iam_path                 = local.iam_path
+}
+
+# The organization trail moved to the organization stack, which the management account applies (#318). This state
+# forgets it without destroying it; the organization stack imports it.
+removed {
+  from = module.log_archive.aws_cloudtrail.organization
+
+  lifecycle {
+    destroy = false
+  }
 }

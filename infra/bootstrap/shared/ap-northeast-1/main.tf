@@ -60,7 +60,7 @@ module "terraform_roles" {
   plan_role_name     = module.conventions.bootstrap_role_names.terraform_plan
   deploy_role_name   = module.conventions.bootstrap_role_names.terraform_deploy
 
-  # The shared stack: registry, zone, log archive and organization trail (#105).
+  # The shared stack: registry, zone and log archive (#105); the organization trail is the organization stack's (#318).
   shared_stack = true
 }
 

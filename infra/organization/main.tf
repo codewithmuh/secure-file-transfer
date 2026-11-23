@@ -8,13 +8,9 @@
 # Files: main.tf (organization, OUs, accounts, trusted access), scps.tf (the five SCPs), identity-center.tf
 # (permission sets, groups, assignments), budgets.tf (budgets and cost allocation tags), break-glass-trail.tf (each
 # environment's read-only role for its break-glass reconciliation, #239), scp-alerts.tf (the alert on any SCP change,
-# in us-east-1, #277).
+# in us-east-1, #277), organization-trail.tf (the organization trail, into the shared account's log archive, #318).
 #
 # What this stack deliberately doesn't hold:
-# - The organization trail. The shared account is CloudTrail's delegated administrator (below) and the shared stack
-#   creates the trail next to its log archive, so the trail, its bucket and its key end together (ADR-0006,
-#   encryption 8.4). That trail must log S3 data events on every sft-*-tfstate-* bucket, which the state buckets rely
-#   on instead of server access logs (.trivyignore.yaml, AVD-AWS-0089).
 # - GuardDuty and AWS Config. Each environment runs its own and tears them down with it (encryption 8.4, capacity
 #   7.4), so neither has a delegated administrator or an organization-wide configuration.
 # - The NFR-19 budget of $7. The retained stack creates it in the prod account (encryption 8.4).
@@ -96,7 +92,7 @@ locals {
 resource "aws_organizations_organization" "this" {
   feature_set = "ALL"
 
-  # Trusted access: Identity Center (ADR-0006), CloudTrail for the organization trail the shared account creates, and
+  # Trusted access: Identity Center (ADR-0006), CloudTrail for the organization trail (organization-trail.tf), and
   # IAM for centralized root access, so member accounts have no root credentials at all (below).
   aws_service_access_principals = [
     "cloudtrail.amazonaws.com",
@@ -150,7 +146,8 @@ resource "aws_iam_organizations_features" "root_access" {
   depends_on = [aws_organizations_organization.this]
 }
 
-# The shared account creates and owns the organization trail (see the header).
+# The shared account is CloudTrail's delegated administrator: it reads the organization trail's status and events.
+# The trail itself is this stack's (organization-trail.tf, #318).
 resource "aws_cloudtrail_organization_delegated_admin_account" "shared" {
   account_id = aws_organizations_account.member["shared"].id
 

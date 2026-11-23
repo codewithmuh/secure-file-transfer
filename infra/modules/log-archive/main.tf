@@ -1,10 +1,10 @@
-# The organization's log archive and its trail, in the shared account (ADR-0006, T-73, T-75, authn-authz 8.3,
+# The organization's log archive, in the shared account (ADR-0006, T-73, T-75, authn-authz 8.3,
 # encryption 3.1).
 #
-# - The organization trail: every account and Region, management events, and S3 data events on every Terraform state
-#   bucket. Those data events are the state buckets' access log, instead of S3 server access logs (.trivyignore.yaml,
-#   AVD-AWS-0089). The organization stack makes this account CloudTrail's delegated administrator; this stack creates
-#   the trail, so the management account holds none.
+# - The organization trail writes here: every account and Region, management events, and S3 data events on every
+#   Terraform state bucket, which are the state buckets' access log instead of S3 server access logs (.trivyignore.yaml,
+#   AVD-AWS-0089). The organization stack creates it in the management account (#318): one created here, as CloudTrail's
+#   delegated administrator, belongs to the management account anyway, and the provider can't read it back from here.
 # - The archive bucket, sft-shared-apne1-log-archive-<account-id> (the name the AuditReader permission set reads), is
 #   under Object Lock in compliance mode for 90 days, so nobody, BreakGlass and the account's own administrators
 #   included, can change or delete a record before then. The environments' own trails deliver their files buckets'
@@ -33,18 +33,6 @@ locals {
   # Every environment's own trails, in any of its Regions (authn-authz 8.3).
   environment_trail_patterns = [for account in values(var.member_account_ids) : "arn:aws:cloudtrail:*:${account}:trail/*"]
   all_trail_patterns         = concat(local.organization_trail_arns, local.environment_trail_patterns)
-
-  # Every Terraform state bucket: sft-<env>-<region-short>-tfstate-<account-id>, and the retained stack's own
-  # (infra/README.md, "State"). Osaka has state buckets in staging and prod only.
-  tfstate_bucket_prefixes = concat(
-    [
-      for pair in [
-        ["management", "apne1"], ["shared", "apne1"], ["dev", "apne1"], ["staging", "apne1"], ["staging", "apne3"],
-        ["prod", "apne1"], ["prod", "apne3"],
-      ] : "arn:aws:s3:::sft-${pair[0]}-${pair[1]}-tfstate-"
-    ],
-    ["arn:aws:s3:::sft-prod-apne1-retained-tfstate-"],
-  )
 
   # IAM Identity Center's role for the AuditReader permission set in this account.
   audit_reader_pattern = "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_AuditReader_*"
@@ -352,47 +340,4 @@ resource "aws_s3_bucket_policy" "archive" {
   policy = data.aws_iam_policy_document.archive.json
 
   depends_on = [aws_s3_bucket_public_access_block.archive]
-}
-
-# --- Organization trail ------------------------------------------------------------------------------------------
-
-resource "aws_cloudtrail" "organization" {
-  name                          = var.trail_name
-  s3_bucket_name                = aws_s3_bucket.archive.id
-  kms_key_id                    = aws_kms_key.logs.arn
-  is_organization_trail         = true
-  is_multi_region_trail         = true
-  include_global_service_events = true
-  enable_log_file_validation    = true
-
-  advanced_event_selector {
-    name = "Management events"
-
-    field_selector {
-      field  = "eventCategory"
-      equals = ["Management"]
-    }
-  }
-
-  # The state buckets' access log (T-73): every read and write of a state or lock file, in every account.
-  advanced_event_selector {
-    name = "Terraform state objects"
-
-    field_selector {
-      field  = "eventCategory"
-      equals = ["Data"]
-    }
-
-    field_selector {
-      field  = "resources.type"
-      equals = ["AWS::S3::Object"]
-    }
-
-    field_selector {
-      field       = "resources.ARN"
-      starts_with = local.tfstate_bucket_prefixes
-    }
-  }
-
-  depends_on = [aws_s3_bucket_policy.archive]
 }

@@ -68,6 +68,11 @@ What `down` leaves, and what still bills afterwards:
    zone answers signed: a DS record before that makes the zone fail validation ([dns-zone](../../infra/modules/dns-zone/README.md)).
    When an environment's bootstrap stack is applied, add it to `MEMBER_ACCOUNT_IDS` and apply again: its DNS roles
    come with it.
+
+   Then, as the management account's `Admin`, apply `infra/organization` with `TF_VAR_log_archive` set from the
+   shared stack's outputs, `{bucket_name = "<the log_archive_bucket_arn's name>", key_arn = "<log_archive_key_arn>"}`,
+   and without `TF_VAR_organization_trail_enabled=false` from then on: it creates the organization trail. Once only, for
+   the trail the shared account made before #318, add `TF_VAR_adopt_organization_trail=true` to import it instead.
 3. An image: a push to `main` builds one (`build.yml`), and merging its pull request pins dev to it. The sign-in
    triggers run that digest, so `up` refuses while the values pin none.
 4. SES production access, requested per account and Region in the console a day ahead (ADR-0015). It stays with the

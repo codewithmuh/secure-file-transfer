@@ -315,6 +315,11 @@ destroy_root() {
         "set it false in modules/tfstate-backend and modules/key-admin-role, and move this root's state back to local" \
         "(terraform init -migrate-state with the backend block removed), as docs/runbooks/teardown.md step 2 says."
       ;;
+    shared)
+      # The organization trail writes into this stack's archive, from the organization stack (#318).
+      manual "As the management account's Admin, apply infra/organization with TF_VAR_organization_trail_enabled=false: that removes the" \
+        "organization trail, which would keep writing to the archive this destroy takes (docs/runbooks/teardown.md, step 3)."
+      ;;
   esac
   tf_root "$root" destroy -auto-approve
 }
