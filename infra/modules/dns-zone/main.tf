@@ -84,6 +84,36 @@ data "aws_iam_policy_document" "dnssec_use" {
       values   = ["true"]
     }
   }
+
+  # Route 53 checks that whoever creates the key-signing key may use the key as well: the deploy role, which applies
+  # this stack. Administering it isn't enough (#318: the first apply failed with InvalidKMSArn).
+  statement {
+    sid       = "DeployRoleCreatesTheKeySigningKey"
+    actions   = ["kms:DescribeKey", "kms:GetPublicKey", "kms:Sign"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [var.deploy_role_arn]
+    }
+  }
+
+  statement {
+    sid       = "DeployRoleGrantsRoute53"
+    actions   = ["kms:CreateGrant"]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = [var.deploy_role_arn]
+    }
+
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
 }
 
 module "dnssec_key_policy" {

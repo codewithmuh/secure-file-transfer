@@ -42,9 +42,8 @@ variable "bucket_name" {
 }
 
 variable "trail_name" {
-  description = "Name of the organization trail."
+  description = "Name of the organization trail, which the bucket and key policies admit (modules/conventions, #318)."
   type        = string
-  default     = "sft-organization"
 }
 
 variable "retention_days" {

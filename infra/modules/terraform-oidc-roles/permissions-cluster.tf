@@ -240,24 +240,6 @@ data "aws_iam_policy_document" "cluster_deploy_iam" {
     }
   }
 
-  statement {
-    sid       = "AttachOnlyTheModulesManagedPolicies"
-    actions   = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
-    resources = local.cluster_role_arns
-
-    condition {
-      test     = "ArnEquals"
-      variable = "iam:PolicyARN"
-      values   = local.cluster_managed_policy_arns
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PermissionsBoundary"
-      values   = [local.cluster_boundary_arn]
-    }
-  }
-
   # Changes that grant nothing new. The boundary can't be removed: no DeleteRolePermissionsBoundary.
   statement {
     sid = "ChangeAndDeleteOwnRoles"
@@ -275,6 +257,31 @@ data "aws_iam_policy_document" "cluster_deploy_iam" {
     effect    = "Deny"
     actions   = ["sts:AssumeRole", "sts:TagSession"]
     resources = local.cluster_role_arns
+  }
+}
+
+# Deploy: attaching the module's managed policies to the cluster layer's roles, passing them, and the service-linked
+# roles. Apart from the policy above, so each managed policy stays under IAM's 6,144 characters (#312: together they
+# came to 8,189 in dev). The deny on assuming these roles stays above, in the policy that writes their trust.
+data "aws_iam_policy_document" "cluster_deploy_pass" {
+  count = local.cluster_enabled ? 1 : 0
+
+  statement {
+    sid       = "AttachOnlyTheModulesManagedPolicies"
+    actions   = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
+    resources = local.cluster_role_arns
+
+    condition {
+      test     = "ArnEquals"
+      variable = "iam:PolicyARN"
+      values   = local.cluster_managed_policy_arns
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [local.cluster_boundary_arn]
+    }
   }
 
   statement {
@@ -441,6 +448,15 @@ resource "aws_iam_policy" "cluster_deploy_iam" {
   policy      = data.aws_iam_policy_document.cluster_deploy_iam[0].json
 }
 
+resource "aws_iam_policy" "cluster_deploy_pass" {
+  count = local.cluster_enabled && var.github_environment != null ? 1 : 0
+
+  name        = "${local.cluster_env_prefix}-terraform-cluster-deploy-pass"
+  path        = var.iam_path
+  description = "Terraform deploy: attach the module's policies to and pass the cluster layer's roles (#103, #312)."
+  policy      = data.aws_iam_policy_document.cluster_deploy_pass[0].json
+}
+
 resource "aws_iam_role_policy_attachment" "plan_cluster_read" {
   count = local.cluster_enabled ? 1 : 0
 
@@ -453,6 +469,7 @@ resource "aws_iam_role_policy_attachment" "deploy_cluster" {
     read   = aws_iam_policy.cluster_read[0].arn
     deploy = aws_iam_policy.cluster_deploy[0].arn
     iam    = aws_iam_policy.cluster_deploy_iam[0].arn
+    pass   = aws_iam_policy.cluster_deploy_pass[0].arn
   } : {}
 
   role       = aws_iam_role.deploy[0].name

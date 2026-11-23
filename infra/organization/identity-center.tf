@@ -153,7 +153,8 @@ resource "aws_ssoadmin_permission_set_inline_policy" "this" {
 
 # BreakGlassApprover creates and removes assignments of BreakGlass and Admin, and reads who is who. IAM can't tell
 # whether the person assigned is someone else; self-approval raises its own alert (authn-authz 8.3, R-08). It can't
-# change permission sets, groups or anything else in this account.
+# change permission sets, groups or anything else in this account, apart from provisioning the Admin and BreakGlass
+# roles of an assignment here.
 data "aws_iam_policy_document" "break_glass_approver" {
   count = var.identity_center_enabled ? 1 : 0
 
@@ -178,6 +179,38 @@ data "aws_iam_policy_document" "break_glass_approver" {
       "sso:DescribePermissionSet", "sso:ListAccountAssignments", "sso:ListAccountAssignmentsForPrincipal",
       "sso:ListInstances", "sso:ListPermissionSets",
     ]
+    resources = ["*"]
+  }
+
+  # An assignment in the management account is provisioned with the caller's own IAM rights, unlike one in a member
+  # account (#312: the first grant of Admin here failed on iam:GetSAMLProvider). Only the roles of the two permission
+  # sets this role assigns, Admin and BreakGlass (the BreakGlass_ prefix doesn't match BreakGlassApprover_), so it can't
+  # widen its own role or any other; and only reads of Identity Center's SAML provider, so it can't break sign-in (#314).
+  statement {
+    sid = "ProvisionAdminAndBreakGlassHere"
+    actions = [
+      "iam:AttachRolePolicy", "iam:CreateRole", "iam:DeleteRole", "iam:DeleteRolePermissionsBoundary",
+      "iam:DeleteRolePolicy", "iam:DetachRolePolicy", "iam:GetRole", "iam:GetRolePolicy", "iam:ListAttachedRolePolicies",
+      "iam:ListRolePolicies", "iam:ListRoleTags", "iam:PutRolePermissionsBoundary", "iam:PutRolePolicy", "iam:TagRole",
+      "iam:UntagRole", "iam:UpdateAssumeRolePolicy", "iam:UpdateRole", "iam:UpdateRoleDescription",
+    ]
+    resources = [
+      "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_*",
+      "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_Admin_*",
+      "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_BreakGlass_*",
+      "arn:aws:iam::${var.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_BreakGlass_*",
+    ]
+  }
+
+  statement {
+    sid       = "ReadIdentityCentersSamlProvider"
+    actions   = ["iam:GetSAMLProvider"]
+    resources = ["arn:aws:iam::${var.account_id}:saml-provider/AWSSSO_*_DO_NOT_DELETE"]
+  }
+
+  statement {
+    sid       = "FindRoles"
+    actions   = ["iam:ListRoles"]
     resources = ["*"]
   }
 }

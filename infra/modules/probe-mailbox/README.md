@@ -38,7 +38,7 @@ Osaka's mailbox (docs/runbooks/regional-failover.md, "Afterwards").
 
 ## The load test's role (staging)
 
-`sft-staging-loadtest` trusts GitHub's OIDC provider for `repo:codewithmuh/secure-file-transfer:environment:loadtest-staging`
+`sft-staging-loadtest` trusts GitHub's OIDC provider for `repo:codewithmuh@51082957/secure-file-transfer@1443829486:environment:loadtest-staging`
 only; that environment accepts deployments from main only, which the maintainer sets in the repository settings. It
 may read `sft/staging/loadtest/api-keys` (made here without a value) and list, read and delete under `loadtest/` in
 Tokyo's mailbox; nothing else. Its ARN is the identity root's `probe_mailbox.load_test_role_arn` output, the workflow's

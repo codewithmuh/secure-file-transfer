@@ -39,8 +39,8 @@ output "tags" {
 }
 
 output "github_repository" {
-  description = "The repository whose workflows may assume the Terraform roles (T-71)."
-  value       = local.github_repository
+  description = "The repository whose workflows may assume the roles, as GitHub's OIDC subject names it: owner@id/name@id (T-71, #316). Only trust policies read it."
+  value       = local.github_oidc_repository
 }
 
 output "bootstrap_iam_path" {
@@ -89,4 +89,9 @@ output "workload_role_names" {
 output "workload_role_arns" {
   description = "Every workload role's ARN at path /, by short name, built from the name so policies can name a role before it exists (#172)."
   value       = { for name, role in local.workload_role_names : name => "arn:aws:iam::${var.account_id}:role/${role}" }
+}
+
+output "organization_trail_name" {
+  description = "Name of the organization trail, which the organization stack creates and the log archive's policies admit (#318)."
+  value       = local.organization_trail_name
 }

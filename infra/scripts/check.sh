@@ -9,12 +9,14 @@
 #   tflint       tflint with the AWS ruleset, every root and module (infra/.tflint.hcl)
 #   trivy        Trivy's misconfiguration scan (exceptions in .trivyignore.yaml)
 #   test         terraform test for every module with a tests/ folder, against a mocked AWS provider (#235)
+#   policy-sizes the self-test of check-policy-sizes.py, which measures a plan's IAM policies before apply (#312)
 #   all          all of the checks above, reporting every failure
 #   lock <root>  write the root's .terraform.lock.hcl for every platform in LOCK_PLATFORMS
 #
 # Every tool runs from a container image pinned by version and digest, so nobody installs Terraform, tflint or Trivy
 # and everyone runs the same versions. Nothing here reaches AWS: the containers get no credentials, no AWS config and
 # none of the host's environment, init runs with -backend=false, and nothing plans or applies.
+# The one exception is policy-sizes: a self-test of a standard-library Python script, run on the host's python3.
 set -euo pipefail
 
 # Terraform's version must satisfy required_version in every root (~> 1.17.0).
@@ -203,9 +205,14 @@ lock() {
   ' sh "$root" "${platforms[@]}"
 }
 
+# The size check itself runs on a plan, which needs AWS; here only its self-test runs.
+policy_sizes() {
+  python3 infra/scripts/check-policy-sizes.py --self-test
+}
+
 all() {
   local status=0 check
-  for check in conventions fmt validate tflint trivy test; do
+  for check in conventions fmt validate tflint trivy test policy_sizes; do
     echo "=== $check"
     "$check" || { echo "=== $check failed" >&2; status=1; }
   done
@@ -214,10 +221,11 @@ all() {
 
 case "${1:-}" in
   conventions | fmt | validate | tflint | trivy | test | all) "$1" ;;
+  policy-sizes) policy_sizes ;;
   fmt-fix) fmt_fix ;;
   lock) lock "${2:-}" ;;
   *)
-    sed -n '4,13p' "$0" >&2
+    sed -n '4,14p' "$0" >&2
     exit 2
     ;;
 esac

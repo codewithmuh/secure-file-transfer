@@ -12,8 +12,3 @@ output "logs_key_arn" {
   description = "ARN of the shared account's logs key, which the environments' trails name."
   value       = aws_kms_key.logs.arn
 }
-
-output "trail_arn" {
-  description = "ARN of the organization trail."
-  value       = aws_cloudtrail.organization.arn
-}

@@ -180,6 +180,14 @@ data "aws_iam_policy_document" "data_deploy" {
     }
   }
 
+}
+
+# Deploy: the data layer's other stores (the counter store, the queues, the master secret, the database's log group)
+# and the keys they use. Apart from the databases above, so each managed policy stays under IAM's 6,144 characters
+# (#312: together they came to 7,173 in dev).
+data "aws_iam_policy_document" "data_deploy_stores" {
+  count = local.network_enabled ? 1 : 0
+
   statement {
     sid = "CounterStoreCreateAndChange"
     actions = [
@@ -349,7 +357,7 @@ resource "aws_iam_policy" "deploy_data" {
 
   name        = "${var.deploy_role_name}-data"
   path        = var.iam_path
-  description = "Terraform applies of the data layer's stores: Aurora, the counter store, the queues (#101)."
+  description = "Terraform applies of the data layer's databases: Aurora, with the layer's reads (#101, #312)."
   policy      = data.aws_iam_policy_document.data_deploy[0].json
 }
 
@@ -358,4 +366,20 @@ resource "aws_iam_role_policy_attachment" "deploy_data" {
 
   role       = aws_iam_role.deploy[0].name
   policy_arn = aws_iam_policy.deploy_data[0].arn
+}
+
+resource "aws_iam_policy" "deploy_data_stores" {
+  count = local.network_enabled && var.github_environment != null ? 1 : 0
+
+  name        = "${var.deploy_role_name}-data-stores"
+  path        = var.iam_path
+  description = "Terraform applies of the data layer's other stores: the counter store, queues, secret, log group (#101, #312)."
+  policy      = data.aws_iam_policy_document.data_deploy_stores[0].json
+}
+
+resource "aws_iam_role_policy_attachment" "deploy_data_stores" {
+  count = local.network_enabled && var.github_environment != null ? 1 : 0
+
+  role       = aws_iam_role.deploy[0].name
+  policy_arn = aws_iam_policy.deploy_data_stores[0].arn
 }

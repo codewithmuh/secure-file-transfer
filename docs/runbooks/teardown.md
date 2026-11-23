@@ -103,7 +103,9 @@ so the destroy leaves it to the retained stack, which adopted it in step 0.
 
 ### 3. The shared registry (final, last environment only)
 
-With `--last`: `infra/shared`, the registry and its key, goes with the last environment. The organization's log
+With `--last`: `infra/shared`, the registry and its key, goes with the last environment. First, as the management
+account's `Admin`, apply `infra/organization` with `TF_VAR_organization_trail_enabled=false`: that removes the organization trail, which
+would otherwise keep writing to an archive that is going (#318). The organization's log
 archive stays under its 90-day Object Lock and bills a few cents until it ends (NFR-19).
 
 ### 4. Nothing left (10 min)

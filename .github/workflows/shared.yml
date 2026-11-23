@@ -1,0 +1,120 @@
+name: shared
+
+# Plan or apply infra/shared, the shared account's stack: the image registry, the sft.<domain> zone and its DNS roles,
+# the web bundles bucket and the organization's log archive and trail (#314). Only the shared account's Terraform deploy
+# role may: SCP 4 keeps roles under /sft-shared/ with the deploy roles, and the stack's KMS keys make that role their
+# administrator, so Admin can't. The role trusts the GitHub environment `shared`, which accepts main alone (T-71).
+#
+#   gh workflow run shared.yml -f action=plan
+#   gh workflow run shared.yml -f action=apply
+#
+# The repository is public, and so are these logs: the account IDs and the domain are masked, and Terraform prints only
+# its summaries here. A plan that destroys or replaces anything is refused: that's a reviewed change of its own.
+#
+# Variables (never literals in this file):
+#   SFT_DOMAIN             repository: the maintainer's domain; the zone is sft.<domain>
+#   AWS_ACCOUNT_ID         environment shared: the shared account
+#   MANAGEMENT_ACCOUNT_ID  environment shared: the management account, which owns the organization trail
+#   MEMBER_ACCOUNT_IDS     environment shared: the environments that exist, as JSON, e.g. {"dev":"111122223333"}
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: plan, or apply (plans first, and applies only a plan that destroys nothing)
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions: {}
+
+concurrency:
+  group: shared
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: ${{ inputs.action }} shared
+    runs-on: ubuntu-24.04 # pinned: upgrade deliberately, not when GitHub moves "latest"
+    timeout-minutes: 60
+    environment: shared # the deploy role's OIDC subject; main only (T-71)
+    permissions:
+      contents: read
+      id-token: write # OIDC into the shared account's deploy role
+    env:
+      ACTION: ${{ inputs.action }}
+      # As cluster-bootstrap-apply.yml: Terraform as infra/scripts/check.sh runs it, checked against its checksum.
+      TERRAFORM_VERSION: 1.17.1
+      TERRAFORM_SHA256: 4638628058e71a55212b1c563712eac03b902128f40740f3dc8174df12135061
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - name: Refuse anything but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::shared.yml runs from main only."
+          exit 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Keep the account IDs and the domain out of the public log
+        env:
+          ACCOUNT: ${{ vars.AWS_ACCOUNT_ID }}
+          MANAGEMENT: ${{ vars.MANAGEMENT_ACCOUNT_ID }}
+          MEMBERS: ${{ vars.MEMBER_ACCOUNT_IDS }}
+          DOMAIN: ${{ vars.SFT_DOMAIN }}
+        run: |
+          for value in "$ACCOUNT" "$MANAGEMENT" "$DOMAIN"; do
+            if [[ -z $value ]]; then
+              echo "::error::AWS_ACCOUNT_ID and MANAGEMENT_ACCOUNT_ID (environment shared) and SFT_DOMAIN must be set."
+              exit 1
+            fi
+            echo "::add-mask::$value"
+          done
+          grep -oE '[0-9]{12}' <<<"$MEMBERS" | while read -r id; do echo "::add-mask::$id"; done
+      - name: Install Terraform, checked against its checksum
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --output terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "${TERRAFORM_SHA256}  terraform.zip" | sha256sum --check --strict
+          unzip -q -o terraform.zip terraform -d bin
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/sft-bootstrap/sft-shared-terraform-deploy
+          role-session-name: shared-${{ inputs.action }}-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ap-northeast-1
+          mask-aws-account-id: true
+      - name: Terraform ${{ inputs.action }}
+        env:
+          TF_VAR_account_id: ${{ vars.AWS_ACCOUNT_ID }}
+          TF_VAR_management_account_id: ${{ vars.MANAGEMENT_ACCOUNT_ID }}
+          TF_VAR_domain: ${{ vars.SFT_DOMAIN }}
+          MEMBERS: ${{ vars.MEMBER_ACCOUNT_IDS }}
+        run: |
+          if [[ -n $MEMBERS ]]; then export TF_VAR_member_account_ids=$MEMBERS; fi
+          root=infra/shared
+          logs="$RUNNER_TEMP/terraform"
+          mkdir -p "$logs"
+          # Full output to files, summaries to the log: the plan names ARNs and IDs this public log mustn't show.
+          show() { grep -E '^(Plan:|No changes|Apply complete|Error|│)' "$1" || true; }
+          terraform -chdir="$root" init -no-color -lockfile=readonly \
+            -backend-config="bucket=sft-shared-apne1-tfstate-$TF_VAR_account_id" > "$logs/init.log" 2>&1 ||
+            { show "$logs/init.log"; exit 1; }
+          terraform -chdir="$root" plan -no-color -out=tfplan > "$logs/plan.log" 2>&1 || { show "$logs/plan.log"; exit 1; }
+          show "$logs/plan.log"
+          # Only the summary lines go to the run's summary page: error boxes can quote ARNs.
+          grep -E '^(Plan:|No changes)' "$logs/plan.log" >> "$GITHUB_STEP_SUMMARY" || true
+          if grep -qE '^Plan: .*[1-9][0-9]* to destroy' "$logs/plan.log"; then
+            if [[ $ACTION != apply ]]; then
+              echo "::warning::The plan destroys or replaces something; apply refuses it. Read the plan as Admin."
+              exit 0
+            fi
+            echo "::error::The plan destroys or replaces something. Make it a reviewed change of its own; nothing applied."
+            exit 1
+          fi
+          if [[ $ACTION != apply ]]; then exit 0; fi
+          terraform -chdir="$root" apply -no-color tfplan > "$logs/apply.log" 2>&1 || { show "$logs/apply.log"; exit 1; }
+          show "$logs/apply.log"
+          grep -E '^Apply complete' "$logs/apply.log" >> "$GITHUB_STEP_SUMMARY" || true
