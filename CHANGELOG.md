@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.1.0](https://github.com/codewithmuh/secure-file-transfer/compare/v1.0.0...v1.1.0) (2026-11-24)
+
+
+### Features
+
+* **infra:** apply infra/shared from a workflow as its deploy role, and the organization fixes that missed [#313](https://github.com/codewithmuh/secure-file-transfer/issues/313) ([#314](https://github.com/codewithmuh/secure-file-transfer/issues/314)) ([#315](https://github.com/codewithmuh/secure-file-transfer/issues/315)) ([225637d](https://github.com/codewithmuh/secure-file-transfer/commit/225637ddc6c0612debdfe371f2a96e303690630a))
+* **ops:** one command to bring an AWS environment up or down ([#295](https://github.com/codewithmuh/secure-file-transfer/issues/295)) ([#296](https://github.com/codewithmuh/secure-file-transfer/issues/296)) ([e41fc3b](https://github.com/codewithmuh/secure-file-transfer/commit/e41fc3b533ab03f60a955a40d3467feff6335bd7))
+
+
+### Bug Fixes
+
+* **ci:** pass the environment's secrets to environment-run.yml ([#321](https://github.com/codewithmuh/secure-file-transfer/issues/321)) ([#322](https://github.com/codewithmuh/secure-file-transfer/issues/322)) ([b38d84e](https://github.com/codewithmuh/secure-file-transfer/commit/b38d84e61312edbbb3f512aa374f8819f21ef640))
+* **infra:** Aurora reboot, and ElastiCache's dax ViaService for the data layer's keys ([#326](https://github.com/codewithmuh/secure-file-transfer/issues/326)) ([#327](https://github.com/codewithmuh/secure-file-transfer/issues/327)) ([bcf251e](https://github.com/codewithmuh/secure-file-transfer/commit/bcf251e3aae5bc468c0ee723ade837fb86fade51))
+* **infra:** DNSSEC key use for the deploy role, and the organization trail in the management account ([#318](https://github.com/codewithmuh/secure-file-transfer/issues/318)) ([#319](https://github.com/codewithmuh/secure-file-transfer/issues/319)) ([9957fb6](https://github.com/codewithmuh/secure-file-transfer/commit/9957fb682610edd4cf238e8aef92078d073bc51a))
+* **infra:** keep the BreakGlass role in each cluster account through an empty standby group ([#328](https://github.com/codewithmuh/secure-file-transfer/issues/328)) ([#329](https://github.com/codewithmuh/secure-file-transfer/issues/329)) ([d7cd620](https://github.com/codewithmuh/secure-file-transfer/commit/d7cd620b65ef0b00c7c0459ca927928fe4cf7a83))
+* **infra:** let the deploy role launch instances from its own launch templates, for EKS's node group check ([#330](https://github.com/codewithmuh/secure-file-transfer/issues/330)) ([#334](https://github.com/codewithmuh/secure-file-transfer/issues/334)) ([d6715f5](https://github.com/codewithmuh/secure-file-transfer/commit/d6715f584d6105cb27fe333fec58217f28b773b6))
+* **infra:** let the deploy role tag VPC endpoints when it creates them ([#324](https://github.com/codewithmuh/secure-file-transfer/issues/324)) ([#325](https://github.com/codewithmuh/secure-file-transfer/issues/325)) ([6d4d1ea](https://github.com/codewithmuh/secure-file-transfer/commit/6d4d1ea3ddb5ab4d8b12fdf96f327a6532a8d0b7))
+* **infra:** split two deploy policies over IAM's 6,144 characters, and measure policies before apply ([#312](https://github.com/codewithmuh/secure-file-transfer/issues/312)) ([#313](https://github.com/codewithmuh/secure-file-transfer/issues/313)) ([5032599](https://github.com/codewithmuh/secure-file-transfer/commit/5032599e5624ad4c5a51085aa3e012fa10b71c42))
+* **infra:** the web ACL's one-path OR, security group descriptions, and DescribeAccountAttributes for the load balancer ([#336](https://github.com/codewithmuh/secure-file-transfer/issues/336)) ([#337](https://github.com/codewithmuh/secure-file-transfer/issues/337)) ([634723b](https://github.com/codewithmuh/secure-file-transfer/commit/634723bbcda475c2c058633fd529d35787a89703))
+* **infra:** trust GitHub's immutable OIDC subject, owner@id/name@id ([#316](https://github.com/codewithmuh/secure-file-transfer/issues/316)) ([#317](https://github.com/codewithmuh/secure-file-transfer/issues/317)) ([b504bd1](https://github.com/codewithmuh/secure-file-transfer/commit/b504bd1a6a509995a0cd60539cad2987ae246bfe))
+* **ops:** [#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)'s review fixes, which missed its merge ([#301](https://github.com/codewithmuh/secure-file-transfer/issues/301)) ([#302](https://github.com/codewithmuh/secure-file-transfer/issues/302)) ([8dcddf0](https://github.com/codewithmuh/secure-file-transfer/commit/8dcddf0c46ea35a1529ade3c075d5b23d61fe7e3))
+* **ops:** review fixes for aws-up/aws-down, and the flow-log bucket that missed [#296](https://github.com/codewithmuh/secure-file-transfer/issues/296) ([#299](https://github.com/codewithmuh/secure-file-transfer/issues/299)) ([#300](https://github.com/codewithmuh/secure-file-transfer/issues/300)) ([820f673](https://github.com/codewithmuh/secure-file-transfer/commit/820f673948ae9bdf698278477eae8bcc87f9ae71))
+
 ## [1.0.0](https://github.com/codewithmuh/secure-file-transfer/compare/v0.1.0...v1.0.0) (2026-11-13)
 
 
