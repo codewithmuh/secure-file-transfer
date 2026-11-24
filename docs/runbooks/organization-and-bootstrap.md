@@ -213,8 +213,9 @@ terraform apply
 ```
 
 It creates the six permission sets (`Admin`, `BreakGlass`, `BreakGlassApprover`, `ReadOnly`, `Operator`,
-`AuditReader`), the four groups, your memberships and the group assignments. It assigns nothing for `Admin` or
-`BreakGlass`: those are never standing.
+`AuditReader`), the five groups, your memberships and the group assignments. Nobody holds `Admin` or `BreakGlass`
+standing: `BreakGlass` is assigned only to the group `sft-breakglass-standby`, which never has members and only keeps
+its role in dev, staging and prod for the clusters' EKS access entries (#328).
 
 It also creates each environment's `sft-<env>-break-glass-trail`, the read-only role the operator API's break-glass
 reconciliation assumes (#239). For each environment, put its role, the `BreakGlass` permission set and the identity

@@ -5,7 +5,8 @@
 # in the console (runbook steps 6 and 7) before identity_center_enabled may be true. MFA is required at every sign-in,
 # by security key or passkey only (authn-authz 8.1).
 #
-# Nobody holds Admin or BreakGlass standing. A BreakGlassApprover assigns either one to a person for at most an hour,
+# Nobody holds Admin or BreakGlass standing (the empty sft-breakglass-standby group only keeps BreakGlass's role in
+# the cluster accounts, #328). A BreakGlassApprover assigns either one to a person for at most an hour,
 # and the assignment is removed afterwards (authn-authz 8.3, ADR-0006). The break-glass tool, which does that with an
 # EventBridge Scheduler removal and the alerts, comes with FR-35 (M6); until then the runbook gives the CLI commands.
 #
@@ -74,7 +75,7 @@ locals {
     ]) : "${pair.set}/${basename(pair.arn)}" => pair
   } : {}
 
-  # Groups and where each is assigned. Admin and BreakGlass have no group: see the header.
+  # Groups and where each is assigned. Nobody holds Admin or BreakGlass through a group: see the header.
   groups = {
     readonly = {
       display_name   = "sft-readonly"
@@ -99,6 +100,16 @@ locals {
       description    = "AuditReader in every member account: the archives are in each environment, the log archive in shared."
       permission_set = "AuditReader"
       accounts       = local.member_account_names
+    }
+    # Never has members: identity_center_group_members refuses any group but the four above. Its assignment only keeps
+    # BreakGlass's role in each account with a cluster, which the cluster's EKS access entry names (ADR-0004). Identity
+    # Center makes a role only for an assignment, and EKS admits a role by its identity, not its name, so the role must
+    # exist before the cluster and outlast every grant (#328). Holding BreakGlass is still an approver's hour-long grant.
+    breakglass_standby = {
+      display_name   = "sft-breakglass-standby"
+      description    = "Never has members. Keeps the BreakGlass role in each account with a cluster, for its EKS access entry (#328)."
+      permission_set = "BreakGlass"
+      accounts       = ["dev", "staging", "prod"]
     }
   }
 
