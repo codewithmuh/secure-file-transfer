@@ -79,10 +79,14 @@ run "web_acl" {
         r.statement[0].rate_based_statement[0].evaluation_window_sec,
         r.statement[0].rate_based_statement[0].aggregate_key_type,
         length(r.action[0].challenge),
-        sort([
-          for s in r.statement[0].rate_based_statement[0].scope_down_statement[0].or_statement[0].statement :
-          s.byte_match_statement[0].search_string
-        ]),
+        # One path is the byte match itself, more are an OR of them (#336).
+        sort(concat(
+          [for b in r.statement[0].rate_based_statement[0].scope_down_statement[0].byte_match_statement : b.search_string],
+          flatten([
+            for o in r.statement[0].rate_based_statement[0].scope_down_statement[0].or_statement :
+            [for s in o.statement : s.byte_match_statement[0].search_string]
+          ]),
+        )),
       ] if r.name == "challenge-link-pages"
     ]) == jsonencode([[30, 300, "IP", 1, ["/t"]]])
     error_message = "challenge-link-pages: a Challenge above 30 link page loads per IP in 300 s."

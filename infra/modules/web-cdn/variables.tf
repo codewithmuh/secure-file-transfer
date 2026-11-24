@@ -49,6 +49,11 @@ variable "link_page_paths" {
   description = "Paths of the recipient and uploader pages, whose bursts get a Challenge (abuse 3.2)."
   type        = list(string)
   default     = ["/t"]
+
+  validation {
+    condition     = length(var.link_page_paths) > 0
+    error_message = "Name at least one link page path."
+  }
 }
 
 variable "managed_rules_in_count" {
