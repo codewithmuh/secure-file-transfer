@@ -62,6 +62,12 @@ locals {
   cluster_launch_templates = [
     for r in var.network_regions : "arn:aws:ec2:${r}:${var.account_id}:launch-template/*"
   ]
+  # What a launch from those templates creates (#330).
+  cluster_launched_arns = flatten([
+    for r in var.network_regions : [
+      for type in ["instance", "volume", "network-interface"] : "arn:aws:ec2:${r}:${var.account_id}:${type}/*"
+    ]
+  ])
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -165,6 +171,44 @@ data "aws_iam_policy_document" "cluster_deploy" {
     sid       = "LaunchTemplates"
     actions   = ["ec2:CreateLaunchTemplate", "ec2:CreateLaunchTemplateVersion", "ec2:CreateTags", "ec2:ModifyLaunchTemplate"]
     resources = local.cluster_launch_templates
+  }
+
+  # EKS checks that whoever creates a managed node group could launch its template's instances itself, though EKS's
+  # own role does the launching (#330). So: instances, volumes and network interfaces only from this account's launch
+  # templates, into its subnets and security groups, from AWS's images, and tagged only as they launch.
+  statement {
+    sid       = "LaunchOnlyFromOwnTemplates"
+    actions   = ["ec2:RunInstances"]
+    resources = local.cluster_launched_arns
+
+    condition {
+      test     = "ArnLike"
+      variable = "ec2:LaunchTemplate"
+      values   = local.cluster_launch_templates
+    }
+  }
+
+  statement {
+    sid     = "LaunchIntoOwnNetworkFromAwsImages"
+    actions = ["ec2:RunInstances"]
+    resources = concat(local.cluster_launch_templates, flatten([
+      for r in var.network_regions : [
+        "arn:aws:ec2:${r}:${var.account_id}:subnet/*", "arn:aws:ec2:${r}:${var.account_id}:security-group/*",
+        "arn:aws:ec2:${r}::image/*",
+      ]
+    ]))
+  }
+
+  statement {
+    sid       = "TagInstancesAsTheyLaunch"
+    actions   = ["ec2:CreateTags"]
+    resources = local.cluster_launched_arns
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["RunInstances"]
+    }
   }
 
   statement {
