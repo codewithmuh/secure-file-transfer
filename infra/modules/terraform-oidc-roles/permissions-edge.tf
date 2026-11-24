@@ -48,6 +48,7 @@ data "aws_iam_policy_document" "edge_read" {
     actions = [
       "acm:DescribeCertificate",
       "acm:ListTagsForCertificate",
+      "ec2:DescribeAccountAttributes", # CreateLoadBalancer reads it (#336)
       "elasticloadbalancing:Describe*",
       "kms:DescribeKey",
       "kms:ListAliases",

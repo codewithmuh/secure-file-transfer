@@ -135,23 +135,46 @@ resource "aws_wafv2_web_acl" "web" {
         evaluation_window_sec = 300
         aggregate_key_type    = "IP"
 
+        # One path is the match itself: WAF refuses an or_statement with fewer than two statements (#336).
         scope_down_statement {
-          or_statement {
-            dynamic "statement" {
-              for_each = toset(var.link_page_paths)
+          dynamic "byte_match_statement" {
+            for_each = length(var.link_page_paths) == 1 ? var.link_page_paths : []
 
-              content {
-                byte_match_statement {
-                  positional_constraint = "EXACTLY"
-                  search_string         = statement.value
+            content {
+              positional_constraint = "EXACTLY"
+              search_string         = byte_match_statement.value
 
-                  field_to_match {
-                    uri_path {}
-                  }
+              field_to_match {
+                uri_path {}
+              }
 
-                  text_transformation {
-                    priority = 0
-                    type     = "NONE"
+              text_transformation {
+                priority = 0
+                type     = "NONE"
+              }
+            }
+          }
+
+          dynamic "or_statement" {
+            for_each = length(var.link_page_paths) > 1 ? [1] : []
+
+            content {
+              dynamic "statement" {
+                for_each = toset(var.link_page_paths)
+
+                content {
+                  byte_match_statement {
+                    positional_constraint = "EXACTLY"
+                    search_string         = statement.value
+
+                    field_to_match {
+                      uri_path {}
+                    }
+
+                    text_transformation {
+                      priority = 0
+                      type     = "NONE"
+                    }
                   }
                 }
               }

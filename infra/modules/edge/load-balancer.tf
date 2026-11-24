@@ -14,7 +14,7 @@ resource "aws_security_group" "load_balancer" {
 # group, decides who gets through.
 resource "aws_vpc_security_group_ingress_rule" "load_balancer_https" {
   security_group_id = aws_security_group.load_balancer.id
-  description       = "HTTPS from the internet: the API's one listener"
+  description       = "HTTPS from the internet: the one listener of the API"
   ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
@@ -38,7 +38,7 @@ resource "aws_vpc_security_group_ingress_rule" "main_nodes_from_load_balancer" {
   for_each = { public = var.api_public_port, internal = var.api_internal_port }
 
   security_group_id            = data.aws_security_group.main_nodes.id
-  description                  = "From the API load balancer: the API's ${each.key} port"
+  description                  = "From the API load balancer: the ${each.key} port of the API"
   ip_protocol                  = "tcp"
   from_port                    = each.value
   to_port                      = each.value
